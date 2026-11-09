@@ -16,7 +16,7 @@ Vertical slices: every phase ends with a runnable build, automated tests and rea
 
 ## Open owner decisions
 
-1. **UI layout** — option A, B or C in [design/README.md](design/README.md).
+1. ~~**UI layout**~~ — decided: C (extended work area) by default, A (classic fixed screen) as preference. See [design/README.md](design/README.md).
 2. **Rust toolchain** — install rustup (pinned via `rust-toolchain.toml`) vs. upgrade Homebrew Rust vs. stay on 1.90 with eframe 0.33.
 
 ## Next steps after Phase 0 sign-off

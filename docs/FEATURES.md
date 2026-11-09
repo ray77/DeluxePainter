@@ -20,7 +20,8 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Magnify window (split view: normal + zoomed) | DPaint's signature zoom |
 | P1 | Spare page (swap, copy, merge front/back) | |
 | P1 | Hide/show toolbox and menu bar for full-screen painting | |
-| P1 | Layout: extended work area (default) or classic fixed screen | owner decision pending |
+| P0 | Layout: extended work area — virtual screen sized to the window, page inside a grey work area, movable requesters, status line (default) | decided, design option C |
+| P1 | Layout preference "Classic screen": fixed 640×512 (PAL) / 640×400 (NTSC) virtual screen, letterboxed | decided, design option A |
 
 ## 2. Documents & hardware targets
 
