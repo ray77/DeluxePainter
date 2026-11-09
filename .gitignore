@@ -1,0 +1,17 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Local, copyrighted reference material (manuals/screenshots of the original
+# software). Never commit or redistribute.
+/Manuals, Pics/
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local scratch
+/scratch/
+*.dpxproj.tmp

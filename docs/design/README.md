@@ -1,0 +1,13 @@
+# UI layout options (design checkpoint 1)
+
+All three keep the same DeluxePaint IV AGA visual language: one-line grey menu bar, two-column toolbox at the right, multi-column AGA palette with page selector, square bevelled requesters, original bitmap font. They differ only in how the modern additions (layers, frames, status) are integrated and how much screen space the canvas gets on large monitors.
+
+The mockups are rough sketches drawn with a placeholder font (the real UI gets an original 8×8 pixel font) and simplified icons. Shown at 2×.
+
+| Option | Mockup | Idea | Pros | Cons |
+|---|---|---|---|---|
+| **A — Classic** | ![A](mockups/option-a-classic.png) | Fixed 640×512 virtual screen exactly like the original. Layers, frames etc. open as pop-up requesters (like Palette/Fill Type in DPaint). | Most authentic; nothing on screen the original didn't have | Layer work means opening/closing a requester often; letterboxed on wide monitors |
+| **B — Classic + docked panel** | ![B](mockups/option-b-docked.png) | Same 640×512 screen, but a permanent pixel side panel (layers) and a frame strip at the bottom. | Layers/frames always visible; still a fixed retro screen | Canvas area shrinks noticeably at 640×512; less authentic |
+| **C — Extended work area** | ![C](mockups/option-c-extended.png) | Virtual screen grows with the window (e.g. 960×540 at 4× on a 4K display). Page sits inside a grey work area; layers etc. are movable pixel requesters; status line at the bottom. | Best use of 4K/wide screens; scrolling/zoom room around the page; authentic widgets | The overall screen proportions differ from the original |
+
+Recommendation: **C as default, A as a "Classic screen" preference** — same widgets, so both cost little extra. B's permanent panel can be added later as an option if layer-heavy work demands it.

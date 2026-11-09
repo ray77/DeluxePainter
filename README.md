@@ -1,0 +1,51 @@
+<p align="center">
+  <img src="assets/app/deluxepainter-logo.png" alt="DeluxePainter logo" width="256">
+</p>
+
+<h1 align="center">DeluxePainter</h1>
+
+<p align="center">
+  A pixel-art editor in the spirit of the classic Amiga paint programs —<br>
+  real OCS/AGA hardware rules, IFF ILBM/ANIM files, layers, and an MCP interface for AI agents.<br>
+  Native Rust · macOS · Windows · Linux
+</p>
+
+---
+
+> **Status: Phase 0 — research and design.** There is no runnable build yet. This repository currently contains the research, architecture and design documents that the implementation will follow.
+
+## What it will be
+
+- **The classic look and feel**, rebuilt from scratch: menu bar, two-column toolbox, palette, requesters — rendered as crisp pixel art at integer scales (1×–5×, 4K-ready), never blurred.
+- **Real Amiga targets**: OCS and AGA profiles (PAL/NTSC, LoRes/HiRes/SuperHiRes, interlace, EHB, HAM6, HAM8) are enforced document rules, not a visual filter.
+- **Amiga files done right**: IFF ILBM import/export (ByteRun1, masks, CAMG, colour cycling) and IFF ANIM; PNG import/export; JPEG import.
+- **Modern project editing**: the native `.dpxproj` format keeps layers, groups, frames, palettes and editor state. Saving is lossless; Amiga files are produced by an explicit, checked export.
+- **Classic tools**: freehand, lines, curves, shapes, fills with gradients and dithering, airbrush, brushes with transform, stencil, symmetry, grid, magnify, spare page, colour cycling, animation with light table.
+- **MCP server**: Claude and other MCP clients can create, draw, inspect and export documents through typed commands — the same command engine the GUI uses, no mouse automation.
+
+See [`docs/FEATURES.md`](docs/FEATURES.md) for the prioritised feature set and [`docs/ROADMAP.md`](docs/ROADMAP.md) for the plan.
+
+## Documentation
+
+| Document | Content |
+|---|---|
+| [FEATURES.md](docs/FEATURES.md) | Condensed, prioritised feature list (MVP → later) |
+| [ROADMAP.md](docs/ROADMAP.md) | Phases and milestones |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crates, document model, command engine, rendering, MCP |
+| [adr/](docs/adr/) | Architecture decision records |
+| [HARDWARE_MODES.md](docs/HARDWARE_MODES.md) | OCS/AGA display modes, palettes, EHB/HAM rules |
+| [IFF_SUPPORT_MATRIX.md](docs/IFF_SUPPORT_MATRIX.md) | ILBM/ANIM chunk layouts and support plan |
+| [research/](docs/research/) | Manual, video and dependency research with sources |
+| [design/](docs/design/) | UI layout mockups |
+
+## Building
+
+Not yet — the Rust workspace arrives in Phase 1.
+
+## License
+
+Copyright © 2026 Dominik Schmidt. DeluxePainter is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You may use, modify and share it for any **noncommercial** purpose. Commercial use requires a separate license from the author.
+
+## Disclaimer
+
+DeluxePainter is an independent project. It is not affiliated with, endorsed by, or connected to Electronic Arts. "Deluxe Paint" / "DeluxePaint" is a trademark of Electronic Arts Inc.; Amiga is a trademark of its respective owner. No original program code, artwork, fonts or documentation of DeluxePaint are included in this repository.
