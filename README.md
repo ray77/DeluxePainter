@@ -12,10 +12,11 @@
 
 ---
 
-> **Status: Phase 1 — first paint (pre-alpha).** The window shows the classic DeluxePaint LoRes screen (title bar, toolbox, palette) rendered pixel-exactly; freehand painting, tool/brush/colour selection, undo and CLR work. Everything else is still to come.
+> **Status: Phase 1 — first paint (pre-alpha).** The window shows a classic Amiga LoRes paint screen (title bar, toolbox, palette, pull-down menus) rendered pixel-exactly; freehand painting, tool/brush/colour selection, undo, CLR, paint-mode selection and a few menu commands work. Everything else is still to come.
 
 <p align="center">
-  <img src="docs/design/screenshots/phase1-lores-default.png" alt="DeluxePainter start screen, 320×256 LoRes at 2×" width="640">
+  <img src="docs/design/screenshots/phase1-lores-default.png" alt="DeluxePainter start screen, 320×256 LoRes at 2×" width="400">
+  <img src="docs/design/screenshots/phase1-menu-picture.png" alt="Picture menu open" width="400">
 </p>
 
 ## What it will be
@@ -56,7 +57,9 @@ Headless snapshot of the start screen (used for visual comparison tests):
 cargo run -p deluxepainter -- --snapshot screen.png --scale 2
 ```
 
-Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; `U` undo; `F10` hide/show toolbox and title bar, `F9` title bar only.
+Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` undo; `F10` hide/show toolbox and title bar, `F9` title bar only.
+
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--font-preview out.png`.
 
 ## License
 

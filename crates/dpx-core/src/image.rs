@@ -75,6 +75,45 @@ impl IndexedImage {
         }
     }
 
+    /// Mirrors the image about its vertical axis (left <-> right).
+    pub fn flip_horizontal(&mut self) {
+        let w = self.width as usize;
+        if w > 0 {
+            for row in self.pixels.chunks_exact_mut(w) {
+                row.reverse();
+            }
+        }
+    }
+
+    /// Mirrors the image about its horizontal axis (top <-> bottom).
+    pub fn flip_vertical(&mut self) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        for y in 0..h / 2 {
+            let (top, bottom) = self.pixels.split_at_mut((h - 1 - y) * w);
+            top[y * w..(y + 1) * w].swap_with_slice(&mut bottom[..w]);
+        }
+    }
+
+    /// Recolours every pixel of index `from` to `to`.
+    pub fn replace_index(&mut self, from: u8, to: u8) {
+        for p in &mut self.pixels {
+            if *p == from {
+                *p = to;
+            }
+        }
+    }
+
+    /// Exchanges the indices `a` and `b` in every pixel.
+    pub fn swap_indices(&mut self, a: u8, b: u8) {
+        for p in &mut self.pixels {
+            if *p == a {
+                *p = b;
+            } else if *p == b {
+                *p = a;
+            }
+        }
+    }
+
     /// Copies `src` with its top-left corner at (`dx`, `dy`), clipped.
     pub fn blit(&mut self, src: &IndexedImage, dx: i32, dy: i32) {
         for y in 0..src.height as i32 {
@@ -101,5 +140,40 @@ mod tests {
         assert_eq!(img.get(1, 1), Some(7));
         assert_eq!(img.get(2, 2), Some(0));
         assert_eq!(img.get(9, 9), None);
+    }
+
+    fn numbered(w: u32, h: u32) -> IndexedImage {
+        let mut img = IndexedImage::new(w, h, 0);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                img.set(x, y, (y * w as i32 + x) as u8);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn flips() {
+        let mut img = numbered(3, 3);
+        img.flip_horizontal();
+        assert_eq!(img.pixels(), &[2, 1, 0, 5, 4, 3, 8, 7, 6]);
+        let mut img = numbered(2, 3);
+        img.flip_vertical();
+        assert_eq!(img.pixels(), &[4, 5, 2, 3, 0, 1]);
+        let mut img = numbered(2, 4);
+        img.flip_vertical();
+        img.flip_vertical();
+        assert_eq!(img, numbered(2, 4));
+    }
+
+    #[test]
+    fn recolouring() {
+        let mut img = IndexedImage::new(3, 1, 0);
+        img.set(1, 0, 1);
+        img.set(2, 0, 2);
+        img.swap_indices(0, 1);
+        assert_eq!(img.pixels(), &[1, 0, 2]);
+        img.replace_index(2, 1);
+        assert_eq!(img.pixels(), &[1, 0, 1]);
     }
 }

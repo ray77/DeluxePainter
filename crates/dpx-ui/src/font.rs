@@ -1,4 +1,6 @@
-//! The DPX 8×8 bitmap font (original, Topaz-style metrics).
+//! The DPX 8×8 bitmap font (original artwork), set proportionally like the DeluxePaint
+//! screen font in the reference screenshots: each glyph is trimmed to its inked columns and
+//! followed by a 1-pixel gap; the line height stays 8 pixels.
 
 use std::sync::OnceLock;
 
@@ -6,8 +8,11 @@ use dpx_core::IndexedImage;
 
 use crate::bitmap;
 
-pub const GLYPH_W: i32 = 8;
 pub const GLYPH_H: i32 = 8;
+/// Blank columns between two glyphs.
+pub const GAP: i32 = 1;
+/// Advance of the space character (measured: 7 px including the gap).
+pub const SPACE_ADVANCE: i32 = 7;
 
 /// Special glyph codes beyond ASCII.
 pub mod glyph {
@@ -18,8 +23,19 @@ pub mod glyph {
     pub const AMIGA_KEY: u8 = 0x84;
 }
 
+#[derive(Clone, Copy)]
+struct Glyph {
+    rows: [u8; 8],
+    /// First inked column.
+    left: i32,
+    /// Inked width (0 for blank glyphs).
+    width: i32,
+}
+
 pub struct Font {
-    glyphs: Vec<Option<[u8; 8]>>,
+    glyphs: Vec<Option<Glyph>>,
+    /// Inked width of the widest digit; digits are tabular so numbers do not jitter.
+    digit_width: i32,
 }
 
 impl Font {
@@ -45,9 +61,24 @@ impl Font {
                     }
                 }
             }
-            glyphs[usize::from(code)] = Some(rows);
+            let ink = rows.iter().fold(0u8, |a, &r| a | r);
+            let (left, width) = if ink == 0 {
+                (0, 0)
+            } else {
+                let left = ink.leading_zeros() as i32;
+                let right = 7 - ink.trailing_zeros() as i32;
+                (left, right - left + 1)
+            };
+            glyphs[usize::from(code)] = Some(Glyph { rows, left, width });
         }
-        Ok(Self { glyphs })
+        let digit_width = (b'0'..=b'9')
+            .filter_map(|c| glyphs[usize::from(c)].map(|g: Glyph| g.width))
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            glyphs,
+            digit_width,
+        })
     }
 
     /// The font shipped in `assets/ui/font/dpx-8x8.txt`.
@@ -70,22 +101,40 @@ impl Font {
         }
     }
 
-    pub fn text_width(text: &str) -> i32 {
-        text.chars().count() as i32 * GLYPH_W
+    /// Horizontal advance of one glyph code, including the trailing gap.
+    pub fn advance(&self, code: u8) -> i32 {
+        match self.glyphs[usize::from(code)] {
+            _ if code == b' ' => SPACE_ADVANCE,
+            _ if code.is_ascii_digit() => self.digit_width + GAP,
+            Some(g) if g.width > 0 => g.width + GAP,
+            _ => SPACE_ADVANCE,
+        }
     }
 
-    /// Draws a single glyph code; returns the x position after it.
+    /// Width of `text` in pixels, without the gap after the last glyph.
+    pub fn text_width(&self, text: &str) -> i32 {
+        let total: i32 = text.chars().map(|c| self.advance(Self::code_for(c))).sum();
+        (total - GAP).max(0)
+    }
+
+    /// Draws a single glyph code; returns the x position after it (including the gap).
     pub fn draw_code(&self, img: &mut IndexedImage, x: i32, y: i32, code: u8, pen: u8) -> i32 {
-        if let Some(rows) = self.glyphs[usize::from(code)] {
-            for (dy, bits) in rows.iter().enumerate() {
-                for dx in 0..8 {
-                    if bits & (0x80 >> dx) != 0 {
-                        img.set(x + dx, y + dy as i32, pen);
+        if let Some(g) = self.glyphs[usize::from(code)] {
+            // Tabular digits are centred in the common digit width.
+            let pad = if code.is_ascii_digit() {
+                (self.digit_width - g.width) / 2
+            } else {
+                0
+            };
+            for (dy, bits) in g.rows.iter().enumerate() {
+                for col in 0..8 {
+                    if bits & (0x80 >> col) != 0 {
+                        img.set(x + pad + col - g.left, y + dy as i32, pen);
                     }
                 }
             }
         }
-        x + GLYPH_W
+        x + self.advance(code)
     }
 
     /// Draws `text` with its top-left at (`x`, `y`); returns the x position after it.
@@ -119,13 +168,27 @@ mod tests {
     }
 
     #[test]
-    fn draws_within_cell() {
+    fn proportional_metrics() {
+        let f = Font::builtin();
+        // Narrow glyphs advance less than wide ones; the gap is one pixel.
+        assert!(f.advance(b'l') < f.advance(b'm'));
+        assert_eq!(f.advance(b' '), SPACE_ADVANCE);
+        assert_eq!(f.text_width(""), 0);
+        let i = f.text_width("i");
+        assert_eq!(f.text_width("ii"), 2 * i + GAP);
+        // Digits are tabular.
+        assert_eq!(f.text_width("1111"), f.text_width("8888"));
+    }
+
+    #[test]
+    fn draws_left_aligned_without_leading_blank_columns() {
         let mut img = IndexedImage::new(16, 8, 0);
-        let end = Font::builtin().draw(&mut img, 0, 0, "A", 1);
-        assert_eq!(end, 8);
-        assert!(img.pixels().contains(&1));
-        for y in 0..8 {
-            assert_eq!(img.get(15, y), Some(0));
-        }
+        let f = Font::builtin();
+        let end = f.draw(&mut img, 0, 0, "l", 1);
+        assert_eq!(end, f.advance(b'l'));
+        assert!(
+            (0..8).any(|y| img.get(0, y) == Some(1)),
+            "ink starts at x=0"
+        );
     }
 }

@@ -1,17 +1,19 @@
 //! DeluxePainter retro UI.
 //!
 //! The whole visible interface is rendered in Amiga screen pixels into an indexed buffer that
-//! shares the picture palette, exactly like DeluxePaint on the Amiga. The host (eframe) only
+//! shares the picture palette, like the classic Amiga paint programs. The host (eframe) only
 //! converts that buffer to RGBA and shows it with nearest-neighbour scaling.
 
 pub mod bitmap;
 pub mod font;
+pub mod menu;
 pub mod pens;
 pub mod screen;
 pub mod toolbox;
 
 use dpx_core::{IndexedImage, Palette};
 
+pub use menu::{Action, MenuState, Pref, Prefs};
 pub use pens::Pens;
 pub use screen::{Hit, PaintMode, Screen, UiState};
 pub use toolbox::Tool;

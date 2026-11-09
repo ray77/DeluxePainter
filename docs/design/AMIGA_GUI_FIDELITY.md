@@ -30,8 +30,8 @@ Implementation:
 
 | Element | Reference | Notes |
 |---|---|---|
-| Title bar | Wikipedia LoRes shot, `inapp_gfx_03`, `Inapp_gfx_02` | `face` background, bold 8×8 text "DeluxePaint" + paint mode name, depth gadget at the right, `dark` line beneath. Becomes the menu bar while the right mouse button is held. |
-| Menus | `inapp_gfx_03` | Intuition style: `face` box with `dark` outline, items in 8×8 font, highlighted item drawn in `select` with `shine` text, Amiga-key shortcut glyph boxes right-aligned, `▸` for submenus. |
+| Title bar | Wikipedia LoRes shot, `inapp_gfx_03`, `Inapp_gfx_02` | `face` background, text **"DeluxePainter"** + two spaces + paint mode name, depth gadget at the right, `dark` line beneath. Becomes the menu strip while the right mouse button is held. The original shows its own product name here; DeluxePainter always shows its own name (owner directive 2026-11-09: never "DeluxePaint" in the GUI — trademark). |
+| Menus | `inapp_gfx_03` | Intuition style: `face` box with `dark` border, highlighted item filled in `select` with `shine` text, Right-Amiga shortcuts as key glyph + letter, plain-key shortcuts in `select`, `▸` for submenus, check marks in Mode/Prefs, ghosted items for unavailable entries. Geometry in §4. |
 | Toolbox | all screenshots, manual §1.4 | Right edge, 2 columns, built-in brush block on top, 10 tool rows, then colour indicator bar, then palette. Buttons: `face` fill, `shine` top/left edge, `dark` gaps/shadow, `dark` icons; selected tool inverted. LoRes width 24 px (to calibrate). |
 | Palette | screenshots | Columns of colour cells below the indicator; column count depends on number of colours; AGA page selector `◂ a ▸` for >64 colours. |
 | Requesters | `Inapp_gfx_04/05`, `Choose_Setup` | `face` panel, 2-px `shine`/`dark` bevels, centred title, bevelled rectangular buttons, numeric fields, selected toggles in `select`. Square corners only. |
@@ -56,7 +56,29 @@ Measured on the 2× captures `inapp_gfx_03/04/05` (320×256 PAL LoRes) by averag
 | Palette | from y 152; 32 colours = 4 columns × 8 rows, cells 6×13; 16 colours = 2 × 8 |
 | FG cell | 1-px `face` frame, offset 1 px up/left |
 
-Font: original 8×8 font, 8-px advance; glyphs with a centre stem are symmetric in the 8-px cell (stem in columns 3–4).
+Font: original 8×8 font, set **proportionally** like the reference screen font (owner decision 2026-11-09): each glyph is trimmed to its inked columns plus a 1-px gap, space advances 7 px, digits are tabular (common width) so coordinates do not jitter. Glyphs with a centre stem are drawn symmetric in the 8-px cell (stem in columns 3–4).
+
+### Menus (implemented in `crates/dpx-ui/src/menu.rs`)
+
+Measured on `inapp_gfx_03` (Picture menu open, "Load.." highlighted).
+
+| Element | Geometry (screen pixels) |
+|---|---|
+| Menu strip | rows 0–10 all `face` (no shine/dark line, no depth gadget) |
+| Title slots | first slot at x 3; title text at slot + 2; highlighted title = slot filled in `select` on rows 0–8, text `shine` |
+| Menu box | left = slot − 3, top = 9; `dark` border 2 px left/right, 1 px top/bottom; `face` inside |
+| Items | first item top = box top + 4, pitch 10; text at (box x + 6, item top + 1); 3 rows padding + border below the last item |
+| Item highlight | x box + 4 … box right − 4, rows item top … item top + 9, `select`; text `shine` |
+| Shortcut column | letter at `box_x + box_w − 12`; Right-Amiga glyph 14×8 at letter − 17; plain keys (e.g. `S`, `Q`) in `select`; submenu triangle 4×7 at letter + 3 |
+| Box width | widest item: text + 8 + shortcut column, or text + 10 without shortcut (reference: "Screen Format.." + 10) |
+
+Not visible in the references, therefore chosen and **to calibrate**: check-mark indent (13 px, Intuition LOWCHECKWIDTH), ghost pattern for disabled items (Intuition 0x2222/0x8888 in `face`), submenu position (right of the parent with 4 px overlap, first sub item level with its parent item; flipped to the left at the screen edge), which shortcuts are displayed inside submenus.
+
+Known deviations:
+- Our font is about 1 px per glyph wider than the original screen font, so menus are wider than in the reference (Picture box 123 instead of 112 px) and title slots use text + 6 instead of text + 8 so that all seven titles fit into 320 px.
+- The Right-Amiga key glyph is an original drawing (an "A" cut out of a key cap), not a copy of the system imagery.
+- Color ▸ BG -> FG and BG <-> FG are undoable in DeluxePainter (not in DeluxePaint).
+- AGA addendum items (Brush ▸ Free, clipboard Cut/Paste) are not in the menus yet: their menu position is not documented.
 
 ## 5. Calibration
 

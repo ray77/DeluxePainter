@@ -1,7 +1,9 @@
 # DPX 8x8
 # Copyright © 2026 Dominik Schmidt, part of DeluxePainter, PolyForm Noncommercial 1.0.0
 # Original artwork, not derived from Topaz (or any other existing font).
-# 8x8 monospaced bitmap font; '#' = set pixel, '.' = clear. Column 7 is the inter-character gap; baseline is row 6.
+# 8x8 cells; '#' = set pixel, '.' = clear; baseline is row 6. The renderer sets the font
+# proportionally: each glyph is trimmed to its inked columns and followed by a 1-pixel gap
+# (digits share one width; space advances 7 pixels).
 
 = 0x20
 ........

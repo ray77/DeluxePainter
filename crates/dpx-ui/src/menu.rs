@@ -1,0 +1,1018 @@
+//! Intuition-style pull-down menus with the DeluxePaint IV AGA menu set.
+//!
+//! While the right mouse button is held on the title bar, the title bar turns into the menu
+//! strip; menus drop down below their title, submenus open to the right of their item.
+//! Releasing the button over an enabled item selects it; clicking the left button while the
+//! menu is held selects an item and keeps the menu open (Intuition multi-select).
+//!
+//! Geometry is measured on the LoRes reference capture `inapp_gfx_03` (Picture menu open);
+//! see `docs/design/AMIGA_GUI_FIDELITY.md`. Values marked "to calibrate" are not visible there.
+
+use std::sync::OnceLock;
+
+use dpx_core::IndexedImage;
+
+use crate::bitmap::{self, Bitmap};
+use crate::font::{Font, glyph};
+use crate::pens::Pens;
+use crate::screen::PaintMode;
+
+/// LoRes menu geometry (screen pixels).
+pub mod geom {
+    /// The menu strip covers rows 0..STRIP_H in `face` (no shine/dark lines).
+    pub const STRIP_H: i32 = 11;
+    /// A highlighted menu title is filled in `select` on rows 0..TITLE_HL_H.
+    pub const TITLE_HL_H: i32 = 9;
+    /// Left edge of the first title slot.
+    pub const FIRST_SLOT_X: i32 = 3;
+    /// Title text offset inside its slot.
+    pub const SLOT_TEXT_DX: i32 = 2;
+    /// Slot width = text width + SLOT_PAD (reference: +8 with the narrower original font;
+    /// +6 keeps all seven titles inside 320 pixels with our font).
+    pub const SLOT_PAD: i32 = 6;
+    /// Menu box top (its border overlaps strip rows 9–10).
+    pub const BOX_TOP: i32 = 9;
+    /// Menu box left edge relative to its title slot.
+    pub const BOX_DX: i32 = -3;
+    /// `dark` border widths.
+    pub const BORDER_X: i32 = 2;
+    pub const BORDER_Y: i32 = 1;
+    /// First item top relative to the box top (border + 3 rows padding).
+    pub const ITEM_DY: i32 = 4;
+    pub const ITEM_H: i32 = 10;
+    /// Rows below the last item (3 padding + border).
+    pub const BOTTOM: i32 = 4;
+    /// Item text offset from the box's left edge.
+    pub const TEXT_DX: i32 = 6;
+    /// Extra text indent in menus with check marks (Intuition LOWCHECKWIDTH; to calibrate).
+    pub const CHECK_W: i32 = 13;
+    /// Item highlight inset from the box edges.
+    pub const HL_DX: i32 = 4;
+    /// Shortcut letter column: `box_x + box_w - KEY_FROM_RIGHT`.
+    pub const KEY_FROM_RIGHT: i32 = 12;
+    /// Amiga-key glyph x relative to the shortcut letter column.
+    pub const AMIGA_DX: i32 = -17;
+    /// Submenu triangle x relative to the shortcut letter column.
+    pub const TRIANGLE_DX: i32 = 3;
+    /// Space between an item's text and its shortcut.
+    pub const KEY_GAP: i32 = 8;
+    /// Space right of the text of items without shortcut.
+    pub const RIGHT_MARGIN: i32 = 10;
+    /// Submenus overlap their parent box by this many pixels (to calibrate).
+    pub const SUB_OVERLAP: i32 = 4;
+}
+
+/// Check-mark preferences of the Prefs menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pref {
+    Coords,
+    FastFb,
+    MultiCycle,
+    BeSquare,
+    Workbench,
+    ExclBrush,
+    AutoTransp,
+    NoIcons,
+    AutoGrid,
+    OriginUl,
+    FastAdjust,
+}
+
+impl Pref {
+    fn bit(self) -> u16 {
+        1 << self as u16
+    }
+}
+
+/// Set of enabled [`Pref`]s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prefs(u16);
+
+impl Default for Prefs {
+    /// AGA defaults: Be Square and AutoGrid on (manual AGA p.10, p.284).
+    fn default() -> Self {
+        Prefs(Pref::BeSquare.bit() | Pref::AutoGrid.bit())
+    }
+}
+
+impl Prefs {
+    pub fn get(self, p: Pref) -> bool {
+        self.0 & p.bit() != 0
+    }
+
+    pub fn set(&mut self, p: Pref, on: bool) {
+        if on {
+            self.0 |= p.bit();
+        } else {
+            self.0 &= !p.bit();
+        }
+    }
+
+    pub fn toggle(&mut self, p: Pref) {
+        self.0 ^= p.bit();
+    }
+}
+
+/// What a menu item does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// A document/editor command, by its command-engine name.
+    Command(&'static str),
+    /// Mode menu: select a paint mode (radio check mark).
+    Mode(PaintMode),
+    /// Prefs menu: toggle a preference (check mark).
+    Pref(Pref),
+}
+
+/// Shortcut shown at the right of an item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    None,
+    /// Right-Amiga + letter, drawn as the Amiga-key glyph and the letter.
+    Amiga(char),
+    /// A plain key, drawn in the `select` pen.
+    Plain(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Entry {
+    Action(Action),
+    Submenu(&'static [Item]),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Item {
+    pub label: &'static str,
+    pub key: Key,
+    pub entry: Entry,
+}
+
+#[derive(Debug)]
+pub struct Menu {
+    pub title: &'static str,
+    pub items: &'static [Item],
+}
+
+const fn cmd(label: &'static str, id: &'static str) -> Item {
+    Item {
+        label,
+        key: Key::None,
+        entry: Entry::Action(Action::Command(id)),
+    }
+}
+
+const fn cmd_key(label: &'static str, key: Key, id: &'static str) -> Item {
+    Item {
+        label,
+        key,
+        entry: Entry::Action(Action::Command(id)),
+    }
+}
+
+const fn sub(label: &'static str, items: &'static [Item]) -> Item {
+    Item {
+        label,
+        key: Key::None,
+        entry: Entry::Submenu(items),
+    }
+}
+
+const fn mode(label: &'static str, key: Key, m: PaintMode) -> Item {
+    Item {
+        label,
+        key,
+        entry: Entry::Action(Action::Mode(m)),
+    }
+}
+
+const fn pref(label: &'static str, p: Pref) -> Item {
+    Item {
+        label,
+        key: Key::None,
+        entry: Entry::Action(Action::Pref(p)),
+    }
+}
+
+const fn plain(k: &'static str) -> Key {
+    Key::Plain(k)
+}
+
+/// The DeluxePaint IV AGA menu set (item order from the manual's menu figures and the
+/// `inapp_gfx_03` capture; see `docs/research/manual-ui-notes.md` §2).
+pub static MENUS: [Menu; 7] = [
+    Menu {
+        title: "Picture",
+        items: &[
+            cmd_key("Load..", Key::Amiga('L'), "picture.load"),
+            cmd_key("Save..", Key::Amiga('S'), "picture.save"),
+            cmd_key("Delete..", Key::Amiga('D'), "picture.delete"),
+            cmd_key("Print..", Key::Amiga('P'), "picture.print"),
+            sub(
+                "Flip",
+                &[
+                    cmd("Horiz", "picture.flip_horizontal"),
+                    cmd("Vert", "picture.flip_vertical"),
+                ],
+            ),
+            sub(
+                "Spare",
+                &[
+                    cmd_key("Swap", plain("j"), "spare.swap"),
+                    cmd("Copy to Spare", "spare.copy"),
+                    cmd("Merge in Front", "spare.merge_front"),
+                    cmd("Merge in Back", "spare.merge_back"),
+                    cmd("Delete This Page", "spare.delete"),
+                ],
+            ),
+            cmd("Page Size..", "picture.page_size"),
+            cmd_key("Show Page", plain("S"), "picture.show_page"),
+            cmd("Screen Format..", "picture.screen_format"),
+            cmd("About..", "app.about"),
+            cmd_key("Quit", plain("Q"), "app.quit"),
+        ],
+    },
+    Menu {
+        title: "Brush",
+        items: &[
+            cmd("Load..", "brush.load"),
+            cmd("Save..", "brush.save"),
+            cmd_key("Restore", plain("B"), "brush.restore"),
+            sub(
+                "Spare",
+                &[
+                    cmd("Brush->Spare", "brush.to_spare"),
+                    cmd("Brush<->Spare", "brush.swap_spare"),
+                    cmd("Metamorph..", "brush.metamorph"),
+                ],
+            ),
+            sub(
+                "Size",
+                &[
+                    cmd_key("Stretch", plain("Z"), "brush.stretch"),
+                    cmd_key("Halve", plain("h"), "brush.halve"),
+                    cmd_key("Double", plain("H"), "brush.double"),
+                    cmd_key("Double Horiz", plain("X"), "brush.double_horizontal"),
+                    cmd_key("Double Vert", plain("Y"), "brush.double_vertical"),
+                ],
+            ),
+            sub(
+                "Flip",
+                &[
+                    cmd_key("Horiz", plain("x"), "brush.flip_horizontal"),
+                    cmd_key("Vert", plain("y"), "brush.flip_vertical"),
+                ],
+            ),
+            sub(
+                "Edge",
+                &[
+                    cmd_key("Outline", plain("o"), "brush.outline"),
+                    cmd_key("Trim", plain("O"), "brush.trim"),
+                ],
+            ),
+            sub(
+                "Rotate",
+                &[
+                    cmd_key("90 Degrees", plain("z"), "brush.rotate_90"),
+                    cmd("Any Angle", "brush.rotate_any"),
+                    cmd("Shear", "brush.shear"),
+                ],
+            ),
+            sub(
+                "Bend",
+                &[
+                    cmd("Horiz", "brush.bend_horizontal"),
+                    cmd("Vert", "brush.bend_vertical"),
+                ],
+            ),
+            sub(
+                "Handle",
+                &[
+                    cmd("Center", "brush.handle_center"),
+                    cmd("Corner", "brush.handle_corner"),
+                    cmd("Place", "brush.handle_place"),
+                ],
+            ),
+        ],
+    },
+    Menu {
+        title: "Mode",
+        items: &[
+            mode("Matte", plain("F1"), PaintMode::Matte),
+            mode("Color", plain("F2"), PaintMode::Color),
+            mode("Replc", plain("F3"), PaintMode::Replace),
+            mode("Smear", plain("F4"), PaintMode::Smear),
+            mode("Shade", plain("F5"), PaintMode::Shade),
+            mode("Blend", plain("F6"), PaintMode::Blend),
+            mode("Cycle", plain("F7"), PaintMode::Cycle),
+            mode("Smooth", plain("F8"), PaintMode::Smooth),
+            mode("Mix", Key::None, PaintMode::Mix),
+            mode("HBrite", Key::None, PaintMode::HBrite),
+        ],
+    },
+    Menu {
+        title: "Anim",
+        items: &[
+            sub(
+                "AnimBrush",
+                &[
+                    cmd("Load..", "animbrush.load"),
+                    cmd("Save..", "animbrush.save"),
+                    cmd("Pick up..", "animbrush.pick_up"),
+                    cmd("Settings..", "animbrush.settings"),
+                    cmd("Use", "animbrush.use"),
+                    cmd("Free", "animbrush.free"),
+                ],
+            ),
+            cmd("Load..", "anim.load"),
+            cmd("Save..", "anim.save"),
+            cmd_key("Move..", plain("M"), "anim.move"),
+            sub(
+                "Frames",
+                &[
+                    cmd("Set #..", "anim.set_frame_count"),
+                    cmd("Add Frames..", "anim.add_frames"),
+                    cmd("Copy Frames..", "anim.copy_frames"),
+                    cmd("Delete Frames..", "anim.delete_frames"),
+                ],
+            ),
+            sub(
+                "Control",
+                &[
+                    cmd("Panel On/Off", "anim.panel"),
+                    cmd("Set Rate..", "anim.set_rate"),
+                    cmd("Set Range..", "anim.set_range"),
+                    cmd_key("Previous", plain("1"), "anim.previous"),
+                    cmd_key("Next", plain("2"), "anim.next"),
+                    cmd_key("Goto..", plain("3"), "anim.goto"),
+                    cmd_key("Play", plain("4"), "anim.play"),
+                    cmd_key("Play once", plain("5"), "anim.play_once"),
+                    cmd_key("Ping-pong", plain("6"), "anim.ping_pong"),
+                ],
+            ),
+            sub(
+                "Method",
+                &[
+                    cmd("Compressed", "anim.method_compressed"),
+                    cmd("Expanded", "anim.method_expanded"),
+                ],
+            ),
+        ],
+    },
+    Menu {
+        title: "Color",
+        items: &[
+            cmd("Ranges..", "color.ranges"),
+            cmd("Cycle", "color.cycle"),
+            sub(
+                "Palette",
+                &[
+                    cmd_key("Mixer On/Off", plain("p"), "palette.mixer"),
+                    cmd_key("Arrange", plain("P"), "palette.arrange"),
+                    cmd("Use Brush Palette", "palette.use_brush"),
+                    cmd("Restore Palette", "palette.restore"),
+                    cmd("Default Palette", "palette.default"),
+                    cmd("Load..", "palette.load"),
+                    cmd("Save..", "palette.save"),
+                ],
+            ),
+            sub(
+                "Color Set",
+                &[
+                    cmd("Load..", "color_set.load"),
+                    cmd("Save..", "color_set.save"),
+                ],
+            ),
+            cmd("BG -> FG", "color.bg_to_fg"),
+            cmd("BG <-> FG", "color.swap_bg_fg"),
+            cmd("Remap", "color.remap"),
+            cmd("Recompute", "color.recompute"),
+            sub(
+                "Brush",
+                &[
+                    cmd("BG -> FG", "brush.bg_to_fg"),
+                    cmd("BG <-> FG", "brush.swap_bg_fg"),
+                    cmd("Remap", "brush.remap"),
+                    cmd("Change Transparency", "brush.change_transparency"),
+                ],
+            ),
+        ],
+    },
+    Menu {
+        title: "Effect",
+        items: &[
+            sub(
+                "Stencil",
+                &[
+                    cmd("Show", "stencil.show"),
+                    cmd_key("Make..", plain("~"), "stencil.make"),
+                    cmd("Remake", "stencil.remake"),
+                    cmd("Paint", "stencil.paint"),
+                    cmd("Reverse", "stencil.reverse"),
+                    cmd_key("On/Off", plain("`"), "stencil.toggle"),
+                    cmd("Free", "stencil.free"),
+                    cmd("Load..", "stencil.load"),
+                    cmd("Save..", "stencil.save"),
+                ],
+            ),
+            sub(
+                "LightTable",
+                &[
+                    cmd_key("On/Off", plain("l"), "light_table.toggle"),
+                    cmd("Merge", "light_table.merge"),
+                    cmd("Dim", "light_table.dim"),
+                    cmd("Two Back", "light_table.two_back"),
+                    cmd("Previous", "light_table.previous"),
+                    cmd("Next", "light_table.next"),
+                    cmd("Spare", "light_table.spare"),
+                ],
+            ),
+            sub(
+                "Background",
+                &[
+                    cmd("Fix", "background.fix"),
+                    cmd("Free", "background.free"),
+                    cmd("Lock FG", "background.lock_fg"),
+                ],
+            ),
+            sub(
+                "AntiAlias",
+                &[
+                    cmd("None", "antialias.none"),
+                    cmd("Low", "antialias.low"),
+                    cmd("High", "antialias.high"),
+                ],
+            ),
+            sub(
+                "Process",
+                &[
+                    cmd("On/Off", "process.toggle"),
+                    cmd("Tint", "process.tint"),
+                    cmd("Hue", "process.hue"),
+                    cmd("Value", "process.value"),
+                ],
+            ),
+            sub(
+                "Translucency",
+                &[
+                    cmd("On/Off", "translucency.toggle"),
+                    cmd("Settings..", "translucency.settings"),
+                ],
+            ),
+            sub(
+                "Perspective",
+                &[
+                    cmd("Do", "perspective.do"),
+                    cmd("FillScreen", "perspective.fill_screen"),
+                    cmd("Reset", "perspective.reset"),
+                    cmd("Center", "perspective.center"),
+                    cmd("Settings..", "perspective.settings"),
+                ],
+            ),
+        ],
+    },
+    Menu {
+        title: "Prefs",
+        items: &[
+            pref("Coords", Pref::Coords),
+            pref("Fast FB", Pref::FastFb),
+            pref("MultiCycle", Pref::MultiCycle),
+            pref("Be Square", Pref::BeSquare),
+            pref("Workbench", Pref::Workbench),
+            pref("ExclBrush", Pref::ExclBrush),
+            pref("AutoTransp", Pref::AutoTransp),
+            pref("No Icons", Pref::NoIcons),
+            pref("AutoGrid", Pref::AutoGrid),
+            pref("OriginUL", Pref::OriginUl),
+            pref("FastAdjust", Pref::FastAdjust),
+        ],
+    },
+];
+
+/// Editor state the menus depend on (check marks, ghosted items).
+#[derive(Clone, Copy, Debug)]
+pub struct MenuContext {
+    pub mode: PaintMode,
+    pub prefs: Prefs,
+    /// Extra-Half-Brite screen (enables Mode ▸ HBrite).
+    pub ehb: bool,
+    /// HAM screen (enables Color ▸ Recompute).
+    pub ham: bool,
+}
+
+impl Action {
+    /// `Some(checked)` for check-mark items, `None` otherwise.
+    pub fn checked(self, ctx: &MenuContext) -> Option<bool> {
+        match self {
+            Action::Mode(m) => Some(ctx.mode == m),
+            Action::Pref(p) => Some(ctx.prefs.get(p)),
+            Action::Command(_) => None,
+        }
+    }
+
+    pub fn enabled(self, ctx: &MenuContext) -> bool {
+        match self {
+            Action::Mode(PaintMode::HBrite) => ctx.ehb,
+            Action::Command("color.recompute") => ctx.ham,
+            _ => true,
+        }
+    }
+}
+
+impl Item {
+    fn action(&self) -> Option<Action> {
+        match self.entry {
+            Entry::Action(a) => Some(a),
+            Entry::Submenu(_) => None,
+        }
+    }
+
+    fn enabled(&self, ctx: &MenuContext) -> bool {
+        self.action().is_none_or(|a| a.enabled(ctx))
+    }
+}
+
+struct Glyphs {
+    amiga_key: Bitmap,
+    submenu: Bitmap,
+}
+
+fn glyphs() -> &'static Glyphs {
+    static GLYPHS: OnceLock<Glyphs> = OnceLock::new();
+    GLYPHS.get_or_init(|| {
+        let mut list = bitmap::parse(include_str!("../../../assets/ui/menu-glyphs.txt"))
+            .expect("menu glyphs are valid");
+        let mut take = |name: &str| {
+            let i = list
+                .iter()
+                .position(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("menu glyph '{name}' missing"));
+            list.swap_remove(i).1
+        };
+        Glyphs {
+            amiga_key: take("amiga_key"),
+            submenu: take("submenu"),
+        }
+    })
+}
+
+fn draw_bitmap(img: &mut IndexedImage, bmp: &Bitmap, x: i32, y: i32, pen: u8) {
+    for by in 0..bmp.height {
+        for bx in 0..bmp.width {
+            if bmp.get(bx, by) {
+                img.set(x + bx as i32, y + by as i32, pen);
+            }
+        }
+    }
+}
+
+/// A title slot in the menu strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slot {
+    pub x: i32,
+    pub w: i32,
+}
+
+/// Title slots of [`MENUS`], left to right.
+pub fn title_slots() -> [Slot; 7] {
+    let font = Font::builtin();
+    let mut x = geom::FIRST_SLOT_X;
+    std::array::from_fn(|i| {
+        let w = font.text_width(MENUS[i].title) + geom::SLOT_PAD;
+        let slot = Slot { x, w };
+        x += w;
+        slot
+    })
+}
+
+/// Position and size of a menu or submenu box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoxLayout {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// Item text offset from `x` (larger in menus with check marks).
+    pub text_dx: i32,
+    pub items: usize,
+}
+
+impl BoxLayout {
+    fn new(items: &[Item], x: i32, y: i32, screen_w: i32, screen_h: i32) -> Self {
+        let font = Font::builtin();
+        let checks = items.iter().any(|it| {
+            it.action()
+                .is_some_and(|a| matches!(a, Action::Mode(_) | Action::Pref(_)))
+        });
+        let text_dx = geom::TEXT_DX + if checks { geom::CHECK_W } else { 0 };
+        let w = items
+            .iter()
+            .map(|it| {
+                let end = text_dx + font.text_width(it.label);
+                match (it.entry, it.key) {
+                    (Entry::Submenu(_), _) => {
+                        end + geom::KEY_GAP + geom::KEY_FROM_RIGHT - geom::TRIANGLE_DX
+                    }
+                    (_, Key::Amiga(_)) => {
+                        end + geom::KEY_GAP + geom::KEY_FROM_RIGHT - geom::AMIGA_DX
+                    }
+                    (_, Key::Plain(k)) => {
+                        end + geom::KEY_GAP + geom::KEY_FROM_RIGHT.max(4 + font.text_width(k))
+                    }
+                    (_, Key::None) => end + geom::RIGHT_MARGIN,
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let h = geom::ITEM_DY + items.len() as i32 * geom::ITEM_H + geom::BOTTOM;
+        Self {
+            x: x.min(screen_w - w).max(0),
+            y: y.min(screen_h - h).max(0),
+            w,
+            h,
+            text_dx,
+            items: items.len(),
+        }
+    }
+
+    pub fn item_top(&self, i: usize) -> i32 {
+        self.y + geom::ITEM_DY + i as i32 * geom::ITEM_H
+    }
+
+    fn key_x(&self) -> i32 {
+        self.x + self.w - geom::KEY_FROM_RIGHT
+    }
+
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        (self.x..self.x + self.w).contains(&x) && (self.y..self.y + self.h).contains(&y)
+    }
+
+    /// Item under (`x`, `y`), if any.
+    pub fn item_at(&self, x: i32, y: i32) -> Option<usize> {
+        let inside_x = (self.x + geom::BORDER_X..self.x + self.w - geom::BORDER_X).contains(&x);
+        let dy = y - self.item_top(0);
+        (inside_x && dy >= 0)
+            .then_some((dy / geom::ITEM_H) as usize)
+            .filter(|&i| i < self.items)
+    }
+}
+
+/// Box of top-level menu `menu`.
+pub fn menu_box(menu: usize, screen_w: i32, screen_h: i32) -> BoxLayout {
+    let slot = title_slots()[menu];
+    BoxLayout::new(
+        MENUS[menu].items,
+        slot.x + geom::BOX_DX,
+        geom::BOX_TOP,
+        screen_w,
+        screen_h,
+    )
+}
+
+/// Box of the submenu of item `item` in `parent`: right of the parent box with its first item
+/// level with `item`; flipped to the left side when it would leave the screen.
+pub fn submenu_box(
+    parent: &BoxLayout,
+    item: usize,
+    items: &[Item],
+    screen_w: i32,
+    screen_h: i32,
+) -> BoxLayout {
+    let y = parent.item_top(item) - geom::ITEM_DY;
+    let right = BoxLayout::new(
+        items,
+        parent.x + parent.w - geom::SUB_OVERLAP,
+        y,
+        screen_w,
+        screen_h,
+    );
+    if parent.x + parent.w - geom::SUB_OVERLAP + right.w <= screen_w {
+        right
+    } else {
+        BoxLayout::new(
+            items,
+            parent.x + geom::SUB_OVERLAP - right.w,
+            y,
+            screen_w,
+            screen_h,
+        )
+    }
+}
+
+/// Interaction state of the menu strip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MenuState {
+    /// The strip is shown (right mouse button held).
+    pub active: bool,
+    pub menu: Option<usize>,
+    pub item: Option<usize>,
+    pub sub_item: Option<usize>,
+}
+
+impl MenuState {
+    /// Activates the strip with the pointer at (`x`, `y`).
+    pub fn open(&mut self, screen_w: i32, screen_h: i32, x: i32, y: i32) {
+        *self = MenuState {
+            active: true,
+            ..MenuState::default()
+        };
+        self.pointer(screen_w, screen_h, x, y);
+    }
+
+    pub fn close(&mut self) {
+        *self = MenuState::default();
+    }
+
+    /// Tracks the pointer; returns whether the visible state changed.
+    pub fn pointer(&mut self, screen_w: i32, screen_h: i32, x: i32, y: i32) -> bool {
+        let before = *self;
+        if !self.active {
+            return false;
+        }
+        if y < geom::BOX_TOP {
+            if let Some(i) = title_slots()
+                .iter()
+                .position(|s| (s.x..s.x + s.w).contains(&x))
+            {
+                self.menu = Some(i);
+            }
+            self.item = None;
+            self.sub_item = None;
+            return *self != before;
+        }
+        let Some(m) = self.menu else {
+            return false;
+        };
+        let mbox = menu_box(m, screen_w, screen_h);
+        if let Some(it) = self.item
+            && let Entry::Submenu(items) = MENUS[m].items[it].entry
+        {
+            let sbox = submenu_box(&mbox, it, items, screen_w, screen_h);
+            if sbox.contains(x, y) {
+                self.sub_item = sbox.item_at(x, y);
+                return *self != before;
+            }
+        }
+        if mbox.contains(x, y) {
+            let item = mbox.item_at(x, y);
+            if item != self.item {
+                self.sub_item = None;
+            }
+            self.item = item;
+        } else {
+            self.item = None;
+            self.sub_item = None;
+        }
+        *self != before
+    }
+
+    /// The enabled action under the pointer, if any.
+    pub fn hovered_action(&self, ctx: &MenuContext) -> Option<Action> {
+        let item = &MENUS[self.menu?].items[self.item?];
+        let target = match item.entry {
+            Entry::Action(_) => item,
+            Entry::Submenu(items) => &items[self.sub_item?],
+        };
+        target.action().filter(|a| a.enabled(ctx))
+    }
+}
+
+/// Draws the menu strip and the open menu/submenu.
+pub fn draw(
+    img: &mut IndexedImage,
+    pens: &Pens,
+    ctx: &MenuContext,
+    state: &MenuState,
+    screen_w: i32,
+    screen_h: i32,
+) {
+    let font = Font::builtin();
+    img.fill_rect(0, 0, screen_w, geom::STRIP_H, pens.face);
+    for (i, slot) in title_slots().iter().enumerate() {
+        let selected = state.menu == Some(i);
+        if selected {
+            img.fill_rect(slot.x, 0, slot.w, geom::TITLE_HL_H, pens.select);
+        }
+        let pen = if selected { pens.shine } else { pens.dark };
+        font.draw(img, slot.x + geom::SLOT_TEXT_DX, 1, MENUS[i].title, pen);
+    }
+    let Some(m) = state.menu else {
+        return;
+    };
+    let mbox = menu_box(m, screen_w, screen_h);
+    draw_box(img, pens, ctx, &mbox, MENUS[m].items, state.item);
+    if let Some(it) = state.item
+        && let Entry::Submenu(items) = MENUS[m].items[it].entry
+    {
+        let sbox = submenu_box(&mbox, it, items, screen_w, screen_h);
+        draw_box(img, pens, ctx, &sbox, items, state.sub_item);
+    }
+}
+
+fn draw_box(
+    img: &mut IndexedImage,
+    pens: &Pens,
+    ctx: &MenuContext,
+    b: &BoxLayout,
+    items: &[Item],
+    highlight: Option<usize>,
+) {
+    let font = Font::builtin();
+    let g = glyphs();
+    img.fill_rect(b.x, b.y, b.w, b.h, pens.dark);
+    img.fill_rect(
+        b.x + geom::BORDER_X,
+        b.y + geom::BORDER_Y,
+        b.w - 2 * geom::BORDER_X,
+        b.h - 2 * geom::BORDER_Y,
+        pens.face,
+    );
+    let key_x = b.key_x();
+    for (i, item) in items.iter().enumerate() {
+        let top = b.item_top(i);
+        let ty = top + 1;
+        let enabled = item.enabled(ctx);
+        let lit = enabled && highlight == Some(i);
+        if lit {
+            img.fill_rect(
+                b.x + geom::HL_DX,
+                top,
+                b.w - 2 * geom::HL_DX,
+                geom::ITEM_H,
+                pens.select,
+            );
+        }
+        let ink = if lit { pens.shine } else { pens.dark };
+        if item.action().and_then(|a| a.checked(ctx)) == Some(true) {
+            font.draw_code(img, b.x + geom::TEXT_DX, ty, glyph::CHECK, ink);
+        }
+        font.draw(img, b.x + b.text_dx, ty, item.label, ink);
+        match (item.entry, item.key) {
+            (Entry::Submenu(_), _) => {
+                draw_bitmap(img, &g.submenu, key_x + geom::TRIANGLE_DX, ty, ink);
+            }
+            (_, Key::Amiga(c)) => {
+                draw_bitmap(img, &g.amiga_key, key_x + geom::AMIGA_DX, ty, ink);
+                font.draw(img, key_x, ty, c.encode_utf8(&mut [0; 4]), ink);
+            }
+            (_, Key::Plain(k)) => {
+                let x = key_x.min(b.x + b.w - 4 - font.text_width(k));
+                font.draw(img, x, ty, k, if lit { pens.shine } else { pens.select });
+            }
+            (_, Key::None) => {}
+        }
+        if !enabled {
+            ghost(img, b, top, pens.face);
+        }
+    }
+}
+
+/// Intuition-style ghosting of a disabled item: a sparse `face` pattern laid over it
+/// (pattern 0x2222 / 0x8888; to calibrate).
+fn ghost(img: &mut IndexedImage, b: &BoxLayout, top: i32, face: u8) {
+    for y in top..top + geom::ITEM_H {
+        let phase = if y % 2 == 0 { 2 } else { 0 };
+        for x in b.x + geom::BORDER_X..b.x + b.w - geom::BORDER_X {
+            if x.rem_euclid(4) == phase {
+                img.set(x, y, face);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dpx_core::Palette;
+
+    fn ctx() -> MenuContext {
+        MenuContext {
+            mode: PaintMode::Color,
+            prefs: Prefs::default(),
+            ehb: false,
+            ham: false,
+        }
+    }
+
+    #[test]
+    fn titles_fit_a_lores_screen() {
+        let last = title_slots()[6];
+        assert!(last.x + last.w <= 320, "strip ends at {}", last.x + last.w);
+        assert_eq!(title_slots()[0].x, geom::FIRST_SLOT_X);
+    }
+
+    #[test]
+    fn picture_menu_geometry_matches_reference() {
+        let b = menu_box(0, 320, 256);
+        // Box at the left edge, top border on row 9, 11 items: rows 9..=126.
+        assert_eq!((b.x, b.y), (0, 9));
+        assert_eq!(b.h, 118);
+        assert_eq!(b.item_top(0), 13);
+        assert_eq!(b.item_top(1), 23);
+    }
+
+    #[test]
+    fn boxes_stay_on_screen() {
+        for (m, menu) in MENUS.iter().enumerate() {
+            let b = menu_box(m, 320, 256);
+            assert!(b.x >= 0 && b.x + b.w <= 320, "menu {m}");
+            for (i, it) in menu.items.iter().enumerate() {
+                if let Entry::Submenu(items) = it.entry {
+                    let s = submenu_box(&b, i, items, 320, 256);
+                    assert!(s.x >= 0 && s.x + s.w <= 320, "submenu {m}/{i}");
+                    assert!(s.y + s.h <= 256, "submenu {m}/{i}");
+                    // The submenu never hides its parent item's label.
+                    let label_end = b.x + b.text_dx + Font::builtin().text_width(it.label);
+                    let left = s.x + s.w <= b.x + geom::SUB_OVERLAP;
+                    assert!(
+                        left || s.x >= label_end,
+                        "submenu {m}/{i} covers its parent"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_and_select() {
+        let mut st = MenuState::default();
+        st.open(320, 256, 10, 4);
+        assert_eq!(st.menu, Some(0));
+        assert_eq!(st.item, None);
+        // Over "Save.." (second item).
+        st.pointer(320, 256, 20, 25);
+        assert_eq!(st.item, Some(1));
+        assert_eq!(
+            st.hovered_action(&ctx()),
+            Some(Action::Command("picture.save"))
+        );
+        // Over "Flip": a submenu, nothing to select until a sub item is hovered.
+        let b = menu_box(0, 320, 256);
+        st.pointer(320, 256, 20, b.item_top(4) + 2);
+        assert_eq!(st.item, Some(4));
+        assert_eq!(st.hovered_action(&ctx()), None);
+        let Entry::Submenu(items) = MENUS[0].items[4].entry else {
+            panic!("Flip is a submenu");
+        };
+        let s = submenu_box(&b, 4, items, 320, 256);
+        st.pointer(320, 256, s.x + s.w - 5, s.item_top(1) + 2);
+        assert_eq!(st.item, Some(4), "parent item stays highlighted");
+        assert_eq!(
+            st.hovered_action(&ctx()),
+            Some(Action::Command("picture.flip_vertical"))
+        );
+        // Leaving all boxes clears the selection.
+        st.pointer(320, 256, 300, 250);
+        assert_eq!(st.hovered_action(&ctx()), None);
+    }
+
+    #[test]
+    fn hbrite_is_ghosted_without_ehb() {
+        assert!(!Action::Mode(PaintMode::HBrite).enabled(&ctx()));
+        let ehb = MenuContext { ehb: true, ..ctx() };
+        assert!(Action::Mode(PaintMode::HBrite).enabled(&ehb));
+        assert_eq!(Action::Mode(PaintMode::Color).checked(&ctx()), Some(true));
+        assert_eq!(Action::Pref(Pref::Coords).checked(&ctx()), Some(false));
+        assert_eq!(Action::Pref(Pref::BeSquare).checked(&ctx()), Some(true));
+    }
+
+    #[test]
+    fn draws_highlighted_item_in_select_with_shine_text() {
+        let pal = Palette::dpaint_default_32();
+        let pens = Pens::from_palette(&pal);
+        let mut img = IndexedImage::new(320, 256, 0);
+        let mut st = MenuState::default();
+        st.open(320, 256, 10, 4);
+        st.pointer(320, 256, 20, 15);
+        draw(&mut img, &pens, &ctx(), &st, 320, 256);
+        let b = menu_box(0, 320, 256);
+        // Title highlight, box borders, item highlight.
+        assert_eq!(img.get(3, 0), Some(pens.select));
+        assert_eq!(img.get(2, 0), Some(pens.face));
+        assert_eq!(img.get(0, 60), Some(pens.dark));
+        assert_eq!(img.get(1, 60), Some(pens.dark));
+        assert_eq!(img.get(2, 60), Some(pens.face));
+        assert_eq!(img.get(b.w - 1, 60), Some(pens.dark));
+        assert_eq!(img.get(4, 13), Some(pens.select));
+        assert_eq!(img.get(3, 13), Some(pens.face));
+        assert_eq!(img.get(b.w - 5, 22), Some(pens.select));
+        assert_eq!(img.get(b.w - 4, 22), Some(pens.face));
+        // The highlighted item's text and shortcut are drawn in shine.
+        let row: Vec<u8> = (b.x..b.x + b.w).filter_map(|x| img.get(x, 15)).collect();
+        assert!(row.contains(&pens.shine));
+        assert_eq!(
+            img.get(b.w + 5, 9),
+            Some(pens.face),
+            "strip row 9 outside the box"
+        );
+    }
+
+    #[test]
+    fn prefs_toggle() {
+        let mut p = Prefs::default();
+        assert!(!p.get(Pref::Coords));
+        p.toggle(Pref::Coords);
+        assert!(p.get(Pref::Coords));
+        p.set(Pref::Coords, false);
+        assert!(!p.get(Pref::Coords));
+    }
+}

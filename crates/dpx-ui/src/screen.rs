@@ -5,8 +5,12 @@
 use dpx_core::{IndexedImage, Palette};
 
 use crate::font::Font;
+use crate::menu::{self, MenuContext, MenuState, Pref, Prefs};
 use crate::pens::Pens;
 use crate::toolbox::{self, BUILTIN_BRUSHES, ICON, IconState, TOOL_ROWS, Tool};
+
+/// Program name shown in the screen title bar.
+pub const APP_TITLE: &str = "DeluxePainter";
 
 /// LoRes geometry (screen pixels).
 pub mod geom {
@@ -74,8 +78,23 @@ pub struct UiState {
     pub mode: PaintMode,
     pub toolbox_visible: bool,
     pub title_visible: bool,
-    /// Coordinates shown at the right of the title bar (Prefs ▸ Coords).
+    /// Pointer position on the page, shown at the right of the title bar with Prefs ▸ Coords.
     pub coords: Option<(i32, i32)>,
+    pub prefs: Prefs,
+    pub menu: MenuState,
+}
+
+impl UiState {
+    /// State the menus need for check marks and ghosted items.
+    pub fn menu_context(&self) -> MenuContext {
+        MenuContext {
+            mode: self.mode,
+            prefs: self.prefs,
+            // EHB/HAM display modes arrive with the hardware profiles (roadmap phase 5).
+            ehb: false,
+            ham: false,
+        }
+    }
 }
 
 impl Default for UiState {
@@ -90,6 +109,8 @@ impl Default for UiState {
             toolbox_visible: true,
             title_visible: true,
             coords: None,
+            prefs: Prefs::default(),
+            menu: MenuState::default(),
         }
     }
 }
@@ -139,7 +160,12 @@ impl Screen {
             self.draw_toolbox(&mut img, palette, ui, &pens);
         }
         if ui.title_visible {
-            self.draw_title_bar(&mut img, ui, &pens);
+            if ui.menu.active {
+                let ctx = ui.menu_context();
+                menu::draw(&mut img, &pens, &ctx, &ui.menu, self.width, self.height);
+            } else {
+                self.draw_title_bar(&mut img, ui, &pens);
+            }
         }
         img
     }
@@ -156,7 +182,7 @@ impl Screen {
         img.hline(0, w - 1, 0, pens.shine);
         img.hline(0, w - 1, geom::TITLE_H - 1, pens.dark);
         let font = Font::builtin();
-        let title = format!("DeluxePaint  {}", ui.mode.title());
+        let title = format!("{APP_TITLE}  {}", ui.mode.title());
         font.draw(
             img,
             geom::TITLE_TEXT_X,
@@ -164,9 +190,9 @@ impl Screen {
             &title,
             pens.dark,
         );
-        if let Some((x, y)) = ui.coords {
+        if let Some((x, y)) = ui.coords.filter(|_| ui.prefs.get(Pref::Coords)) {
             let text = format!("{x:4} {y:4}");
-            let tx = w - geom::DEPTH_W - 3 - Font::text_width(&text);
+            let tx = w - geom::DEPTH_W - 3 - font.text_width(&text);
             font.draw(img, tx, geom::TITLE_TEXT_Y, &text, pens.dark);
         }
         self.draw_depth_gadget(img, pens);
@@ -377,6 +403,44 @@ mod tests {
         assert_eq!(img.get(100, 0), Some(p.shine));
         assert_eq!(img.get(100, 9), Some(p.face));
         assert_eq!(img.get(100, 10), Some(p.dark));
+    }
+
+    #[test]
+    fn title_shows_program_name_and_mode() {
+        let (img, p) = render_default();
+        let mut expected = IndexedImage::new(320, 256, 0);
+        let text = format!("{APP_TITLE}  Color");
+        let end = Font::builtin().draw(
+            &mut expected,
+            geom::TITLE_TEXT_X,
+            geom::TITLE_TEXT_Y,
+            &text,
+            1,
+        );
+        assert_eq!(APP_TITLE, "DeluxePainter");
+        for y in geom::TITLE_TEXT_Y..geom::TITLE_TEXT_Y + 8 {
+            for x in 0..end {
+                let ink = expected.get(x, y) == Some(1);
+                let got = img.get(x, y);
+                assert_eq!(got == Some(p.dark), ink, "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn coords_need_the_preference() {
+        let pal = Palette::dpaint_default_32();
+        let page = IndexedImage::new(320, 256, 0);
+        let screen = Screen::new(320, 256);
+        let mut ui = UiState {
+            coords: Some((123, 45)),
+            ..UiState::default()
+        };
+        let off = screen.render(&page, &pal, &ui);
+        ui.prefs.set(Pref::Coords, true);
+        let on = screen.render(&page, &pal, &ui);
+        let differs = (200..300).any(|x| (1..9).any(|y| off.get(x, y) != on.get(x, y)));
+        assert!(differs, "coordinates appear only with Prefs > Coords");
     }
 
     #[test]
