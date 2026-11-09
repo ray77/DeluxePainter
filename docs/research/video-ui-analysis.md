@@ -22,7 +22,7 @@
 | 0:00–3:10 | Intro | Presenter, title cards |
 | 3:30 | Screen format | **Choose Screen Format** requester: Format list (Lo-Res 320×200, Med-Res 640×200, Interlace 320×400, Hi-Res 640×400), Colors (2/4/8/16/32/64, HAM), Overscan (Off/Std/Max), NTSC/PAL toggle, Program Loading (Save/Load All), Ok |
 | 3:50–5:30 | Display modes | Explainer cards: resolution × colour matrix, 32 base colours + Halfbrite (EHB), HAM 4096 colours, Overscan maximum |
-| 5:50–7:30 | Main screen | Empty page, menu bar (`DeluxePaint` + current mode name, e.g. "Color"/"Matte"), toolbox at right, palette below toolbox. Mode menu open: Stencil, LightTable, Background, AntiAlias(?), Process(?), Translucency, Perspective |
+| 5:50–7:30 | Main screen | Empty page, menu bar (`DeluxePaint` + current mode name, e.g. "Color"/"Matte"), toolbox at right, palette below toolbox. Effect menu open: Stencil, LightTable, Background, AntiAlias(?), Process(?), Translucency, Perspective |
 | 8:30–9:10 | Freehand | Dotted freehand (spaced) vs continuous freehand; on-screen captions name the tool ("Reduce"…) |
 | 9:30–12:10 | Fill types | Solid, Brush, Wrap, Perspective; gradient fills Linear / Shape / Circle / Contour / Highlite. **Fill Type requester**: Solid/Brush/Wrap/Perspective/Pattern buttons, From brush, gradient type buttons, Range selector, Dither slider, Random, Cancel/Ok |
 | 12:50–13:10 | Spacing | Spacing types explained: N Total, Every Nth dot, Airbrush, Continuous (matches local screenshot `Inapp_gfx_05.png`) |
@@ -36,7 +36,7 @@
 | 21:50–22:10 | Spare page | Spare ▸ Swap, Copy to Spare, Merge in Front, Merge in Back, Delete this Page |
 | 23:10 | Page size | Screen-format style requester with Page Size: Screen / Overscan(?) |
 | 23:30–25:10 | Brush menu | Load, Save, Restore, Size ▸ (Stretch, Halve, Double, Double Horiz, Double Vert), Flip ▸ (Horiz, Vert), Edge ▸ (Outline, Trim), Rotate ▸ (90°, Any angle, Shear), Bend, Handle ▸ (Center, Corner, Place); Brush→Spare |
-| 25:30–26:50 | Mode menu (paint modes) | Matte, Color, Repl, Smear, Shade, Blend, Cycle, Smooth, Tint(?), HBrite. Demonstrated on a photo-like image |
+| 25:30–26:50 | Mode menu (paint modes) | Matte, Color, Replc, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite (names confirmed by the manual). Demonstrated on a photo-like image |
 | 27:10–34:30 | Color menu | Ranges…, Cycle, Palette, Color Set ▸, BG→FG, BG↔FG, Remap, Brush ▸ (Remap, Change Transparency). Palette requester is a **horizontal strip at the bottom of the screen** (palette grid, RGB/HSV sliders, spread/copy/exchange buttons, range editing). Color Set ▸ Mixer On/Off, Arrange, Use Brush Palette, Restore Palette, Default Palette, Load, Save |
 | 34:50–38:50 | Effect menu | Stencil ▸ (Show, Make, Remake, Lock FG, Paint On/Off, Reverse, Free, Load, Save) with **Make Stencil** requester (colour grid, Clear, Invert, Make, Cancel); LightTable ▸ (On/Off, Two Back, Previous, Next, Spare); Background ▸; AntiAlias (None/Low/High); Translucency (Tint/Hue/Value?); Perspective ▸ (Do, FillScreen, Reset, Center, Settings…) |
 | 39:10–39:50 | Perspective settings | Requester: X/Y/Z angle fields, Grid, From Brush, Angle Step, Type (Screen/Brush), Display (Angle/Pos), Cancel/Ok |

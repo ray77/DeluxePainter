@@ -1,6 +1,6 @@
 # Features — condensed
 
-The essence of all Phase 0 research (master plan, DPaint IV AGA manual, DPaint IV manual, tutorial video, screenshots, format and dependency research), reduced to what DeluxePainter must do. Detail lives in the linked documents; this page is the scope contract.
+The essence of all Phase 0 research (master plan, DPaint IV AGA manual — see `research/manual-ui-notes.md`, DPaint IV manual, tutorial video, screenshots, format and dependency research), reduced to what DeluxePainter must do. Note: the AGA manual's reference chapters are identical to the 4.0 manual; all AGA additions come from its 13-page addendum. Detail lives in the linked documents; this page is the scope contract.
 
 Priorities: **P0** = first usable release core · **P1** = classic DPaint toolset · **P2** = Amiga special modes & animation · **P3** = later.
 
@@ -9,10 +9,12 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P | Feature | Notes |
 |---|---|---|
 | P0 | Pixel-perfect retro UI at integer scale 1×–5× / Auto, never blurred (Retina, 4K, Windows 125/150 %) | ADR-3 |
-| P0 | Menu bar with drop-down menus: Picture, Brush, Mode, Anim, Color, Effect, Prefs | DPaint IV AGA menu set; modern Cmd/Ctrl shortcuts |
-| P0 | Two-column toolbox at the right; left-click = select tool, right-click = tool options requester | |
-| P0 | Palette panel with FG/BG colour (left/right mouse), AGA page selector for 256 colours | |
-| P0 | Canvas zoom (1–16×), pan, pixel grid, coordinates display | |
+| P0 | Title bar = menu bar: idle it shows program name, paint mode, frame `n/total`, status flags (A/a antialias, B background, P process, S/s stencil, T translucency) and coordinates; menus Picture, Brush, Mode, Anim, Color, Effect, Prefs drop down | DPaint IV AGA menu set; historic single-key shortcuts kept where conflict-free, Cmd/Ctrl for file/edit |
+| P0 | Two-column toolbox at the right: 10 built-in brushes, then Dotted/Continuous freehand, Line/Curve, Fill/Airbrush, Rect/Circle, Ellipse/Polygon, Brush selector/Text, Grid/Symmetry, Magnify/Zoom, Undo/CLR. Shape icons split diagonally: upper-left = outline, lower-right = filled | left-click selects; right-click opens the tool's options (Spacing, Fill Type, Font, Gridding, Symmetry, size drag, Clear) |
+| P0 | Colour indicator + palette under the toolbox, FG = left mouse, BG = right mouse, AGA page selector for 256 colours; `[ ]` / `{ }` step FG/BG | |
+| P0 | Canvas zoom (1–16×), pan, pixel grid; coordinates with lower-left (DPaint default) or upper-left origin | |
+| P1 | F10 hide toolbox + bar, F9 bar only, Shift-F10 all panels; `S` show page | |
+| P1 | Keyboard navigation in requesters (AGA addition) | |
 | P0 | Undo / redo (multi-level) | DPaint had one level; we keep the button, add history |
 | P1 | Requesters (modal, keyboard: Enter/Esc/Tab): Screen Format, Page Size, Palette, Fill Type, Spacing, Grid, Symmetry, Font, File | Square corners, 1-px bevels |
 | P1 | Magnify window (split view: normal + zoomed) | DPaint's signature zoom |
@@ -41,7 +43,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P0 | Rectangle, circle, ellipse — outline / filled | Shift constrains |
 | P1 | Polygon — outline / filled | |
 | P0 | Flood fill (solid) | |
-| P1 | Fill types: brush, wrap, perspective(P3), gradients (linear, shape, circle, contour, highlight) with dither + range | Fill Type requester |
+| P1 | Fill types: solid, brush, wrap, pattern, perspective(P3), 8 gradient types (linear, shape, circle, contour, highlight …) with dither, random + range | Fill Type requester; also used by filled shapes |
 | P1 | Airbrush, spacing (N total / every Nth / airbrush / continuous) | Spacing requester |
 | P0 | Pipette (pick colour) | |
 | P1 | Brush pick-up (rectangle, lasso), last brush, custom brush stamping | |
@@ -49,7 +51,8 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Text tool with bitmap fonts | original fonts only |
 | P1 | Grid snap, symmetry (point/mirror, N-fold) | |
 | P1 | Stencil (protect colours) | |
-| P1 | Paint modes: Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Tint, HBrite | |
+| P1 | Paint modes (F1–F8 + menu): Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite | |
+| P2 | Effects: Translucency, Process, AntiAlias (off/low/high, off by default), fixed Background | Effect menu |
 | P0 | Antialiasing **off** by default for all tools | |
 | P3 | Perspective, bend/shear, metamorph | |
 
@@ -57,9 +60,9 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 
 | P | Feature | Notes |
 |---|---|---|
-| P0 | Palette editor: RGB/HSV sliders, spread, copy, exchange | Palette requester docked at bottom like DPaint |
-| P1 | Remap picture/brush to palette, use brush palette, default palette, load/save palette | |
-| P2 | Colour cycling: up to N ranges, rate, direction, live preview (display-only) | CRNG/CCRT |
+| P0 | Colour mixer: RGB/HSV sliders, spread, copy, exchange, undo; AGA "Scale" RGB4→RGB8 | docked as a strip at the bottom like DPaint |
+| P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | |
+| P2 | Colour cycling: 8 ranges × up to 32 colours, rate 0–63, direction, live preview (display-only) | Range requester (bottom strip); CRNG/CCRT |
 
 ## 5. Layers & projects (modern additions)
 
@@ -81,7 +84,9 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P2 | ILBM EHB / HAM6 / HAM8, CRNG/CCRT | ✓ | ✓ |
 | P2 | IFF ANIM (op 5 first) | ✓ | ✓ |
 | P2 | IFF brushes / AnimBrushes | ✓ | ✓ |
-| P3 | PCHG, SHAM, CTBL, DEEP, PBM | after documented need | — |
+| P2 | 24-bit IFF ILBM, PBM | ✓ (DPaint IV AGA reads these) | — |
+| P1 | Brush via system clipboard (copy/paste image) | ✓ | ✓ |
+| P3 | PCHG, SHAM, CTBL, DEEP | after documented need | — |
 
 ## 7. Animation
 
