@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license-file = "LICENSE.md"
+repository = "https://github.com/ray77/DeluxePainter"
+authors = ["Dominik Schmidt"]
+
+[workspace.dependencies]
+dpx-core = { path = "crates/dpx-core" }
+dpx-ui = { path = "crates/dpx-ui" }
+eframe = "0.37"
+png = "0.18"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

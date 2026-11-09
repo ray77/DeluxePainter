@@ -12,7 +12,11 @@
 
 ---
 
-> **Status: Phase 0 — research and design.** There is no runnable build yet. This repository currently contains the research, architecture and design documents that the implementation will follow.
+> **Status: Phase 1 — first paint (pre-alpha).** The window shows the classic DeluxePaint LoRes screen (title bar, toolbox, palette) rendered pixel-exactly; freehand painting, tool/brush/colour selection, undo and CLR work. Everything else is still to come.
+
+<p align="center">
+  <img src="docs/design/screenshots/phase1-lores-default.png" alt="DeluxePainter start screen, 320×256 LoRes at 2×" width="640">
+</p>
 
 ## What it will be
 
@@ -40,7 +44,19 @@ See [`docs/FEATURES.md`](docs/FEATURES.md) for the prioritised feature set and [
 
 ## Building
 
-Not yet — the Rust workspace arrives in Phase 1.
+Requires [rustup](https://rustup.rs); the toolchain version is pinned in `rust-toolchain.toml`.
+
+```bash
+cargo run -p deluxepainter --release
+```
+
+Headless snapshot of the start screen (used for visual comparison tests):
+
+```bash
+cargo run -p deluxepainter -- --snapshot screen.png --scale 2
+```
+
+Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; `U` undo; `F10` hide/show toolbox and title bar, `F9` title bar only.
 
 ## License
 

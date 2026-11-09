@@ -1,5 +1,7 @@
 # UI layout options (design checkpoint 1)
 
+> **Superseded in visual style** by [AMIGA_GUI_FIDELITY.md](AMIGA_GUI_FIDELITY.md): the GUI reproduces the Amiga DeluxePaint screen exactly. The sketches below only illustrate the layout decision (C = screen sized to the window, A = stock Amiga screen sizes); their widgets, font and grey work area are not the target. Real renders: [screenshots/](screenshots/).
+
 All three keep the same DeluxePaint IV AGA visual language: one-line grey menu bar, two-column toolbox at the right, multi-column AGA palette with page selector, square bevelled requesters, original bitmap font. They differ only in how the modern additions (layers, frames, status) are integrated and how much screen space the canvas gets on large monitors.
 
 The mockups are rough sketches drawn with a placeholder font (the real UI gets an original 8×8 pixel font) and simplified icons. Shown at 2×.
