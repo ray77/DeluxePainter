@@ -8,7 +8,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
-use crate::image::Rect;
+use crate::image::{IndexedImage, Rect};
+use crate::mode::DisplayMode;
 use crate::palette::{Palette, Rgb8};
 use crate::raster;
 
@@ -20,6 +21,8 @@ pub const MAX_BRUSH_PIXELS: usize = 100 * 100;
 pub const MAX_BRUSH_OFFSET: i32 = 1_000;
 /// Largest absolute stroke coordinate; points may lie outside the page but not arbitrarily far.
 pub const MAX_COORD: i32 = 1_000_000;
+/// Largest page width or height.
+pub const MAX_PAGE_SIDE: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +55,17 @@ pub enum Command {
     SwapColors { a: u8, b: u8 },
     /// Replaces all palette entries; the number of colours must stay the same.
     SetPalette { colors: Vec<Rgb8> },
+    /// Picture ▸ Screen Format: display mode, palette size and page size. With `retain` the
+    /// picture is kept (top-left aligned, cut off if the page shrinks), otherwise the page is
+    /// cleared to colour 0. New palette entries get a grey ramp; dropped entries must be
+    /// unused when `retain` is set.
+    SetFormat {
+        mode: DisplayMode,
+        colors: u16,
+        width: u32,
+        height: u32,
+        retain: bool,
+    },
 }
 
 /// What a command changes; decides what the engine snapshots for undo.
@@ -60,6 +74,8 @@ pub(crate) enum Footprint {
     /// Page pixels inside the rect (already clipped to the page; may be empty).
     Pixels(Rect),
     Palette,
+    /// Page size, palette and target may all change.
+    Document,
 }
 
 impl Command {
@@ -118,6 +134,55 @@ impl Command {
             Command::Flip { .. } => Ok(()),
             Command::ReplaceColor { from, to } => color(*from).and(color(*to)),
             Command::SwapColors { a, b } => color(*a).and(color(*b)),
+            Command::SetFormat {
+                mode,
+                colors: n,
+                width,
+                height,
+                retain,
+            } => {
+                let max = mode.max_colors(doc.target.chipset).ok_or_else(|| {
+                    CommandError::new(
+                        ErrorCode::UnsupportedMode,
+                        format!(
+                            "{} is not available on {:?}",
+                            mode.name(),
+                            doc.target.chipset
+                        ),
+                    )
+                })?;
+                if !n.is_power_of_two() || *n < 2 || *n > max {
+                    return Err(CommandError::new(
+                        ErrorCode::PaletteRangeInvalid,
+                        format!(
+                            "{n} colours: {} allows 2..={max} (powers of two)",
+                            mode.name()
+                        ),
+                    ));
+                }
+                if !(1..=MAX_PAGE_SIDE).contains(width) || !(1..=MAX_PAGE_SIDE).contains(height) {
+                    return Err(CommandError::invalid(format!(
+                        "page {width}x{height} is outside 1..={MAX_PAGE_SIDE}"
+                    )));
+                }
+                if *retain {
+                    let kept = doc
+                        .page
+                        .crop(Rect::new(0, 0, *width as i32, *height as i32));
+                    if let Some(&max_used) = kept.pixels().iter().max()
+                        && u16::from(max_used) >= *n
+                    {
+                        return Err(CommandError::new(
+                            ErrorCode::PaletteRangeInvalid,
+                            format!(
+                                "the picture uses colour {max_used}; keep at least {} colours",
+                                (u16::from(max_used) + 1).next_power_of_two()
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
+            }
             Command::SetPalette { colors: new } => {
                 if new.len() == colors {
                     Ok(())
@@ -143,6 +208,7 @@ impl Command {
             | Command::ReplaceColor { .. }
             | Command::SwapColors { .. } => Footprint::Pixels(page),
             Command::SetPalette { .. } => Footprint::Palette,
+            Command::SetFormat { .. } => Footprint::Document,
         }
     }
 
@@ -171,8 +237,39 @@ impl Command {
             Command::SetPalette { colors } => {
                 doc.palette = Palette::new(colors.clone()).expect("size checked by validate");
             }
+            Command::SetFormat {
+                mode,
+                colors,
+                width,
+                height,
+                retain,
+            } => {
+                let mut new_page = IndexedImage::new(*width, *height, 0);
+                if *retain {
+                    new_page.blit(&doc.page, 0, 0);
+                }
+                doc.page = new_page;
+                doc.palette = resized_palette(&doc.palette, usize::from(*colors));
+                doc.target.mode = *mode;
+            }
         }
     }
+}
+
+/// Keeps the first `n` entries; missing ones become a grey ramp from black to white.
+fn resized_palette(palette: &Palette, n: usize) -> Palette {
+    let mut colors: Vec<Rgb8> = palette.colors().iter().copied().take(n).collect();
+    let start = colors.len();
+    let extra = n - start;
+    for i in 0..extra {
+        let v = if extra > 1 {
+            (i * 255 / (extra - 1)) as u8
+        } else {
+            255
+        };
+        colors.push(Rgb8::new(v, v, v));
+    }
+    Palette::new(colors).expect("1..=256 entries")
 }
 
 /// Stable error codes, also used by the MCP interface.
@@ -182,6 +279,7 @@ pub enum ErrorCode {
     InvalidArgument,
     PaletteRangeInvalid,
     RevisionConflict,
+    UnsupportedMode,
     NothingToUndo,
     NothingToRedo,
 }
@@ -192,6 +290,7 @@ impl ErrorCode {
             ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
             ErrorCode::PaletteRangeInvalid => "PALETTE_RANGE_INVALID",
             ErrorCode::RevisionConflict => "REVISION_CONFLICT",
+            ErrorCode::UnsupportedMode => "UNSUPPORTED_MODE",
             ErrorCode::NothingToUndo => "NOTHING_TO_UNDO",
             ErrorCode::NothingToRedo => "NOTHING_TO_REDO",
         }

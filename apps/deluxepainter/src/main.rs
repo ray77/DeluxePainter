@@ -7,6 +7,7 @@
 //!     [--fg N] [--tool NAME[:filled]]   foreground colour and selected tool
 //!     [--menu M[:I[:S]]]                open menu M (0 = Picture), highlight item I / sub item S
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
+//!     [--requester]                     show the Screen Format requester instead
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter info <file>`           describe an IFF ILBM or PNG picture
 //! `deluxepainter convert <in> <out>`    convert between IFF ILBM and PNG
@@ -16,13 +17,74 @@ mod files;
 use std::path::Path;
 use std::sync::Arc;
 
-use dpx_core::{Axis, Command, Document, Engine, ErrorCode, IndexedImage, Palette, raster};
+use dpx_core::{
+    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, Target, raster,
+};
 use dpx_ui::menu::{self, MENUS};
+use dpx_ui::requester::{self, ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 use dpx_ui::{Action, Hit, PaintMode, Screen, Tool, UiState, to_rgba};
 use eframe::egui;
 
-const SCREEN_W: i32 = 320;
-const SCREEN_H: i32 = 256;
+/// Initial window size in points: PAL LoRes at 3×.
+const START_W: f32 = 960.0;
+const START_H: f32 = 768.0;
+
+/// How a display mode maps to the window: its screen size, the size of a UI (LoRes) pixel in
+/// screen pixels, and the displayed shape of one screen pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct View {
+    screen_w: i32,
+    screen_h: i32,
+    ux: i32,
+    uy: i32,
+    fx: i32,
+    fy: i32,
+}
+
+impl View {
+    fn of(mode: DisplayMode) -> Self {
+        let (w, h) = mode.size();
+        let (ux, uy) = mode.ui_scale();
+        let (fx, fy) = mode.pixel_shape();
+        Self {
+            screen_w: w as i32,
+            screen_h: h as i32,
+            ux: ux as i32,
+            uy: uy as i32,
+            fx: fx as i32,
+            fy: fy as i32,
+        }
+    }
+
+    /// The UI layout screen (always LoRes geometry: 320 wide).
+    fn ui_screen(&self) -> Screen {
+        Screen::new(self.screen_w / self.ux, self.screen_h / self.uy)
+    }
+
+    fn compose(&self, page: &IndexedImage, palette: &Palette, ui: &UiState) -> IndexedImage {
+        self.ui_screen()
+            .render_scaled(page, palette, ui, self.ux, self.uy)
+    }
+
+    /// Screen pixel → UI pixel.
+    fn ui_pos(self, (x, y): (i32, i32)) -> (i32, i32) {
+        (x.div_euclid(self.ux), y.div_euclid(self.uy))
+    }
+}
+
+/// The document for a loaded picture: its display mode is guessed from CAMG and size.
+fn document_for(p: &files::Picture) -> Document {
+    let img = p.image();
+    let mode = DisplayMode::guess(p.camg(), img.width(), img.height());
+    Document::from_picture(
+        img.clone(),
+        p.palette().clone(),
+        Target {
+            mode,
+            ..Target::default()
+        },
+    )
+}
 
 /// A small 16-colour palette (blacks, blues, golds) to demonstrate palette-derived UI pens.
 fn gold16() -> Palette {
@@ -72,15 +134,19 @@ fn main() -> eframe::Result {
         let scale = arg_value(&args, "--scale")
             .and_then(|s| s.parse().ok())
             .unwrap_or(2);
-        let (page, palette) = match &opened {
-            Some(p) => (p.image().clone(), p.palette().clone()),
-            None => (
-                IndexedImage::new(SCREEN_W as u32, SCREEN_H as u32, 0),
-                match arg_value(&args, "--palette").as_deref() {
-                    Some("gold16") => gold16(),
-                    _ => Palette::dpaint_default_32(),
-                },
-            ),
+        let doc = match &opened {
+            Some(p) => document_for(p),
+            None => {
+                let (w, h) = DisplayMode::PAL_LORES.size();
+                Document::new(
+                    w,
+                    h,
+                    match arg_value(&args, "--palette").as_deref() {
+                        Some("gold16") => gold16(),
+                        _ => Palette::dpaint_default_32(),
+                    },
+                )
+            }
         };
         let mut ui = UiState::default();
         if let Some(fg) = arg_value(&args, "--fg").and_then(|s| s.parse().ok()) {
@@ -119,7 +185,25 @@ fn main() -> eframe::Result {
                 }
             }
         }
-        if let Err(e) = snapshot(path, scale, &page, &palette, &ui) {
+        if args.iter().any(|a| a == "--requester") {
+            let page = (doc.page().width(), doc.page().height());
+            let req = ScreenFormatRequester::new(doc.target(), page, doc.palette().len());
+            let screen = req.render();
+            let view = View::of(requester::SCREEN);
+            let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
+            let rgba = to_rgba(&screen, &requester::palette(), sx, sy);
+            if let Err(e) = write_png(
+                path,
+                screen.width() * sx as u32,
+                screen.height() * sy as u32,
+                &rgba,
+            ) {
+                eprintln!("snapshot failed: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        if let Err(e) = snapshot(path, scale, &doc, &ui) {
             eprintln!("snapshot failed: {e}");
             std::process::exit(1);
         }
@@ -129,8 +213,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeluxePainter")
-            .with_inner_size([(SCREEN_W * 3) as f32, (SCREEN_H * 3) as f32])
-            .with_min_inner_size([SCREEN_W as f32, SCREEN_H as f32])
+            .with_inner_size([START_W, START_H])
+            .with_min_inner_size([320.0, 256.0])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };
@@ -140,10 +224,7 @@ fn main() -> eframe::Result {
         Box::new(move |_cc| {
             let mut app = PainterApp::new();
             if let Some(p) = opened {
-                app.engine = Engine::new(Document::from_picture(
-                    p.image().clone(),
-                    p.palette().clone(),
-                ));
+                app.engine = Engine::new(document_for(&p));
             }
             Ok(Box::new(app))
         }),
@@ -191,19 +272,22 @@ fn exit_with(result: Result<(), String>) -> ! {
     }
 }
 
+/// Renders the screen of `doc` headless; each screen pixel becomes `scale` × its displayed
+/// shape (e.g. HiRes pixels are twice as tall as wide).
 fn snapshot(
     path: &str,
     scale: usize,
-    page: &IndexedImage,
-    palette: &Palette,
+    doc: &Document,
     ui: &UiState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let screen = Screen::new(SCREEN_W, SCREEN_H).render(page, palette, ui);
-    let rgba = to_rgba(&screen, palette, scale, scale);
+    let view = View::of(doc.target().mode);
+    let screen = view.compose(doc.page(), doc.palette(), ui);
+    let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
+    let rgba = to_rgba(&screen, doc.palette(), sx, sy);
     write_png(
         path,
-        SCREEN_W as u32 * scale as u32,
-        SCREEN_H as u32 * scale as u32,
+        screen.width() * sx as u32,
+        screen.height() * sy as u32,
         &rgba,
     )
 }
@@ -260,10 +344,13 @@ struct PainterApp {
     /// The document; every change goes through its command engine.
     engine: Engine,
     ui: UiState,
-    screen: Screen,
     texture: Option<egui::TextureHandle>,
     dirty: bool,
     stroke: Option<Stroke>,
+    /// Picture ▸ Screen Format while it is open (shown on its own screen).
+    requester: Option<ScreenFormatRequester>,
+    /// Requester-screen pointer position while the left button is held.
+    req_pointer: Option<(i32, i32)>,
 }
 
 /// A freehand stroke in progress: drawn into a preview copy of the page with the same raster
@@ -278,23 +365,64 @@ struct Stroke {
 
 impl PainterApp {
     fn new() -> Self {
-        let doc = Document::new(
-            SCREEN_W as u32,
-            SCREEN_H as u32,
-            Palette::dpaint_default_32(),
-        );
+        let (w, h) = DisplayMode::PAL_LORES.size();
+        let doc = Document::new(w, h, Palette::dpaint_default_32());
         Self {
             engine: Engine::new(doc),
             ui: UiState::default(),
-            screen: Screen::new(SCREEN_W, SCREEN_H),
             texture: None,
             dirty: true,
             stroke: None,
+            requester: None,
+            req_pointer: None,
         }
     }
 
     fn palette(&self) -> &Palette {
         self.engine.document().palette()
+    }
+
+    /// The screen currently shown: the requester screen or the document's display mode.
+    fn view(&self) -> View {
+        if self.requester.is_some() {
+            View::of(requester::SCREEN)
+        } else {
+            View::of(self.engine.document().target().mode)
+        }
+    }
+
+    fn open_screen_format(&mut self) {
+        self.finish_stroke();
+        let doc = self.engine.document();
+        let page = (doc.page().width(), doc.page().height());
+        self.requester = Some(ScreenFormatRequester::new(
+            doc.target(),
+            page,
+            doc.palette().len(),
+        ));
+        self.dirty = true;
+    }
+
+    /// Feeds one event to the open requester and acts on its answer.
+    fn requester_event(&mut self, event: ReqEvent) {
+        let Some(req) = &mut self.requester else {
+            return;
+        };
+        match req.handle(event) {
+            ReqResponse::Continue => {}
+            ReqResponse::Cancel => self.requester = None,
+            ReqResponse::Use(command) => match self.engine.execute(command) {
+                Ok(_) => {
+                    self.requester = None;
+                    // Colours beyond the new palette would be invalid.
+                    let max = (self.palette().len() - 1) as u8;
+                    self.ui.fg = self.ui.fg.min(max);
+                    self.ui.bg = self.ui.bg.min(max);
+                }
+                Err(e) => req.set_message(e.message),
+            },
+        }
+        self.dirty = true;
     }
 
     /// The page as shown: the stroke preview while painting, else the document page.
@@ -433,6 +561,7 @@ impl PainterApp {
                 "palette.default" if self.palette().len() == 32 => self.run(Command::SetPalette {
                     colors: Palette::dpaint_default_32().colors().to_vec(),
                 }),
+                "picture.screen_format" => self.open_screen_format(),
                 "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 _ => {}
             },
@@ -469,14 +598,23 @@ impl eframe::App for PainterApp {
         let area = ctx.content_rect();
 
         // Integer scale in physical pixels, letterboxed and snapped to the device pixel grid.
+        // Each screen pixel is shown fx×fy times larger (its shape in this display mode).
+        let view = self.view();
         let phys_w = (area.width() * ppp).floor() as i32;
         let phys_h = (area.height() * ppp).floor() as i32;
-        let scale = (phys_w / SCREEN_W).min(phys_h / SCREEN_H).max(1);
-        let img_w = SCREEN_W * scale;
-        let img_h = SCREEN_H * scale;
+        let (unit_w, unit_h) = (view.screen_w * view.fx, view.screen_h * view.fy);
+        let scale = (phys_w / unit_w).min(phys_h / unit_h).max(1);
+        let img_w = unit_w * scale;
+        let img_h = unit_h * scale;
         let origin_px = egui::vec2(((phys_w - img_w) / 2) as f32, ((phys_h - img_h) / 2) as f32);
         let origin = area.min + origin_px / ppp;
         let rect = egui::Rect::from_min_size(origin, egui::vec2(img_w as f32, img_h as f32) / ppp);
+
+        if self.requester.is_some() {
+            self.requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
 
         // Input.
         let (hover, press_l, press_r, down_l, down_r) = ctx.input(|i| {
@@ -491,16 +629,18 @@ impl eframe::App for PainterApp {
         let to_screen = |p: egui::Pos2| -> (i32, i32) {
             let v = (p - origin) * ppp;
             (
-                (v.x / scale as f32).floor() as i32,
-                (v.y / scale as f32).floor() as i32,
+                (v.x / (scale * view.fx) as f32).floor() as i32,
+                (v.y / (scale * view.fy) as f32).floor() as i32,
             )
         };
-        let (sw, sh) = (SCREEN_W, SCREEN_H);
+        // Menus and the toolbox live in UI (LoRes) coordinates.
+        let ui_screen = view.ui_screen();
+        let (sw, sh) = (ui_screen.width, ui_screen.height);
         if self.ui.menu.active {
             // Menu strip held with the right button: track, multi-select with the left button,
             // select on release.
             if let Some(pos) = hover {
-                let (sx, sy) = to_screen(pos);
+                let (sx, sy) = view.ui_pos(to_screen(pos));
                 if self.ui.menu.pointer(sw, sh, sx, sy) {
                     self.dirty = true;
                 }
@@ -519,7 +659,12 @@ impl eframe::App for PainterApp {
             }
         } else if let Some(pos) = hover {
             let (sx, sy) = to_screen(pos);
-            let hit = self.screen.hit_test(self.palette().len(), &self.ui, sx, sy);
+            let (ux, uy) = view.ui_pos((sx, sy));
+            // Page hits use screen pixels, which are page pixels.
+            let hit = match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
+                Hit::Page { .. } => Hit::Page { x: sx, y: sy },
+                h => h,
+            };
             let on_page = match hit {
                 Hit::Page { x, y } => Some((x, y)),
                 _ => None,
@@ -532,7 +677,7 @@ impl eframe::App for PainterApp {
                 self.dirty |= self.ui.prefs.get(dpx_ui::Pref::Coords);
             }
             if press_r && hit == Hit::TitleBar {
-                self.ui.menu.open(sw, sh, sx, sy);
+                self.ui.menu.open(sw, sh, ux, uy);
                 self.dirty = true;
             } else if press_l || press_r {
                 self.handle_press(hit, press_r);
@@ -590,6 +735,60 @@ impl eframe::App for PainterApp {
 }
 
 impl PainterApp {
+    /// Pointer and keys while the Screen Format requester is open (left button only).
+    fn requester_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: i32,
+        view: View,
+    ) {
+        let (hover, press, down) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+            )
+        });
+        let pos = hover.map(|p| {
+            let v = (p - origin) * ppp;
+            (
+                (v.x / (scale * view.fx) as f32).floor() as i32,
+                (v.y / (scale * view.fy) as f32).floor() as i32,
+            )
+        });
+        if press && let Some(p) = pos {
+            self.req_pointer = Some(p);
+            self.requester_event(ReqEvent::Press(p.0, p.1));
+        } else if down && let Some(p) = pos {
+            if self.req_pointer != Some(p) {
+                self.req_pointer = Some(p);
+                self.requester_event(ReqEvent::Drag(p.0, p.1));
+            }
+        } else if !down && self.req_pointer.take().is_some() {
+            self.requester_event(ReqEvent::Release);
+        }
+        let keys: Vec<ReqKey> = ctx.input(|i| {
+            [
+                (egui::Key::ArrowUp, ReqKey::Up),
+                (egui::Key::ArrowDown, ReqKey::Down),
+                (egui::Key::Enter, ReqKey::Enter),
+                (egui::Key::Escape, ReqKey::Escape),
+                (egui::Key::U, ReqKey::Char('u')),
+                (egui::Key::C, ReqKey::Char('c')),
+                (egui::Key::R, ReqKey::Char('r')),
+            ]
+            .into_iter()
+            .filter(|(k, _)| i.key_pressed(*k))
+            .map(|(_, r)| r)
+            .collect()
+        });
+        for k in keys {
+            self.requester_event(ReqEvent::Key(k));
+        }
+    }
+
     fn upload_and_paint(
         &mut self,
         ui: &mut egui::Ui,
@@ -599,10 +798,20 @@ impl PainterApp {
     ) {
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
-            let screen = self.screen.render(self.page(), self.palette(), &self.ui);
-            let rgba = to_rgba(&screen, self.palette(), 1, 1);
+            let (screen, rgba) = match &self.requester {
+                Some(req) => {
+                    let screen = req.render();
+                    let rgba = to_rgba(&screen, &requester::palette(), 1, 1);
+                    (screen, rgba)
+                }
+                None => {
+                    let screen = self.view().compose(self.page(), self.palette(), &self.ui);
+                    let rgba = to_rgba(&screen, self.palette(), 1, 1);
+                    (screen, rgba)
+                }
+            };
             let image = egui::ColorImage::from_rgba_unmultiplied(
-                [SCREEN_W as usize, SCREEN_H as usize],
+                [screen.width() as usize, screen.height() as usize],
                 &rgba,
             );
             match &mut self.texture {
@@ -647,9 +856,9 @@ mod tests {
         app.finish_stroke();
         assert_eq!(app.page().get(0, 0), Some(5));
         app.run_action(Action::Command("picture.flip_horizontal"), &ctx);
-        assert_eq!(app.page().get(SCREEN_W - 1, 0), Some(5));
+        assert_eq!(app.page().get(319, 0), Some(5));
         app.run_action(Action::Command("picture.flip_vertical"), &ctx);
-        assert_eq!(app.page().get(SCREEN_W - 1, SCREEN_H - 1), Some(5));
+        assert_eq!(app.page().get(319, 255), Some(5));
         app.select_tool(Tool::Undo, false);
         app.select_tool(Tool::Undo, false);
         assert_eq!(app.page().get(0, 0), Some(5), "flips are undoable");
@@ -662,6 +871,37 @@ mod tests {
         // BG -> FG recolours background pixels with the foreground colour.
         app.run_action(Action::Command("color.bg_to_fg"), &ctx);
         assert_eq!(app.page().get(1, 1), Some(app.ui.fg));
+    }
+
+    #[test]
+    fn screen_format_requester_changes_the_mode_and_is_undoable() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.ui.fg = 31;
+        app.run_action(Action::Command("picture.screen_format"), &ctx);
+        assert!(app.requester.is_some());
+        assert_eq!(app.view(), View::of(requester::SCREEN));
+        // Arrow up from PAL:Low Res selects PAL:High Res Laced; Enter = Use.
+        app.requester_event(ReqEvent::Key(ReqKey::Up));
+        app.requester_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.requester.is_none());
+        let mode = app.engine.document().target().mode;
+        assert_eq!(mode.name(), "PAL:High Res Laced");
+        assert_eq!(app.page().width(), 640);
+        assert_eq!(app.page().height(), 512);
+        assert_eq!(app.view().screen_w, 640);
+        app.undo();
+        assert_eq!(app.engine.document().target().mode, DisplayMode::PAL_LORES);
+
+        // A refused format keeps the requester open with a message.
+        app.engine.execute(Command::Clear { color: 31 }).unwrap();
+        app.open_screen_format();
+        for _ in 0..4 {
+            app.requester_event(ReqEvent::Key(ReqKey::Down));
+        }
+        // Escape cancels.
+        app.requester_event(ReqEvent::Key(ReqKey::Escape));
+        assert!(app.requester.is_none());
     }
 
     #[test]

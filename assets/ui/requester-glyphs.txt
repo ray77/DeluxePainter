@@ -1,0 +1,14 @@
+# DeluxePainter requester glyphs, HiRes ('#' = drawn pen, '.' = transparent).
+# Copyright © 2026 Dominik Schmidt, part of DeluxePainter, PolyForm Noncommercial 1.0.0.
+# Original artwork drawn for DeluxePainter in the style of the classic Amiga gadgets.
+
+# Cycle gadget symbol: a loop with an arrow head, 7x8.
+= cycle
+.####..
+#....#.
+#...###
+#....#.
+#......
+#......
+#....#.
+.####..

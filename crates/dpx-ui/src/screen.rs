@@ -156,18 +156,61 @@ impl Screen {
         let pens = Pens::from_palette(palette);
         let mut img = IndexedImage::new(self.width as u32, self.height as u32, ui.bg);
         img.blit(page, 0, 0);
+        self.draw_ui(&mut img, palette, ui, &pens);
+        img
+    }
+
+    /// Composes a screen whose pixels are finer than LoRes (HiRes, SuperHiRes, laced). `self`
+    /// has LoRes geometry; the result is `ux`×`uy` times larger. The page keeps its own
+    /// pixels, while every UI pixel covers `ux`×`uy` screen pixels, so the interface looks
+    /// the same in every mode until HiRes artwork exists (AMIGA_GUI_FIDELITY.md).
+    pub fn render_scaled(
+        &self,
+        page: &IndexedImage,
+        palette: &Palette,
+        ui: &UiState,
+        ux: i32,
+        uy: i32,
+    ) -> IndexedImage {
+        if (ux, uy) == (1, 1) {
+            return self.render(page, palette, ui);
+        }
+        let pens = Pens::from_palette(palette);
+        let (sw, sh) = (self.width * ux, self.height * uy);
+        let mut out = IndexedImage::new(sw as u32, sh as u32, ui.bg);
+        out.blit(page, 0, 0);
+        // Draw the UI over two different backgrounds: where both agree, the UI drew a pixel.
+        let layer = |fill: u8| {
+            let mut img = IndexedImage::new(self.width as u32, self.height as u32, fill);
+            self.draw_ui(&mut img, palette, ui, &pens);
+            img
+        };
+        let (a, b) = (layer(0), layer(1));
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let p = a.get(x, y);
+                if p == b.get(x, y)
+                    && let Some(p) = p
+                {
+                    out.fill_rect(x * ux, y * uy, ux, uy, p);
+                }
+            }
+        }
+        out
+    }
+
+    fn draw_ui(&self, img: &mut IndexedImage, palette: &Palette, ui: &UiState, pens: &Pens) {
         if ui.toolbox_visible {
-            self.draw_toolbox(&mut img, palette, ui, &pens);
+            self.draw_toolbox(img, palette, ui, pens);
         }
         if ui.title_visible {
             if ui.menu.active {
                 let ctx = ui.menu_context();
-                menu::draw(&mut img, &pens, &ctx, &ui.menu, self.width, self.height);
+                menu::draw(img, pens, &ctx, &ui.menu, self.width, self.height);
             } else {
-                self.draw_title_bar(&mut img, ui, &pens);
+                self.draw_title_bar(img, ui, pens);
             }
         }
-        img
     }
 
     fn bevel_box(img: &mut IndexedImage, x: i32, y: i32, w: i32, h: i32, pens: &Pens) {
@@ -389,6 +432,28 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaled_render_keeps_page_pixels_and_enlarges_the_ui() {
+        let pal = Palette::dpaint_default_32();
+        let ui = UiState::default();
+        let lores = Screen::new(320, 256);
+        // HiRes laced: 640×512, UI pixels 2×2.
+        let mut page = IndexedImage::new(640, 512, 0);
+        page.set(1, 101, 5);
+        let hi = lores.render_scaled(&page, &pal, &ui, 2, 2);
+        assert_eq!((hi.width(), hi.height()), (640, 512));
+        assert_eq!(hi.get(1, 101), Some(5), "page pixel at its own resolution");
+        assert_eq!(hi.get(0, 101), Some(0));
+        let small = lores.render(&IndexedImage::new(320, 256, 0), &pal, &ui);
+        for (x, y) in [(0, 0), (5, 3), (319, 255), (300, 40), (310, 200)] {
+            let p = small.get(x, y);
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                assert_eq!(hi.get(2 * x + dx, 2 * y + dy), p, "UI pixel ({x},{y})");
+            }
+        }
+        assert_eq!(lores.render_scaled(&page, &pal, &ui, 1, 1).width(), 320);
+    }
 
     fn render_default() -> (IndexedImage, Pens) {
         let pal = Palette::dpaint_default_32();

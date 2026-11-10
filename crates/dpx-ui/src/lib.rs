@@ -8,6 +8,7 @@ pub mod bitmap;
 pub mod font;
 pub mod menu;
 pub mod pens;
+pub mod requester;
 pub mod screen;
 pub mod toolbox;
 
@@ -15,6 +16,7 @@ use dpx_core::{IndexedImage, Palette};
 
 pub use menu::{Action, MenuState, Pref, Prefs};
 pub use pens::Pens;
+pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 pub use screen::{Hit, PaintMode, Screen, UiState};
 pub use toolbox::Tool;
 

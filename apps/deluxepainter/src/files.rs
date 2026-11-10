@@ -37,6 +37,14 @@ impl Picture {
             Picture::Png { palette, .. } => palette,
         }
     }
+
+    /// The ILBM display mode id, if the file has one.
+    pub fn camg(&self) -> Option<u32> {
+        match self {
+            Picture::Ilbm(i) => i.camg,
+            Picture::Png { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

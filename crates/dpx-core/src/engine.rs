@@ -37,6 +37,8 @@ pub struct Outcome {
     pub affected: Option<Rect>,
     /// Whether the palette (would) change.
     pub palette_changed: bool,
+    /// Whether page size or display mode (would) change; front-ends rebuild their screen.
+    pub format_changed: bool,
     pub undo_available: bool,
     pub redo_available: bool,
 }
@@ -46,6 +48,7 @@ pub struct Outcome {
 enum Before {
     Pixels { rect: Rect, pixels: IndexedImage },
     Palette(Palette),
+    Document(Box<Document>),
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +133,12 @@ impl Engine {
                 self.doc.palette = palette;
                 Footprint::Palette
             }
+            Before::Document(doc) => {
+                let revision = self.doc.revision;
+                self.doc = *doc;
+                self.doc.revision = revision;
+                Footprint::Document
+            }
         };
         self.redo.push(step.command);
         self.doc.revision += 1;
@@ -155,6 +164,7 @@ impl Engine {
                 pixels: self.doc.page.crop(rect),
             },
             Footprint::Palette => Before::Palette(self.doc.palette.clone()),
+            Footprint::Document => Before::Document(Box::new(self.doc.clone())),
         };
         command.apply(&mut self.doc);
         if self.undo.len() == self.undo_limit {
@@ -166,14 +176,16 @@ impl Engine {
     }
 
     fn outcome(&self, footprint: Footprint) -> Outcome {
-        let (affected, palette_changed) = match footprint {
-            Footprint::Pixels(r) => ((!r.is_empty()).then_some(r), false),
-            Footprint::Palette => (None, true),
+        let (affected, palette_changed, format_changed) = match footprint {
+            Footprint::Pixels(r) => ((!r.is_empty()).then_some(r), false, false),
+            Footprint::Palette => (None, true, false),
+            Footprint::Document => (Some(self.doc.page.bounds()), true, true),
         };
         Outcome {
             revision: self.doc.revision,
             affected,
             palette_changed,
+            format_changed,
             undo_available: self.can_undo(),
             redo_available: self.can_redo(),
         }
@@ -345,6 +357,101 @@ mod tests {
     }
 
     const MAX_POINT: i32 = crate::command::MAX_COORD + 1;
+
+    #[test]
+    fn set_format_changes_mode_page_and_palette_and_undoes() {
+        use crate::{DisplayMode, Resolution, Video};
+        let mut e = engine();
+        e.execute(stroke(31, &[(2, 2)])).unwrap();
+        let before = e.document().clone();
+        let hires = DisplayMode::new(Video::Pal, Resolution::Hi, false);
+        let out = e
+            .execute(Command::SetFormat {
+                mode: hires,
+                colors: 64,
+                width: 640,
+                height: 256,
+                retain: true,
+            })
+            .unwrap();
+        assert!(out.format_changed && out.palette_changed);
+        assert_eq!(out.affected, Some(Rect::new(0, 0, 640, 256)));
+        let d = e.document();
+        assert_eq!(d.target().mode, hires);
+        assert_eq!((d.page().width(), d.page().height()), (640, 256));
+        assert_eq!(d.page().get(2, 2), Some(31), "picture retained");
+        assert_eq!(d.palette().len(), 64);
+        assert_eq!(d.palette().get(31), before.palette().get(31));
+        assert_eq!(d.palette().get(63), Some(Rgb8::WHITE));
+
+        // Fewer colours than the picture uses: refused, nothing changes.
+        let err = e
+            .execute(Command::SetFormat {
+                mode: hires,
+                colors: 16,
+                width: 640,
+                height: 256,
+                retain: true,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        // Without retain the page is cleared, so 16 colours are fine.
+        e.execute(Command::SetFormat {
+            mode: hires,
+            colors: 16,
+            width: 100,
+            height: 50,
+            retain: false,
+        })
+        .unwrap();
+        assert_eq!(e.document().page(), &IndexedImage::new(100, 50, 0));
+
+        e.undo().unwrap();
+        e.undo().unwrap();
+        let restored = e.document();
+        assert_eq!(restored.page(), before.page());
+        assert_eq!(restored.palette(), before.palette());
+        assert_eq!(restored.target(), before.target());
+        // stroke, two formats, two undos (the refused command does not count)
+        assert_eq!(restored.revision(), 5);
+    }
+
+    #[test]
+    fn set_format_respects_chipset_limits() {
+        use crate::{Chipset, DisplayMode, Resolution, Target, Video};
+        let ocs = Target {
+            chipset: Chipset::Ocs,
+            mode: DisplayMode::PAL_LORES,
+        };
+        let mut e = Engine::new(Document::from_picture(
+            IndexedImage::new(8, 8, 0),
+            Palette::dpaint_default_32(),
+            ocs,
+        ));
+        let fmt = |mode, colors| Command::SetFormat {
+            mode,
+            colors,
+            width: 8,
+            height: 8,
+            retain: false,
+        };
+        let hires = DisplayMode::new(Video::Pal, Resolution::Hi, false);
+        let shires = DisplayMode::new(Video::Pal, Resolution::SuperHi, false);
+        assert_eq!(
+            e.execute(fmt(hires, 32)).unwrap_err().code,
+            ErrorCode::PaletteRangeInvalid
+        );
+        assert!(e.execute(fmt(hires, 16)).is_ok());
+        assert_eq!(
+            e.execute(fmt(shires, 4)).unwrap_err().code,
+            ErrorCode::UnsupportedMode
+        );
+        assert_eq!(
+            e.execute(fmt(DisplayMode::PAL_LORES, 24)).unwrap_err().code,
+            ErrorCode::PaletteRangeInvalid,
+            "not a power of two"
+        );
+    }
 
     #[test]
     fn revision_check_and_dry_run() {

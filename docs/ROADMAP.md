@@ -25,11 +25,12 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 - `dpx-iff`: IFF container, ByteRun1 (written by a Sonnet subagent, reviewed), ILBM read/write incl. CMAP 4-bit fix, CAMG, CRNG/CCRT, GRAB, mask plane, unknown chunks kept.
 - `dpx-formats`: indexed PNG import/export (palette kept exactly).
 - CLI: `deluxepainter info <file>`, `deluxepainter convert <in> <out>` (reports whatever the target format cannot store), `--open <file>` for the GUI and snapshots.
+- Display modes (ADR-7): PAL/NTSC × LoRes/HiRes/SuperHiRes × laced, chipset limits, `SetFormat` command with whole-document undo; Picture ▸ Screen Format requester on its own HiRes screen (menu only, owner decision); screens shown with the right pixel shape; `--open` picks the picture's mode.
 
 Next in Phase 2:
-1. Screen-mode model (resolution, PAL/NTSC, colours, page size) with the start requester and Picture ▸ Screen Format (owner request), so loaded pictures open in their own mode.
-2. Picture ▸ Load/Save with a DeluxePaint-style file requester (needs the requester framework).
-3. True-colour PNG and JPEG import with colour reduction.
+1. Picture ▸ Load/Save with a DeluxePaint-style file requester, writing the document's CAMG and aspect.
+2. True-colour PNG and JPEG import with colour reduction.
+3. Page larger than the screen (scrolling), overscan and custom screen sizes.
 4. Error diagnostics for broken files; more golden fixtures.
 
 ## Phase 1 status

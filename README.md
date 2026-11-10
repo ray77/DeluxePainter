@@ -73,7 +73,9 @@ cargo run -p deluxepainter --release -- convert picture.iff picture.png
 cargo run -p deluxepainter --release -- --open picture.iff
 ```
 
-Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff`, `--font-preview out.png`.
+Display modes: Picture ▸ Screen Format.. chooses PAL/NTSC LoRes, HiRes and SuperHiRes (laced or not), palette size, page size and whether to keep the picture.
+
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff`, `--requester` (Screen Format requester), `--font-preview out.png`.
 
 ## License
 
