@@ -250,9 +250,9 @@ impl PainterApp {
                 if spare.palette() == &palette {
                     s
                 } else if spare.palette().len() == palette.len() {
-                    let page = spare.page().clone();
+                    // ADR-28: with_palette keeps every animation frame of the other page.
                     OtherPage {
-                        engine: Engine::new(Document::from_picture(page, palette, target)),
+                        engine: Engine::new(spare.with_palette(palette)),
                         ..s
                     }
                 } else {

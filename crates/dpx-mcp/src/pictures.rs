@@ -178,6 +178,15 @@ pub fn encode_document(
     format: Format,
 ) -> Result<(Vec<u8>, Vec<String>), ToolError> {
     validate_hardware(doc)?;
+    // ADR-28: an animation is written one frame at a time until IFF ANIM export exists.
+    let mut notes = Vec::new();
+    if doc.frame_count() > 1 {
+        notes.push(format!(
+            "frame {} of {} saved as a picture (IFF ANIM export comes later)",
+            doc.current_frame() + 1,
+            doc.frame_count()
+        ));
+    }
     match format {
         Format::Ilbm => {
             let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
@@ -188,18 +197,16 @@ pub fn encode_document(
             out.page_height = sh as i16;
             let bytes = ilbm::write(&out, ilbm::Compression::ByteRun1)
                 .map_err(|e| hardware(e.to_string()))?;
-            Ok((bytes, Vec::new()))
+            Ok((bytes, notes))
         }
         Format::Png => {
             let bytes = dpx_formats::write_png(doc.page(), doc.palette())
                 .map_err(|e| ToolError::new("INVALID_FILE", e.to_string()))?;
-            Ok((
-                bytes,
-                vec![format!(
-                    "PNG cannot store: display mode {}",
-                    doc.target().mode.name()
-                )],
-            ))
+            notes.push(format!(
+                "PNG cannot store: display mode {}",
+                doc.target().mode.name()
+            ));
+            Ok((bytes, notes))
         }
     }
 }

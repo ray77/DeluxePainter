@@ -103,6 +103,12 @@ pub struct UiState {
     pub can_restore: bool,
     /// Gridding, Symmetry, Spacing, Fill Type or Make Stencil while open (ADR-20).
     pub tool_requester: Option<crate::tool_requesters::ToolRequester>,
+    // Animation (ADR-28).
+    /// An Anim menu requester while open.
+    pub anim_requester: Option<crate::anim_requester::AnimRequester>,
+    /// Current frame (from 1) and frame count, shown at the left of the title bar instead of
+    /// the program name while the picture has more than one frame (AGA p.84).
+    pub frame_counter: Option<(usize, usize)>,
 }
 
 impl UiState {
@@ -144,6 +150,8 @@ impl Default for UiState {
             has_brush: false,
             can_restore: false,
             tool_requester: None,
+            anim_requester: None,
+            frame_counter: None,
         }
     }
 }
@@ -299,6 +307,9 @@ impl Screen {
         if let Some(req) = &ui.tool_requester {
             req.draw(img, pens, palette);
         }
+        if let Some(req) = &ui.anim_requester {
+            req.draw(img, pens);
+        }
     }
 
     fn bevel_box(img: &mut IndexedImage, x: i32, y: i32, w: i32, h: i32, pens: &Pens) {
@@ -313,7 +324,10 @@ impl Screen {
         img.hline(0, w - 1, 0, pens.shine);
         img.hline(0, w - 1, geom::TITLE_H - 1, pens.dark);
         let font = Font::builtin();
-        let title = format!("{APP_TITLE}  {}", ui.mode.title());
+        let title = match ui.frame_counter {
+            Some((current, count)) => format!("{current}/{count}  {}", ui.mode.title()),
+            None => format!("{APP_TITLE}  {}", ui.mode.title()),
+        };
         font.draw(
             img,
             geom::TITLE_TEXT_X,
@@ -635,6 +649,32 @@ mod tests {
                 assert_eq!(got == Some(p.dark), ink, "pixel ({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn title_shows_the_frame_counter_with_several_frames() {
+        let (plain, p) = render_default();
+        let ui = UiState {
+            frame_counter: Some((3, 10)),
+            ..UiState::default()
+        };
+        let pal = Palette::dpaint_default_32();
+        let img = Screen::new(320, 256).render(&IndexedImage::new(320, 256, 0), &pal, &ui);
+        let mut expected = IndexedImage::new(320, 256, 0);
+        let end = Font::builtin().draw(
+            &mut expected,
+            geom::TITLE_TEXT_X,
+            geom::TITLE_TEXT_Y,
+            "3/10  Color",
+            1,
+        );
+        for y in geom::TITLE_TEXT_Y..geom::TITLE_TEXT_Y + 8 {
+            for x in 0..end {
+                let ink = expected.get(x, y) == Some(1);
+                assert_eq!(img.get(x, y) == Some(p.dark), ink, "pixel ({x}, {y})");
+            }
+        }
+        assert_ne!(img, plain);
     }
 
     #[test]

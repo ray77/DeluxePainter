@@ -73,7 +73,7 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 
 | P | Feature | Notes |
 |---|---|---|
-| P0 | `.dpxproj` save/open — lossless, atomic writes | Picture ▸ Save.. writes the project, Load.. opens it, Export.. writes IFF ILBM / PNG (ADR-23, ADR-27, [PROJECT_FORMAT.md](PROJECT_FORMAT.md)); one layer, no undo history or spare page yet |
+| P0 | `.dpxproj` save/open — lossless, atomic writes | Picture ▸ Save.. writes the project, Load.. opens it, Export.. writes IFF ILBM / PNG (ADR-23, ADR-27, [PROJECT_FORMAT.md](PROJECT_FORMAT.md)); animation frames saved as format version 2 (ADR-28); one layer, no undo history or spare page yet |
 | P1 | Layers: add/delete/rename/reorder, visibility, lock, opacity, Normal blend | |
 | P1 | Layer groups | |
 | P1 | Autosave & crash recovery | |
@@ -99,6 +99,8 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 |---|---|
 | P2 | Frames: add/copy/delete/set count, frame rate, go to, play / play once / ping-pong |
 | P2 | Light table (onion skin: previous / two back / next / spare) |
+
+**Frames and Light Table (ADR-28), done:** a document holds 1–999 frames (at most 128 MiB of frame pixels); every page command paints the current frame and undo steps back to the frame they changed. Anim ▸ Frames ▸ Set #.. / Add Frames.. / Copy Frames.. / Delete Frames.., Control ▸ Set Rate.. / Previous (`1`) / Next (`2`) / Goto.. (`3`) / Play (`4`) / Play once (`5`) / Ping-pong (`6`), Alt+`=` adds a frame; playback only redraws (Esc, Space or a click stops, Left/Right change the rate). The title bar shows `n/total` with several frames. Effect ▸ LightTable (`l`; Alt+`l` Dim; Ctrl+`1`–`4` Two Back / Previous / Next / Spare; Merge, undoable) shows the other frames through the BG colour, dimmed by nearest palette colours, on screen only. Export writes the current frame with a note until ANIM export exists. Open: Set Range, Control Panel, Method, Move, AnimBrush, animpainting, Load/Save Anim, the multi-frame Clear requester, menu check marks for the LightTable items.
 | P2 | AnimBrush pick-up and settings |
 | P3 | Move requester (path/rotation with easing), metamorph |
 

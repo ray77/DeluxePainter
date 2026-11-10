@@ -556,11 +556,31 @@ pub fn page_at_least_screen(doc: Document) -> (Document, Option<String>) {
         return (doc, None);
     }
     let (w, h) = (pw.max(sw), ph.max(sh));
-    let mut page = IndexedImage::new(w, h, 0);
-    page.blit(doc.page(), 0, 0);
     let note = format!("page enlarged from {pw}x{ph} to the {w}x{h} screen, picture top-left");
-    let doc = Document::from_picture(page, doc.palette().clone(), doc.target());
-    (doc, Some(note))
+    // Every animation frame grows the same way (ADR-28).
+    let frames: Vec<IndexedImage> = doc
+        .frames()
+        .map(|f| {
+            let mut page = IndexedImage::new(w, h, 0);
+            page.blit(f, 0, 0);
+            page
+        })
+        .collect();
+    let grown = Document::from_frames(
+        frames,
+        doc.current_frame(),
+        doc.fps(),
+        doc.palette().clone(),
+        doc.target(),
+    );
+    match grown {
+        Ok(grown) => (grown, Some(note)),
+        // Too many frames for the bigger page: keep the picture as it is.
+        Err(e) => (
+            doc,
+            Some(format!("page not enlarged to the screen: {}", e.message)),
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -613,6 +633,14 @@ pub fn encode_document(
     let transparent = extras
         .transparent_color
         .filter(|&c| usize::from(c) < colors);
+    let frames = doc.frame_count();
+    if frames > 1 && save_format(path)? != SaveFormat::Project {
+        // ADR-28: one picture per export until IFF ANIM export exists.
+        notes.push(format!(
+            "frame {} of {frames} exported as a picture (IFF ANIM export comes later)",
+            doc.current_frame() + 1
+        ));
+    }
     match save_format(path)? {
         SaveFormat::Ilbm => {
             let mode = doc.target().mode;
@@ -773,17 +801,25 @@ pub fn info(path: &Path) -> Result<String, String> {
             let t = doc.target();
             out += &format!(
                 "{name}: DeluxePainter project (dpxproj format {}) {}x{}, {} colours\n",
-                project::FORMAT_VERSION,
+                project::format_version_for(doc),
                 img.width(),
                 img.height(),
                 doc.palette().len()
             );
             out += &format!(
-                "  target: {:?} {}, screen {}x{}\n  1 frame, 1 layer{}\n",
+                "  target: {:?} {}, screen {}x{}\n  {}, 1 layer{}\n",
                 t.chipset,
                 t.mode.name(),
                 t.screen.0,
                 t.screen.1,
+                match doc.frame_count() {
+                    1 => "1 frame".to_string(),
+                    n => format!(
+                        "{n} frames (frame {} current, {} per second)",
+                        doc.current_frame() + 1,
+                        doc.fps()
+                    ),
+                },
                 match &p.spare {
                     Some(s) => format!(", spare page {}x{}", s.width(), s.height()),
                     None => String::new(),

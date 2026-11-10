@@ -5,6 +5,10 @@
 //! [`Command`]s with multi-level undo/redo). Layers and frames follow (see
 //! `docs/ARCHITECTURE.md`).
 
+// Animation frames (ADR-28).
+pub mod anim;
+mod frame_ops;
+
 pub mod brush_ops;
 pub mod command;
 pub mod document;
@@ -20,6 +24,7 @@ pub mod resample;
 pub mod rgba;
 pub mod shapes;
 
+pub use anim::{LightTable, PlayMode};
 pub use command::{Axis, Command, CommandError, ErrorCode};
 pub use document::Document;
 pub use engine::{Engine, Outcome, Request};

@@ -55,14 +55,17 @@ enum Before {
 struct Step {
     command: Command,
     before: Before,
+    /// The current frame when the command ran (ADR-28): undo and redo go back to it.
+    frame: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Engine {
     doc: Document,
     undo: VecDeque<Step>,
-    /// Undone commands, most recent last; redo replays them (commands are deterministic).
-    redo: Vec<Command>,
+    /// Undone commands with their frame, most recent last; redo replays them (commands are
+    /// deterministic).
+    redo: Vec<(Command, usize)>,
     undo_limit: usize,
 }
 
@@ -96,6 +99,8 @@ impl Engine {
     }
 
     /// Validates and executes a command as one undo step. A new command clears the redo list.
+    /// Settings (GotoFrame, SetFrameRate; ADR-28) are applied without an undo step and keep
+    /// the redo list.
     pub fn execute(&mut self, request: impl Into<Request>) -> Result<Outcome, CommandError> {
         let request = request.into();
         if let Some(expected) = request.expected_revision
@@ -114,11 +119,17 @@ impl Engine {
         if request.dry_run {
             return Ok(self.outcome(footprint));
         }
+        if footprint == Footprint::Setting {
+            request.command.apply(&mut self.doc);
+            self.doc.revision += 1;
+            return Ok(self.outcome(footprint));
+        }
         self.redo.clear();
         Ok(self.commit(request.command, footprint))
     }
 
-    /// Reverts the most recent step.
+    /// Reverts the most recent step. A pixel step of another frame makes that frame current
+    /// first, so the change shows (ADR-28).
     pub fn undo(&mut self) -> Result<Outcome, CommandError> {
         let step = self
             .undo
@@ -126,6 +137,7 @@ impl Engine {
             .ok_or_else(|| CommandError::new(ErrorCode::NothingToUndo, "nothing to undo"))?;
         let footprint = match step.before {
             Before::Pixels { rect, pixels } => {
+                self.doc.go_to(step.frame);
                 self.doc.page.blit(&pixels, rect.x, rect.y);
                 Footprint::Pixels(rect)
             }
@@ -134,24 +146,28 @@ impl Engine {
                 Footprint::Palette
             }
             Before::Document(doc) => {
-                let revision = self.doc.revision;
+                // The rate is a setting outside the undo history.
+                let (revision, fps) = (self.doc.revision, self.doc.fps);
                 self.doc = *doc;
                 self.doc.revision = revision;
+                self.doc.fps = fps;
                 Footprint::Document
             }
         };
-        self.redo.push(step.command);
+        self.redo.push((step.command, step.frame));
         self.doc.revision += 1;
         Ok(self.outcome(footprint))
     }
 
-    /// Re-applies the most recently undone command.
+    /// Re-applies the most recently undone command, on the frame it first ran on.
     pub fn redo(&mut self) -> Result<Outcome, CommandError> {
-        let command = self
+        let (command, frame) = self
             .redo
             .pop()
             .ok_or_else(|| CommandError::new(ErrorCode::NothingToRedo, "nothing to redo"))?;
-        // The document is back in the state the command was first validated against.
+        // The document is back in the state the command was first validated against (only
+        // the current frame may differ: settings keep the redo list).
+        self.doc.go_to(frame);
         command.validate(&self.doc)?;
         let footprint = command.footprint(&self.doc);
         Ok(self.commit(command, footprint))
@@ -164,13 +180,21 @@ impl Engine {
                 pixels: self.doc.page.crop(rect),
             },
             Footprint::Palette => Before::Palette(self.doc.palette.clone()),
-            Footprint::Document => Before::Document(Box::new(self.doc.clone())),
+            // Other frames are shared, not copied (Arc).
+            Footprint::Document | Footprint::Frames | Footprint::Setting => {
+                Before::Document(Box::new(self.doc.clone()))
+            }
         };
+        let frame = self.doc.current;
         command.apply(&mut self.doc);
         if self.undo.len() == self.undo_limit {
             self.undo.pop_front();
         }
-        self.undo.push_back(Step { command, before });
+        self.undo.push_back(Step {
+            command,
+            before,
+            frame,
+        });
         self.doc.revision += 1;
         self.outcome(footprint)
     }
@@ -180,6 +204,7 @@ impl Engine {
             Footprint::Pixels(r) => ((!r.is_empty()).then_some(r), false, false),
             Footprint::Palette => (None, true, false),
             Footprint::Document => (Some(self.doc.page.bounds()), true, true),
+            Footprint::Frames | Footprint::Setting => (Some(self.doc.page.bounds()), false, false),
         };
         Outcome {
             revision: self.doc.revision,
@@ -843,6 +868,146 @@ mod tests {
         .unwrap();
         e.undo().unwrap();
         assert_eq!(e.document().page(), before.page());
+    }
+
+    /// Colour of pixel (2, 2) in every frame.
+    fn frame_pixels(e: &Engine) -> Vec<u8> {
+        e.document()
+            .frames()
+            .map(|f| f.get(2, 2).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn page_commands_act_on_the_current_frame_and_undo_goes_back_to_it() {
+        let mut e = engine();
+        e.execute(Command::Clear { color: 1 }).unwrap();
+        e.execute(Command::SetFrameCount { count: 3 }).unwrap();
+        assert_eq!(e.document().frame_count(), 3);
+        assert_eq!(
+            frame_pixels(&e),
+            [1, 1, 1],
+            "new frames copy the current one"
+        );
+        // Going to a frame is no undo step.
+        let undo_before = e.can_undo();
+        let out = e.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        assert_eq!(out.affected, Some(Rect::new(0, 0, 16, 8)));
+        assert_eq!(e.can_undo(), undo_before);
+        e.execute(stroke(5, &[(2, 2)])).unwrap();
+        assert_eq!(frame_pixels(&e), [1, 5, 1]);
+        // Undo from another frame goes back to frame 2 and restores it there.
+        e.execute(Command::GotoFrame { frame: 2 }).unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.document().current_frame(), 1);
+        assert_eq!(frame_pixels(&e), [1, 1, 1]);
+        // Going elsewhere keeps the redo list; redo paints frame 2 again.
+        e.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        assert!(e.can_redo());
+        e.redo().unwrap();
+        assert_eq!(e.document().current_frame(), 1);
+        assert_eq!(frame_pixels(&e), [1, 5, 1]);
+        // Frame commands undo as one step, back to the frame they ran on.
+        e.execute(Command::AddFrames { count: 2 }).unwrap();
+        assert_eq!(frame_pixels(&e), [1, 5, 5, 5, 1]);
+        assert_eq!(e.document().current_frame(), 3);
+        e.execute(Command::SetFrameRate { fps: 12 }).unwrap();
+        e.undo().unwrap();
+        assert_eq!(frame_pixels(&e), [1, 5, 1]);
+        assert_eq!(e.document().current_frame(), 1);
+        assert_eq!(e.document().fps(), 12, "the rate is a setting, not undone");
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.document().frame_count(), 1);
+        e.undo().unwrap();
+        assert_eq!(e.document().page(), &IndexedImage::new(16, 8, 0));
+        // A dry run goes nowhere.
+        e.redo().unwrap();
+        e.redo().unwrap();
+        let dry = Request {
+            command: Command::GotoFrame { frame: 2 },
+            expected_revision: None,
+            dry_run: true,
+        };
+        e.execute(dry).unwrap();
+        assert_eq!(e.document().current_frame(), 0);
+        assert_eq!(
+            e.execute(Command::GotoFrame { frame: 3 }).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn page_size_and_format_change_every_frame() {
+        use crate::{DisplayMode, Target};
+        let mut e = Engine::new(Document::from_picture(
+            IndexedImage::new(320, 256, 2),
+            Palette::dpaint_default_32(),
+            Target::default(),
+        ));
+        e.execute(Command::SetFrameCount { count: 3 }).unwrap();
+        e.execute(Command::GotoFrame { frame: 2 }).unwrap();
+        e.execute(Command::Clear { color: 31 }).unwrap();
+        e.execute(Command::SetPageSize {
+            width: 400,
+            height: 300,
+            fill: 4,
+        })
+        .unwrap();
+        for f in e.document().frames() {
+            assert_eq!((f.width(), f.height()), (400, 300));
+            assert_eq!(f.get(399, 299), Some(4));
+        }
+        // Colours of every frame count when the palette shrinks.
+        e.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        let fewer = Command::SetFormat {
+            mode: DisplayMode::PAL_LORES,
+            colors: 16,
+            width: 400,
+            height: 300,
+            retain: true,
+            screen: None,
+        };
+        assert_eq!(
+            e.execute(fewer).unwrap_err().code,
+            ErrorCode::PaletteRangeInvalid,
+            "frame 3 uses colour 31"
+        );
+        // Another page size by SetPage would split the frames: refused.
+        let other = Command::SetPage {
+            width: 320,
+            height: 256,
+            pixels: vec![0; 320 * 256],
+        };
+        assert_eq!(
+            e.execute(other).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        // Too many frames for the memory limit: a big page with many frames is refused.
+        e.execute(Command::SetFrameCount { count: 200 }).unwrap();
+        let big = Command::SetPageSize {
+            width: 1008,
+            height: 1024,
+            fill: 0,
+        };
+        assert_eq!(e.execute(big).unwrap_err().code, ErrorCode::InvalidArgument);
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert!(e.document().frames().all(|f| f.width() == 320));
+        assert_eq!(e.document().frame_count(), 3);
+        // JSON names of the frame commands.
+        let json = serde_json::to_string(&Command::GotoFrame { frame: 2 }).unwrap();
+        assert_eq!(json, r#"{"op":"goto_frame","frame":2}"#);
+        let cmd: Command =
+            serde_json::from_str(r#"{"op":"delete_frames","first":0,"last":1}"#).unwrap();
+        assert_eq!(
+            cmd,
+            Command::DeleteFrames {
+                first: 0,
+                last: 1,
+                fill: 0
+            }
+        );
     }
 
     /// A 3×2 brush with colour 0 transparent: `.5.` over `66.`.

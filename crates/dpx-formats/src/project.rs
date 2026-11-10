@@ -1,6 +1,8 @@
 //! The lossless project format `.dpxproj` (ADR-23, `docs/PROJECT_FORMAT.md`).
 //!
-//! A ZIP container with a JSON manifest and one indexed PNG per layer. The reader validates
+//! A ZIP container with a JSON manifest and one indexed PNG per layer of every animation
+//! frame. Single-frame documents are written as format version 1, exactly as before frames
+//! existed; animations as version 2 (ADR-28). The reader validates
 //! everything it is given (versions, entry names, sizes, PNG kind and palette) and the writer
 //! is deterministic, so the same project always gives the same bytes. The app maps its
 //! picture-file extras (colour ranges, grab point, transparent colour) from and to
@@ -10,7 +12,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{Cursor, Read, Write};
 
-use dpx_core::{Document, IndexedImage, Palette, Rgb8, Target};
+use dpx_core::{Document, IndexedImage, Palette, Rgb8, Target, anim};
 use serde::{Deserialize, Serialize};
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
@@ -19,8 +21,15 @@ use crate::png_io::{PngImage, read_png, write_png};
 
 /// The format name in the manifest.
 pub const FORMAT: &str = "dpxproj";
-/// The newest format version this build reads and the one it writes.
-pub const FORMAT_VERSION: u32 = 1;
+/// The newest format version this build reads. Version 1: one frame; version 2 (ADR-28):
+/// 1..N animation frames plus the current frame and the playback rate.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The version a document is written as: 1 for a single frame (byte-identical to the files
+/// of earlier builds, so they stay readable by them), 2 for an animation.
+pub fn format_version_for(doc: &Document) -> u32 {
+    if doc.frame_count() > 1 { 2 } else { 1 }
+}
 
 const MANIFEST: &str = "manifest.json";
 const SPARE_PATH: &str = "spare/page.png";
@@ -159,6 +168,12 @@ struct Manifest {
     transparent_color: Option<u16>,
     frames: Vec<FrameEntry>,
     spare: Option<SpareEntry>,
+    /// Version 2: the frame shown when the project was saved (0-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_frame: Option<u32>,
+    /// Version 2: playback rate in frames per second (1 to 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fps: Option<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -203,11 +218,13 @@ pub fn write_project(project: &Project) -> Result<Vec<u8>, ProjectError> {
     let png = |image: &IndexedImage| {
         write_png(image, palette).map_err(|e| ProjectError::Write(e.to_string()))
     };
-    let page_png = png(page)?;
+    let frame_pngs = doc.frames().map(png).collect::<Result<Vec<_>, _>>()?;
     let spare_png = project.spare.as_ref().map(png).transpose()?;
+    let version = format_version_for(doc);
+    let animated = version >= 2;
     let manifest = Manifest {
         format: FORMAT.into(),
-        format_version: FORMAT_VERSION,
+        format_version: version,
         app_version: env!("CARGO_PKG_VERSION").into(),
         target: doc.target(),
         page: PageSize {
@@ -218,24 +235,30 @@ pub fn write_project(project: &Project) -> Result<Vec<u8>, ProjectError> {
         ranges: project.extras.ranges.clone(),
         grab: project.extras.grab,
         transparent_color: project.extras.transparent_color,
-        frames: vec![FrameEntry {
-            layers: vec![LayerEntry {
-                name: LAYER_NAME.into(),
-                image: layer_path(0, 0),
-            }],
-        }],
+        frames: (0..frame_pngs.len())
+            .map(|f| FrameEntry {
+                layers: vec![LayerEntry {
+                    name: LAYER_NAME.into(),
+                    image: layer_path(f, 0),
+                }],
+            })
+            .collect(),
         spare: project.spare.as_ref().map(|s| SpareEntry {
             image: SPARE_PATH.into(),
             width: s.width(),
             height: s.height(),
         }),
+        current_frame: animated.then_some(doc.current_frame() as u32),
+        fps: animated.then_some(doc.fps()),
     };
     let mut json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| ProjectError::Write(format!("manifest: {e}")))?;
     json.push(b'\n');
 
-    let mut entries: Vec<(String, Vec<u8>)> =
-        vec![(MANIFEST.into(), json), (layer_path(0, 0), page_png)];
+    let mut entries: Vec<(String, Vec<u8>)> = vec![(MANIFEST.into(), json)];
+    for (f, data) in frame_pngs.into_iter().enumerate() {
+        entries.push((layer_path(f, 0), data));
+    }
     if let Some(spare) = spare_png {
         entries.push((SPARE_PATH.into(), spare));
     }
@@ -385,29 +408,76 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
         .collect::<Result<Vec<_>, _>>()?;
     let palette = Palette::new(colors).map_err(|e| invalid(format!("palette: {e}")))?;
 
-    // Layers: exactly one frame with one layer in version 1.
-    let [frame] = m.frames.as_slice() else {
+    // Frames: version 1 holds exactly one, version 2 one or more (ADR-28); every frame has
+    // exactly one layer so far.
+    let version = m.format_version;
+    if version == 1 {
+        if m.frames.len() != 1 {
+            return Err(invalid(format!(
+                "version 1 holds exactly one frame, the manifest lists {}",
+                m.frames.len()
+            )));
+        }
+        if m.current_frame.is_some() || m.fps.is_some() {
+            return Err(invalid(
+                "version 1 has no current_frame or fps (they came with version 2)",
+            ));
+        }
+    } else if m.frames.is_empty() {
+        return Err(invalid("the manifest lists no frames"));
+    }
+    let max_frames = anim::max_frames_for(m.page.width, m.page.height);
+    if m.frames.len() > max_frames {
+        return Err(ProjectError::TooLarge(format!(
+            "{} frames of {}x{} pixels; at most {max_frames} are accepted.",
+            m.frames.len(),
+            m.page.width,
+            m.page.height
+        )));
+    }
+    let (current, fps) = match (m.current_frame, m.fps) {
+        _ if version == 1 => (0, anim::DEFAULT_FPS),
+        (Some(c), Some(r)) => (c as usize, r),
+        _ => {
+            return Err(invalid(format!(
+                "version {version} needs current_frame and fps"
+            )));
+        }
+    };
+    if current >= m.frames.len() {
         return Err(invalid(format!(
-            "version 1 holds exactly one frame, the manifest lists {}",
+            "current_frame {current} is outside the {} frames (counted from 0)",
             m.frames.len()
         )));
-    };
-    let [layer] = frame.layers.as_slice() else {
-        return Err(invalid(format!(
-            "version 1 holds exactly one layer, the manifest lists {}",
-            frame.layers.len()
-        )));
-    };
-    if layer.name.chars().count() > 255 {
-        return Err(invalid("layer name is longer than 255 characters"));
     }
-    check_name(&layer.image)?;
+    if !(anim::MIN_FPS..=anim::MAX_FPS).contains(&fps) {
+        return Err(invalid(format!(
+            "fps {fps} is outside {}..={}",
+            anim::MIN_FPS,
+            anim::MAX_FPS
+        )));
+    }
+    let mut layers: Vec<&LayerEntry> = Vec::with_capacity(m.frames.len());
+    for (f, frame) in m.frames.iter().enumerate() {
+        let [layer] = frame.layers.as_slice() else {
+            return Err(invalid(format!(
+                "frame {f} must hold exactly one layer, the manifest lists {}",
+                frame.layers.len()
+            )));
+        };
+        if layer.name.chars().count() > 255 {
+            return Err(invalid("layer name is longer than 255 characters"));
+        }
+        check_name(&layer.image)?;
+        layers.push(layer);
+    }
     if let Some(s) = &m.spare {
         check_name(&s.image)?;
     }
 
     // The entry set must be exactly the manifest plus the images it names.
-    let mut expected: Vec<&str> = vec![MANIFEST, &layer.image];
+    let mut expected: Vec<&str> = vec![MANIFEST];
+    expected.extend(layers.iter().map(|l| l.image.as_str()));
     if let Some(s) = &m.spare {
         expected.push(&s.image);
     }
@@ -429,13 +499,17 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
         let data = read_entry(path, budget)?;
         decode_layer(path, &data, w, h, &palette, limits)
     };
-    let page = image(&layer.image, m.page.width, m.page.height)?;
+    let frames = layers
+        .iter()
+        .map(|l| image(&l.image, m.page.width, m.page.height))
+        .collect::<Result<Vec<_>, _>>()?;
     let spare = match &m.spare {
         Some(s) => Some(image(&s.image, s.width, s.height)?),
         None => None,
     };
 
-    let document = Document::from_picture(page, palette, m.target);
+    let document = Document::from_frames(frames, current, fps, palette, m.target)
+        .map_err(|e| invalid(e.message))?;
     let extras = ProjectExtras {
         ranges: m.ranges,
         grab: m.grab,
@@ -857,6 +931,153 @@ mod tests {
         // Cut off.
         let cut = &e[1].1[..e[1].1.len() - 12];
         assert!(read_project(&with_png(cut)).is_err());
+    }
+
+    /// A version-1 project written by the build before frames existed (ADR-28).
+    const V1_FIXTURE: &[u8] = include_bytes!("../tests/data/v1-single-frame.dpxproj");
+
+    /// The project of [`V1_FIXTURE`], built again.
+    fn v1_fixture_project() -> Project {
+        let mut p = project(8, 4, 4);
+        p.extras = ProjectExtras {
+            ranges: vec![ProjectRange {
+                rate: 4096,
+                flags: 1,
+                low: 1,
+                high: 3,
+            }],
+            grab: Some((2, 1)),
+            transparent_color: Some(0),
+        };
+        p.spare = Some(sample_image(8, 4, 4));
+        p
+    }
+
+    #[test]
+    fn single_frame_projects_stay_version_1_byte_for_byte() {
+        let old = read_project(V1_FIXTURE).unwrap();
+        let p = v1_fixture_project();
+        assert_same(&old, &p);
+        assert_eq!(old.document.frame_count(), 1);
+        let written = write_project(&p).unwrap();
+        let (a, b) = (entries(&written), entries(V1_FIXTURE));
+        assert_eq!(a.len(), b.len());
+        for ((na, da), (nb, db)) in a.iter().zip(&b) {
+            assert_eq!(na, nb);
+            if na == MANIFEST {
+                // Only the writing build's version may differ.
+                let norm = |d: &[u8]| {
+                    let mut m: serde_json::Value = serde_json::from_slice(d).unwrap();
+                    m["app_version"] = "x".into();
+                    m
+                };
+                assert_eq!(norm(da), norm(db));
+                assert_eq!(manifest_of(&written)["format_version"], 1);
+            } else {
+                assert_eq!(da, db, "{na}");
+            }
+        }
+        if env!("CARGO_PKG_VERSION") == "0.1.0" {
+            assert_eq!(written, V1_FIXTURE, "the whole file is the same");
+        }
+    }
+
+    fn animation(frames: u8, current: usize, fps: u8) -> Project {
+        let images = (0..frames)
+            .map(|f| {
+                let mut img = sample_image(12, 6, 32);
+                img.set(i32::from(f), 0, 31);
+                img
+            })
+            .collect();
+        let doc = Document::from_frames(
+            images,
+            current,
+            fps,
+            Palette::dpaint_default_32(),
+            Target::default(),
+        )
+        .unwrap();
+        Project::new(doc, ProjectExtras::default())
+    }
+
+    #[test]
+    fn three_frames_round_trip_as_version_2() {
+        let mut p = animation(3, 1, 12);
+        p.spare = Some(sample_image(5, 5, 32));
+        let bytes = write_project(&p).unwrap();
+        let back = read_project(&bytes).unwrap();
+        assert_eq!(back.document, p.document, "frames, current frame and rate");
+        assert_eq!(back.spare, p.spare);
+        assert_eq!(back.document.frame(2).unwrap().get(2, 0), Some(31));
+        let m = manifest_of(&bytes);
+        assert_eq!(m["format_version"], 2);
+        assert_eq!(m["current_frame"], 1);
+        assert_eq!(m["fps"], 12);
+        assert_eq!(
+            m["frames"][2]["layers"][0]["image"],
+            "frames/2/layers/0.png"
+        );
+        let names: Vec<_> = entries(&bytes).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            [
+                "manifest.json",
+                "frames/0/layers/0.png",
+                "frames/1/layers/0.png",
+                "frames/2/layers/0.png",
+                "spare/page.png"
+            ]
+        );
+        assert_eq!(bytes, write_project(&back).unwrap(), "deterministic");
+    }
+
+    #[test]
+    fn version_2_rules_are_checked() {
+        let bytes = write_project(&animation(3, 0, 30)).unwrap();
+        let changed = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut e = entries(&bytes);
+            let mut m = manifest_of(&bytes);
+            f(&mut m);
+            e[0].1 = serde_json::to_vec(&m).unwrap();
+            read_project(&zip_entries(&e).unwrap())
+        };
+        let err = |f: &dyn Fn(&mut serde_json::Value)| changed(f).unwrap_err().details();
+        assert!(err(&|m| m["current_frame"] = 3.into()).contains("current_frame"));
+        assert!(err(&|m| m["fps"] = 0.into()).contains("fps"));
+        assert!(err(&|m| m["fps"] = 61.into()).contains("fps"));
+        assert!(
+            err(&|m| {
+                m.as_object_mut().unwrap().remove("fps");
+            })
+            .contains("needs current_frame and fps")
+        );
+        assert!(err(&|m| m["frames"] = serde_json::json!([])).contains("no frames"));
+        // Two frames naming one image.
+        assert!(
+            err(&|m| m["frames"][1]["layers"][0]["image"] = "frames/0/layers/0.png".into())
+                .contains("twice")
+        );
+        // A version-1 manifest cannot carry the version-2 fields or several frames.
+        assert!(err(&|m| m["format_version"] = 1.into()).contains("exactly one frame"));
+        let v1 = write_project(&project(8, 4, 4)).unwrap();
+        let mut e = entries(&v1);
+        let mut m = manifest_of(&v1);
+        m["fps"] = 30.into();
+        e[0].1 = serde_json::to_vec(&m).unwrap();
+        let e = read_project(&zip_entries(&e).unwrap()).unwrap_err();
+        assert!(e.details().contains("version 1 has no"), "{e}");
+        // More frames than the frame limits allow are refused before decoding.
+        let many = changed(&|m| {
+            let one = m["frames"][0].clone();
+            m["frames"] = serde_json::Value::Array(vec![one; 1000]);
+        });
+        assert!(matches!(many, Err(ProjectError::TooLarge(_))));
+        // A newer version than 2 is named.
+        assert!(matches!(
+            changed(&|m| m["format_version"] = 3.into()),
+            Err(ProjectError::NewerVersion(3))
+        ));
     }
 
     #[test]
