@@ -85,7 +85,13 @@ Menus that work (everything else is ghosted until it exists, ADR-15): Picture â–
   <img src="docs/design/screenshots/phase3-menus.png" alt="Color menu with the Palette submenu; unavailable items ghosted" width="400">
 </p>
 
-Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--notes` (the notes of `--open`), `--font-preview out.png`.
+Color â–¸ Ranges.. opens the Range requester (ADR-22): pick one of eight ranges, click its first and last colour (or drag across the palette), set its speed, direction and Active; a new picture starts with two inactive default ranges. Ok keeps the ranges (saved as CRNG chunks), Cancel drops the edits.
+
+<p align="center">
+  <img src="docs/design/screenshots/phase3-ranges.png" alt="The Range requester over the default palette" width="400">
+</p>
+
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--palette-requester`, `--range-requester`, `--notes` (the notes of `--open`), `--font-preview out.png`.
 
 ## License
 

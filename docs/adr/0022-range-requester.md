@@ -1,0 +1,21 @@
+# ADR-22: Range requester and default ranges
+
+- Status: accepted (Phase 3, 2026-11-10)
+- Context: Color ▸ Ranges.. (`color.ranges`) is DeluxePaint IV's editor for colour-cycling ranges (up to 8 per picture, up to 32 colours each; notes in `docs/research/manual-ui-notes.md` §3.5 and §8). Tab cycling (ADR-15) already rotates the CRNG ranges of a loaded picture; a new picture had none, and nothing edited them. Shade/Cycle modes and gradient fills will read the same ranges later.
+- Decision:
+  - **Requester (`dpx_ui::range_requester`):** modal, centred, 288×122 LoRes UI pixels, square corners, bitmap font, palette-derived pens, `widgets.rs` buttons; title "Range". The palette grid is the Mixer's (one row up to 16 colours, 16 columns up to 64, 32 above). A small box marks each colour of the selected range. Controls: range buttons 1–8 (keys `1`–`8`), Rate slider (0–63), Forward/Reverse (`r`), Active, Clear, Cancel (Esc), Ok (Return). Info lines show the span, colour count and steps per second.
+  - **Span:** click the first colour, then the last (the first click only arms it; Esc withdraws it), or press on the first and drag to the last. Either order gives the same span; spans are limited to 32 colours. Setting the span of a range that had none makes it active at 15 steps/s (rate 4096), so it is visible at once. A range needs two colours; Rate, Forward/Reverse, Active and Clear are ghosted (pens.ghost) until it has a span.
+  - **Rate unit:** the slider shows steps of 256 CRNG rate units (63 ≈ 59 steps/s); the CRNG value (16384 = 60 steps/s) is what is stored. DeluxePaint's slider is a non-linear abstract scale; ours is linear in steps per second. A rate the user did not touch keeps its exact file value.
+  - **Data:** ranges are not document data. They live in `PictureExtras.ranges` (as loaded from the ILBM) and are written back as CRNG chunks by Save, so Ok writes them directly; it is **not** an undo step. Empty slots between used ones are kept as empty CRNG entries so range numbers do not shift; ranges beyond the eighth in a file are kept untouched. Cancel drops the edit copy. Ok also restarts the cycling clock so Tab uses the new ranges.
+  - **Default ranges for a new picture (32-colour default palette):** the manual does not list DeluxePaint's defaults (it only says Palette ▸ Default Palette restores "default ranges"). Ours: range 1 = grey ramp, colours 20–27; range 2 = colour sweep, colours 8–15; both inactive at 15 steps/s, so Tab changes nothing until a range is switched on. Palettes below 32 colours get none. Palette ▸ Default Palette does not reset the ranges yet.
+  - Snapshot option `--range-requester` (ranges of `--open`, else the defaults); `docs/design/screenshots/phase3-ranges.png`.
+- Deviations from DeluxePaint IV AGA (documented, to revisit):
+  - A centred modal requester instead of the bottom strip (as the Mixer, ADR-16).
+  - Spans of palette registers only: no colour "beads", no free RGB values, no interpolated intermediate shades, no sample square, no Random/Dither, no Undo/Revert (Cancel covers it), no Show.
+  - Linear rate slider, 8 buttons instead of a range slider; `r` instead of Alt-r for reverse.
+  - Default ranges are our choice (see above).
+- Verified:
+  - Unit tests in `dpx-ui`: range selection by button and key, click-first-then-last (either order), drag span, 32-colour limit, Esc withdrawing a half-set span, ghosted controls without a span, rate slider (drag, one step, exact value kept when untouched), direction/active (other flag bits survive), Clear, Ok/Cancel by button and key, slot numbering and kept extras, rendering marks the span, layout inside the box.
+  - App tests: new pictures have the two inactive default ranges and Tab changes nothing; the menu item opens the requester, Cancel leaves the ranges, Ok stores them, the cycled palette uses them; save as ILBM and load again gives identical CRNG ranges.
+  - Headless snapshot looked at (PAL LoRes, default palette).
+- Not verified: pointer handling in the real window (only driven by tests through the shared modal-requester code), how the ranges look in DeluxePaint itself, loading our ranges in the original program.

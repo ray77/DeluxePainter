@@ -65,6 +65,8 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | |
 | P2 | Colour cycling: 8 ranges × up to 32 colours, rate 0–63, direction, live preview (display-only) | Range requester (bottom strip); CRNG/CCRT |
 
+Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester (range 1–8, span by two clicks or a drag, rate 0–63, direction, active, clear) with two inactive default ranges on new pictures; the requester is not yet a bottom strip, has no colour beads/free RGB values, Random/Dither or Undo/Revert, and the ranges are not yet used by gradient fills, Shade or Cycle modes.
+
 ## 5. Layers & projects (modern additions)
 
 | P | Feature | Notes |
