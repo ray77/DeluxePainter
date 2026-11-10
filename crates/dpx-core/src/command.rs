@@ -72,6 +72,25 @@ pub enum Command {
     /// Picture ▸ Page Size: the picture stays top-left; new area gets `fill` (the BG colour),
     /// a smaller page crops (ADR-10).
     SetPageSize { width: u32, height: u32, fill: u8 },
+    /// Replaces the whole page with `pixels` (`width`×`height`, row by row), e.g. Picture ▸
+    /// Spare ▸ Delete This Page or CLR on a fixed background (ADR-15). Another size must fit the
+    /// target's page limits.
+    SetPage {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    /// Picture ▸ Spare ▸ Merge in Front / Back: combines the page with another page
+    /// (`width`×`height`, top-left aligned, clipped to the page). `front`: the other page lies
+    /// on top and its `transparent` pixels let the page show through; otherwise the page lies
+    /// on top and its own `transparent` pixels show the other page (ADR-15).
+    MergePage {
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        front: bool,
+        transparent: u8,
+    },
 }
 
 /// What a command changes; decides what the engine snapshots for undo.
@@ -218,6 +237,32 @@ impl Command {
                     )))
                 }
             }
+            Command::SetPage {
+                width,
+                height,
+                pixels,
+            } => {
+                other_page(*width, *height, pixels, colors)?;
+                let same = (*width, *height) == (doc.page.width(), doc.page.height());
+                if same || doc.target.page_fits(*width, *height) {
+                    Ok(())
+                } else {
+                    let ((min_w, min_h), (max_w, max_h)) = doc.target.page_limits();
+                    Err(CommandError::invalid(format!(
+                        "Page must be {min_w}x{min_h} to {max_w}x{max_h}"
+                    )))
+                }
+            }
+            Command::MergePage {
+                width,
+                height,
+                pixels,
+                transparent,
+                ..
+            } => {
+                color(*transparent)?;
+                other_page(*width, *height, pixels, colors)
+            }
             Command::SetPalette { colors: new } => {
                 if new.len() == colors {
                     Ok(())
@@ -244,6 +289,16 @@ impl Command {
             | Command::SwapColors { .. } => Footprint::Pixels(page),
             Command::SetPalette { .. } => Footprint::Palette,
             Command::SetFormat { .. } | Command::SetPageSize { .. } => Footprint::Document,
+            Command::SetPage { width, height, .. } => {
+                if (*width, *height) == (doc.page.width(), doc.page.height()) {
+                    Footprint::Pixels(page)
+                } else {
+                    Footprint::Document
+                }
+            }
+            Command::MergePage { width, height, .. } => {
+                Footprint::Pixels(page.intersect(Rect::new(0, 0, *width as i32, *height as i32)))
+            }
         }
     }
 
@@ -298,7 +353,61 @@ impl Command {
                 new_page.blit(&doc.page, 0, 0);
                 doc.page = new_page;
             }
+            Command::SetPage {
+                width,
+                height,
+                pixels,
+            } => {
+                doc.page = IndexedImage::from_pixels(*width, *height, pixels.clone())
+                    .expect("size checked by validate");
+            }
+            Command::MergePage {
+                width,
+                height,
+                pixels,
+                front,
+                transparent,
+            } => {
+                let w = (*width).min(page.width()) as usize;
+                let h = (*height).min(page.height()) as usize;
+                let pw = page.width() as usize;
+                let mut merged = page.pixels().to_vec();
+                for y in 0..h {
+                    let other = &pixels[y * *width as usize..][..w];
+                    for (x, &o) in other.iter().enumerate() {
+                        let p = &mut merged[y * pw + x];
+                        if (*front && o != *transparent) || (!*front && *p == *transparent) {
+                            *p = o;
+                        }
+                    }
+                }
+                *page = IndexedImage::from_pixels(page.width(), page.height(), merged)
+                    .expect("same size");
+            }
         }
+    }
+}
+
+/// Checks a page passed in a command: `width`×`height` pixels, all inside the palette.
+fn other_page(width: u32, height: u32, pixels: &[u8], colors: usize) -> Result<(), CommandError> {
+    if !(1..=MAX_PAGE_SIDE).contains(&width) || !(1..=MAX_PAGE_SIDE).contains(&height) {
+        return Err(CommandError::invalid(format!(
+            "page {width}x{height} is outside 1..={MAX_PAGE_SIDE}"
+        )));
+    }
+    let n = width as usize * height as usize;
+    if pixels.len() != n {
+        return Err(CommandError::invalid(format!(
+            "page {width}x{height} needs {n} pixels, got {}",
+            pixels.len()
+        )));
+    }
+    match pixels.iter().max() {
+        Some(&max) if usize::from(max) >= colors => Err(CommandError::new(
+            ErrorCode::PaletteRangeInvalid,
+            format!("colour {max} is outside the palette (0..{colors})"),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -403,5 +512,91 @@ mod tests {
             serde_json::to_string(&ErrorCode::PaletteRangeInvalid).unwrap(),
             format!("\"{}\"", ErrorCode::PaletteRangeInvalid.as_str())
         );
+    }
+
+    fn doc_4x2() -> Document {
+        let page = IndexedImage::from_pixels(4, 2, vec![0, 1, 0, 2, 3, 0, 0, 0]).unwrap();
+        Document::from_picture(
+            page,
+            Palette::dpaint_default_32(),
+            crate::mode::Target::default(),
+        )
+    }
+
+    #[test]
+    fn merge_page_in_front_and_in_back() {
+        // The other page is 3x3: clipped to the 4x2 page, top-left aligned.
+        let other = vec![5, 0, 6, 7, 8, 0, 9, 9, 9];
+        let merge = |front| Command::MergePage {
+            width: 3,
+            height: 3,
+            pixels: other.clone(),
+            front,
+            transparent: 0,
+        };
+        let mut doc = doc_4x2();
+        merge(true).validate(&doc).unwrap();
+        assert_eq!(
+            merge(true).footprint(&doc),
+            Footprint::Pixels(Rect::new(0, 0, 3, 2))
+        );
+        merge(true).apply(&mut doc);
+        // In front: the other page's colour-0 pixels let the page show through.
+        assert_eq!(doc.page.pixels(), &[5, 1, 6, 2, 7, 8, 0, 0]);
+        let mut doc = doc_4x2();
+        merge(false).apply(&mut doc);
+        // In back: the page's own colour-0 pixels show the other page.
+        assert_eq!(doc.page.pixels(), &[5, 1, 6, 2, 3, 8, 0, 0]);
+        // Colours outside the palette and wrong sizes are refused.
+        let bad = Command::MergePage {
+            width: 1,
+            height: 1,
+            pixels: vec![40],
+            front: true,
+            transparent: 0,
+        };
+        assert_eq!(
+            bad.validate(&doc).unwrap_err().code,
+            ErrorCode::PaletteRangeInvalid
+        );
+        let short = Command::SetPage {
+            width: 4,
+            height: 2,
+            pixels: vec![0; 7],
+        };
+        assert_eq!(
+            short.validate(&doc).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn set_page_replaces_the_pixels() {
+        let mut doc = doc_4x2();
+        let same = Command::SetPage {
+            width: 4,
+            height: 2,
+            pixels: vec![1; 8],
+        };
+        same.validate(&doc).unwrap();
+        assert_eq!(same.footprint(&doc), Footprint::Pixels(doc.page.bounds()));
+        same.apply(&mut doc);
+        assert_eq!(doc.page.pixels(), &[1; 8]);
+        // Another size must be a valid page for the target (at least the 320x256 screen).
+        let small = Command::SetPage {
+            width: 2,
+            height: 2,
+            pixels: vec![0; 4],
+        };
+        assert!(small.validate(&doc).is_err());
+        let big = Command::SetPage {
+            width: 320,
+            height: 300,
+            pixels: vec![2; 320 * 300],
+        };
+        big.validate(&doc).unwrap();
+        assert_eq!(big.footprint(&doc), Footprint::Document);
+        let json = serde_json::to_string(&small).unwrap();
+        assert!(json.starts_with(r#"{"op":"set_page","width":2"#), "{json}");
     }
 }
