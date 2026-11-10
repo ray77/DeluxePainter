@@ -103,6 +103,9 @@ pub struct UiState {
     pub can_restore: bool,
     /// Gridding, Symmetry, Spacing, Fill Type or Make Stencil while open (ADR-20).
     pub tool_requester: Option<crate::tool_requesters::ToolRequester>,
+    /// Effect flags shown after the paint mode in the title bar (A/a, P, S/s, T; ADR-31); the
+    /// app keeps them in sync.
+    pub flags: String,
 }
 
 impl UiState {
@@ -144,6 +147,7 @@ impl Default for UiState {
             has_brush: false,
             can_restore: false,
             tool_requester: None,
+            flags: String::new(),
         }
     }
 }
@@ -313,7 +317,11 @@ impl Screen {
         img.hline(0, w - 1, 0, pens.shine);
         img.hline(0, w - 1, geom::TITLE_H - 1, pens.dark);
         let font = Font::builtin();
-        let title = format!("{APP_TITLE}  {}", ui.mode.title());
+        let title = if ui.flags.is_empty() {
+            format!("{APP_TITLE}  {}", ui.mode.title())
+        } else {
+            format!("{APP_TITLE}  {}  {}", ui.mode.title(), ui.flags)
+        };
         font.draw(
             img,
             geom::TITLE_TEXT_X,

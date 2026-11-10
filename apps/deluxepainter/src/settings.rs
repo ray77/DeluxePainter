@@ -73,6 +73,34 @@ pub fn snapshot_requester(args: &[String], doc: &Document) -> Option<ToolRequest
             protect.as_deref(),
         )));
     }
+    if has("--arrange-requester") {
+        // `--moves FROM:TO,...` drags swatches first, e.g. `--moves 9:0,31:2`.
+        let mut r = dpx_ui::ArrangeRequester::new(doc.palette().len());
+        let moves = args
+            .iter()
+            .position(|a| a == "--moves")
+            .and_then(|i| args.get(i + 1));
+        for m in moves.iter().flat_map(|m| m.split(',')) {
+            let Some((a, b)) = m.split_once(':') else {
+                continue;
+            };
+            if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>())
+                && a < doc.palette().len()
+                && b < doc.palette().len()
+            {
+                let (from, to) = (r.cell_rect(a), r.cell_rect(b));
+                r.handle(ReqEvent::Press(from.x + 1, from.y + 1));
+                r.handle(ReqEvent::Drag(to.x + 1, to.y + 1));
+                r.handle(ReqEvent::Release);
+            }
+        }
+        return Some(ToolRequester::Arrange(r));
+    }
+    if has("--translucency-requester") {
+        return Some(ToolRequester::Translucency(
+            dpx_ui::TranslucencyRequester::new(50),
+        ));
+    }
     None
 }
 
@@ -187,6 +215,8 @@ impl PainterApp {
                     ToolRequester::Symmetry(r) => self.tools.symmetry_settings = r.settings(),
                     ToolRequester::Spacing(r) => self.tools.spacing = r.settings(),
                     ToolRequester::Fill(r) => self.tools.fill = r.settings(),
+                    ToolRequester::Arrange(r) => self.apply_arrange(r.order()),
+                    ToolRequester::Translucency(r) => self.set_translucency(&r),
                     ToolRequester::Stencil(r) => {
                         // No colour protected is no stencil.
                         self.tools.stencil_off = None;
@@ -585,7 +615,10 @@ mod tests {
             assert!(IMPLEMENTED.contains(&id), "{id}");
             assert!(Action::Command(id).enabled(&PainterApp::new().ui.menu_context()));
         }
-        assert!(!IMPLEMENTED.contains(&"stencil.show"));
+        assert!(
+            !IMPLEMENTED.contains(&"stencil.paint"),
+            "Paint is still open (ADR-31)"
+        );
     }
 
     #[test]

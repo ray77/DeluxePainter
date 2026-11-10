@@ -214,6 +214,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         }
     }
 
@@ -609,6 +610,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         }
     }
 

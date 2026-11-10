@@ -1,0 +1,12 @@
+[
+{"op":"clear","color":0},
+{"op":"shape","shape":{"kind":"rect","from":[10,10],"to":[45,110]},"color":2,"filled":true},
+{"op":"shape","shape":{"kind":"rect","from":[50,10],"to":[85,110]},"color":5,"filled":true},
+{"op":"shape","shape":{"kind":"rect","from":[90,10],"to":[125,110]},"color":9,"filled":true},
+{"op":"shape","shape":{"kind":"rect","from":[130,10],"to":[165,110]},"color":14,"filled":true},
+{"op":"shape","shape":{"kind":"rect","from":[170,10],"to":[205,110]},"color":20,"filled":true},
+{"op":"shape","shape":{"kind":"rect","from":[210,10],"to":[245,110]},"color":26,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[90,60],"radius":[50,36]},"color":3,"filled":true,"fx":{"translucency":50}},
+{"op":"shape","shape":{"kind":"ellipse","center":[150,60],"radius":[50,36]},"color":1,"filled":true,"fx":{"translucency":25}},
+{"op":"shape","shape":{"kind":"ellipse","center":[210,60],"radius":[30,30]},"color":3,"filled":true}
+]

@@ -91,6 +91,10 @@ Color ▸ Ranges.. opens the Range requester (ADR-22): pick one of eight ranges,
   <img src="docs/design/screenshots/phase3-ranges.png" alt="The Range requester over the default palette" width="400">
 </p>
 
+Palette operations and effects (ADR-31): Color ▸ Palette ▸ Arrange (`P`) reorders the palette by dragging swatches (Ex exchanges) and keeps the picture looking the same in one undoable step; Color ▸ Remap re-points the pixels after a palette change; Effect ▸ Translucency, Process and AntiAlias (title-bar flags `T`, `P`, `a`/`A`), Stencil ▸ Show, Load.. and Save.. work. The snapshot below was made with `--commands docs/design/screenshots/phase3-palette-ops.json --arrange-requester --moves 9:0,31:2,20:12`.
+
+![Translucent shapes and the Arrange requester](docs/design/screenshots/phase3-palette-ops.png)
+
 Toolbox settings (ADR-20): right-click Grid, Symmetry or Fill, or the freehand, line, curve, outline-shape and Airbrush buttons, to open the Gridding, Symmetry, Fill Type or Spacing requester (Return = Ok, Esc = Cancel, Tab = next field; `F` and `V` open Fill Type and Spacing). Fill can paint gradients through the colour range of the foreground colour, Spacing lays brush stamps along lines and outlines (N total, every Nth pixel, airbrushed), Symmetry can mirror, and Effect ▸ Stencil ▸ Make.. protects colours.
 
 <p align="center">
@@ -105,7 +109,7 @@ Custom brushes (ADR-18): the Brush Selector (`b`) picks up the part of the page 
 
 Paint modes and the Brush menu (ADR-19): `dpx_core::paint::plot` implements Smear, Shade, Blend, Cycle, Smooth, Mix and HBrite. The Brush menu flips, rotates by 90 degrees, doubles/halves, outlines/trims and recolours the custom brush, moves its handle, and loads/saves brush files (IFF ILBM). Items that need a drag (Stretch, Any Angle, Shear, Bend, Place) stay ghosted. `DPX_MODES_PNG=out.png cargo test -p deluxepainter mode_demo` renders the mode demo `docs/design/screenshots/phase3-modes.png`.
 
-Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save|export` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save/Export requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--fill-requester`, `--grid-requester`, `--symmetry-requester`, `--spacing-requester`, `--stencil-requester [--protect 1,2,3]`, `--palette-requester`, `--range-requester`, `--notes` (the notes of `--open`), `--font-preview out.png`.
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save|export` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save/Export requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--fill-requester`, `--grid-requester`, `--symmetry-requester`, `--spacing-requester`, `--stencil-requester [--protect 1,2,3]`, `--arrange-requester [--moves 9:0,31:2]`, `--translucency-requester`, `--palette-requester`, `--range-requester`, `--notes` (the notes of `--open`), `--font-preview out.png`.
 
 ## MCP server (spike)
 

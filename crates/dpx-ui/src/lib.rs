@@ -4,6 +4,7 @@
 //! shares the picture palette, like the classic Amiga paint programs. The host (eframe) only
 //! converts that buffer to RGBA and shows it with nearest-neighbour scaling.
 
+pub mod arrange_requester;
 pub mod bitmap;
 pub mod file_requester;
 pub mod font;
@@ -25,6 +26,7 @@ pub(crate) mod widgets;
 
 use dpx_core::{IndexedImage, Palette};
 
+pub use arrange_requester::ArrangeRequester;
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
 pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};
@@ -39,6 +41,7 @@ pub use stencil_requester::StencilRequester;
 pub use tool_requesters::{
     FillRequester, FillSettings, GridRequester, GridSettings, SpacingMode, SpacingRequester,
     SpacingSettings, SymmetryRequester, SymmetrySettings, ToolReqResponse, ToolRequester,
+    TranslucencyRequester,
 };
 pub use toolbox::Tool;
 

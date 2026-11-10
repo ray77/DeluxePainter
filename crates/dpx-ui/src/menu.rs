@@ -630,6 +630,24 @@ pub const IMPLEMENTED: &[&str] = &[
     "stencil.reverse",
     "stencil.toggle",
     "stencil.free",
+    // Palette ops and effects (ADR-31); Use Brush Palette (brushes carry no palette) and
+    // Background > Lock FG (needs an area stencil) stay ghosted.
+    "palette.arrange",
+    "color.remap",
+    "color_set.load",
+    "color_set.save",
+    "stencil.show",
+    "stencil.load",
+    "stencil.save",
+    "antialias.none",
+    "antialias.low",
+    "antialias.high",
+    "process.toggle",
+    "process.tint",
+    "process.hue",
+    "process.value",
+    "translucency.toggle",
+    "translucency.settings",
     // Prefs
     "view.largest_pixel_size",
     // Range requester (ADR-22)
@@ -1313,7 +1331,7 @@ mod tests {
         assert!(Action::Command("spare.swap").enabled(&c));
         assert!(!Action::Command("picture.print").enabled(&c));
         assert!(Action::Command("stencil.make").enabled(&c));
-        assert!(!Action::Command("stencil.show").enabled(&c));
+        assert!(!Action::Command("stencil.paint").enabled(&c));
         assert!(!Action::Command("color.recompute").enabled(&c));
         // Mode, Prefs and Pixel Size items stay enabled.
         assert!(Action::Mode(PaintMode::Matte).enabled(&c));

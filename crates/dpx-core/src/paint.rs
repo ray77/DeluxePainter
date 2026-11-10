@@ -99,6 +99,59 @@ pub enum DrawMode {
     HBrite,
 }
 
+/// Effect ▸ AntiAlias (ADR-31): how the edge pixels of a custom brush blend with the page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiAlias {
+    #[default]
+    None,
+    /// Brush pixels that touch a transparent (or outside) pixel are mixed 50 % with the page.
+    Low,
+    /// Every brush pixel is weighted by the share of opaque pixels in its 3x3 neighbourhood.
+    High,
+}
+
+/// Effect ▸ Process (ADR-31): which parts of the page colour the brush colour replaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessMode {
+    /// The page colour takes the brush colour's hue and saturation and keeps its own value.
+    #[default]
+    Tint,
+    /// Only the hue comes from the brush colour.
+    Hue,
+    /// Only the value (brightness) comes from the brush colour.
+    Value,
+}
+
+/// The Effect menu's settings that change how [`plot_fx`] sets a pixel (ADR-31). They travel
+/// with every stroke and shape command, so the GUI, the CLI and MCP paint alike; left out of
+/// the JSON while at their defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PaintFx {
+    /// Translucency: the percentage of the page colour that remains (DeluxePaint's slider,
+    /// 50 by default); `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translucency: Option<u8>,
+    /// Process painting; `None` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessMode>,
+    /// Edge blending of custom brushes.
+    #[serde(default, skip_serializing_if = "is_none_aa")]
+    pub antialias: AntiAlias,
+}
+
+fn is_none_aa(a: &AntiAlias) -> bool {
+    *a == AntiAlias::None
+}
+
+impl PaintFx {
+    /// Whether no effect is on.
+    pub fn is_off(&self) -> bool {
+        *self == PaintFx::default()
+    }
+}
+
 /// What [`plot`] needs besides the pixel: palette, range, stencil, the page before the
 /// gesture and how the brush moved since the last stamp.
 #[derive(Clone, Copy, Debug)]
@@ -131,6 +184,25 @@ pub fn plot(
     mode: DrawMode,
     ctx: &PaintContext,
 ) {
+    plot_fx(page, x, y, color, mode, ctx, &PaintFx::default(), 100);
+}
+
+/// [`plot`] with the Effect menu (ADR-31). In the modes that set a colour (Matte, Color,
+/// Replace) the colour first goes through Process (against the page colour before the
+/// gesture), then is mixed with that page colour: `cover` percent of it (100 = the whole
+/// brush pixel, less at antialiased brush edges) times the share Translucency leaves, and the
+/// nearest palette colour is used. The other modes ignore the effects.
+#[allow(clippy::too_many_arguments)]
+pub fn plot_fx(
+    page: &mut IndexedImage,
+    x: i32,
+    y: i32,
+    color: u8,
+    mode: DrawMode,
+    ctx: &PaintContext,
+    fx: &PaintFx,
+    cover: u8,
+) {
     let Some(under) = page.get(x, y) else {
         return;
     };
@@ -142,7 +214,9 @@ pub fn plot(
     }
     let before = ctx.before.get(x, y).unwrap_or(under);
     let new = match mode {
-        DrawMode::Matte | DrawMode::Color | DrawMode::Replace => Some(color),
+        DrawMode::Matte | DrawMode::Color | DrawMode::Replace => {
+            Some(apply_fx(ctx, before, color, fx, cover))
+        }
         DrawMode::Smear => page.get(x - ctx.motion.0, y - ctx.motion.1),
         DrawMode::Shade => step_in_range(before, ctx, false),
         DrawMode::Cycle => match ctx.range {
@@ -157,6 +231,101 @@ pub fn plot(
     };
     if let Some(c) = new {
         page.set(x, y, c);
+    }
+}
+
+/// The colour a set-mode pixel gets: `color` after Process, mixed with `under`.
+fn apply_fx(ctx: &PaintContext, under: u8, color: u8, fx: &PaintFx, cover: u8) -> u8 {
+    if fx.is_off() && cover >= 100 {
+        return color;
+    }
+    let (Some(u), Some(mut b)) = (ctx.palette.get(under), ctx.palette.get(color)) else {
+        return color;
+    };
+    if let Some(p) = fx.process {
+        b = process(u, b, p);
+    }
+    // Weight of the brush colour in percent.
+    let own = 100 - u32::from(fx.translucency.map_or(0, |t| t.min(100)));
+    let weight = own * u32::from(cover.min(100)) / 100;
+    if weight == 0 {
+        return under;
+    }
+    if weight >= 100 && fx.process.is_none() {
+        return color;
+    }
+    let ch =
+        |p: u8, q: u8| ((u32::from(p) * (100 - weight) + u32::from(q) * weight + 50) / 100) as u8;
+    let mixed = Rgb8::new(ch(u.r, b.r), ch(u.g, b.g), ch(u.b, b.b));
+    // An unchanged colour keeps its index (the nearest of two equal entries could differ).
+    if mixed == u {
+        return under;
+    }
+    ctx.palette.nearest(mixed)
+}
+
+/// Process painting: `under` recoloured with parts of `brush` (see [`ProcessMode`]).
+pub fn process(under: Rgb8, brush: Rgb8, mode: ProcessMode) -> Rgb8 {
+    let (uh, us, uv) = rgb_to_hsv(under);
+    let (bh, bs, bv) = rgb_to_hsv(brush);
+    let (h, s, v) = match mode {
+        ProcessMode::Tint => (bh, bs, uv),
+        ProcessMode::Hue => (bh, us, uv),
+        ProcessMode::Value => (uh, us, bv),
+    };
+    hsv_to_rgb(h, s, v)
+}
+
+/// Hue 0..6, saturation and value 0..1.
+fn rgb_to_hsv(c: Rgb8) -> (f32, f32, f32) {
+    let (r, g, b) = (
+        f32::from(c.r) / 255.0,
+        f32::from(c.g) / 255.0,
+        f32::from(c.b) / 255.0,
+    );
+    let max = r.max(g).max(b);
+    let d = max - r.min(g).min(b);
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h, if max == 0.0 { 0.0 } else { d / max }, max)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Rgb8 {
+    let f = |n: f32| {
+        let k = (n + h).rem_euclid(6.0);
+        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    let q = |x: f32| (x * 255.0 + 0.5) as u8;
+    Rgb8::new(q(f(5.0)), q(f(3.0)), q(f(1.0)))
+}
+
+/// How much of the brush colour (percent) the brush pixel (`bx`, `by`) of `brush` paints
+/// under `aa`: edge pixels less, inner pixels fully.
+pub fn edge_cover(brush: &BrushImage, bx: i32, by: i32, aa: AntiAlias) -> u8 {
+    let opaque = |dx: i32, dy: i32| brush.is_opaque(bx + dx, by + dy);
+    match aa {
+        AntiAlias::None => 100,
+        AntiAlias::Low => {
+            if opaque(-1, 0) && opaque(1, 0) && opaque(0, -1) && opaque(0, 1) {
+                100
+            } else {
+                50
+            }
+        }
+        AntiAlias::High => {
+            let n = (-1..=1)
+                .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
+                .filter(|&(dx, dy)| opaque(dx, dy))
+                .count() as u32;
+            (n * 100 / 9) as u8
+        }
     }
 }
 
@@ -407,5 +576,159 @@ mod tests {
         c.range = Some((4, 8));
         c.stencil = Some(&stencil);
         assert_eq!(one(DrawMode::Shade, &img, &c, 1), Some(5));
+    }
+
+    fn plot_with(
+        pal: &Palette,
+        under: u8,
+        color: u8,
+        fx: PaintFx,
+        cover: u8,
+        mode: DrawMode,
+    ) -> u8 {
+        let before = IndexedImage::new(3, 3, under);
+        let c = ctx(pal, &before);
+        let mut page = before.clone();
+        plot_fx(&mut page, 1, 1, color, mode, &c, &fx, cover);
+        page.get(1, 1).unwrap()
+    }
+
+    #[test]
+    fn effects_off_paint_the_plain_colour() {
+        let pal = bw();
+        for mode in [DrawMode::Matte, DrawMode::Color, DrawMode::Replace] {
+            assert_eq!(plot_with(&pal, 0, 1, PaintFx::default(), 100, mode), 1);
+        }
+        assert!(PaintFx::default().is_off());
+    }
+
+    #[test]
+    fn translucency_keeps_the_given_share_of_the_page() {
+        let pal = bw();
+        let fx = |t| PaintFx {
+            translucency: Some(t),
+            ..PaintFx::default()
+        };
+        // White over black: 50 % remains = 128 grey (index 2); 75 % remains = 64 (index 3).
+        assert_eq!(plot_with(&pal, 0, 1, fx(50), 100, DrawMode::Matte), 2);
+        assert_eq!(plot_with(&pal, 0, 1, fx(75), 100, DrawMode::Matte), 3);
+        // 100 % remains: nothing changes; 0 % remains: the plain colour.
+        assert_eq!(plot_with(&pal, 0, 1, fx(100), 100, DrawMode::Matte), 0);
+        assert_eq!(plot_with(&pal, 0, 1, fx(0), 100, DrawMode::Matte), 1);
+        // The same colour over itself stays put.
+        assert_eq!(plot_with(&pal, 1, 1, fx(50), 100, DrawMode::Color), 1);
+        // Modes that are not "set" modes ignore it.
+        assert_eq!(plot_with(&pal, 0, 1, fx(50), 100, DrawMode::Blend), 2);
+    }
+
+    #[test]
+    fn translucency_reads_the_page_before_the_gesture() {
+        let pal = bw();
+        let before = IndexedImage::new(3, 3, 0);
+        let c = ctx(&pal, &before);
+        let fx = PaintFx {
+            translucency: Some(50),
+            ..PaintFx::default()
+        };
+        let mut page = before.clone();
+        for _ in 0..3 {
+            plot_fx(&mut page, 1, 1, 1, DrawMode::Matte, &c, &fx, 100);
+        }
+        assert_eq!(
+            page.get(1, 1),
+            Some(2),
+            "painting over twice does not add up"
+        );
+    }
+
+    #[test]
+    fn cover_blends_antialiased_edges() {
+        let pal = bw();
+        let fx = PaintFx::default();
+        assert_eq!(plot_with(&pal, 0, 1, fx, 50, DrawMode::Matte), 2);
+        assert_eq!(plot_with(&pal, 0, 1, fx, 0, DrawMode::Matte), 0);
+        // Cover and Translucency multiply: 50 % * 50 % of white = 64 grey.
+        let fx = PaintFx {
+            translucency: Some(50),
+            ..fx
+        };
+        assert_eq!(plot_with(&pal, 0, 1, fx, 50, DrawMode::Matte), 3);
+    }
+
+    #[test]
+    fn edge_cover_low_and_high() {
+        let img = IndexedImage::new(3, 3, 5);
+        let b = BrushImage::from_image(&img, Some(0));
+        assert_eq!(edge_cover(&b, 1, 1, AntiAlias::None), 100);
+        assert_eq!(edge_cover(&b, 1, 1, AntiAlias::Low), 100, "inner pixel");
+        assert_eq!(edge_cover(&b, 0, 1, AntiAlias::Low), 50, "left edge");
+        assert_eq!(edge_cover(&b, 0, 0, AntiAlias::Low), 50, "corner");
+        assert_eq!(edge_cover(&b, 1, 1, AntiAlias::High), 100);
+        assert_eq!(edge_cover(&b, 0, 1, AntiAlias::High), 66, "6 of 9");
+        assert_eq!(edge_cover(&b, 0, 0, AntiAlias::High), 44, "4 of 9");
+    }
+
+    fn colours() -> Palette {
+        Palette::new(vec![
+            Rgb8::new(128, 128, 128),
+            Rgb8::new(255, 0, 0),
+            Rgb8::new(0, 255, 0),
+            Rgb8::new(255, 255, 255),
+            Rgb8::new(40, 40, 40),
+            Rgb8::new(128, 0, 0),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn process_modes_take_parts_of_the_brush_colour() {
+        let grey = Rgb8::new(128, 128, 128);
+        let red = Rgb8::new(255, 0, 0);
+        // Tint: red's hue and saturation at the grey's brightness.
+        assert_eq!(process(grey, red, ProcessMode::Tint), Rgb8::new(128, 0, 0));
+        // Hue: a grey has no saturation of its own, so it stays grey.
+        assert_eq!(process(grey, red, ProcessMode::Hue), grey);
+        // Value: the brush's brightness on the page's hue.
+        assert_eq!(
+            process(
+                Rgb8::new(0, 100, 0),
+                Rgb8::new(255, 255, 255),
+                ProcessMode::Value
+            ),
+            Rgb8::new(0, 255, 0)
+        );
+        assert_eq!(
+            process(Rgb8::new(0, 100, 0), Rgb8::new(255, 0, 0), ProcessMode::Hue),
+            Rgb8::new(100, 0, 0)
+        );
+    }
+
+    #[test]
+    fn process_paints_the_processed_page_colour() {
+        let pal = colours();
+        let fx = PaintFx {
+            process: Some(ProcessMode::Tint),
+            ..PaintFx::default()
+        };
+        // Page grey (0), FG red (1): the page turns dark red = entry 5.
+        assert_eq!(plot_with(&pal, 0, 1, fx, 100, DrawMode::Matte), 5);
+        // Value with white brightens the grey to white.
+        let fx = PaintFx {
+            process: Some(ProcessMode::Value),
+            ..PaintFx::default()
+        };
+        assert_eq!(plot_with(&pal, 0, 3, fx, 100, DrawMode::Matte), 3);
+    }
+
+    #[test]
+    fn fx_round_trips_through_json_and_is_left_out_by_default() {
+        let fx = PaintFx {
+            translucency: Some(30),
+            process: Some(ProcessMode::Hue),
+            antialias: AntiAlias::High,
+        };
+        let json = serde_json::to_string(&fx).unwrap();
+        assert_eq!(serde_json::from_str::<PaintFx>(&json).unwrap(), fx);
+        assert_eq!(serde_json::to_string(&PaintFx::default()).unwrap(), "{}");
     }
 }
