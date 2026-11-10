@@ -113,6 +113,21 @@ impl Prefs {
     }
 }
 
+/// Size of one interface (LoRes) pixel, a DeluxePainter preference (ADR-13). `Fixed(n)` is
+/// n points (logical pixels) per interface pixel; the app turns it into a whole number of
+/// physical pixels. `Auto` is the largest size at which the picture's whole screen fits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PixelSize {
+    #[default]
+    Auto,
+    Fixed(u8),
+}
+
+impl PixelSize {
+    pub const MIN: u8 = 1;
+    pub const MAX: u8 = 8;
+}
+
 /// What a menu item does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -122,6 +137,8 @@ pub enum Action {
     Mode(PaintMode),
     /// Prefs menu: toggle a preference (check mark).
     Pref(Pref),
+    /// Prefs ▸ Pixel Size: choose the interface pixel size (radio check mark).
+    PixelSize(PixelSize),
 }
 
 /// Shortcut shown at the right of an item.
@@ -190,6 +207,14 @@ const fn pref(label: &'static str, p: Pref) -> Item {
         label,
         key: Key::None,
         entry: Entry::Action(Action::Pref(p)),
+    }
+}
+
+const fn pixel_size(label: &'static str, key: Key, p: PixelSize) -> Item {
+    Item {
+        label,
+        key,
+        entry: Entry::Action(Action::PixelSize(p)),
     }
 }
 
@@ -484,6 +509,20 @@ pub static MENUS: [Menu; 7] = [
             pref("AutoGrid", Pref::AutoGrid),
             pref("OriginUL", Pref::OriginUl),
             pref("FastAdjust", Pref::FastAdjust),
+            sub(
+                "Pixel Size",
+                &[
+                    pixel_size("Auto", Key::Amiga('0'), PixelSize::Auto),
+                    pixel_size("1x", Key::None, PixelSize::Fixed(1)),
+                    pixel_size("2x", Key::None, PixelSize::Fixed(2)),
+                    pixel_size("3x", Key::None, PixelSize::Fixed(3)),
+                    pixel_size("4x", Key::None, PixelSize::Fixed(4)),
+                    pixel_size("5x", Key::None, PixelSize::Fixed(5)),
+                    pixel_size("6x", Key::None, PixelSize::Fixed(6)),
+                    pixel_size("7x", Key::None, PixelSize::Fixed(7)),
+                    pixel_size("8x", Key::None, PixelSize::Fixed(8)),
+                ],
+            ),
         ],
     },
 ];
@@ -497,6 +536,8 @@ pub struct MenuContext {
     pub ehb: bool,
     /// HAM screen (enables Color ▸ Recompute).
     pub ham: bool,
+    /// Prefs ▸ Pixel Size.
+    pub pixel_size: PixelSize,
 }
 
 impl Action {
@@ -505,6 +546,7 @@ impl Action {
         match self {
             Action::Mode(m) => Some(ctx.mode == m),
             Action::Pref(p) => Some(ctx.prefs.get(p)),
+            Action::PixelSize(p) => Some(ctx.pixel_size == p),
             Action::Command(_) => None,
         }
     }
@@ -600,8 +642,9 @@ impl BoxLayout {
     fn new(items: &[Item], x: i32, y: i32, screen_w: i32, screen_h: i32) -> Self {
         let font = Font::builtin();
         let checks = items.iter().any(|it| {
-            it.action()
-                .is_some_and(|a| matches!(a, Action::Mode(_) | Action::Pref(_)))
+            it.action().is_some_and(|a| {
+                matches!(a, Action::Mode(_) | Action::Pref(_) | Action::PixelSize(_))
+            })
         });
         let text_dx = geom::TEXT_DX + if checks { geom::CHECK_W } else { 0 };
         let w = items
@@ -899,6 +942,7 @@ mod tests {
             prefs: Prefs::default(),
             ehb: false,
             ham: false,
+            pixel_size: PixelSize::Auto,
         }
     }
 
@@ -972,6 +1016,76 @@ mod tests {
         // Leaving all boxes clears the selection.
         st.pointer(320, 256, 300, 250);
         assert_eq!(st.hovered_action(&ctx()), None);
+    }
+
+    #[test]
+    fn pixel_size_submenu_is_last_prefs_item() {
+        let prefs = MENUS.last().unwrap();
+        assert_eq!(prefs.title, "Prefs");
+        let last = prefs.items.last().unwrap();
+        assert_eq!(last.label, "Pixel Size");
+        let Entry::Submenu(items) = last.entry else {
+            panic!("Pixel Size is a submenu");
+        };
+        let labels: Vec<_> = items.iter().map(|i| i.label).collect();
+        assert_eq!(
+            labels,
+            ["Auto", "1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x"]
+        );
+        assert_eq!(items[0].key, Key::Amiga('0'));
+        assert_eq!(items[0].action(), Some(Action::PixelSize(PixelSize::Auto)));
+        for n in PixelSize::MIN..=PixelSize::MAX {
+            assert_eq!(
+                items[n as usize].action(),
+                Some(Action::PixelSize(PixelSize::Fixed(n)))
+            );
+        }
+    }
+
+    #[test]
+    fn pixel_size_checked() {
+        let c = MenuContext {
+            pixel_size: PixelSize::Fixed(2),
+            ..ctx()
+        };
+        assert_eq!(
+            Action::PixelSize(PixelSize::Fixed(2)).checked(&c),
+            Some(true)
+        );
+        assert_eq!(Action::PixelSize(PixelSize::Auto).checked(&c), Some(false));
+        assert_eq!(
+            Action::PixelSize(PixelSize::Auto).checked(&ctx()),
+            Some(true)
+        );
+        assert!(Action::PixelSize(PixelSize::Fixed(8)).enabled(&c));
+    }
+
+    #[test]
+    fn select_pixel_size_3x_on_lores_screen() {
+        let m = MENUS.len() - 1;
+        let it = MENUS[m].items.len() - 1;
+        let mut st = MenuState::default();
+        let mb = menu_box(m, 320, 256);
+        st.open(320, 256, title_slots()[m].x + 2, 4);
+        assert_eq!(st.menu, Some(m));
+        st.pointer(320, 256, mb.x + 5, mb.item_top(it) + 2);
+        assert_eq!(st.item, Some(it));
+        let Entry::Submenu(items) = MENUS[m].items[it].entry else {
+            panic!("submenu");
+        };
+        let sb = submenu_box(&mb, it, items, 320, 256);
+        assert!(sb.x >= 0 && sb.x + sb.w <= 320 && sb.y + sb.h <= 256);
+        // Move horizontally into the submenu level with the parent item, then down to "3x".
+        st.pointer(320, 256, sb.x + sb.w / 2, sb.item_top(0) + 2);
+        st.pointer(320, 256, sb.x + sb.w / 2, sb.item_top(3) + 2);
+        assert_eq!(
+            st.hovered_action(&ctx()),
+            Some(Action::PixelSize(PixelSize::Fixed(3)))
+        );
+        // Drawing with the submenu open must not panic.
+        let pens = Pens::from_palette(&Palette::dpaint_default_32());
+        let mut img = IndexedImage::new(320, 256, pens.dark);
+        draw(&mut img, &pens, &ctx(), &st, 320, 256);
     }
 
     #[test]

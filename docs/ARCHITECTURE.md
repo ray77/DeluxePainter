@@ -93,13 +93,13 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
             │     menu bar, toolbox, palette, requesters, canvas viewport  │
             │  upload changed rows → egui texture (TextureOptions::NEAREST) │
             │  draw one textured rect at integer scale, snapped to device  │
-            │  pixels, letterboxed                                         │
+            │  pixels, screen sized to the window (ADR-13)                 │
             └──────────────────────────────────────────────────────────────┘
 ```
 
 - The **whole visible UI**, including the zoomed canvas viewport, is software-rendered into one RGBA framebuffer at "Amiga screen" resolution. egui only provides the window, input, clipboard and the GPU blit.
-- Integer UI scale `1×–5×` or `Auto` = `floor(min(window_px / virtual_px))`, computed in **physical** pixels using `native_pixels_per_point` so Retina/Windows 150 % stay crisp.
-- Virtual screen size: fixed classic size (e.g. 640×512) or "extended" = `floor(window_px / scale)` — see design decision B.
+- Integer scale computed in **physical** pixels so Retina/Windows 150 % stay crisp: Prefs ▸ Pixel Size `Auto` = the largest scale at which the document's whole screen fits, or `1x`–`8x` points per UI pixel (ADR-13).
+- Screen size: the window divided by the scale, in whole UI pixels (layout C, ADR-13). Beyond the page a dark pattern is shown. A fixed classic screen (layout A) is a possible later preference.
 - Because rendering is pure CPU code, **UI screenshots are deterministic** and testable headless (golden PNGs) and available to MCP (`get_ui_screenshot`).
 - Colour cycling is a display-time palette rotation; document pixels never change while cycling.
 - Font: an **original** 8×8 / 8×9 bitmap font drawn for this project (Topaz and other Amiga ROM fonts are not redistributable). Icons are original pixel art drawn in the spirit of DPaint IV, not copied.

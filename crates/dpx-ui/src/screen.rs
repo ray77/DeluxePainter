@@ -6,7 +6,7 @@ use dpx_core::{IndexedImage, Palette};
 
 use crate::file_requester::FileRequester;
 use crate::font::Font;
-use crate::menu::{self, MenuContext, MenuState, Pref, Prefs};
+use crate::menu::{self, MenuContext, MenuState, PixelSize, Pref, Prefs};
 use crate::note_requester::NoteRequester;
 use crate::page_size_requester::PageSizeRequester;
 use crate::pens::Pens;
@@ -84,6 +84,8 @@ pub struct UiState {
     /// Pointer position on the page, shown at the right of the title bar with Prefs ▸ Coords.
     pub coords: Option<(i32, i32)>,
     pub prefs: Prefs,
+    /// Prefs ▸ Pixel Size.
+    pub pixel_size: PixelSize,
     pub menu: MenuState,
     /// Picture ▸ Load/Save while it is open (drawn over everything else).
     pub file_requester: Option<FileRequester>,
@@ -99,6 +101,7 @@ impl UiState {
         MenuContext {
             mode: self.mode,
             prefs: self.prefs,
+            pixel_size: self.pixel_size,
             // EHB/HAM display modes arrive with the hardware profiles (roadmap phase 5).
             ehb: false,
             ham: false,
@@ -119,10 +122,43 @@ impl Default for UiState {
             title_visible: true,
             coords: None,
             prefs: Prefs::default(),
+            pixel_size: PixelSize::Auto,
             menu: MenuState::default(),
             file_requester: None,
             page_size_requester: None,
             note_requester: None,
+        }
+    }
+}
+
+/// Pen of the screen area outside the page, for interface pixel (`u`, `v`): a dark area with
+/// sparse face-coloured dots in a staggered 4×4 lattice (1 in 8 pixels), so the page edge is
+/// clearly visible while the area stays calm. A DeluxePainter addition (DeluxePaint pages were
+/// never smaller than the screen); the owner chose "dark pattern, page edge clear" (ADR-13).
+fn off_page_pen(u: i32, v: i32, pens: &Pens) -> u8 {
+    let (u, v) = (u.rem_euclid(4), v.rem_euclid(4));
+    if (u, v) == (0, 0) || (u, v) == (2, 2) {
+        pens.face
+    } else {
+        pens.dark
+    }
+}
+
+/// Paints the off-page pattern on every pixel of `img` not covered by `page` (at 0,0): the
+/// right and bottom strips only. `img` is expected to be pre-filled with `pens.dark`, so only
+/// the dots are drawn.
+fn fill_off_page(img: &mut IndexedImage, page: &IndexedImage, ux: i32, uy: i32, pens: &Pens) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let (pw, ph) = (page.width() as i32, page.height() as i32);
+    for y in 0..h {
+        let v = y / uy;
+        // Rows below the page are uncovered over the full width, others right of the page.
+        let from = if y >= ph { 0 } else { pw.min(w) };
+        for x in from..w {
+            let pen = off_page_pen(x / ux, v, pens);
+            if pen != pens.dark {
+                img.set(x, y, pen);
+            }
         }
     }
 }
@@ -163,10 +199,13 @@ impl Screen {
         self.width - geom::TOOLBOX_W
     }
 
-    /// Composes the full screen. The page is drawn first (it fills the screen), then the UI.
+    /// Composes the full screen. `page` is the visible part of the page, at the screen's
+    /// top-left; it may be smaller than the screen, and the rest then shows the off-page
+    /// pattern ([`off_page_pen`]). The UI is drawn on top.
     pub fn render(&self, page: &IndexedImage, palette: &Palette, ui: &UiState) -> IndexedImage {
         let pens = Pens::from_palette(palette);
-        let mut img = IndexedImage::new(self.width as u32, self.height as u32, ui.bg);
+        let mut img = IndexedImage::new(self.width as u32, self.height as u32, pens.dark);
+        fill_off_page(&mut img, page, 1, 1, &pens);
         img.blit(page, 0, 0);
         self.draw_ui(&mut img, palette, ui, &pens);
         img
@@ -175,7 +214,8 @@ impl Screen {
     /// Composes a screen whose pixels are finer than LoRes (HiRes, SuperHiRes, laced). `self`
     /// has LoRes geometry; the result is `ux`×`uy` times larger. The page keeps its own
     /// pixels, while every UI pixel covers `ux`×`uy` screen pixels, so the interface looks
-    /// the same in every mode until HiRes artwork exists (AMIGA_GUI_FIDELITY.md).
+    /// the same in every mode until HiRes artwork exists (AMIGA_GUI_FIDELITY.md). Screen
+    /// pixels not covered by `page` show the off-page pattern, `ux`×`uy` pixels per cell.
     pub fn render_scaled(
         &self,
         page: &IndexedImage,
@@ -189,7 +229,8 @@ impl Screen {
         }
         let pens = Pens::from_palette(palette);
         let (sw, sh) = (self.width * ux, self.height * uy);
-        let mut out = IndexedImage::new(sw as u32, sh as u32, ui.bg);
+        let mut out = IndexedImage::new(sw as u32, sh as u32, pens.dark);
+        fill_off_page(&mut out, page, ux, uy, &pens);
         out.blit(page, 0, 0);
         // Draw the UI over two different backgrounds: where both agree, the UI drew a pixel.
         let layer = |fill: u8| {
@@ -474,6 +515,63 @@ mod tests {
             }
         }
         assert_eq!(lores.render_scaled(&page, &pal, &ui, 1, 1).width(), 320);
+    }
+
+    #[test]
+    fn pixel_size_defaults_to_auto() {
+        assert_eq!(UiState::default().pixel_size, PixelSize::Auto);
+    }
+
+    #[test]
+    fn off_page_pattern_right_and_below_page() {
+        let pal = Palette::dpaint_default_32();
+        let pens = Pens::from_palette(&pal);
+        let ui = UiState {
+            toolbox_visible: false,
+            title_visible: false,
+            ..UiState::default()
+        };
+        let screen = Screen::new(320, 256);
+        let page = IndexedImage::new(100, 80, 5);
+        let lo = screen.render(&page, &pal, &ui);
+        // Inside the page: untouched. Outside: sparse staggered dots, dark elsewhere.
+        assert_eq!(lo.get(99, 79), Some(5));
+        assert_eq!(lo.get(100, 80), Some(pens.face));
+        assert_eq!(lo.get(101, 80), Some(pens.dark));
+        assert_eq!(lo.get(100, 81), Some(pens.dark));
+        assert_eq!(lo.get(200, 8), Some(pens.face));
+        assert_eq!(lo.get(202, 10), Some(pens.face), "staggered");
+        assert_eq!(lo.get(201, 10), Some(pens.dark));
+        assert_eq!(lo.get(12, 200), Some(pens.face));
+        assert_eq!(lo.get(11, 201), Some(pens.dark));
+        let hi = screen.render_scaled(&page, &pal, &ui, 2, 1);
+        assert_eq!(hi.width(), 640);
+        assert_eq!(hi.get(99, 79), Some(5));
+        // UI pixel u = x / 2: screen x 200 and 201 form the dot u=100, 202 and 203 are u=101.
+        assert_eq!(hi.get(200, 8), Some(pens.face));
+        assert_eq!(hi.get(201, 8), Some(pens.face));
+        assert_eq!(hi.get(202, 8), Some(pens.dark));
+        assert_eq!(hi.get(203, 8), Some(pens.dark));
+        assert_eq!(hi.get(200, 9), Some(pens.dark));
+        assert_eq!(hi.get(200, 100), Some(pens.face));
+    }
+
+    #[test]
+    fn full_page_shows_no_pattern() {
+        let pal = Palette::dpaint_default_32();
+        let pens = Pens::from_palette(&pal);
+        let ui = UiState {
+            toolbox_visible: false,
+            title_visible: false,
+            ..UiState::default()
+        };
+        let page = IndexedImage::new(320, 256, 7);
+        let img = Screen::new(320, 256).render(&page, &pal, &ui);
+        assert!((0..256).all(|y| (0..320).all(|x| img.get(x, y) == Some(7))));
+        assert_ne!(pens.face, 7);
+        let hi =
+            Screen::new(320, 256).render_scaled(&IndexedImage::new(640, 256, 7), &pal, &ui, 2, 1);
+        assert!((0..256).all(|y| (0..640).all(|x| hi.get(x, y) == Some(7))));
     }
 
     fn render_default() -> (IndexedImage, Pens) {

@@ -29,7 +29,7 @@
     - Example: a 352×272 picture opens on a 352×272 PAL LoRes screen; a 640×512 LoRes page with page fields 320×256 keeps the 320×256 screen and scrolls.
   - **Saving:** ILBM page fields are the screen size.
   - **True-colour import (ADR-9):** big pictures are scaled to the current screen size (overscan or custom included). Pictures that fit a standard format get their screen as above.
-  - **Display:** the window shows the screen at its size with the mode's pixel shape. The interface keeps its LoRes geometry, and the toolbox moves to the right edge of the wider screen.
+  - **Display:** the window shows the screen at its size with the mode's pixel shape. The interface keeps its LoRes geometry, and the toolbox moves to the right edge of the wider screen. Since ADR-13 the window shows a screen sized to the window; this screen size decides the Auto pixel size.
 - Verified:
   - Unit tests: limits, fit rules and picture screens in dpx-core; SetFormat with screens and JSON without `screen`; the requester cycle, typing, mode change, Keep Same and the info panel.
   - App tests: requester → Overscan → Use → view and page 368×283 → undo.

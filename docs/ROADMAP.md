@@ -35,6 +35,8 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 
 - Notes after Load/Save (ADR-12): whatever was not kept, reduced, scaled or cannot be stored is listed in a "Picture loaded" / "Picture saved" requester with Ok (also after `--open`), not only on stderr. Verified by tests and a snapshot.
 
+- The screen fills the window (layout C, ADR-13, owner request): no black bars; Prefs ▸ Pixel Size (Auto or 1x–8x, Cmd/Ctrl +/−/0); a dark pattern beyond the page; full screen with Ctrl+Cmd+F / F11. Verified by tests and snapshots; resizing, keys and full screen not tried by hand.
+
 Next in Phase 2:
 1. Error diagnostics for broken files; more golden fixtures.
 

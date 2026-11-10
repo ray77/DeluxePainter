@@ -21,7 +21,7 @@ pub(crate) mod widgets;
 use dpx_core::{IndexedImage, Palette};
 
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
-pub use menu::{Action, MenuState, Pref, Prefs};
+pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};
 pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};
 pub use pens::Pens;
