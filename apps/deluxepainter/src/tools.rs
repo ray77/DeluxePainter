@@ -7,6 +7,7 @@
 //! Custom brushes (ADR-18): the Brush Selector picks up part of the page; every drawing tool
 //! then stamps it, in the Mode menu's drawing mode, and it follows the pointer as a preview.
 
+use dpx_core::brush_ops;
 use dpx_core::gradient::range_for;
 use dpx_core::shapes::MAX_SHAPE_POINTS;
 use dpx_core::{
@@ -68,6 +69,17 @@ pub struct ToolState {
     rng: u32,
     /// The tool (and its filled half) to go back to after a Brush Selector pick-up.
     pick_return: Option<(Tool, bool)>,
+    /// Brush menu gesture waiting for or in a drag (Stretch, Any Angle, Shear, Bend, Place;
+    /// ADR-30).
+    xform: Option<Xform>,
+    /// After Rotate > Any Angle: the brush it made and the one it was made from, so that
+    /// a second use starts again from the original orientation.
+    rotate_base: Option<(BrushImage, BrushImage)>,
+    /// The hidden spare brush (Brush > Spare, ADR-30).
+    pub spare_brush: Option<BrushImage>,
+    /// The page palette when the custom brush was picked up or loaded: what its colour
+    /// indices meant then. Brush > Remap fits them to the current palette (ADR-30).
+    pub brush_palette: Option<Palette>,
 }
 
 impl Default for ToolState {
@@ -95,6 +107,10 @@ impl Default for ToolState {
             shift: false,
             rng: 0x2545_F491,
             pick_return: None,
+            xform: None,
+            rotate_base: None,
+            spare_brush: None,
+            brush_palette: None,
         }
     }
 }
@@ -708,6 +724,204 @@ impl Stroke {
     }
 }
 
+/// The Brush menu gestures (ADR-30).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XformKind {
+    Stretch,
+    Rotate,
+    Shear,
+    BendH,
+    BendV,
+    Place,
+}
+
+/// A Brush menu gesture: armed by the menu item, started by a press on the page, ended by
+/// the release (one brush change).
+#[derive(Clone, Debug)]
+pub struct Xform {
+    kind: XformKind,
+    /// Where the button went down; `None` while the gesture only waits for it.
+    origin: Option<(i32, i32)>,
+    /// The pointer.
+    cur: (i32, i32),
+    shift: bool,
+    /// The brush that is transformed (for Any Angle: the original orientation).
+    base: BrushImage,
+}
+
+impl Xform {
+    /// The new brush and where the top-left of its image lies on the page, for the pointer
+    /// at `self.cur` and the button down at `origin`.
+    fn result(&self, colors: usize) -> (BrushImage, (i32, i32)) {
+        let b = &self.base;
+        let Some(o) = self.origin else {
+            // Waiting: the brush as it is, its handle (Place) or top-left at the pointer.
+            let at = if self.kind == XformKind::Place {
+                (self.cur.0 - b.handle.0, self.cur.1 - b.handle.1)
+            } else {
+                self.cur
+            };
+            return (b.clone(), at);
+        };
+        let (dx, dy) = (self.cur.0 - o.0, self.cur.1 - o.1);
+        match self.kind {
+            XformKind::Stretch => {
+                let (mut w, mut h) = (f64::from((dx + 1).max(1)), f64::from((dy + 1).max(1)));
+                if self.shift {
+                    let s = (w / f64::from(b.width)).max(h / f64::from(b.height));
+                    (w, h) = (s * f64::from(b.width), s * f64::from(b.height));
+                }
+                (brush_ops::stretch(b, w.round() as u32, h.round() as u32), o)
+            }
+            XformKind::Rotate => {
+                // The bottom edge follows the line from the press to the pointer.
+                let mut angle = if dx == 0 && dy == 0 {
+                    0.0
+                } else {
+                    f64::from(dy).atan2(f64::from(dx)).to_degrees()
+                };
+                if self.shift {
+                    angle = (angle / 15.0).round() * 15.0;
+                }
+                let r = brush_ops::rotate_any(b, angle, colors);
+                let (ax, ay) = brush_ops::rotated_point(b, angle, (0.0, f64::from(b.height)));
+                (r, (o.0 - ax.round() as i32, o.1 - ay.round() as i32))
+            }
+            XformKind::Shear => (brush_ops::shear(b, dx, colors), (o.0 + dx.min(0), o.1)),
+            XformKind::BendH => (
+                brush_ops::bend(b, true, dx, dy, colors),
+                (o.0 + dx.min(0), o.1),
+            ),
+            XformKind::BendV => (
+                brush_ops::bend(b, false, dy, dx, colors),
+                (o.0, o.1 + dy.min(0)),
+            ),
+            XformKind::Place => (brush_ops::handle_place(b, dx, dy), o),
+        }
+    }
+}
+
+impl PainterApp {
+    /// Arms a Brush menu gesture on the custom brush: the brush follows the pointer until the
+    /// button goes down.
+    pub(crate) fn arm_xform(&mut self, kind: XformKind) {
+        let Some(current) = self.custom_brush.clone() else {
+            return;
+        };
+        let base = match (&self.tools.rotate_base, kind) {
+            (Some((result, original)), XformKind::Rotate) if *result == current => original.clone(),
+            _ => current,
+        };
+        let cur = self.pointer_page.unwrap_or((0, 0));
+        self.tools.xform = Some(Xform {
+            kind,
+            origin: None,
+            cur,
+            shift: false,
+            base,
+        });
+        self.xform_preview();
+    }
+
+    /// Ends an armed or running Brush menu gesture without changing the brush.
+    fn drop_xform(&mut self) {
+        if self.tools.xform.take().is_some() {
+            self.stroke = None;
+            self.dirty = true;
+        }
+    }
+
+    fn xform_press(&mut self, x: i32, y: i32) {
+        let shift = self.tools.shift;
+        let Some(g) = &mut self.tools.xform else {
+            return;
+        };
+        if g.origin.is_some() {
+            return;
+        }
+        g.cur = (x, y);
+        // Place: the brush stays where it was shown; the pointer then moves the handle.
+        g.origin = Some(if g.kind == XformKind::Place {
+            (x - g.base.handle.0, y - g.base.handle.1)
+        } else {
+            (x, y)
+        });
+        g.shift = shift;
+        self.xform_preview();
+    }
+
+    fn xform_move(&mut self, x: i32, y: i32) {
+        let shift = self.tools.shift;
+        let Some(g) = &mut self.tools.xform else {
+            return;
+        };
+        if g.cur == (x, y) && g.shift == shift {
+            return;
+        }
+        g.cur = (x, y);
+        g.shift = shift;
+        self.xform_preview();
+    }
+
+    /// The button went up: the gesture's brush becomes the custom brush. A click without a
+    /// drag changes nothing, except for Place.
+    fn xform_commit(&mut self) {
+        let Some(g) = self.tools.xform.take() else {
+            return;
+        };
+        self.stroke = None;
+        self.dirty = true;
+        if g.origin == Some(g.cur) && g.kind != XformKind::Place {
+            return;
+        }
+        let (brush, _) = g.result(self.engine.document().palette().len());
+        if g.kind == XformKind::Rotate {
+            self.tools.rotate_base = Some((brush.clone(), g.base));
+        }
+        self.custom_brush = Some(brush);
+    }
+
+    /// Shows the gesture's brush in the page preview, in its own colours.
+    fn xform_preview(&mut self) {
+        let Some(g) = &self.tools.xform else {
+            return;
+        };
+        let doc = self.engine.document();
+        let (mut brush, at) = g.result(doc.palette().len());
+        let handle = brush.handle;
+        let mark = g.kind == XformKind::Place;
+        brush.handle = (0, 0);
+        let mut ink = self.ink(false);
+        ink.custom = Some(brush);
+        ink.mode = DrawMode::Matte;
+        ink.range = None;
+        ink.stencil = None;
+        let mut s = Stroke {
+            preview: doc.page().clone(),
+            drawn: Rect::default(),
+            ink,
+            filled: false,
+            symmetry: None,
+            spacing: self.tools.spacing,
+            aspect: (1, 1),
+            held: false,
+            kind: Kind::Hover { at },
+        };
+        s.redraw(doc.page(), doc.palette());
+        if mark {
+            // The handle: its pixel in the complementary colour.
+            let (x, y) = (at.0 + handle.0, at.1 + handle.1);
+            let top = (doc.palette().len().clamp(1, 256) - 1) as u8;
+            if let Some(p) = s.preview.get(x, y) {
+                s.preview.set(x, y, top.saturating_sub(p));
+                s.drawn = s.drawn.union(Rect { x, y, w: 1, h: 1 });
+            }
+        }
+        self.stroke = Some(s);
+        self.dirty = true;
+    }
+}
+
 /// Where the halves of the Magnify screen are, in screen pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MagnifyLayout {
@@ -848,6 +1062,9 @@ impl PainterApp {
     /// The custom brush at the pointer (`at`; `None` = off the page) while a tool that stamps
     /// it is selected and no gesture is in progress. Shown in the preview, never committed.
     pub(crate) fn hover_brush(&mut self, at: Option<(i32, i32)>) {
+        if self.tools.xform.is_some() {
+            return;
+        }
         let idle = self.stroke.is_none() && self.custom_brush.is_none();
         if idle
             || self
@@ -940,6 +1157,7 @@ impl PainterApp {
         }
         self.custom_brush = Some(brush.clone());
         self.picked_brush = Some(brush);
+        self.tools.brush_palette = Some(self.engine.document().palette().clone());
         self.ui.mode = PaintMode::Matte;
         let (tool, filled) = self
             .tools
@@ -975,6 +1193,9 @@ impl PainterApp {
 
     /// A press on the page (`right` = BG colour).
     pub(crate) fn press_page(&mut self, x: i32, y: i32, right: bool) {
+        if self.tools.xform.is_some() {
+            return self.xform_press(x, y);
+        }
         // A pending curve bend or polygon takes the click.
         if let Some(s) = &mut self.stroke
             && !s.held
@@ -1090,6 +1311,9 @@ impl PainterApp {
 
     /// The pointer moved to page pixel (`x`, `y`) with a button held.
     pub(crate) fn handle_drag(&mut self, x: i32, y: i32) {
+        if self.tools.xform.is_some() {
+            return self.xform_move(x, y);
+        }
         let p = self.snap((x, y));
         let aspect = self.aspect();
         let shift = self.tools.shift;
@@ -1161,6 +1385,9 @@ impl PainterApp {
     /// The pointer moved over the page with no button held: the curve's bend and the
     /// polygon's rubber band follow it, else a custom brush does ([`Self::hover_brush`]).
     pub(crate) fn handle_hover(&mut self, x: i32, y: i32) {
+        if self.tools.xform.is_some() {
+            return self.xform_move(x, y);
+        }
         if self
             .stroke
             .as_ref()
@@ -1192,6 +1419,14 @@ impl PainterApp {
     /// polygons to the next corner, text to typing, the Brush Selector picks up; everything
     /// else is committed.
     pub(crate) fn release(&mut self) {
+        if self
+            .tools
+            .xform
+            .as_ref()
+            .is_some_and(|x| x.origin.is_some())
+        {
+            return self.xform_commit();
+        }
         let doc = self.engine.document();
         let (page, palette) = (doc.page(), doc.palette());
         let Some(s) = &mut self.stroke else {
@@ -1234,6 +1469,7 @@ impl PainterApp {
     /// Commits the gesture in progress as one command (what it shows, without a polygon's
     /// rubber band).
     pub(crate) fn finish_stroke(&mut self) {
+        self.drop_xform();
         if let Some(s) = self.stroke.take() {
             if let Some(cmd) = s.candidate(true) {
                 self.execute(cmd);
@@ -1244,6 +1480,7 @@ impl PainterApp {
 
     /// Drops the gesture in progress.
     fn cancel_stroke(&mut self) {
+        self.drop_xform();
         if self.stroke.take().is_some() {
             self.dirty = true;
         }
@@ -1655,6 +1892,56 @@ fn run_commands(
             .map_err(|e| format!("{path}: command {i}: {e}"))?;
     }
     Ok(commands.len())
+}
+
+/// `--brush-xforms SPEC` (snapshots, ADR-30): `OP[:ARGS]@X,Y` entries separated by `;`. Each
+/// transforms `brush` with the Brush menu's pure operation (`stretch:W,H`, `rotate:DEGREES`,
+/// `shear:DX`, `bend_h:AMOUNT,LINE`, `bend_v:AMOUNT,LINE`) and stamps it with its top-left
+/// at X,Y in Matte mode, as one command each.
+pub fn run_xform_spec(engine: &mut Engine, brush: &BrushImage, spec: &str) -> Result<(), String> {
+    let colors = engine.document().palette().len();
+    for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let bad = || format!("'{entry}': expected OP[:ARGS]@X,Y");
+        let (op, at) = entry.split_once('@').ok_or_else(bad)?;
+        let nums = |s: &str| -> Result<Vec<f64>, String> {
+            s.split(',')
+                .map(|n| n.trim().parse::<f64>().map_err(|_| bad()))
+                .collect()
+        };
+        let at = nums(at)?;
+        let (name, args) = op.split_once(':').unwrap_or((op, ""));
+        let args = if args.is_empty() { vec![] } else { nums(args)? };
+        let arg = |i: usize| args.get(i).copied().ok_or_else(bad);
+        let mut b = match name {
+            "stretch" => brush_ops::stretch(brush, arg(0)? as u32, arg(1)? as u32),
+            "rotate" => brush_ops::rotate_any(brush, arg(0)?, colors),
+            "shear" => brush_ops::shear(brush, arg(0)? as i32, colors),
+            "bend_h" => brush_ops::bend(brush, true, arg(0)? as i32, arg(1)? as i32, colors),
+            "bend_v" => brush_ops::bend(brush, false, arg(0)? as i32, arg(1)? as i32, colors),
+            _ => return Err(format!("'{name}': unknown brush operation")),
+        };
+        b.handle = (0, 0);
+        let &[x, y] = at.as_slice() else {
+            return Err(bad());
+        };
+        engine
+            .execute(Command::Shape {
+                shape: Shape::Dots {
+                    points: vec![(x as i32, y as i32)],
+                },
+                brush: Vec::new(),
+                color: 0,
+                filled: false,
+                symmetry: None,
+                custom: Some(b),
+                mode: DrawMode::Matte,
+                range: None,
+                stencil: None,
+                right: false,
+            })
+            .map_err(|e| format!("'{entry}': {e}"))?;
+    }
+    Ok(())
 }
 
 /// `--pick X,Y,W,H`: that part of `page` as a custom brush, picked up like the Brush
@@ -2317,5 +2604,125 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(run_command_file(&mut engine, &path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The custom brush of `picked` (14x9, handle in the centre), the pointer at rest.
+    fn with_brush() -> PainterApp {
+        let mut app = picked(Tool::DottedFreehand, false);
+        app.release();
+        assert!(app.custom_brush.is_some());
+        app
+    }
+
+    fn brush_size(app: &PainterApp) -> (u32, u32) {
+        let b = app.custom_brush.as_ref().unwrap();
+        (b.width, b.height)
+    }
+
+    #[test]
+    fn stretch_drags_a_new_size_and_commits_one_brush_change() {
+        let mut app = with_brush();
+        let original = app.custom_brush.clone().unwrap();
+        let rev = app.engine.document().revision();
+        app.brush_action("brush.stretch");
+        // Armed: the brush shows at the pointer, nothing changes.
+        app.handle_hover(100, 100);
+        assert!(app.stroke.is_some());
+        assert_eq!(app.page().get(100, 100), original.get(0, 0));
+        assert_eq!(app.custom_brush.as_ref(), Some(&original));
+        press(&mut app, 100, 100);
+        app.handle_drag(129, 119);
+        assert_eq!(brush_size(&app), (14, 9), "only previewed while dragging");
+        app.release();
+        assert_eq!(brush_size(&app), (30, 20));
+        assert!(app.stroke.is_none() && app.tools.xform.is_none());
+        assert_eq!(app.engine.document().revision(), rev, "no page change");
+        // Brush > Restore brings the picked brush back.
+        app.tool_key(ToolKey::Char('B'));
+        assert_eq!(app.custom_brush.as_ref(), Some(&original));
+        // Shift keeps the aspect ratio (14:9): width wins.
+        app.brush_action("brush.stretch");
+        press(&mut app, 100, 100);
+        app.tools.shift = true;
+        app.handle_drag(139, 104);
+        app.release();
+        let (w, h) = brush_size(&app);
+        assert_eq!(w, 40);
+        assert_eq!(h, (9.0 * 40.0 / 14.0_f64).round() as u32);
+    }
+
+    #[test]
+    fn a_click_without_a_drag_changes_nothing_and_place_sets_the_handle() {
+        let mut app = with_brush();
+        let original = app.custom_brush.clone().unwrap();
+        app.brush_action("brush.rotate_any");
+        press(&mut app, 50, 50);
+        app.release();
+        assert_eq!(app.custom_brush.as_ref(), Some(&original));
+        // Place: the brush is shown with its handle at the pointer; the press fixes its place.
+        app.brush_action("brush.handle_place");
+        app.handle_hover(100, 100);
+        assert_eq!(app.page().get(100 - 7, 100 - 4), original.get(0, 0));
+        press(&mut app, 100, 100);
+        app.handle_drag(96, 98);
+        app.release();
+        let b = app.custom_brush.clone().unwrap();
+        assert_eq!(b.handle, (3, 2), "pointer minus the brush's top left");
+        assert_eq!(b.pixels, original.pixels);
+    }
+
+    #[test]
+    fn any_angle_restarts_from_the_original_orientation() {
+        let mut app = with_brush();
+        let original = app.custom_brush.clone().unwrap();
+        app.brush_action("brush.rotate_any");
+        press(&mut app, 60, 60);
+        app.handle_drag(60, 80);
+        app.release();
+        assert_eq!(
+            app.custom_brush.as_ref(),
+            Some(&brush_ops::rotate_90(&original))
+        );
+        // The second use starts again from the original: pointing right is 0 degrees.
+        app.brush_action("brush.rotate_any");
+        press(&mut app, 60, 60);
+        app.handle_drag(90, 60);
+        app.release();
+        assert_eq!(app.custom_brush.as_ref(), Some(&original));
+    }
+
+    #[test]
+    fn shear_and_bend_grow_the_brush_and_escape_cancels() {
+        let mut app = with_brush();
+        app.brush_action("brush.shear");
+        press(&mut app, 60, 60);
+        app.handle_drag(70, 60);
+        app.release();
+        assert_eq!(brush_size(&app), (24, 9));
+        app.tool_key(ToolKey::Char('B'));
+        app.brush_action("brush.bend_horizontal");
+        press(&mut app, 60, 60);
+        app.handle_drag(66, 64);
+        app.release();
+        assert_eq!(brush_size(&app), (20, 9));
+        app.tool_key(ToolKey::Char('B'));
+        app.brush_action("brush.bend_vertical");
+        press(&mut app, 60, 60);
+        app.handle_drag(66, 66);
+        app.release();
+        assert_eq!(brush_size(&app), (14, 15));
+        // Escape drops an armed gesture; the next press paints normally.
+        app.tool_key(ToolKey::Char('B'));
+        app.brush_action("brush.stretch");
+        app.tool_key(ToolKey::Escape);
+        assert!(app.tools.xform.is_none() && app.stroke.is_none());
+        let rev = app.engine.document().revision();
+        press(&mut app, 100, 100);
+        app.release();
+        assert_eq!(app.engine.document().revision(), rev + 1);
+        // Choosing another tool drops it too.
+        app.brush_action("brush.shear");
+        app.select_tool(Tool::Line, false);
+        assert!(app.tools.xform.is_none());
     }
 }

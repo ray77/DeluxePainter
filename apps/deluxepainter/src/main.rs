@@ -305,6 +305,17 @@ fn main() -> eframe::Result {
                 std::process::exit(2);
             }
         }
+        // ADR-30: stamp Brush menu transforms of the picked brush.
+        if let Some(spec) = arg_value(&args, "--brush-xforms") {
+            let Some(brush) = &picked else {
+                eprintln!("--brush-xforms needs --pick");
+                std::process::exit(2);
+            };
+            if let Err(e) = tools::run_xform_spec(&mut engine, brush, &spec) {
+                eprintln!("--brush-xforms {e}");
+                std::process::exit(2);
+            }
+        }
         if let Some(i) = arg_value(&args, "--frame") {
             let frame = i.parse::<u32>().unwrap_or(0).saturating_sub(1);
             if let Err(e) = engine.execute(Command::GotoFrame { frame }) {

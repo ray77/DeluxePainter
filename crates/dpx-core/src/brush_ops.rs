@@ -265,6 +265,226 @@ pub fn handle_next_corner(b: &BrushImage) -> BrushImage {
     }
 }
 
+// ---- Interactive transforms (ADR-30) -------------------------------------------------------
+
+/// Largest side a stretch may produce (keeps a wild drag from allocating without bound).
+pub const MAX_SIDE: u32 = 1024;
+
+/// The colour that stands for "nothing" in a transformed brush: its transparent colour, else
+/// the lowest colour below `colors` that no pixel uses, else 0 (then colour 0 pixels turn
+/// transparent; only a brush that uses every palette colour gets here).
+pub fn fill_colour(b: &BrushImage, colors: usize) -> u8 {
+    if let Some(t) = b.transparent {
+        return t;
+    }
+    let mut used = [false; 256];
+    for &p in &b.pixels {
+        used[usize::from(p)] = true;
+    }
+    (0..colors.clamp(1, 256))
+        .find(|&c| !used[c])
+        .map_or(0, |c| c as u8)
+}
+
+/// Brush ▸ Size ▸ Stretch: the brush resized to `width` x `height` (nearest neighbour,
+/// each side 1..=[`MAX_SIDE`]). The handle keeps its relative position.
+pub fn stretch(b: &BrushImage, width: u32, height: u32) -> BrushImage {
+    let (w, h) = (width.clamp(1, MAX_SIDE), height.clamp(1, MAX_SIDE));
+    let handle = (
+        (b.handle.0 * w as i32 / b.width as i32).clamp(0, w as i32 - 1),
+        (b.handle.1 * h as i32 / b.height as i32).clamp(0, h as i32 - 1),
+    );
+    let mut out = new_brush(w, h, 0, b, handle);
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = (x * b.width / w, y * b.height / h);
+            put(&mut out, x, y, b.pixels[(sy * b.width + sx) as usize]);
+        }
+    }
+    out
+}
+
+/// `(sin, cos)` of `degrees`, exact for multiples of 90.
+fn sin_cos(degrees: f64) -> (f64, f64) {
+    let d = degrees.rem_euclid(360.0);
+    if d == 0.0 {
+        (0.0, 1.0)
+    } else if d == 90.0 {
+        (1.0, 0.0)
+    } else if d == 180.0 {
+        (0.0, -1.0)
+    } else if d == 270.0 {
+        (-1.0, 0.0)
+    } else {
+        d.to_radians().sin_cos()
+    }
+}
+
+/// Where the point (`x`, `y`) of the brush (pixel corner coordinates: the brush covers 0..w,
+/// 0..h) ends up in the brush [`rotate_any`] makes of it.
+pub fn rotated_point(b: &BrushImage, degrees: f64, (x, y): (f64, f64)) -> (f64, f64) {
+    let (s, c) = sin_cos(degrees);
+    let (w, h) = (f64::from(b.width), f64::from(b.height));
+    let (dw, dh) = rotated_size(b, degrees);
+    let (rx, ry) = (x - w / 2.0, y - h / 2.0);
+    (
+        rx * c - ry * s + f64::from(dw) / 2.0,
+        rx * s + ry * c + f64::from(dh) / 2.0,
+    )
+}
+
+fn rotated_size(b: &BrushImage, degrees: f64) -> (u32, u32) {
+    let (s, c) = sin_cos(degrees);
+    let (w, h) = (f64::from(b.width), f64::from(b.height));
+    let fit = |v: f64| ((v - 1e-6).ceil() as u32).clamp(1, MAX_SIDE);
+    (
+        fit(w * c.abs() + h * s.abs()),
+        fit(w * s.abs() + h * c.abs()),
+    )
+}
+
+/// Brush ▸ Rotate ▸ Any Angle: rotated clockwise by `degrees` (nearest neighbour). The new
+/// area is transparent: the brush's transparent colour, or one picked by [`fill_colour`]
+/// from the `colors` of the palette. The handle turns with the pixels. Multiples of 90
+/// degrees give the same pixels as [`rotate_90`] and the flips.
+pub fn rotate_any(b: &BrushImage, degrees: f64, colors: usize) -> BrushImage {
+    let fill = fill_colour(b, colors);
+    let (s, c) = sin_cos(degrees);
+    let (dw, dh) = rotated_size(b, degrees);
+    let (hx, hy) = rotated_point(
+        b,
+        degrees,
+        (f64::from(b.handle.0) + 0.5, f64::from(b.handle.1) + 0.5),
+    );
+    let handle = (
+        (hx.floor() as i32).clamp(0, dw as i32 - 1),
+        (hy.floor() as i32).clamp(0, dh as i32 - 1),
+    );
+    let mut out = new_brush(dw, dh, fill, b, handle);
+    out.transparent = Some(fill);
+    let (w, h) = (f64::from(b.width), f64::from(b.height));
+    for y in 0..dh {
+        for x in 0..dw {
+            let (rx, ry) = (
+                f64::from(x) + 0.5 - f64::from(dw) / 2.0,
+                f64::from(y) + 0.5 - f64::from(dh) / 2.0,
+            );
+            // Inverse rotation back into the source brush.
+            let sx = (rx * c + ry * s + w / 2.0 + 1e-9).floor();
+            let sy = (-rx * s + ry * c + h / 2.0 + 1e-9).floor();
+            if let Some(p) = b.get(sx as i32, sy as i32) {
+                put(&mut out, x, y, p);
+            }
+        }
+    }
+    out
+}
+
+/// Moves every row (`rows` true) or column of the brush by its own offset along the row or
+/// column; rows move sideways, columns up and down. The new area is transparent.
+fn displace(b: &BrushImage, offsets: &[i32], rows: bool, colors: usize) -> BrushImage {
+    let fill = fill_colour(b, colors);
+    let (min, max) = (
+        offsets.iter().copied().min().unwrap_or(0).min(0),
+        offsets.iter().copied().max().unwrap_or(0).max(0),
+    );
+    let grow = (max - min) as u32;
+    let (w, h) = if rows {
+        (b.width + grow, b.height)
+    } else {
+        (b.width, b.height + grow)
+    };
+    let handle = if rows {
+        (b.handle.0 + offsets[b.handle.1 as usize] - min, b.handle.1)
+    } else {
+        (b.handle.0, b.handle.1 + offsets[b.handle.0 as usize] - min)
+    };
+    let mut out = new_brush(w, h, fill, b, handle);
+    out.transparent = Some(fill);
+    for y in 0..b.height {
+        for x in 0..b.width {
+            let p = b.pixels[(y * b.width + x) as usize];
+            if rows {
+                put(
+                    &mut out,
+                    (x as i32 + offsets[y as usize] - min) as u32,
+                    y,
+                    p,
+                );
+            } else {
+                put(
+                    &mut out,
+                    x,
+                    (y as i32 + offsets[x as usize] - min) as u32,
+                    p,
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Brush ▸ Rotate ▸ Shear: the top row stays, the bottom row moves `dx` pixels sideways
+/// (negative = left), rows in between in proportion. The brush grows to hold the result.
+pub fn shear(b: &BrushImage, dx: i32, colors: usize) -> BrushImage {
+    let dx = dx.clamp(-(MAX_SIDE as i32), MAX_SIDE as i32);
+    let span = (b.height as i32 - 1).max(1);
+    let offsets: Vec<i32> = (0..b.height as i32)
+        .map(|y| (f64::from(dx) * f64::from(y) / f64::from(span)).round() as i32)
+        .collect();
+    displace(b, &offsets, true, colors)
+}
+
+/// Brush ▸ Bend ▸ Horiz (`horizontal`) or Vert: a quadratic bend. The two edges stay; the
+/// row (column) at `line` moves `amount` pixels sideways (up or down), the others along
+/// the parabola through those three points. `line` is clamped to the inside of the brush.
+pub fn bend(b: &BrushImage, horizontal: bool, amount: i32, line: i32, colors: usize) -> BrushImage {
+    let amount = amount.clamp(-(MAX_SIDE as i32), MAX_SIDE as i32);
+    let n = if horizontal { b.height } else { b.width } as i32;
+    if n < 3 {
+        return b.clone();
+    }
+    let line = line.clamp(1, n - 2);
+    let denom = f64::from(line) * f64::from(n - 1 - line);
+    let offsets: Vec<i32> = (0..n)
+        .map(|i| (f64::from(amount) * f64::from(i) * f64::from(n - 1 - i) / denom).round() as i32)
+        .collect();
+    displace(b, &offsets, horizontal, colors)
+}
+
+/// Brush ▸ Handle ▸ Place: the handle at brush coordinates (`x`, `y`), kept inside the brush.
+pub fn handle_place(b: &BrushImage, x: i32, y: i32) -> BrushImage {
+    BrushImage {
+        handle: (
+            x.clamp(0, b.width as i32 - 1),
+            y.clamp(0, b.height as i32 - 1),
+        ),
+        ..b.clone()
+    }
+}
+
+/// Color ▸ Brush ▸ Remap: every colour index `from` of the brush's own palette becomes the
+/// nearest colour of `to` (the transparent colour keeps its index). Indices `from` does not
+/// have stay. Returns the brush and how many distinct colours changed.
+pub fn remap(b: &BrushImage, from: &crate::Palette, to: &crate::Palette) -> (BrushImage, usize) {
+    let mut map: [Option<u8>; 256] = [None; 256];
+    let mut changed = 0;
+    let mut out = b.clone();
+    for p in &mut out.pixels {
+        let slot = &mut map[usize::from(*p)];
+        let new = *slot.get_or_insert_with(|| match from.get(*p) {
+            Some(c) if Some(*p) != b.transparent && to.get(*p) != Some(c) => {
+                let n = to.nearest(c);
+                changed += usize::from(n != *p);
+                n
+            }
+            _ => *p,
+        });
+        *p = new;
+    }
+    (out, changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +684,149 @@ mod tests {
             ..b
         };
         assert_eq!(handle_next_corner(&lost).handle, (0, 0));
+    }
+
+    #[test]
+    fn stretch_resizes_nearest_neighbour_and_scales_the_handle() {
+        let b = stretch(&sample(), 6, 4);
+        assert_eq!((b.width, b.height), (6, 4));
+        assert_eq!(&b.pixels[0..6], &[0, 0, 5, 5, 6, 6]);
+        assert_eq!(&b.pixels[18..24], &[7, 7, 0, 0, 8, 8]);
+        assert_eq!(b.handle, (4, 0));
+        assert_eq!(b.transparent, Some(0));
+        let s = stretch(&sample(), 1, 1);
+        assert_eq!(s.pixels, vec![0]);
+        assert_eq!(stretch(&sample(), 0, 5000).height, MAX_SIDE);
+    }
+
+    #[test]
+    fn rotate_any_is_exact_for_quarter_turns() {
+        let b = sample();
+        assert_eq!(rotate_any(&b, 0.0, 32), b);
+        assert_eq!(rotate_any(&b, 90.0, 32), rotate_90(&b));
+        assert_eq!(
+            rotate_any(&b, 180.0, 32),
+            flip_vertical(&flip_horizontal(&b))
+        );
+        assert_eq!(
+            rotate_any(&b, -90.0, 32),
+            rotate_90(&rotate_90(&rotate_90(&b)))
+        );
+        assert_eq!(rotate_any(&b, 450.0, 32), rotate_90(&b));
+    }
+
+    #[test]
+    fn rotate_any_grows_the_brush_and_fills_with_transparent() {
+        let b = BrushImage {
+            width: 4,
+            height: 4,
+            pixels: vec![5; 16],
+            handle: (0, 0),
+            transparent: None,
+        };
+        let r = rotate_any(&b, 45.0, 32);
+        assert!(r.width >= 5 && r.height >= 5, "{}x{}", r.width, r.height);
+        // No transparent colour before: an unused one is picked (colour 0 here).
+        assert_eq!(r.transparent, Some(0));
+        assert_eq!(r.get(0, 0), Some(0), "corners are empty");
+        let (cx, cy) = (r.width as i32 / 2, r.height as i32 / 2);
+        assert_eq!(r.get(cx, cy), Some(5));
+        // The handle (top-left corner pixel) is rotated to the top middle.
+        assert!(
+            r.handle.1 < cy && (r.handle.0 - cx).abs() <= 2,
+            "{:?}",
+            r.handle
+        );
+        // A used colour 0 is skipped as the fill colour.
+        let mut c = b.clone();
+        c.pixels[0] = 0;
+        assert_eq!(fill_colour(&c, 32), 1);
+    }
+
+    #[test]
+    fn rotated_point_follows_the_rotation() {
+        let b = sample();
+        // Top-left corner (0,0) of a 3x2 brush turned 90 degrees clockwise: top-right of 2x3.
+        assert_eq!(rotated_point(&b, 90.0, (0.0, 0.0)), (2.0, 0.0));
+        let (x, y) = rotated_point(&b, 90.0, (0.0, 2.0));
+        assert!((x - 0.0).abs() < 1e-9 && (y - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shear_moves_rows_in_proportion() {
+        let b = BrushImage {
+            width: 2,
+            height: 3,
+            pixels: vec![1, 2, 3, 4, 5, 6],
+            handle: (0, 2),
+            transparent: Some(0),
+        };
+        let s = shear(&b, 4, 32);
+        assert_eq!((s.width, s.height), (6, 3));
+        assert_eq!(&s.pixels[0..6], &[1, 2, 0, 0, 0, 0]);
+        assert_eq!(&s.pixels[6..12], &[0, 0, 3, 4, 0, 0]);
+        assert_eq!(&s.pixels[12..18], &[0, 0, 0, 0, 5, 6]);
+        assert_eq!(s.handle, (4, 2), "the handle stays on its pixel");
+        let l = shear(&b, -2, 32);
+        assert_eq!(l.width, 4);
+        assert_eq!(&l.pixels[0..4], &[0, 0, 1, 2]);
+        assert_eq!(&l.pixels[8..12], &[5, 6, 0, 0]);
+        assert_eq!(l.handle, (0, 2));
+        assert_eq!(shear(&b, 0, 32), b);
+    }
+
+    #[test]
+    fn bend_is_a_parabola_through_edges_and_line() {
+        let b = BrushImage {
+            width: 1,
+            height: 5,
+            pixels: vec![1, 2, 3, 4, 5],
+            handle: (0, 0),
+            transparent: Some(0),
+        };
+        // Bend line at row 2 by 4: offsets 0, 3, 4, 3, 0.
+        let r = bend(&b, true, 4, 2, 32);
+        assert_eq!((r.width, r.height), (5, 5));
+        for (y, x) in [(0, 0), (1, 3), (2, 4), (3, 3), (4, 0)] {
+            assert_eq!(r.get(x, y), Some(y as u8 + 1), "row {y}");
+        }
+        // Negative amounts bend the other way and keep every pixel.
+        let n = bend(&b, true, -4, 2, 32);
+        assert_eq!(n.get(4, 0), Some(1));
+        assert_eq!(n.get(0, 2), Some(3));
+        assert_eq!(n.pixels.iter().filter(|&&p| p != 0).count(), 5);
+        // Vertical bend works on columns.
+        let v = bend(&rotate_90(&b), false, 4, 2, 32);
+        assert_eq!((v.width, v.height), (5, 5));
+        assert_eq!(bend(&b, true, 0, 2, 32), b);
+        // Too small to bend.
+        let tiny = stretch(&b, 1, 2);
+        assert_eq!(bend(&tiny, true, 3, 1, 32), tiny);
+    }
+
+    #[test]
+    fn handle_place_stays_inside() {
+        let b = handle_place(&sample(), 1, 1);
+        assert_eq!(b.handle, (1, 1));
+        assert_eq!(handle_place(&sample(), -4, 9).handle, (0, 1));
+        assert_eq!(handle_place(&sample(), 1, 1).pixels, sample().pixels);
+    }
+
+    #[test]
+    fn remap_fits_colours_to_the_new_palette() {
+        use crate::Rgb8;
+        let from = crate::Palette::dpaint_default_32();
+        let mut colors = from.colors().to_vec();
+        colors[5] = Rgb8::new(1, 2, 3);
+        let to = crate::Palette::new(colors).unwrap();
+        let (r, changed) = remap(&sample(), &from, &to);
+        assert_eq!(r.transparent, Some(0));
+        assert_eq!(r.pixels[0], 0);
+        let want = to.nearest(from.get(5).unwrap());
+        assert_ne!(want, 5);
+        assert_eq!(r.pixels[1], want);
+        assert_eq!(changed, 1);
+        let (same, none) = remap(&sample(), &from, &from);
+        assert_eq!((same, none), (sample(), 0));
     }
 }

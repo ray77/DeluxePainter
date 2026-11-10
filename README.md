@@ -99,6 +99,10 @@ Toolbox settings (ADR-20): right-click Grid, Symmetry or Fill, or the freehand, 
 
 Custom brushes (ADR-18): the Brush Selector (`b`) picks up the part of the page you drag over (right button: cut, leaving BG behind, one undo step; Shift: square); the BG colour becomes transparent and the mode switches to Matte, then the previous tool comes back. Every brush tool stamps the custom brush, which also follows the pointer over the page. Matte paints its own colours, Color its shape in FG (BG with the right button), Replace the whole rectangle. `B` or a right-click on the Brush Selector brings the last brush back; clicking a built-in brush drops it. The snapshot below was made with `--commands docs/design/screenshots/phase3-brushes.json --pick 24,34,25,25 --brush-commands docs/design/screenshots/phase3-brushes-stamps.json` (`--pick X,Y,W,H` picks up a brush after `--commands`; `--brush-commands FILE.json` then runs commands that stamp it).
 
+Brush transforms (ADR-30): Brush > Size > Stretch, Rotate > Any Angle / Shear, Bend > Horiz / Vert and Handle > Place are drag gestures: choose the item, the brush follows the pointer, press and drag on the page to preview, release to keep (Esc cancels, Brush > Restore returns to the picked brush). Brush > Spare and Remap work on the app's brush; none of this touches the page. Snapshot: `--commands docs/design/screenshots/phase3-brushes.json --pick 24,34,25,25 --brush-xforms 'stretch:60,30@6,160;rotate:30@85,152;shear:14@150,160;bend_h:12,12@200,160;bend_v:12,12@255,165;rotate:75@150,205'` (`--brush-xforms` stamps transformed copies of the picked brush; ops `stretch:W,H`, `rotate:DEG`, `shear:DX`, `bend_h:AMOUNT,LINE`, `bend_v:AMOUNT,LINE`, each `@X,Y`).
+
+![Stretched, rotated, sheared and bent brushes](docs/design/screenshots/phase3-brush-transforms.png)
+
 <p align="center">
   <img src="docs/design/screenshots/phase3-brushes.png" alt="A picked-up brush stamped in Matte, Replace and Color, with Dotted Freehand and a Color-mode curve" width="400">
 </p>
