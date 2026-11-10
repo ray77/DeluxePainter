@@ -119,6 +119,14 @@ impl FileAccess {
     /// refused unless `overwrite`.
     pub fn resolve_write(&self, path: &str, overwrite: bool) -> Result<PathBuf, ToolError> {
         self.require_on()?;
+        // A name must end in a file name, not `..` or `.`; checked on the raw input because
+        // Windows verbatim (`\\?\`) paths do not interpret `..` once joined.
+        if !matches!(
+            Path::new(path).components().next_back(),
+            Some(std::path::Component::Normal(_))
+        ) {
+            return Err(ToolError::invalid(format!("{path}: not a file name")));
+        }
         let abs = self.absolute(path)?;
         let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
             return Err(ToolError::invalid(format!("{path}: not a file name")));
