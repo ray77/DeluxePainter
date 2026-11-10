@@ -10,3 +10,5 @@
 - Verified: unit and fixture tests (raw plane values and notes, EHB exact indices and 64 colours, EHB save/convert round trip as 6-plane non-EHB ILBM, HAM6/HAM8 decoded pixels hand-computed, reduction note on a 64x64 HAM6, `info` text). The local `Examplepics/` folder holds no EHB or HAM file (all 5 or 8 planes).
 - Not verified: any real-world EHB/HAM file (ADR-25's open points stand: HAM8 control-bit location, line start colour, control-code mapping); the 6-planes-without-CAMG guess (a plain 64-colour file without CAMG would be read as HAM6); EHB with 64-entry CMAPs (entries 32-63 are ignored even if a writer stored non-derived values); 8-bit vs 4-bit half-brite choice for AGA files whose colours happen to be 12-bit values.
 - Consequences: a HAM picture is lossy on load (reduced to the screen's palette) and its saved copy is plain indexed. Phase 4/5 replace this with the RGBA layer plus raw planes (ADR-4), where the same reader output feeds the layer and the original planes stay the source of truth.
+
+- Review fix (fix/mcp): MCP `open_picture` follows this ADR for EHB (64 free colours, EHB bit cleared) and refuses HAM with UNSUPPORTED_FILE_TYPE.

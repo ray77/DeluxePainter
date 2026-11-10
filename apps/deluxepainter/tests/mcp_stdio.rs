@@ -278,6 +278,47 @@ fn paint_look_undo_and_files() {
 }
 
 #[test]
+fn argument_errors_are_coded_results() {
+    let mut c = Client::start();
+    initialize(&mut c);
+    let r = c.call("new_document", json!({"colors": 70000}));
+    let t = error_text(&r);
+    assert!(t.starts_with("INVALID_ARGUMENT: "), "{t}");
+    let r = c.call(
+        "get_pixels",
+        json!({"rect": {"x": 0, "y": 0, "w": -1, "h": 1}}),
+    );
+    assert!(error_text(&r).starts_with("INVALID_ARGUMENT: "), "{r}");
+}
+
+#[test]
+fn ham_and_ehb_pictures_over_stdio() {
+    let dir = std::env::temp_dir().join(format!("dpx-stdio-special-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = format!(
+        "{}/../../crates/dpx-iff/tests/data",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    for f in ["ehb-16x2.iff", "ham6-16x2.iff"] {
+        std::fs::copy(format!("{data}/{f}"), dir.join(f)).unwrap();
+    }
+    let mut c = Client::start_with(&["--allow-dir", dir.to_str().unwrap()]);
+    initialize(&mut c);
+    let r = c.call("open_picture", json!({"path": "ham6-16x2.iff"}));
+    assert!(error_text(&r).starts_with("UNSUPPORTED_FILE_TYPE: "), "{r}");
+    let r = c.call("open_picture", json!({"path": "ehb-16x2.iff"}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let r = c.call("save_picture", json!({"path": "out.png"}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let r = c.call(
+        "open_picture",
+        json!({"path": "//attacker.invalid/s/a.iff"}),
+    );
+    assert!(error_text(&r).starts_with("PATH_NOT_ALLOWED: "), "{r}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn missing_allow_dir_fails_at_startup() {
     let out = Command::new(env!("CARGO_BIN_EXE_deluxepainter"))
         .args(["mcp", "--allow-dir", "/definitely/not/a/dir"])
