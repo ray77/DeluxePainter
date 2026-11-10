@@ -39,8 +39,16 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 
 - File diagnostics (ADR-17): broken and foreign files give a short first line for the file requester plus details (chunk, offset, values) on stderr and in `info`; foreign formats are named (PBM, ACBM, ANIM, LIST, GIF, PowerPacker …); HAM with odd plane counts is refused (HAM/EHB themselves open since ADR-26). Harmless quirks (BODY ending early → colour 0, odd CMAP sizes, missing pad bytes, wrong FORM sizes, trailing data, short CRNG/CAMG, lasso) load with a note. Golden fixtures built byte by byte from the spec (1–8 planes, odd widths, ByteRun1, mask, CRNG, 4-bit CMAP, truncated and broken variants) with exact pixels and texts. Verified by tests and CLI output; the app's Load handler still has to show only the first line in the file requester (main.rs, open).
 
-Next in Phase 2:
-1. Picture ▸ Load shows only the first line of a load error in the file requester (`e.lines().next()` in main.rs, ADR-17).
+Done since (night of 2026-11-10/11, parallel agent waves; verified by unit/app tests, headless snapshots and the CI gate on macOS, Windows and Linux — **not yet tried by hand in the window**):
+- Phase 3 tools (ADR-14, 18-20, 30, 31): line, curve, rectangle, circle, ellipse, polygon (outline/filled), fill with gradients, airbrush, text, grid, symmetry (cyclic/mirror), Magnify; custom brushes (Brush Selector, cut, Matte/Color/Replace) with every tool; paint modes Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite; Brush menu incl. interactive Stretch/Rotate/Shear/Bend; requesters for Grid, Symmetry, Spacing, Fill Type, Stencil, Ranges, Arrange; spare page, colour cycling, palette files, fixed background, translucency, antialias, process.
+- Phase 4 start: `.dpxproj` project format (ADR-23); Picture ▸ Save writes it, Export.. writes ILBM/PNG/ANIM (ADR-27).
+- Phase 5 groundwork: EHB and HAM6/HAM8 codecs (ADR-25); EHB/HAM pictures open (ADR-26); HAM export not yet.
+- Phase 6 start: animation frames, Anim menu, playback, Light Table (ADR-28); IFF ANIM op-5 read/write (ADR-29) wired into Load / Anim ▸ Save / Export (ADR-32).
+- Phase 7 start: MCP server with painting, viewing and file tools in approved directories (ADR-21, 24).
+- CI on macOS, Windows and Linux (GitHub Actions).
+- An independent code review found 20 issues (2 high: a hostile .dpxproj could exhaust memory; MCP opened HAM/EHB wrongly); fixes are in progress.
+
+Still open: hand testing in the window; AnimBrush, Move, Perspective, Metamorph, Print, layers (Phase 4), HAM export, autosave.
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 
