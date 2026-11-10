@@ -75,7 +75,7 @@ Measured on `inapp_gfx_03` (Picture menu open, "Load.." highlighted).
 Not visible in the references, therefore chosen and **to calibrate**: check-mark indent (13 px, Intuition LOWCHECKWIDTH), ghost pattern for disabled items (Intuition 0x2222/0x8888 in `face`), submenu position (right of the parent with 4 px overlap, first sub item level with its parent item; flipped to the left at the screen edge), which shortcuts are displayed inside submenus.
 
 Known deviations:
-- Our font is about 1 px per glyph wider than the original screen font, so menus are wider than in the reference (Picture box 123 instead of 112 px) and title slots use text + 6 instead of text + 8 so that all seven titles fit into 320 px.
+- Our font is about 1 px per glyph wider than the original screen font, so menus are wider than in the reference (Picture box 123 instead of 112 px) and title slots use text + 6 instead of text + 8 so that all seven titles fit into 320 px. Owner decision (2026-11-10): keep the current font; the wider menus are accepted.
 - The Right-Amiga key glyph is an original drawing (an "A" cut out of a key cap), not a copy of the system imagery.
 - Color ▸ BG -> FG and BG <-> FG are undoable in DeluxePainter (not in DeluxePaint).
 - AGA addendum items (Brush ▸ Free, clipboard Cut/Paste) are not in the menus yet: their menu position is not documented.
