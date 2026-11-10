@@ -431,6 +431,7 @@ impl Painter {
             format: match format {
                 pictures::Format::Ilbm => "iff_ilbm".into(),
                 pictures::Format::Png => "png_indexed".into(),
+                pictures::Format::Anim => "iff_anim".into(),
             },
             bytes: bytes.len(),
             notes,

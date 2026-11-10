@@ -2,6 +2,7 @@
 //! ByteRun1 compression and ILBM pictures and ANIM animations. See `docs/IFF_SUPPORT_MATRIX.md`.
 
 pub mod anim;
+pub mod anim_doc;
 pub mod byterun1;
 pub mod iff;
 pub mod ilbm;

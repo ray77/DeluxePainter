@@ -112,6 +112,16 @@ pub fn snapshot_requester(kind: &str, doc: &Document) -> Option<AnimRequester> {
 impl PainterApp {
     /// The Anim menu's frame and control items and Effect ▸ LightTable.
     pub(crate) fn anim_action(&mut self, id: &str, now: f64) {
+        // ADR-32: IFF ANIM files.
+        match id {
+            "anim.load" => {
+                return self.open_file_requester(dpx_ui::file_requester::FileKind::LoadAnim);
+            }
+            "anim.save" => {
+                return self.open_file_requester(dpx_ui::file_requester::FileKind::SaveAnim);
+            }
+            _ => {}
+        }
         let doc = self.engine.document();
         let (count, current) = (doc.frame_count(), doc.current_frame());
         let max = anim::max_frames_for(doc.page().width(), doc.page().height());
