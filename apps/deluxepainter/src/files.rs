@@ -182,6 +182,32 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                         HamKind::Ham8
                     };
                     let image = decode_ham(kind, &pic.image, pic.palette.colors());
+                    if !pic.ranges.is_empty() {
+                        notes.push(format!(
+                            "{} colour-cycling ranges (CRNG) not kept",
+                            pic.ranges.len()
+                        ));
+                    }
+                    if pic.grab.is_some() {
+                        notes.push("GRAB point not kept".to_string());
+                    }
+                    match pic.masking {
+                        Masking::TransparentColor => notes.push(format!(
+                            "transparent colour {} not kept",
+                            pic.transparent_color
+                        )),
+                        Masking::HasMask => {
+                            notes.push("mask plane not kept (pages are opaque)".to_string());
+                        }
+                        Masking::None | Masking::Lasso => {}
+                    }
+                    for c in &pic.other_chunks {
+                        notes.push(format!(
+                            "{} chunk ({} bytes) not kept",
+                            dpx_iff::iff::id_str(c.id),
+                            c.data.len()
+                        ));
+                    }
                     return Ok(Loaded {
                         picture: Picture::TrueColor {
                             image,
@@ -372,7 +398,7 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
             dpx_formats::write_png(image, palette).map_err(|e| e.to_string())?
         }
     };
-    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    write_atomic(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(notes)
 }
 
@@ -609,6 +635,10 @@ fn open_anim(a: AnimContent) -> (Document, PictureExtras, Vec<String>) {
 /// picture's own size.
 pub fn page_at_least_screen(doc: Document) -> (Document, Option<String>) {
     let (sw, sh) = doc.target().screen;
+    if !doc.target().mode.screen_fits(sw, sh) {
+        let note = format!("page not enlarged: {sw}x{sh} is no screen of this mode");
+        return (doc, Some(note));
+    }
     let (pw, ph) = (doc.page().width(), doc.page().height());
     if pw >= sw && ph >= sh {
         return (doc, None);
@@ -772,12 +802,19 @@ pub fn encode_document(
 /// Writes through a temporary file in the same drawer and renames it, so a failed save never
 /// leaves a half-written picture behind.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| "no file name".to_string())?
-        .to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.dpx-tmp"));
-    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    path.file_name().ok_or_else(|| "no file name".to_string())?;
+    // A short name, so a target name at the file system's limit still saves.
+    let tmp = path.with_file_name(format!(
+        ".dpx-{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1041,7 +1078,7 @@ pub fn convert(input: &Path, output: &Path) -> Result<Vec<String>, String> {
         let (doc, extras, opened) = open_picture(loaded.picture, Target::default());
         notes.extend(opened);
         let (bytes, saved) = encode_document(&doc, &extras, output)?;
-        std::fs::write(output, bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+        write_atomic(output, &bytes).map_err(|e| format!("{}: {e}", output.display()))?;
         notes.extend(saved);
     } else {
         notes.extend(save(&loaded.picture, output)?);
@@ -1931,5 +1968,90 @@ mod tests {
         assert_eq!(doc.target().mode, DisplayMode::PAL_LORES);
         assert_eq!(doc.target().screen, (352, 272));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forty_colour_png_converts_to_iff_and_loads_the_same() {
+        let own = own_dir("png40");
+        let mut img = IndexedImage::new(12, 5, 0);
+        for x in 0..12 {
+            for y in 0..5 {
+                img.set(x, y, ((x * 5 + y) % 40) as u8);
+            }
+        }
+        let pal = Palette::new((0..40).map(|i| Rgb8::new(i * 6, i, 255 - i)).collect()).unwrap();
+        let png = own.join("a.png");
+        std::fs::write(&png, dpx_formats::write_png(&img, &pal).unwrap()).unwrap();
+        let iff = own.join("a.iff");
+        convert(&png, &iff).unwrap();
+        let loaded = load(&iff).unwrap();
+        match loaded.picture {
+            Picture::Ilbm(i) => {
+                assert_eq!(i.image, img);
+                assert_eq!(&i.palette.colors()[..40], pal.colors());
+            }
+            _ => panic!("expected an indexed picture"),
+        }
+        let _ = std::fs::remove_dir_all(own);
+    }
+
+    #[test]
+    fn ham_load_notes_dropped_extras() {
+        let mut src = Ilbm::from_indexed(IndexedImage::new(16, 2, 0), {
+            Palette::new((0..16).map(|i| Rgb8::new(i, i, i)).collect()).unwrap()
+        });
+        src.planes = 6;
+        src.camg = Some(ilbm::CAMG_HAM);
+        src.grab = Some((1, 2));
+        src.ranges.push(ColorRange {
+            rate: 1,
+            flags: 1,
+            low: 0,
+            high: 3,
+        });
+        src.other_chunks.push(dpx_iff::ilbm::RawChunk {
+            id: *b"DPPS",
+            data: vec![0; 4],
+        });
+        let own = own_dir("ham-extras");
+        let path = own.join("h.iff");
+        std::fs::write(&path, write_ham_like(&src)).unwrap();
+        let loaded = load(&path).unwrap();
+        let all = loaded.notes.join("|");
+        assert!(all.contains("CRNG"), "{all}");
+        assert!(all.contains("GRAB"), "{all}");
+        assert!(all.contains("DPPS"), "{all}");
+        let _ = std::fs::remove_dir_all(own);
+    }
+
+    /// The writer refuses HAM, so the CAMG is written as plain and patched afterwards.
+    fn write_ham_like(src: &Ilbm) -> Vec<u8> {
+        let mut plain = src.clone();
+        plain.camg = Some(0);
+        let mut bytes = ilbm::write(&plain, Compression::ByteRun1).unwrap();
+        let at = bytes.windows(4).position(|w| w == b"CAMG").unwrap() + 8;
+        bytes[at..at + 4].copy_from_slice(&ilbm::CAMG_HAM.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn write_atomic_handles_long_names_and_leaves_no_temp_file() {
+        let own = own_dir("atomic-long");
+        let path = own.join("n".repeat(250));
+        write_atomic(&path, b"data").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"data");
+        assert_eq!(std::fs::read_dir(&own).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(own);
+    }
+
+    #[test]
+    fn page_at_least_screen_refuses_a_hostile_screen() {
+        let doc = Document::new(8, 8, Palette::dpaint_default_32());
+        let mut t = doc.target();
+        t.screen = (u32::MAX, u32::MAX);
+        let hostile = Document::from_picture(doc.page().clone(), doc.palette().clone(), t);
+        let (out, note) = page_at_least_screen(hostile);
+        assert_eq!(out.page().width(), 8);
+        assert!(note.is_some());
     }
 }

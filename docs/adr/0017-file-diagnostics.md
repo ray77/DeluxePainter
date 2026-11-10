@@ -30,3 +30,5 @@
   - Other readers (ANIM, PBM, palette files) can reuse `iff::read_form`, the note conventions and the first-line contract.
 
 - Addendum (ADR-26): HAM and EHB pictures are no longer refused; the "arrive in Phase 5" messages are gone (HAM with a plane count other than 6/8 is still refused).
+
+Note: all file writes (save and CLI convert) go through `write_atomic`: short temp name, fsync before rename.

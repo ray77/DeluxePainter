@@ -28,7 +28,12 @@ pub const FORMAT_VERSION: u32 = 2;
 /// The version a document is written as: 1 for a single frame (byte-identical to the files
 /// of earlier builds, so they stay readable by them), 2 for an animation.
 pub fn format_version_for(doc: &Document) -> u32 {
-    if doc.frame_count() > 1 { 2 } else { 1 }
+    // Version 1 has no fps field: a one-frame document with its own rate needs version 2.
+    if doc.frame_count() > 1 || doc.fps() != anim::DEFAULT_FPS {
+        2
+    } else {
+        1
+    }
 }
 
 const MANIFEST: &str = "manifest.json";
@@ -511,6 +516,18 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
         None => None,
     };
 
+    if !m
+        .target
+        .mode
+        .screen_fits(m.target.screen.0, m.target.screen.1)
+    {
+        return Err(invalid(format!(
+            "target screen {}x{} is not valid for {}",
+            m.target.screen.0,
+            m.target.screen.1,
+            m.target.mode.name()
+        )));
+    }
     let document = Document::from_frames(frames, current, fps, palette, m.target)
         .map_err(|e| invalid(e.message))?;
     let extras = ProjectExtras {
@@ -1089,5 +1106,32 @@ mod tests {
             Document::from_picture(sample_image(8, 4, 4), sample_palette(2), Target::default());
         let e = write_project(&Project::new(doc, ProjectExtras::default())).unwrap_err();
         assert!(matches!(e, ProjectError::Write(_)), "{e}");
+    }
+
+    #[test]
+    fn hostile_target_screen_is_refused() {
+        for screen in [
+            serde_json::json!([4294967295u32, 4294967295u32]),
+            serde_json::json!([0, 0]),
+            serde_json::json!([65535, 65535]),
+        ] {
+            let bytes = with_manifest(|m| m["target"]["screen"] = screen.clone());
+            assert!(
+                matches!(read_project(&bytes), Err(ProjectError::Invalid(_))),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_frame_frame_rate_survives_as_version_2() {
+        let mut doc = project(8, 4, 4).document;
+        let frame = doc.page().clone();
+        doc =
+            Document::from_frames(vec![frame], 0, 12, doc.palette().clone(), doc.target()).unwrap();
+        let p = Project::new(doc, ProjectExtras::default());
+        let bytes = write_project(&p).unwrap();
+        assert_eq!(manifest_of(&bytes)["format_version"], 2);
+        assert_eq!(read_project(&bytes).unwrap().document.fps(), 12);
     }
 }

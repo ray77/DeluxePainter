@@ -28,3 +28,5 @@
   - App: Set #.. / Add / Copy / Delete / Goto / Set Rate requesters through the engine, keys `1` `2` `l` Alt+`l` Ctrl+`3`, undo going back to its frame, playback timing and stop frame, Light Table display and undoable Merge, project save/load/info and ILBM export note, small pages growing in every frame.
   - Snapshot `docs/design/screenshots/phase6-anim.png` (frame 2 of 3 with Previous and Next dimmed) and `phase6-anim-copy-frames.png`, looked at.
 - Not verified: real key and mouse input in the window (Alt+`l` and Ctrl+digits on macOS keyboards in particular), playback smoothness in the running app, Windows/Linux, opening a version-2 project in an older build (expected: "Project is from a newer version").
+
+Note: a single-frame document with a non-default fps is written as format version 2 (v1 has no fps); the reader refuses a target screen its mode does not allow.

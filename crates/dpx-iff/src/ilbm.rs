@@ -1052,8 +1052,11 @@ pub fn write(ilbm: &Ilbm, compression: Compression) -> Result<Vec<u8>, IlbmError
         d.extend_from_slice(&y.to_be_bytes());
         out.chunk(*b"GRAB", &d);
     }
-    if let Some(camg) = ilbm.camg {
-        out.chunk(*b"CAMG", &camg.to_be_bytes());
+    // A 6-plane file without CAMG reads back as HAM6, so a plain one always says so.
+    match ilbm.camg {
+        Some(camg) => out.chunk(*b"CAMG", &camg.to_be_bytes()),
+        None if ilbm.planes == 6 => out.chunk(*b"CAMG", &0u32.to_be_bytes()),
+        None => {}
     }
     for r in &ilbm.ranges {
         let mut d = vec![0, 0];
@@ -1408,5 +1411,15 @@ mod tests {
         let r = ccrt_to_range(&d);
         assert_eq!((r.low, r.high, r.active(), r.reverse()), (4, 9, true, true));
         assert!((r.steps_per_second() - 30.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn six_planes_without_camg_never_read_back_as_ham() {
+        let src = sample(9, 4, 40);
+        assert_eq!(src.camg, None);
+        let back = read(&write(&src, Compression::ByteRun1).unwrap()).unwrap();
+        assert_eq!(back.special, None);
+        assert_eq!(back.image, src.image);
+        assert_eq!(&back.palette.colors()[..40], src.palette.colors());
     }
 }
