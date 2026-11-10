@@ -23,6 +23,15 @@ impl Document {
         }
     }
 
+    /// A document holding an existing picture (e.g. a loaded file) at revision 0.
+    pub fn from_picture(page: IndexedImage, palette: Palette) -> Self {
+        Self {
+            page,
+            palette,
+            revision: 0,
+        }
+    }
+
     pub fn page(&self) -> &IndexedImage {
         &self.page
     }

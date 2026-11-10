@@ -12,6 +12,8 @@ authors = ["Dominik Schmidt"]
 
 [workspace.dependencies]
 dpx-core = { path = "crates/dpx-core" }
+dpx-formats = { path = "crates/dpx-formats" }
+dpx-iff = { path = "crates/dpx-iff" }
 dpx-ui = { path = "crates/dpx-ui" }
 eframe = "0.37"
 png = "0.18"

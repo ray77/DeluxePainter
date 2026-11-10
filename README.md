@@ -12,7 +12,7 @@
 
 ---
 
-> **Status: Phase 1 — first paint (pre-alpha).** The window shows a classic Amiga LoRes paint screen (title bar, toolbox, palette, pull-down menus) rendered pixel-exactly; freehand painting, tool/brush/colour selection, undo, CLR, paint-mode selection and a few menu commands work. Everything else is still to come.
+> **Status: pre-alpha (Phase 1 first paint, Phase 2 files started).** The window shows a classic Amiga LoRes paint screen (title bar, toolbox, palette, pull-down menus) rendered pixel-exactly; freehand painting, tool/brush/colour selection, undo/redo, CLR, paint-mode selection and a few menu commands work. IFF ILBM and indexed PNG pictures can be inspected, converted and opened from the command line. Everything else is still to come.
 
 <p align="center">
   <img src="docs/design/screenshots/phase1-lores-default.png" alt="DeluxePainter start screen, 320×256 LoRes at 2×" width="400">
@@ -59,7 +59,21 @@ cargo run -p deluxepainter -- --snapshot screen.png --scale 2
 
 Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` or UNDO undo, `Shift+U` or right-click on UNDO redo (64 steps); `F10` hide/show toolbox and title bar, `F9` title bar only.
 
-Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--font-preview out.png`.
+Pictures (IFF ILBM and indexed PNG; HAM/EHB and true-colour import come later):
+
+```bash
+cargo run -p deluxepainter --release -- info picture.iff
+```
+
+```bash
+cargo run -p deluxepainter --release -- convert picture.iff picture.png
+```
+
+```bash
+cargo run -p deluxepainter --release -- --open picture.iff
+```
+
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff`, `--font-preview out.png`.
 
 ## License
 

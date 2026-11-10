@@ -87,6 +87,15 @@ impl IndexedImage {
         }
     }
 
+    /// Wraps a row-major index buffer; `None` if its length is not `width * height`.
+    pub fn from_pixels(width: u32, height: u32, pixels: Vec<u8>) -> Option<Self> {
+        (pixels.len() == width as usize * height as usize).then_some(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }

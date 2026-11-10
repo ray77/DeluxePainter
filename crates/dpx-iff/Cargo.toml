@@ -1,0 +1,15 @@
+[package]
+name = "dpx-iff"
+description = "DeluxePainter IFF support: container, ByteRun1, ILBM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dpx-core.workspace = true

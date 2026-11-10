@@ -712,6 +712,8 @@ name = "deluxepainter"
 version = "0.1.0"
 dependencies = [
  "dpx-core",
+ "dpx-formats",
+ "dpx-iff",
  "dpx-ui",
  "eframe",
  "png",
@@ -780,6 +782,21 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dpx-formats"
+version = "0.1.0"
+dependencies = [
+ "dpx-core",
+ "png",
+]
+
+[[package]]
+name = "dpx-iff"
+version = "0.1.0"
+dependencies = [
+ "dpx-core",
 ]
 
 [[package]]

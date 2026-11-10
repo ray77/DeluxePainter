@@ -7,7 +7,13 @@
 //!     [--fg N] [--tool NAME[:filled]]   foreground colour and selected tool
 //!     [--menu M[:I[:S]]]                open menu M (0 = Picture), highlight item I / sub item S
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
+//! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
+//! `deluxepainter info <file>`           describe an IFF ILBM or PNG picture
+//! `deluxepainter convert <in> <out>`    convert between IFF ILBM and PNG
 
+mod files;
+
+use std::path::Path;
 use std::sync::Arc;
 
 use dpx_core::{Axis, Command, Document, Engine, ErrorCode, IndexedImage, Palette, raster};
@@ -29,6 +35,28 @@ fn gold16() -> Palette {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
+    match (args.get(1).map(String::as_str), &args[args.len().min(2)..]) {
+        (Some("info"), [path]) => exit_with(files::info(Path::new(path)).map(|s| print!("{s}"))),
+        (Some("convert"), [input, output]) => exit_with(
+            files::convert(Path::new(input), Path::new(output))
+                .map(|notes| notes.iter().for_each(|n| eprintln!("note: {n}"))),
+        ),
+        (Some("info" | "convert"), _) => {
+            eprintln!("usage: deluxepainter info <file> | convert <in> <out>");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+    let opened = arg_value(&args, "--open").map(|p| match files::load(Path::new(&p)) {
+        Ok(loaded) => {
+            loaded.notes.iter().for_each(|n| eprintln!("note: {n}"));
+            loaded.picture
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    });
     if let Some(path) = arg_value(&args, "--font-preview") {
         if let Err(e) = font_preview(&path) {
             eprintln!("font preview failed: {e}");
@@ -44,9 +72,15 @@ fn main() -> eframe::Result {
         let scale = arg_value(&args, "--scale")
             .and_then(|s| s.parse().ok())
             .unwrap_or(2);
-        let palette = match arg_value(&args, "--palette").as_deref() {
-            Some("gold16") => gold16(),
-            _ => Palette::dpaint_default_32(),
+        let (page, palette) = match &opened {
+            Some(p) => (p.image().clone(), p.palette().clone()),
+            None => (
+                IndexedImage::new(SCREEN_W as u32, SCREEN_H as u32, 0),
+                match arg_value(&args, "--palette").as_deref() {
+                    Some("gold16") => gold16(),
+                    _ => Palette::dpaint_default_32(),
+                },
+            ),
         };
         let mut ui = UiState::default();
         if let Some(fg) = arg_value(&args, "--fg").and_then(|s| s.parse().ok()) {
@@ -85,7 +119,7 @@ fn main() -> eframe::Result {
                 }
             }
         }
-        if let Err(e) = snapshot(path, scale, palette, &ui) {
+        if let Err(e) = snapshot(path, scale, &page, &palette, &ui) {
             eprintln!("snapshot failed: {e}");
             std::process::exit(1);
         }
@@ -103,7 +137,16 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "DeluxePainter",
         options,
-        Box::new(|_cc| Ok(Box::new(PainterApp::new()))),
+        Box::new(move |_cc| {
+            let mut app = PainterApp::new();
+            if let Some(p) = opened {
+                app.engine = Engine::new(Document::from_picture(
+                    p.image().clone(),
+                    p.palette().clone(),
+                ));
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -137,15 +180,26 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// Ends a headless command: prints the error and exits non-zero on failure.
+fn exit_with(result: Result<(), String>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn snapshot(
     path: &str,
     scale: usize,
-    palette: Palette,
+    page: &IndexedImage,
+    palette: &Palette,
     ui: &UiState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let page = IndexedImage::new(SCREEN_W as u32, SCREEN_H as u32, 0);
-    let screen = Screen::new(SCREEN_W, SCREEN_H).render(&page, &palette, ui);
-    let rgba = to_rgba(&screen, &palette, scale, scale);
+    let screen = Screen::new(SCREEN_W, SCREEN_H).render(page, palette, ui);
+    let rgba = to_rgba(&screen, palette, scale, scale);
     write_png(
         path,
         SCREEN_W as u32 * scale as u32,

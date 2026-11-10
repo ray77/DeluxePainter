@@ -264,3 +264,20 @@ Roundtrip: write op 5 with interleave 2 (standard ANIM5) unless source was brush
 4. CMAP low-nibble variant and EHB palette length: check real files.
 5. TINY, DPPS, PCHG, SHAM, CTBL, DEEP layouts not yet read (later phases).
 6. The Devices Manual mirror at amigadev.elowar.com could not be fetched securely (expired TLS certificate); all ILBM layout facts come from wiki.amigaos.net [S2] and cross-checks [S4][S16].
+
+## 8. Implementation status (Phase 2 start, 2026-11-10)
+
+Crate `dpx-iff` (`iff`, `byterun1`, `ilbm`), used by `deluxepainter info|convert` and `--open`.
+
+| Item | Status |
+|---|---|
+| FORM/chunk parsing, even padding, oversized FORM/chunk sizes clamped | done, tested |
+| BMHD, CMAP (4-bit fix, padded/truncated to 2^nPlanes, grey ramp without CMAP), CAMG (kept raw), CRNG (kept raw, order kept), CCRT (converted to CRNG when no CRNG), GRAB | done, tested |
+| BODY 1–8 planes, uncompressed and ByteRun1, mask plane (masking 1), masking 2 flag + transparent colour kept | done, tested |
+| Unknown chunks before BODY (DPPS, DPPV, TINY …) | kept and re-emitted before BODY |
+| Writer | canonical order BMHD, CMAP, GRAB, CAMG, CRNG*, other chunks, BODY; CMAP written in replicated 8-bit form; refuses pixels outside the palette, a palette larger than the plane count, and inconsistent masks |
+| Refused with a clear message | HAM, EHB, 6 planes without CAMG, lasso masking, >8 planes / DEEP, other FORM types (PBM, ANIM) |
+| Not done | EHB/HAM/AGA mode interpretation (Phase 5), CMAP low-nibble variant, chunks after BODY, ANIM |
+
+Verification on six real DeluxePaint-era pictures (320×200, 5 and 8 planes, ByteRun1, masking 0/2, 4-bit CMAPs, DPPS/DPPV/TINY, up to 16 CRNG): pixels and palettes of our PNG export, our ILBM rewrite and a PNG → ILBM round trip all match an independent Python ILBM decoder read with Pillow. Rewritten files are not byte-identical to the originals: the CMAP is written in replicated form (0xNN instead of 0xN0) and chunks are written in canonical order.
+

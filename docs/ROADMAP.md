@@ -19,6 +19,19 @@ Vertical slices: every phase ends with a runnable build, automated tests and rea
 1. ~~**UI layout**~~ — decided: C (extended work area) by default, A (classic fixed screen) as preference. See [design/README.md](design/README.md).
 2. ~~**Rust toolchain**~~ — decided: rustup, Rust 1.99.1 pinned in `rust-toolchain.toml`; eframe/egui 0.37.
 
+## Phase 2 status (started 2026-11-10, before Phase 1 was finished, on owner request)
+
+Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_MATRIX.md §8):
+- `dpx-iff`: IFF container, ByteRun1 (written by a Sonnet subagent, reviewed), ILBM read/write incl. CMAP 4-bit fix, CAMG, CRNG/CCRT, GRAB, mask plane, unknown chunks kept.
+- `dpx-formats`: indexed PNG import/export (palette kept exactly).
+- CLI: `deluxepainter info <file>`, `deluxepainter convert <in> <out>` (reports whatever the target format cannot store), `--open <file>` for the GUI and snapshots.
+
+Next in Phase 2:
+1. Screen-mode model (resolution, PAL/NTSC, colours, page size) with the start requester and Picture ▸ Screen Format (owner request), so loaded pictures open in their own mode.
+2. Picture ▸ Load/Save with a DeluxePaint-style file requester (needs the requester framework).
+3. True-colour PNG and JPEG import with colour reduction.
+4. Error diagnostics for broken files; more golden fixtures.
+
 ## Phase 1 status
 
 Done (verified by tests and headless snapshots):

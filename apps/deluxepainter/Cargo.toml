@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 dpx-core.workspace = true
+dpx-formats.workspace = true
+dpx-iff.workspace = true
 dpx-ui.workspace = true
 eframe.workspace = true
 png.workspace = true
