@@ -234,6 +234,7 @@ pub static MENUS: [Menu; 7] = [
         items: &[
             cmd_key("Load..", Key::Amiga('L'), "picture.load"),
             cmd_key("Save..", Key::Amiga('S'), "picture.save"),
+            cmd("Export..", "picture.export"),
             cmd_key("Delete..", Key::Amiga('D'), "picture.delete"),
             cmd_key("Print..", Key::Amiga('P'), "picture.print"),
             sub(
@@ -597,6 +598,7 @@ pub const IMPLEMENTED: &[&str] = &[
     // Picture
     "picture.load",
     "picture.save",
+    "picture.export",
     "picture.delete",
     "picture.flip_horizontal",
     "picture.flip_vertical",

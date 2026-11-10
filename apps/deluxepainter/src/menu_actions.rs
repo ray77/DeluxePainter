@@ -424,7 +424,7 @@ impl PainterApp {
             FileKind::DeleteFile => self.delete_file(path, overwrite),
             FileKind::LoadPalette => self.load_palette(path),
             FileKind::SavePalette => self.save_palette(path, overwrite),
-            FileKind::LoadPicture | FileKind::SavePicture => {}
+            FileKind::LoadPicture | FileKind::SavePicture | FileKind::ExportPicture => {}
             FileKind::LoadBrush | FileKind::SaveBrush => {
                 self.brush_file_accept(kind, path, overwrite)
             }

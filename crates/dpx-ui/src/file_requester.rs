@@ -76,7 +76,10 @@ mod geom {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
     LoadPicture,
+    /// Picture ▸ Save..: the lossless project (`.dpxproj`, ADR-27).
     SavePicture,
+    /// Picture ▸ Export..: IFF ILBM or PNG (ADR-27).
+    ExportPicture,
     /// Picture ▸ Delete..: the action button asks Yes/No before it answers (ADR-15).
     DeleteFile,
     LoadPalette,
@@ -90,7 +93,8 @@ impl FileKind {
     pub fn title(self) -> &'static str {
         match self {
             FileKind::LoadPicture => "Load Picture",
-            FileKind::SavePicture => "Save Picture",
+            FileKind::SavePicture => "Save Project",
+            FileKind::ExportPicture => "Export Picture",
             FileKind::DeleteFile => "Delete File",
             FileKind::LoadPalette => "Load Palette",
             FileKind::SavePalette => "Save Palette",
@@ -104,6 +108,7 @@ impl FileKind {
             FileKind::LoadPicture | FileKind::LoadPalette | FileKind::LoadBrush => "Load",
             FileKind::SavePicture | FileKind::SavePalette | FileKind::SaveBrush => "Save",
             FileKind::DeleteFile => "Delete",
+            FileKind::ExportPicture => "Export",
         }
     }
 }

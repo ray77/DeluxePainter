@@ -7,7 +7,7 @@
 //!     [--fg N] [--tool NAME[:filled]]   foreground colour and selected tool
 //!     [--menu M[:I[:S]]]                open menu M (0 = Picture), highlight item I / sub item S
 //!     [--requester]                     show the Screen Format requester instead
-//!     [--file-requester load|save]      show the Load/Save Picture requester
+//!     [--file-requester load|save|export] show the Load/Save/Export requester
 //!     [--drawer DIR] [--file NAME]      … listing DIR, with NAME in the File field
 //!     [--drawer-as TEXT]                … showing TEXT in the Drawer field (doc screenshots)
 //!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
@@ -347,8 +347,9 @@ fn main() -> eframe::Result {
             let kind = match kind.as_str() {
                 "load" => FileKind::LoadPicture,
                 "save" => FileKind::SavePicture,
+                "export" => FileKind::ExportPicture,
                 _ => {
-                    eprintln!("--file-requester expects load or save");
+                    eprintln!("--file-requester expects load, save or export");
                     std::process::exit(2);
                 }
             };
@@ -466,6 +467,39 @@ fn main() -> eframe::Result {
 /// Title of the note requester after Picture ▸ Load (and `--open`) and after Save.
 const LOADED: &str = "Picture loaded";
 const SAVED: &str = "Picture saved";
+const EXPORTED: &str = "Picture exported";
+
+/// Picture ▸ Save.. always writes the lossless project (ADR-27): a picture extension becomes
+/// `.dpxproj`, any other name gets `.dpxproj` appended (Amiga names often have no extension).
+fn project_path(path: &Path) -> PathBuf {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("dpxproj") => path.to_path_buf(),
+        Some("iff" | "ilbm" | "lbm" | "png" | "jpg" | "jpeg") => path.with_extension("dpxproj"),
+        _ => {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".dpxproj");
+            PathBuf::from(name)
+        }
+    }
+}
+
+/// The name Picture ▸ Export.. suggests: the picture's own name, or for a project the same
+/// name as an IFF picture (ADR-27).
+fn export_name(path: &Path) -> Option<String> {
+    let is_project = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("dpxproj"));
+    let name = if is_project {
+        path.with_extension("iff")
+    } else {
+        path.to_path_buf()
+    };
+    name.file_name().map(|n| n.to_string_lossy().into_owned())
+}
 
 /// The note requester for `notes`, or `None` when there is nothing to tell (ADR-12).
 fn note_requester(title: &str, notes: &[String]) -> Option<NoteRequester> {
@@ -810,10 +844,15 @@ impl PainterApp {
     fn open_file_requester(&mut self, kind: FileKind) {
         self.finish_stroke();
         let mut req = FileRequester::new(kind);
-        if kind == FileKind::SavePicture
-            && let Some(name) = self.picture_path.as_ref().and_then(|p| p.file_name())
-        {
-            req.set_file(&name.to_string_lossy());
+        let suggested = match (kind, &self.picture_path) {
+            (FileKind::SavePicture, Some(p)) => project_path(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            (FileKind::ExportPicture, Some(p)) => export_name(p),
+            _ => None,
+        };
+        if let Some(name) = suggested {
+            req.set_file(&name);
         }
         let start = self.last_drawer.clone().unwrap_or_else(|| ".".into());
         Self::browse(&mut req, Browse::Drawer(start));
@@ -860,7 +899,10 @@ impl PainterApp {
                 let path = browse::expand_home(&drawer).join(file);
                 match kind {
                     FileKind::LoadPicture => self.load_picture(path),
-                    FileKind::SavePicture => self.save_picture(path, overwrite),
+                    FileKind::SavePicture => {
+                        self.save_picture(project_path(&path), overwrite, false)
+                    }
+                    FileKind::ExportPicture => self.save_picture(path, overwrite, true),
                     FileKind::LoadBrush | FileKind::SaveBrush => {
                         self.brush_file_accept(kind, &path, overwrite)
                     }
@@ -902,9 +944,14 @@ impl PainterApp {
         }
     }
 
-    fn save_picture(&mut self, path: PathBuf, overwrite: bool) {
+    /// Picture ▸ Save.. (the project, `export` false) and Export.. (IFF ILBM or PNG by name,
+    /// `export` true; the picture keeps its name).
+    fn save_picture(&mut self, path: PathBuf, overwrite: bool, export: bool) {
         if path.is_dir() {
             return self.requester_message("That is a drawer".into());
+        }
+        if export && matches!(files::save_format(&path), Ok(files::SaveFormat::Project)) {
+            return self.requester_message("Use Save.. for projects".into());
         }
         if path.exists() && !overwrite {
             if let Some(req) = &mut self.ui.file_requester {
@@ -920,9 +967,12 @@ impl PainterApp {
                     eprintln!("note: {}: {n}", path.display());
                 }
                 self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
-                self.picture_path = Some(path);
                 self.ui.file_requester = None;
-                self.ui.note_requester = note_requester(SAVED, &notes);
+                self.ui.note_requester =
+                    note_requester(if export { EXPORTED } else { SAVED }, &notes);
+                if !export {
+                    self.picture_path = Some(path);
+                }
             }
             Err(e) => {
                 eprintln!("{}: {e}", path.display());
@@ -1192,6 +1242,7 @@ impl PainterApp {
                 "picture.show_page" => self.open_show_page(),
                 "picture.load" => self.open_file_requester(FileKind::LoadPicture),
                 "picture.save" => self.open_file_requester(FileKind::SavePicture),
+                "picture.export" => self.open_file_requester(FileKind::ExportPicture),
                 "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 // ADR-15 (menu_actions.rs).
                 "spare.swap" => self.swap_spare(),
@@ -2084,7 +2135,7 @@ mod tests {
     #[test]
     fn menu_spec_parsing() {
         assert_eq!(parse_menu_spec("0"), Some((0, None, None)));
-        assert_eq!(parse_menu_spec("0:4:1"), Some((0, Some(4), Some(1))));
+        assert_eq!(parse_menu_spec("0:5:1"), Some((0, Some(5), Some(1))));
         assert_eq!(parse_menu_spec("7"), None);
         assert_eq!(parse_menu_spec("0:0:0"), None, "Load.. has no submenu");
         assert_eq!(parse_menu_spec("0:99"), None);
@@ -2190,8 +2241,38 @@ mod tests {
         assert_eq!(app.page(), &img);
         assert_eq!(app.view().screen_w, 640);
 
-        // Save offers the current name; replacing it needs a "yes".
+        // Save writes the project and offers the picture's name as one (ADR-27).
         app.run_action(Action::Command("picture.save"), &ctx);
+        assert_eq!(
+            app.ui.file_requester.as_ref().unwrap().file(),
+            "Castle.dpxproj"
+        );
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none(), "saved without asking");
+        let project = files::load(&dir.join("Castle.dpxproj")).unwrap().picture;
+        assert_eq!(project.indexed().unwrap().0, &img);
+        assert_eq!(
+            app.picture_path.as_deref(),
+            Some(dir.join("Castle.dpxproj").as_path())
+        );
+        // A name without extension gets .dpxproj; Export refuses a project name.
+        assert_eq!(project_path(Path::new("Venus")), Path::new("Venus.dpxproj"));
+        assert_eq!(project_path(Path::new("a/V.LBM")), Path::new("a/V.dpxproj"));
+        app.run_action(Action::Command("picture.export"), &ctx);
+        assert_eq!(app.ui.file_requester.as_ref().unwrap().file(), "Castle.iff");
+        for _ in 0.."Castle.iff".len() {
+            app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
+        }
+        type_into(&mut app, "Castle.dpxproj");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(
+            app.ui.file_requester.is_some(),
+            "Export does not write projects"
+        );
+        app.file_requester_event(ReqEvent::Key(ReqKey::Escape), 0);
+
+        // Export offers the IFF name; replacing it needs a "yes"; the picture keeps its name.
+        app.run_action(Action::Command("picture.export"), &ctx);
         assert_eq!(app.ui.file_requester.as_ref().unwrap().file(), "Castle.iff");
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
         assert!(app.ui.file_requester.is_some(), "asks before replacing");
@@ -2200,9 +2281,13 @@ mod tests {
         let back = files::load(&dir.join("Castle.iff")).unwrap().picture;
         assert_eq!(back.indexed().unwrap().0, &img);
         assert_eq!(back.camg(), Some(0x0002_9000), "AGA PAL HiRes mode id");
+        assert_eq!(
+            app.picture_path.as_deref(),
+            Some(dir.join("Castle.dpxproj").as_path())
+        );
 
         // A new name with .png writes PNG; JPEG is refused with a message.
-        app.run_action(Action::Command("picture.save"), &ctx);
+        app.run_action(Action::Command("picture.export"), &ctx);
         for _ in 0.."Castle.iff".len() {
             app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
         }
@@ -2382,8 +2467,8 @@ mod tests {
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
         assert!(app.ui.note_requester.is_none());
 
-        // Saving PNG tells what PNG cannot store (the display mode); Return closes.
-        app.run_action(Action::Command("picture.save"), &ctx);
+        // Exporting PNG tells what PNG cannot store (the display mode); Return closes.
+        app.run_action(Action::Command("picture.export"), &ctx);
         for _ in 0.."Plain.iff".len() {
             app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
         }

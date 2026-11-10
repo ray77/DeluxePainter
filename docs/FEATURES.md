@@ -73,7 +73,7 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 
 | P | Feature | Notes |
 |---|---|---|
-| P0 | `.dpxproj` save/open — lossless, atomic writes | ADR-1, `DPXPROJ_FORMAT.md` (Phase 4) |
+| P0 | `.dpxproj` save/open — lossless, atomic writes | Picture ▸ Save.. writes the project, Load.. opens it, Export.. writes IFF ILBM / PNG (ADR-23, ADR-27, [PROJECT_FORMAT.md](PROJECT_FORMAT.md)); one layer, no undo history or spare page yet |
 | P1 | Layers: add/delete/rename/reorder, visibility, lock, opacity, Normal blend | |
 | P1 | Layer groups | |
 | P1 | Autosave & crash recovery | |
