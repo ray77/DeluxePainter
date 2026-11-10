@@ -57,7 +57,7 @@ Headless snapshot of the start screen (used for visual comparison tests):
 cargo run -p deluxepainter -- --snapshot screen.png --scale 2
 ```
 
-Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` undo; `F10` hide/show toolbox and title bar, `F9` title bar only.
+Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` or UNDO undo, `Shift+U` or right-click on UNDO redo (64 steps); `F10` hide/show toolbox and title bar, `F9` title bar only.
 
 Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--font-preview out.png`.
 

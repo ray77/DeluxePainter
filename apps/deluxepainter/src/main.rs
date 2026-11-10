@@ -10,14 +10,13 @@
 
 use std::sync::Arc;
 
-use dpx_core::{IndexedImage, Palette, raster};
+use dpx_core::{Axis, Command, Document, Engine, ErrorCode, IndexedImage, Palette, raster};
 use dpx_ui::menu::{self, MENUS};
 use dpx_ui::{Action, Hit, PaintMode, Screen, Tool, UiState, to_rgba};
 use eframe::egui;
 
 const SCREEN_W: i32 = 320;
 const SCREEN_H: i32 = 256;
-const MAX_UNDO: usize = 64;
 
 /// A small 16-colour palette (blacks, blues, golds) to demonstrate palette-derived UI pens.
 fn gold16() -> Palette {
@@ -204,57 +203,118 @@ fn app_icon() -> egui::IconData {
 }
 
 struct PainterApp {
-    palette: Palette,
-    page: IndexedImage,
+    /// The document; every change goes through its command engine.
+    engine: Engine,
     ui: UiState,
     screen: Screen,
-    undo: Vec<IndexedImage>,
     texture: Option<egui::TextureHandle>,
     dirty: bool,
-    /// Last painted page position and the colour while a stroke is in progress.
-    stroke: Option<((i32, i32), u8)>,
+    stroke: Option<Stroke>,
+}
+
+/// A freehand stroke in progress: drawn into a preview copy of the page with the same raster
+/// code the engine uses, and committed as one [`Command::Stroke`] when the button is released.
+struct Stroke {
+    preview: IndexedImage,
+    brush: Vec<(i32, i32)>,
+    color: u8,
+    continuous: bool,
+    points: Vec<(i32, i32)>,
 }
 
 impl PainterApp {
     fn new() -> Self {
+        let doc = Document::new(
+            SCREEN_W as u32,
+            SCREEN_H as u32,
+            Palette::dpaint_default_32(),
+        );
         Self {
-            palette: Palette::dpaint_default_32(),
-            page: IndexedImage::new(SCREEN_W as u32, SCREEN_H as u32, 0),
+            engine: Engine::new(doc),
             ui: UiState::default(),
             screen: Screen::new(SCREEN_W, SCREEN_H),
-            undo: Vec::new(),
             texture: None,
             dirty: true,
             stroke: None,
         }
     }
 
-    fn push_undo(&mut self) {
-        if self.undo.len() == MAX_UNDO {
-            self.undo.remove(0);
-        }
-        self.undo.push(self.page.clone());
+    fn palette(&self) -> &Palette {
+        self.engine.document().palette()
     }
 
-    fn stamp(&mut self, x: i32, y: i32, color: u8) {
-        for (dx, dy) in dpx_ui::toolbox::BUILTIN_BRUSHES[self.ui.brush].footprint() {
-            self.page.set(x + dx, y + dy, color);
+    /// The page as shown: the stroke preview while painting, else the document page.
+    fn page(&self) -> &IndexedImage {
+        self.stroke
+            .as_ref()
+            .map_or(self.engine.document().page(), |s| &s.preview)
+    }
+
+    /// Executes a command; a pending stroke is committed first so the order stays intact.
+    fn run(&mut self, command: Command) {
+        self.finish_stroke();
+        self.execute(command);
+    }
+
+    fn execute(&mut self, command: Command) {
+        if let Err(e) = self.engine.execute(command) {
+            eprintln!("command rejected: {e}");
         }
         self.dirty = true;
     }
 
+    fn undo(&mut self) {
+        self.finish_stroke();
+        Self::report(self.engine.undo(), ErrorCode::NothingToUndo);
+        self.dirty = true;
+    }
+
+    fn redo(&mut self) {
+        self.finish_stroke();
+        Self::report(self.engine.redo(), ErrorCode::NothingToRedo);
+        self.dirty = true;
+    }
+
+    /// Logs unexpected engine errors; an empty undo/redo list is normal.
+    fn report<T>(result: Result<T, dpx_core::CommandError>, expected: ErrorCode) {
+        if let Err(e) = result
+            && e.code != expected
+        {
+            eprintln!("{e}");
+        }
+    }
+
+    fn start_stroke(&mut self, x: i32, y: i32, color: u8) {
+        self.finish_stroke();
+        let brush = dpx_ui::toolbox::BUILTIN_BRUSHES[self.ui.brush].footprint();
+        let continuous = self.ui.tool == Tool::ContinuousFreehand;
+        let mut preview = self.engine.document().page().clone();
+        raster::stroke(&mut preview, &brush, color, &[(x, y)], continuous);
+        self.stroke = Some(Stroke {
+            preview,
+            brush,
+            color,
+            continuous,
+            points: vec![(x, y)],
+        });
+        self.dirty = true;
+    }
+
+    fn finish_stroke(&mut self) {
+        if let Some(s) = self.stroke.take() {
+            self.execute(Command::Stroke {
+                brush: s.brush,
+                color: s.color,
+                points: s.points,
+                continuous: s.continuous,
+            });
+        }
+    }
+
     fn select_tool(&mut self, tool: Tool, filled_half: bool) {
         match tool {
-            Tool::Undo => {
-                if let Some(prev) = self.undo.pop() {
-                    self.page = prev;
-                }
-            }
-            Tool::Clear => {
-                self.push_undo();
-                let (w, h) = (self.page.width() as i32, self.page.height() as i32);
-                self.page.fill_rect(0, 0, w, h, self.ui.bg);
-            }
+            Tool::Undo => self.undo(),
+            Tool::Clear => self.run(Command::Clear { color: self.ui.bg }),
             _ => {
                 self.ui.tool = tool;
                 self.ui.filled = filled_half;
@@ -265,6 +325,10 @@ impl PainterApp {
 
     fn handle_press(&mut self, hit: Hit, right: bool) {
         match hit {
+            // DeluxePaint has one undo level; the right button on UNDO is our redo.
+            Hit::Tool {
+                tool: Tool::Undo, ..
+            } if right => self.redo(),
             Hit::Tool { tool, filled_half } => self.select_tool(tool, filled_half),
             Hit::Brush(i) => {
                 self.ui.brush = i;
@@ -283,10 +347,8 @@ impl PainterApp {
                     self.ui.tool,
                     Tool::DottedFreehand | Tool::ContinuousFreehand
                 ) {
-                    self.push_undo();
                     let color = if right { self.ui.bg } else { self.ui.fg };
-                    self.stamp(x, y, color);
-                    self.stroke = Some(((x, y), color));
+                    self.start_stroke(x, y, color);
                 }
             }
             Hit::TitleBar | Hit::Indicator | Hit::ToolboxBackground => {}
@@ -299,26 +361,24 @@ impl PainterApp {
             Action::Mode(m) => self.ui.mode = m,
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::Command(id) => match id {
-                "picture.flip_horizontal" => {
-                    self.push_undo();
-                    self.page.flip_horizontal();
-                }
-                "picture.flip_vertical" => {
-                    self.push_undo();
-                    self.page.flip_vertical();
-                }
+                "picture.flip_horizontal" => self.run(Command::Flip {
+                    axis: Axis::Horizontal,
+                }),
+                "picture.flip_vertical" => self.run(Command::Flip {
+                    axis: Axis::Vertical,
+                }),
                 // DeluxePaint cannot undo these two; DeluxePainter keeps them undoable.
-                "color.bg_to_fg" => {
-                    self.push_undo();
-                    self.page.replace_index(self.ui.bg, self.ui.fg);
-                }
-                "color.swap_bg_fg" => {
-                    self.push_undo();
-                    self.page.swap_indices(self.ui.bg, self.ui.fg);
-                }
-                "palette.default" if self.palette.len() == 32 => {
-                    self.palette = Palette::dpaint_default_32();
-                }
+                "color.bg_to_fg" => self.run(Command::ReplaceColor {
+                    from: self.ui.bg,
+                    to: self.ui.fg,
+                }),
+                "color.swap_bg_fg" => self.run(Command::SwapColors {
+                    a: self.ui.bg,
+                    b: self.ui.fg,
+                }),
+                "palette.default" if self.palette().len() == 32 => self.run(Command::SetPalette {
+                    colors: Palette::dpaint_default_32().colors().to_vec(),
+                }),
                 "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 _ => {}
             },
@@ -327,21 +387,24 @@ impl PainterApp {
     }
 
     fn handle_drag(&mut self, x: i32, y: i32) {
-        let Some((last, color)) = self.stroke else {
+        let Some(s) = &mut self.stroke else {
             return;
         };
+        let last = *s.points.last().expect("a stroke starts with one point");
         if last == (x, y) {
             return;
         }
-        match self.ui.tool {
-            Tool::ContinuousFreehand => {
-                for (px, py) in raster::line_points(last, (x, y)).into_iter().skip(1) {
-                    self.stamp(px, py, color);
-                }
-            }
-            _ => self.stamp(x, y, color),
-        }
-        self.stroke = Some(((x, y), color));
+        // Stamping the previous point again changes nothing, so the preview equals the
+        // committed stroke (see `raster::stroke`).
+        raster::stroke(
+            &mut s.preview,
+            &s.brush,
+            s.color,
+            &[last, (x, y)],
+            s.continuous,
+        );
+        s.points.push((x, y));
+        self.dirty = true;
     }
 }
 
@@ -402,7 +465,7 @@ impl eframe::App for PainterApp {
             }
         } else if let Some(pos) = hover {
             let (sx, sy) = to_screen(pos);
-            let hit = self.screen.hit_test(self.palette.len(), &self.ui, sx, sy);
+            let hit = self.screen.hit_test(self.palette().len(), &self.ui, sx, sy);
             let on_page = match hit {
                 Hit::Page { x, y } => Some((x, y)),
                 _ => None,
@@ -424,7 +487,7 @@ impl eframe::App for PainterApp {
             }
         }
         if !(down_l || down_r) {
-            self.stroke = None;
+            self.finish_stroke();
         }
         if self.ui.menu.active {
             // Keyboard shortcuts are ignored while the menu strip is shown.
@@ -459,8 +522,14 @@ impl eframe::App for PainterApp {
                 }
             }
         });
-        if ctx.input(|i| i.key_pressed(egui::Key::U)) {
-            self.select_tool(Tool::Undo, false);
+        // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
+        let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
+        if undo_key {
+            if shift {
+                self.redo();
+            } else {
+                self.undo();
+            }
         }
         self.upload_and_paint(ui, &ctx, rect, area);
     }
@@ -476,8 +545,8 @@ impl PainterApp {
     ) {
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
-            let screen = self.screen.render(&self.page, &self.palette, &self.ui);
-            let rgba = to_rgba(&screen, &self.palette, 1, 1);
+            let screen = self.screen.render(self.page(), self.palette(), &self.ui);
+            let rgba = to_rgba(&screen, self.palette(), 1, 1);
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [SCREEN_W as usize, SCREEN_H as usize],
                 &rgba,
@@ -519,14 +588,17 @@ mod tests {
     fn menu_actions_change_the_document_and_ui() {
         let ctx = egui::Context::default();
         let mut app = PainterApp::new();
-        app.page.set(0, 0, 5);
+        app.ui.fg = 5;
+        app.handle_press(Hit::Page { x: 0, y: 0 }, false);
+        app.finish_stroke();
+        assert_eq!(app.page().get(0, 0), Some(5));
         app.run_action(Action::Command("picture.flip_horizontal"), &ctx);
-        assert_eq!(app.page.get(SCREEN_W - 1, 0), Some(5));
+        assert_eq!(app.page().get(SCREEN_W - 1, 0), Some(5));
         app.run_action(Action::Command("picture.flip_vertical"), &ctx);
-        assert_eq!(app.page.get(SCREEN_W - 1, SCREEN_H - 1), Some(5));
+        assert_eq!(app.page().get(SCREEN_W - 1, SCREEN_H - 1), Some(5));
         app.select_tool(Tool::Undo, false);
         app.select_tool(Tool::Undo, false);
-        assert_eq!(app.page.get(0, 0), Some(5), "flips are undoable");
+        assert_eq!(app.page().get(0, 0), Some(5), "flips are undoable");
 
         app.run_action(Action::Mode(PaintMode::Smear), &ctx);
         assert_eq!(app.ui.mode, PaintMode::Smear);
@@ -535,6 +607,50 @@ mod tests {
 
         // BG -> FG recolours background pixels with the foreground colour.
         app.run_action(Action::Command("color.bg_to_fg"), &ctx);
-        assert_eq!(app.page.get(1, 1), Some(app.ui.fg));
+        assert_eq!(app.page().get(1, 1), Some(app.ui.fg));
+    }
+
+    #[test]
+    fn a_stroke_is_previewed_then_committed_as_one_undo_step() {
+        let mut app = PainterApp::new();
+        app.ui.tool = Tool::ContinuousFreehand;
+        app.ui.fg = 2;
+        app.handle_press(Hit::Page { x: 10, y: 10 }, false);
+        app.handle_drag(20, 14);
+        app.handle_drag(30, 10);
+        // Shown while painting, but not yet in the document.
+        assert_eq!(app.page().get(20, 14), Some(2));
+        assert_eq!(app.engine.document().page().get(20, 14), Some(0));
+        let preview = app.page().clone();
+        app.finish_stroke();
+        assert_eq!(app.engine.document().page(), &preview);
+        assert_eq!(app.engine.document().revision(), 1);
+
+        app.undo();
+        assert_eq!(
+            app.page().get(20, 14),
+            Some(0),
+            "whole stroke undone at once"
+        );
+        app.redo();
+        assert_eq!(app.page(), &preview);
+
+        // Right-click on UNDO redoes, left-click undoes.
+        app.handle_press(
+            Hit::Tool {
+                tool: Tool::Undo,
+                filled_half: false,
+            },
+            false,
+        );
+        assert_eq!(app.page().get(20, 14), Some(0));
+        app.handle_press(
+            Hit::Tool {
+                tool: Tool::Undo,
+                filled_half: false,
+            },
+            true,
+        );
+        assert_eq!(app.page(), &preview);
     }
 }

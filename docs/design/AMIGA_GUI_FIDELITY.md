@@ -80,6 +80,7 @@ Known deviations:
 - Our font is about 1 px per glyph wider than the original screen font, so menus are wider than in the reference (Picture box 123 instead of 112 px) and title slots use text + 6 instead of text + 8 so that all seven titles fit into 320 px. Owner decision (2026-11-10): keep the current font; the wider menus are accepted.
 - The Right-Amiga key glyph is an original drawing (an "A" cut out of a key cap), not a copy of the system imagery.
 - Color ▸ BG -> FG and BG <-> FG are undoable in DeluxePainter (not in DeluxePaint).
+- Undo keeps 64 steps instead of one; `Shift+U` and a right click on UNDO redo (ADR-6).
 - AGA addendum items (Brush ▸ Free, clipboard Cut/Paste) are not in the menus yet: their menu position is not documented.
 
 ## 5. Calibration

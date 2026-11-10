@@ -2,8 +2,10 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// A 24-bit colour.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rgb8 {
     pub r: u8,
     pub g: u8,

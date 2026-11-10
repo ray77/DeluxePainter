@@ -27,10 +27,10 @@ Done (verified by tests and headless snapshots):
 - Title bar ("DeluxePainter" + paint mode), depth gadget, toolbox (brush block, 18 tools, split icons, selected-variant display), colour indicator, palette with FG frame — matched against reference screenshots.
 - Original 8×8 bitmap font, set proportionally with tabular digits.
 - Pull-down menus: full DPaint IV AGA menu set (Picture, Brush, Mode, Anim, Color, Effect, Prefs) with submenus, shortcuts, check marks and ghosted items; geometry matched against `inapp_gfx_03`. Working actions: Mode (also F1–F8), Prefs toggles (Coords readout), Picture ▸ Flip, Color ▸ BG -> FG / BG <-> FG, Palette ▸ Default Palette, Quit. Other items are shown but do nothing yet.
+- Command engine in `dpx-core` (ADR-6): validated, serialisable commands (stroke, clear, flip, replace/swap colours, set palette), 64-step undo/redo, revision checks and dry runs. Freehand strokes are previewed and committed as one undo step; all menu commands go through it.
 - Window with integer nearest-neighbour scaling (starts; painting and menu handling are covered by unit tests of the logic, not yet by an automated UI test).
 
 Next:
-1. Command engine with multi-level undo in `dpx-core`; move painting and menu commands there.
-2. Zoom/Magnify and pixel grid.
-3. Requester framework (Screen Format first) and HiRes geometry.
-4. MCP spike (`app_status`, `new_document`, `get_document_state`) and CI on macOS/Windows/Linux.
+1. Zoom/Magnify and pixel grid.
+2. Requester framework (Screen Format first) and HiRes geometry.
+3. MCP spike (`app_status`, `new_document`, `get_document_state`) on top of the engine, and CI on macOS/Windows/Linux.

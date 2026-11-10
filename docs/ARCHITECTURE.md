@@ -60,6 +60,8 @@ struct Document {
 
 ## 4. Command engine (ADR-2)
 
+Phase 1 status: implemented for a single page + palette; see ADR-6 for what exists today (snapshot undo, redo by replay, no transactions or tiles yet).
+
 ```rust
 enum Command {
     NewDocument{..}, SetHardwareTarget{..}, ResizeCanvas{..},
