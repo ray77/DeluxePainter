@@ -243,6 +243,22 @@ Which ops a given DPaint IV version writes is **unverified**; check by hex-dumpi
 
 Roundtrip: write op 5 with interleave 2 (standard ANIM5) unless source was brush type; keep per-frame CRNG only on the first frame; preserve reltime per frame.
 
+### 5.8 Status of the codec in `dpx_iff::anim` (ADR-29, library only, not wired into the app)
+
+| Item | Read | Write | Notes |
+|---|---|---|---|
+| FORM ANIM with first FORM ILBM (BODY, ByteRun1/none) | yes | yes (ByteRun1) | HAM/EHB first frames are read as raw plane values like the ILBM reader; the writer takes indexed frames only |
+| ANHD (40 bytes, all fields) | yes (24 bytes minimum, shorter than 40 gives a note) | yes | write: interleave 0, bits 0, w/h = frame size |
+| Method 0 (full ILBM frame) | yes | first frame only | |
+| Method 5 Byte Vertical Delta, set and XOR | yes (XOR if `bits & 6`) | set mode only | XOR bit contradiction of 5.2 handled by accepting either bit |
+| Methods 7, 8 | refused (`ANIM method 7: not supported`) | no | not implemented: only the summary in 5.5 exists as source and no sample file was available to check against |
+| Methods 1-4, 6, J | refused | no | |
+| DPAN (version, nframes, flags) | yes | yes (version 4, nframes = frames without the 2 closing frames) | DPAN carries no frame rate; timing is ANHD `rel_time` |
+| Per-frame CMAP | yes (`AnimFrame::palette`) | no | |
+| Double buffering (interleave 0 = 2) | yes, interleave 1 and others too | interleave 0 | frame 1 applies to frame 0 |
+| Closing loop frames | detected (DPAN or content) | written for 2 or more frames | `Anim::loop_frames`, `logical_frames()` |
+| First frame as delta against black | refused | no | |
+
 ## 6. Roundtrip notes
 
 | Topic | Note |
