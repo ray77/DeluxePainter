@@ -5,6 +5,7 @@
 
 use dpx_core::{GradientDirection, IndexedImage, Palette, Rect};
 
+use crate::arrange_requester::ArrangeRequester;
 use crate::form::{Form, FormResponse};
 use crate::pens::Pens;
 use crate::requester::ReqEvent;
@@ -272,6 +273,40 @@ impl FillRequester {
     }
 }
 
+// ------------------------------------------------------------ Translucency
+
+/// Translucency limits in percent of the picture that stays.
+pub const TRANSLUCENCY_RANGE: (i32, i32) = (0, 100);
+
+/// Effect ▸ Translucency ▸ Settings..: the share of the picture that remains under the paint
+/// (DeluxePaint uses a slider; this is a number field, ADR-31).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslucencyRequester {
+    form: Form,
+}
+
+impl TranslucencyRequester {
+    pub fn new(percent: u8) -> Self {
+        let mut form = Form::new("Translucency", 184, 62);
+        form.field(
+            "Picture stays",
+            (8, 20),
+            Rect::new(100, 19, 36, 9),
+            TRANSLUCENCY_RANGE,
+            i32::from(percent),
+            None,
+        );
+        form.text((142, 20), "%");
+        form.text((8, 33), "0 = solid paint, 100 = none");
+        Self { form }
+    }
+
+    /// Percent of the picture that remains.
+    pub fn percent(&self) -> u8 {
+        self.form.number(0).clamp(0, 100) as u8
+    }
+}
+
 // --------------------------------------------------------------- the enum
 
 /// The one modal requester of the toolbox settings.
@@ -282,6 +317,10 @@ pub enum ToolRequester {
     Spacing(SpacingRequester),
     Fill(FillRequester),
     Stencil(StencilRequester),
+    /// Color ▸ Palette ▸ Arrange (ADR-31).
+    Arrange(ArrangeRequester),
+    /// Effect ▸ Translucency ▸ Settings.. (ADR-31).
+    Translucency(TranslucencyRequester),
 }
 
 impl ToolRequester {
@@ -291,7 +330,8 @@ impl ToolRequester {
             ToolRequester::Symmetry(r) => Some(&r.form),
             ToolRequester::Spacing(r) => Some(&r.form),
             ToolRequester::Fill(r) => Some(&r.form),
-            ToolRequester::Stencil(_) => None,
+            ToolRequester::Translucency(r) => Some(&r.form),
+            ToolRequester::Stencil(_) | ToolRequester::Arrange(_) => None,
         }
     }
 
@@ -299,7 +339,8 @@ impl ToolRequester {
         match (self.form(), self) {
             (Some(f), _) => f.size(),
             (None, ToolRequester::Stencil(r)) => r.size(),
-            _ => unreachable!("every requester but Stencil is a form"),
+            (None, ToolRequester::Arrange(r)) => r.size(),
+            _ => unreachable!("every requester but Stencil and Arrange is a form"),
         }
     }
 
@@ -317,6 +358,8 @@ impl ToolRequester {
             ToolRequester::Spacing(r) => r.form.handle(event).into(),
             ToolRequester::Fill(r) => r.form.handle(event).into(),
             ToolRequester::Stencil(r) => r.handle(event),
+            ToolRequester::Arrange(r) => r.handle(event),
+            ToolRequester::Translucency(r) => r.form.handle(event).into(),
         }
     }
 
@@ -324,6 +367,7 @@ impl ToolRequester {
     pub fn render(&self, pens: &Pens, palette: &Palette) -> IndexedImage {
         match self {
             ToolRequester::Stencil(r) => r.render(pens, palette),
+            ToolRequester::Arrange(r) => r.render(pens, palette),
             _ => self.form().expect("a form requester").render(pens),
         }
     }

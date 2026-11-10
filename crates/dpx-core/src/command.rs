@@ -11,7 +11,7 @@ use crate::document::{Document, check_frame_count};
 use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
 use crate::mode::DisplayMode;
-use crate::paint::{BrushImage, DrawMode};
+use crate::paint::{BrushImage, DrawMode, PaintFx};
 use crate::palette::{Palette, Rgb8};
 use crate::shapes::{Shape, Symmetry};
 
@@ -66,6 +66,9 @@ pub enum Command {
         /// Painted with the right mouse button.
         #[serde(default, skip_serializing_if = "is_default")]
         right: bool,
+        /// Effect menu: Translucency, Process, AntiAlias (ADR-31).
+        #[serde(default, skip_serializing_if = "is_default")]
+        fx: PaintFx,
     },
     /// A drawing-tool shape (ADR-14): the brush stamped along the outline, or with `filled` a
     /// solid shape in `color` (the brush is not used). With `symmetry`, rotated copies too.
@@ -89,6 +92,9 @@ pub enum Command {
         stencil: Option<Vec<bool>>,
         #[serde(default, skip_serializing_if = "is_default")]
         right: bool,
+        /// Effect menu: Translucency, Process, AntiAlias (ADR-31).
+        #[serde(default, skip_serializing_if = "is_default")]
+        fx: PaintFx,
     },
     /// Fill tool: the 4-connected region of the colour at (`x`, `y`) becomes `color`, or with
     /// a gradient `fill` (ADR-20) steps through its colour range.
@@ -174,6 +180,9 @@ pub enum Command {
     GotoFrame { frame: u32 },
     /// Anim ▸ Control ▸ Set Rate..: playback rate, 1 to 60 frames per second.
     SetFrameRate { fps: u8 },
+    /// Color ▸ Palette ▸ Arrange (ADR-31): reorders the palette, `order[new] = old` (a
+    /// permutation of all entries), and renumbers the pixels so the picture looks the same.
+    ArrangePalette { order: Vec<u8> },
 }
 
 impl Command {
@@ -437,6 +446,16 @@ impl Command {
             | Command::DeleteFrames { .. }
             | Command::GotoFrame { .. }
             | Command::SetFrameRate { .. } => unreachable!("frame commands are checked above"),
+            Command::ArrangePalette { order } => {
+                if crate::remap::is_permutation(order, colors) {
+                    Ok(())
+                } else {
+                    Err(CommandError::new(
+                        ErrorCode::PaletteRangeInvalid,
+                        format!("order must be a permutation of the {colors} palette entries"),
+                    ))
+                }
+            }
         }
     }
 
@@ -472,6 +491,7 @@ impl Command {
             | Command::InsertFrameCopies { .. }
             | Command::DeleteFrames { .. } => Footprint::Frames,
             Command::GotoFrame { .. } | Command::SetFrameRate { .. } => Footprint::Setting,
+            Command::ArrangePalette { .. } => Footprint::Document,
         }
     }
 
@@ -569,6 +589,17 @@ impl Command {
             | Command::DeleteFrames { .. }
             | Command::GotoFrame { .. }
             | Command::SetFrameRate { .. } => unreachable!("frame commands are applied above"),
+            Command::ArrangePalette { order } => {
+                // Every animation frame shares the palette (ADR-28), so all are renumbered.
+                doc.for_each_frame(|frame| {
+                    let pixels = crate::remap::reindex(frame.pixels(), order);
+                    *frame = IndexedImage::from_pixels(frame.width(), frame.height(), pixels)
+                        .expect("same size");
+                });
+                doc.palette =
+                    Palette::new(crate::remap::arranged_palette(doc.palette.colors(), order))
+                        .expect("same number of colours");
+            }
         }
     }
 }
@@ -770,6 +801,7 @@ mod tests {
                 range: None,
                 stencil: None,
                 right: false,
+                fx: Default::default(),
             }
         );
         // Without the paint fields set, the JSON stays as it was before ADR-18.

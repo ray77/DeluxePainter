@@ -132,6 +132,9 @@ pub struct Pen<'a> {
     /// Palette, range, stencil, the page before the command and the button; `motion` is
     /// set for each stamp.
     pub ctx: PaintContext<'a>,
+    /// The Effect menu: Translucency, Process and the AntiAlias of custom brush edges
+    /// (ADR-31).
+    pub fx: paint::PaintFx,
 }
 
 impl Pen<'_> {
@@ -149,7 +152,16 @@ impl Pen<'_> {
         let ctx = PaintContext { motion, ..self.ctx };
         let Some(b) = self.custom else {
             for &(dx, dy) in self.offsets {
-                paint::plot(img, x + dx, y + dy, self.color, self.mode, &ctx);
+                paint::plot_fx(
+                    img,
+                    x + dx,
+                    y + dy,
+                    self.color,
+                    self.mode,
+                    &ctx,
+                    &self.fx,
+                    100,
+                );
             }
             return;
         };
@@ -161,7 +173,8 @@ impl Pen<'_> {
         for by in y0..y1 {
             for bx in x0..x1 {
                 if let Some(c) = custom_color(b, bx, by, self.mode, self.color, ctx.right) {
-                    paint::plot(img, ox + bx, oy + by, c, self.mode, &ctx);
+                    let cover = paint::edge_cover(b, bx, by, self.fx.antialias);
+                    paint::plot_fx(img, ox + bx, oy + by, c, self.mode, &ctx, &self.fx, cover);
                 }
             }
         }
@@ -173,7 +186,7 @@ impl Pen<'_> {
             motion: (0, 0),
             ..self.ctx
         };
-        paint::plot(img, x, y, self.color, self.mode, &ctx);
+        paint::plot_fx(img, x, y, self.color, self.mode, &ctx, &self.fx, 100);
     }
 }
 

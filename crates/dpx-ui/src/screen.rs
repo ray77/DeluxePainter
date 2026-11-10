@@ -109,6 +109,9 @@ pub struct UiState {
     /// Current frame (from 1) and frame count, shown at the left of the title bar instead of
     /// the program name while the picture has more than one frame (AGA p.84).
     pub frame_counter: Option<(usize, usize)>,
+    /// Effect flags shown after the paint mode in the title bar (A/a, P, S/s, T; ADR-31); the
+    /// app keeps them in sync.
+    pub flags: String,
 }
 
 impl UiState {
@@ -152,6 +155,7 @@ impl Default for UiState {
             tool_requester: None,
             anim_requester: None,
             frame_counter: None,
+            flags: String::new(),
         }
     }
 }
@@ -324,9 +328,14 @@ impl Screen {
         img.hline(0, w - 1, 0, pens.shine);
         img.hline(0, w - 1, geom::TITLE_H - 1, pens.dark);
         let font = Font::builtin();
-        let title = match ui.frame_counter {
-            Some((current, count)) => format!("{current}/{count}  {}", ui.mode.title()),
-            None => format!("{APP_TITLE}  {}", ui.mode.title()),
+        let left = match ui.frame_counter {
+            Some((current, count)) => format!("{current}/{count}"),
+            None => APP_TITLE.to_string(),
+        };
+        let title = if ui.flags.is_empty() {
+            format!("{left}  {}", ui.mode.title())
+        } else {
+            format!("{left}  {}  {}", ui.mode.title(), ui.flags)
         };
         font.draw(
             img,

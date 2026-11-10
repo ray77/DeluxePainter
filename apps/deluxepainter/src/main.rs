@@ -32,6 +32,7 @@
 mod anim;
 mod browse;
 mod brush_menu;
+mod effects;
 mod files;
 mod menu_actions;
 mod settings;
@@ -1256,6 +1257,8 @@ impl PainterApp {
                 }
                 self.dirty = true;
             }
+            // Stencil ▸ Show disables painting meanwhile (ADR-31).
+            Hit::Page { .. } if self.menu_data.effects.stencil_show => {}
             Hit::Page { x, y } => self.press_page(x, y, right),
             Hit::TitleBar | Hit::Indicator | Hit::ToolboxBackground => {}
         }
@@ -1326,6 +1329,23 @@ impl PainterApp {
                     self.anim_action(id, ctx.input(|i| i.time));
                     ctx.request_repaint();
                 }
+                // ADR-31 (effects.rs).
+                "palette.arrange"
+                | "color.remap"
+                | "color_set.load"
+                | "color_set.save"
+                | "stencil.show"
+                | "stencil.load"
+                | "stencil.save"
+                | "antialias.none"
+                | "antialias.low"
+                | "antialias.high"
+                | "process.toggle"
+                | "process.tint"
+                | "process.hue"
+                | "process.value"
+                | "translucency.toggle"
+                | "translucency.settings" => self.effect_action(id),
                 // ADR-19 (brush_menu.rs).
                 id if id.starts_with("brush.") => self.brush_action(id),
                 _ => {}
@@ -1340,6 +1360,7 @@ impl eframe::App for PainterApp {
         let ctx = ui.ctx().clone();
         self.ui.has_brush = self.custom_brush.is_some();
         self.ui.can_restore = self.picked_brush.is_some();
+        self.refresh_effects();
         let ppp = ctx.pixels_per_point();
         let area = ctx.content_rect();
         let window = Window {

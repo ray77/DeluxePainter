@@ -138,6 +138,8 @@ struct Ink {
     range: Option<(u8, u8)>,
     stencil: Option<Vec<bool>>,
     right: bool,
+    /// Effect menu: Translucency, Process, AntiAlias (ADR-31).
+    fx: dpx_core::PaintFx,
 }
 
 impl Ink {
@@ -516,6 +518,7 @@ impl Stroke {
             range: ink.range,
             stencil: ink.stencil.clone(),
             right: ink.right,
+            fx: ink.fx,
         }
     }
 
@@ -537,6 +540,7 @@ impl Stroke {
                 range: ink.range,
                 stencil: ink.stencil.clone(),
                 right: ink.right,
+                fx: ink.fx,
             },
             (Some(_), true) => self.shape(
                 Shape::Polygon {
@@ -562,6 +566,7 @@ impl Stroke {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         }
     }
 
@@ -676,6 +681,8 @@ impl Stroke {
                     range: self.ink.range,
                     stencil: self.ink.stencil.clone(),
                     right: self.ink.right,
+                    // Translucency does not work with Text (manual AGA p.278).
+                    fx: Default::default(),
                 }
             }
             // The pick-up is no page command; its frame is drawn by `redraw`.
@@ -1043,6 +1050,7 @@ impl PainterApp {
             range: self.fg_range(),
             stencil: self.stencil.clone(),
             right,
+            fx: self.menu_data.effects.fx(),
         }
     }
 
@@ -1153,6 +1161,7 @@ impl PainterApp {
                 range: None,
                 stencil: None,
                 right: true,
+                fx: Default::default(),
             });
         }
         self.custom_brush = Some(brush.clone());
@@ -1938,6 +1947,7 @@ pub fn run_xform_spec(engine: &mut Engine, brush: &BrushImage, spec: &str) -> Re
                 range: None,
                 stencil: None,
                 right: false,
+                fx: Default::default(),
             })
             .map_err(|e| format!("'{entry}': {e}"))?;
     }

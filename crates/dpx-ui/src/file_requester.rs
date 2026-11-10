@@ -87,6 +87,9 @@ pub enum FileKind {
     /// Brush ▸ Load.. / Save.. (ADR-19).
     LoadBrush,
     SaveBrush,
+    /// Effect ▸ Stencil ▸ Load.. / Save.. (ADR-31).
+    LoadStencil,
+    SaveStencil,
 }
 
 impl FileKind {
@@ -100,13 +103,21 @@ impl FileKind {
             FileKind::SavePalette => "Save Palette",
             FileKind::LoadBrush => "Load Brush",
             FileKind::SaveBrush => "Save Brush",
+            FileKind::LoadStencil => "Load Stencil",
+            FileKind::SaveStencil => "Save Stencil",
         }
     }
 
     fn action(self) -> &'static str {
         match self {
-            FileKind::LoadPicture | FileKind::LoadPalette | FileKind::LoadBrush => "Load",
-            FileKind::SavePicture | FileKind::SavePalette | FileKind::SaveBrush => "Save",
+            FileKind::LoadPicture
+            | FileKind::LoadPalette
+            | FileKind::LoadBrush
+            | FileKind::LoadStencil => "Load",
+            FileKind::SavePicture
+            | FileKind::SavePalette
+            | FileKind::SaveBrush
+            | FileKind::SaveStencil => "Save",
             FileKind::DeleteFile => "Delete",
             FileKind::ExportPicture => "Export",
         }

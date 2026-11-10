@@ -51,9 +51,9 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | flip, rotate 90, halve/double, outline/trim, handle centre/corner, BG/FG colour items, load/save brush files (ILBM) done (ADR-19); stretch, any angle, shear, bend, place handle (drag gestures), spare brush and Remap done (ADR-30); Metamorph open |
 | P1 | Text tool with bitmap fonts | original fonts only; UI font done (ADR-14), Choose Font open |
 | P1 | Grid snap, symmetry (point/mirror, N-fold) | Grid and cyclic symmetry done (ADR-14); Gridding and Symmetry requesters (X/Y spacing, cyclic or mirror, order 2–40) done (ADR-20); tile open |
-| P1 | Stencil (protect colours) | Effect ▸ Stencil Make.. / Remake / Reverse / On-Off / Free done (ADR-20); Show, Paint, Load, Save open; painting code honouring it is wired separately (ADR-18) |
+| P1 | Stencil (protect colours) | Effect ▸ Stencil Make.. / Remake / Reverse / On-Off / Free done (ADR-20); Show, Load, Save done (ADR-31, own JSON file), Paint and Background ▸ Lock FG open (area stencil); painting code honouring it is wired separately (ADR-18) |
 | P1 | Paint modes (F1–F8 + menu): Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite | implemented in `paint::plot` (ADR-19, Mix is a guess); the tools call it once custom brushes are wired |
-| P2 | Effects: Translucency, Process, AntiAlias (off/low/high, off by default), fixed Background | Effect menu |
+| P2 | Effects: Translucency, Process, AntiAlias (off/low/high, off by default), fixed Background | Effect menu; Translucency, Process, AntiAlias (custom brushes) done (ADR-31) |
 | P0 | Antialiasing **off** by default for all tools | |
 | P3 | Perspective, bend/shear, metamorph | |
 
@@ -64,7 +64,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P | Feature | Notes |
 |---|---|---|
 | P0 | Colour mixer: RGB/HSV sliders, spread, copy, exchange, undo; AGA "Scale" RGB4→RGB8 | docked as a strip at the bottom like DPaint |
-| P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | |
+| P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | Arrange and picture Remap done (ADR-31); Color Set Load/Save = palette files; Use Brush Palette and brush remap open |
 | P2 | Colour cycling: 8 ranges × up to 32 colours, rate 0–63, direction, live preview (display-only) | Range requester (bottom strip); CRNG/CCRT |
 
 Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester (range 1–8, span by two clicks or a drag, rate 0–63, direction, active, clear) with two inactive default ranges on new pictures; the requester is not yet a bottom strip, has no colour beads/free RGB values, Random/Dither or Undo/Revert, and the ranges are not yet used by gradient fills, Shade or Cycle modes.

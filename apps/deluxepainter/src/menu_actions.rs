@@ -42,11 +42,21 @@ pub struct MenuData {
     pub cycle_start: Option<f64>,
     /// The palette shown while cycling (the document palette stays unchanged).
     pub cycled: Option<Palette>,
+    /// Effect menu settings, the Remap base and the stencil view (ADR-31).
+    pub effects: crate::effects::Effects,
 }
 
 impl MenuData {
     /// The palette to show for document palette `doc`: the cycled one while cycling.
     pub fn shown_palette<'a>(&'a self, doc: &'a Palette) -> &'a Palette {
+        if let Some(v) = self
+            .effects
+            .stencil_view
+            .as_ref()
+            .filter(|v| v.len() == doc.len())
+        {
+            return v;
+        }
         self.cycled
             .as_ref()
             .filter(|p| p.len() == doc.len())
@@ -424,6 +434,9 @@ impl PainterApp {
             FileKind::DeleteFile => self.delete_file(path, overwrite),
             FileKind::LoadPalette => self.load_palette(path),
             FileKind::SavePalette => self.save_palette(path, overwrite),
+            FileKind::LoadStencil | FileKind::SaveStencil => {
+                self.stencil_file_accept(kind, path, overwrite)
+            }
             FileKind::LoadPicture | FileKind::SavePicture | FileKind::ExportPicture => {}
             FileKind::LoadBrush | FileKind::SaveBrush => {
                 self.brush_file_accept(kind, path, overwrite)
@@ -609,6 +622,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         });
     }
 

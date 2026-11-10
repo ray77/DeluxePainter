@@ -299,7 +299,7 @@ impl Command {
     /// The pen a Stroke or Shape paints with (ADR-18); `before` is the page before the
     /// command. `None` for other commands.
     pub fn pen<'a>(&'a self, before: &'a IndexedImage, palette: &'a Palette) -> Option<Pen<'a>> {
-        let (brush, color, custom, mode, range, stencil, right) = match self {
+        let (brush, color, custom, mode, range, stencil, right, fx) = match self {
             Command::Stroke {
                 brush,
                 color,
@@ -308,6 +308,7 @@ impl Command {
                 range,
                 stencil,
                 right,
+                fx,
                 ..
             }
             | Command::Shape {
@@ -318,8 +319,9 @@ impl Command {
                 range,
                 stencil,
                 right,
+                fx,
                 ..
-            } => (brush, color, custom, mode, range, stencil, right),
+            } => (brush, color, custom, mode, range, stencil, right, fx),
             _ => return None,
         };
         Some(Pen {
@@ -335,6 +337,7 @@ impl Command {
                 motion: (0, 0),
                 right: *right,
             },
+            fx: *fx,
         })
     }
 
@@ -439,6 +442,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         }
     }
 
@@ -764,6 +768,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         };
         let mut img = IndexedImage::new(21, 21, 0);
         let before = img.clone();
@@ -796,6 +801,7 @@ mod tests {
                 range: None,
                 stencil: None,
                 right: false,
+                fx: Default::default(),
             }
         );
         assert_eq!(

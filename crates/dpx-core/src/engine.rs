@@ -220,6 +220,31 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrange_palette_renumbers_every_frame() {
+        let pal = Palette::dpaint_default_32();
+        let frame = |c: u8| IndexedImage::new(2, 1, c);
+        let doc = Document::from_frames(
+            vec![frame(1), frame(2)],
+            0,
+            30,
+            pal.clone(),
+            crate::Target::default(),
+        )
+        .unwrap();
+        let mut e = Engine::new(doc);
+        // Swap entries 1 and 2: both frames keep their look.
+        let mut order: Vec<u8> = (0..32).collect();
+        order.swap(1, 2);
+        e.execute(Command::ArrangePalette { order }).unwrap();
+        let d = e.document();
+        assert_eq!(d.palette().get(1), pal.get(2));
+        assert_eq!(d.frame(0).unwrap().get(0, 0), Some(2));
+        assert_eq!(d.frame(1).unwrap().get(0, 0), Some(1));
+        e.undo().unwrap();
+        assert_eq!(e.document().frame(1).unwrap().get(0, 0), Some(2));
+    }
     use crate::command::Axis;
     use crate::raster;
     use crate::{BrushImage, DrawMode, IndexedImage, Rgb8};
@@ -239,6 +264,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         }
     }
 
@@ -634,6 +660,7 @@ mod tests {
             range: None,
             stencil: None,
             right: false,
+            fx: Default::default(),
         }
     }
 
