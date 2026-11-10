@@ -276,10 +276,57 @@ Crate `dpx-iff` (`iff`, `byterun1`, `ilbm`), used by `deluxepainter info|convert
 | BODY 1–8 planes, uncompressed and ByteRun1, mask plane (masking 1), masking 2 flag + transparent colour kept | done, tested |
 | Unknown chunks before BODY (DPPS, DPPV, TINY …) | kept and re-emitted before BODY |
 | Writer | canonical order BMHD, CMAP, GRAB, CAMG, CRNG*, other chunks, BODY; CMAP written in replicated 8-bit form; refuses pixels outside the palette, a palette larger than the plane count, and inconsistent masks |
-| Refused with a clear message | HAM, EHB, 6 planes without CAMG, lasso masking, >8 planes / DEEP, other FORM types (PBM, ANIM) |
+| Refused with a clear message | HAM, EHB, 6 planes without CAMG, >8 planes / DEEP, other FORM types (PBM, ACBM, ANIM …); broken files with chunk and offset, see §9 |
+| Tolerated with a note (§9) | lasso masking (read as transparent colour), BODY ending early, odd CMAP sizes, short CAMG/CRNG/CCRT/GRAB, missing pad bytes, wrong FORM sizes, trailing data |
 | GUI Picture ▸ Save (ADR-8) | writes CAMG from the document target (AGA full mode id, OCS 16-bit), BMHD aspect and page size from the display mode, CRNG/GRAB/transparent colour kept from the loaded file; private chunks (DPPS, DPPV, TINY) and mask planes are not carried over after editing, with a note |
 | True-colour PNG/JPEG → ILBM (ADR-9) | reduced to the mode's colour count, saved with that mode's CAMG; transparent pixels → masking 2 with transparent colour 0 (pink); `convert photo.jpg out.iff` uses the default screen (AGA PAL LoRes) |
 | Not done | EHB/HAM/AGA mode interpretation (Phase 5), CMAP low-nibble variant, chunks after BODY, ANIM |
 
 Verification on six real DeluxePaint-era pictures (320×200, 5 and 8 planes, ByteRun1, masking 0/2, 4-bit CMAPs, DPPS/DPPV/TINY, up to 16 CRNG): pixels and palettes of our PNG export, our ILBM rewrite and a PNG → ILBM round trip all match an independent Python ILBM decoder read with Pillow. Rewritten files are not byte-identical to the originals: the CMAP is written in replicated form (0xNN instead of 0xN0) and chunks are written in canonical order.
 
+## 9. Diagnostics for broken and foreign files (ADR-17)
+
+Every read error is a short first line (at most 34 characters / 252 UI-font pixels, shown in the file requester) followed by details for stderr and `deluxepainter info`: which chunk, its file offset in decimal and hex (`offset 60 ($3C)`), the values found and what was expected. Tolerated quirks become notes (lower case, shown in the "Picture loaded" requester, ADR-12). Fixtures: `crates/dpx-iff/tests/golden.rs` and `crates/dpx-iff/tests/data/`.
+
+### 9.1 Refused
+
+| Case | First line | Details name |
+|---|---|---|
+| empty file / fewer than 12 bytes | `File is empty` / `File too short for IFF` | byte count |
+| does not start with FORM | `Not an IFF file` (file level: GIF, BMP, TIFF, WebP, PowerPacker, XPK, archives, Amiga programs are named) | first four bytes in hex and ASCII |
+| IFF `LIST` / `CAT` | `IFF LIST files: not supported yet` | |
+| FORM PBM / ACBM | `PBM pictures: not supported yet` | what the format is |
+| FORM ANIM | `ANIM files arrive in Phase 6` | |
+| FORM DEEP / RGBN / RGB8 / TVPP | `RGBN pictures: not supported yet` | true colour |
+| other FORM (8SVX, SMUS, FTXT …) | `IFF FORM 8SVX: not a picture` | |
+| no BMHD before the BODY | `No picture header (BMHD missing)` | chunks found with offsets, truncation |
+| no BODY, planes > 0 (also: file cut inside an earlier chunk or chunk header) | `No pixel data (BODY missing)` | planes, chunks found, where the file ends |
+| BMHD < 20 bytes / cut off | `Picture header (BMHD) too short` / `… is cut off` | offset, bytes present / needed |
+| width or height 0 | `Bad picture size 0x200` | offset |
+| more than 64 megapixels | `Picture too big: 65535x65535` | offset, limit |
+| planes 9–23, 25–31, > 32 | `Bad BMHD: 12 bitplanes` | allowed counts |
+| planes 24 / 32 | `24-bit ILBM: not supported yet` | |
+| masking > 3 / compression > 1 | `Unknown masking type 7` / `Unknown compression type 2` | known values |
+| CAMG HAM / EHB, 6 planes without CAMG | `HAM pictures arrive in Phase 5` / `EHB …` / `HAM/EHB arrive in Phase 5` | CAMG offset and value |
+| DEEP chunk inside an ILBM | `DEEP ILBM: not supported yet` | offset |
+| ByteRun1 run or literal longer than the rest of its row | `BODY: bad ByteRun1 run, row 12` | file offset of the control byte, run length, plane, bytes left |
+| PNG / JPEG decoder errors | `PNG file is cut off`, `PNG file is damaged`, `JPEG file is cut off`, `JPEG cannot be decoded`, `JPEG variant not supported` … | the decoder's own reason |
+
+### 9.2 Tolerated with a note
+
+| Quirk | Handling |
+|---|---|
+| data after the end of the FORM (XMODEM padding, a second FORM) | ignored, note with byte count and offset |
+| FORM size larger than the file, all chunks complete | ignored, note |
+| FORM size too small for the chunks that follow (e.g. 0, never patched) | file read to its end, note |
+| pad byte missing after an odd chunk, at the end or mid-file (next id checked) | read without it, note |
+| chunk header cut off after the BODY | ignored, note |
+| BODY ends early (file cut or chunk too short) | incomplete plane rows stay 0 (rest of picture colour 0), note with row, plane, byte counts for uncompressed data |
+| CMAP fewer / more entries than 2^planes | missing entries black / surplus dropped, note |
+| CMAP length not a multiple of 3; no complete colour; no CMAP | stray bytes ignored; grey ramp; grey ramp; note |
+| CAMG < 4, CRNG < 8, CCRT < 14, GRAB < 4 bytes | chunk ignored, note |
+| chunk id not printable ASCII | skipped (not re-written), note |
+| chunks after the BODY | not read, note naming them |
+| lasso masking (3) | read as transparent colour, note (no outline fill yet) |
+
+Not diagnosed: BODY data longer than needed (ignored silently, harmless); repeated BMHD/CMAP (last one wins, per spec); pixel values that are fine but meaningless (e.g. transparent colour outside the palette, which saving already reports).

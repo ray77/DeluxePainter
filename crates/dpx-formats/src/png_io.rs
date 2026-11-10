@@ -8,24 +8,54 @@ use std::io::Cursor;
 
 use dpx_core::{IndexedImage, Palette, Rgb8, Rgba8, RgbaImage};
 
+/// Errors from [`read_png`] and [`write_png`]. Read errors display as a short first line (at
+/// most 34 characters, for the file requester) followed by the details (ADR-17).
 #[derive(Debug)]
 pub enum PngError {
     Decode(png::DecodingError),
     Encode(png::EncodingError),
-    /// Valid PNG that cannot be loaded (e.g. too large).
-    Unsupported(String),
+    /// A PNG that cannot be loaded (e.g. too large): short summary and details.
+    Unsupported(&'static str, String),
     /// The picture cannot be written as described.
     Invalid(String),
 }
 
+impl PngError {
+    /// The short first line.
+    pub fn summary(&self) -> String {
+        use png::DecodingError as D;
+        match self {
+            PngError::Decode(D::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                "PNG file is cut off".into()
+            }
+            PngError::Decode(D::IoError(_)) => "PNG file cannot be read".into(),
+            PngError::Decode(D::Format(_)) => "PNG file is damaged".into(),
+            PngError::Decode(D::LimitsExceeded) => "PNG picture is too large".into(),
+            PngError::Decode(D::Parameter(_)) => "PNG decoding failed".into(),
+            PngError::Unsupported(summary, _) => (*summary).into(),
+            PngError::Encode(e) => format!("PNG encoding failed: {e}"),
+            PngError::Invalid(what) => format!("cannot write PNG: {what}"),
+        }
+    }
+
+    /// What exactly is wrong (empty for write errors).
+    pub fn details(&self) -> String {
+        match self {
+            PngError::Decode(e) => format!("The PNG decoder reports: {}", e.to_string().trim_end()),
+            PngError::Unsupported(_, details) => details.clone(),
+            PngError::Encode(_) | PngError::Invalid(_) => String::new(),
+        }
+    }
+}
+
 impl fmt::Display for PngError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PngError::Decode(e) => write!(f, "PNG decoding failed: {e}"),
-            PngError::Encode(e) => write!(f, "PNG encoding failed: {e}"),
-            PngError::Unsupported(what) => write!(f, "not supported yet: {what}"),
-            PngError::Invalid(what) => write!(f, "cannot write PNG: {what}"),
+        f.write_str(&self.summary())?;
+        let details = self.details();
+        if !details.is_empty() {
+            write!(f, "\n{details}")?;
         }
+        Ok(())
     }
 }
 
@@ -66,10 +96,13 @@ pub fn read_png(bytes: &[u8]) -> Result<PngImage, PngError> {
     let mut reader = decoder.read_info().map_err(PngError::Decode)?;
     let info = reader.info();
     if u64::from(info.width) * u64::from(info.height) > MAX_PIXELS {
-        return Err(PngError::Unsupported(format!(
-            "{}x{} exceeds the 64 megapixel limit",
-            info.width, info.height
-        )));
+        return Err(PngError::Unsupported(
+            "PNG picture is too large",
+            format!(
+                "{}x{} pixels exceed the 64 megapixel limit.",
+                info.width, info.height
+            ),
+        ));
     }
     if info.color_type != png::ColorType::Indexed {
         return read_true_color(bytes).map(PngImage::TrueColor);
@@ -78,15 +111,15 @@ pub fn read_png(bytes: &[u8]) -> Result<PngImage, PngError> {
     let plte = info
         .palette
         .as_deref()
-        .ok_or_else(|| PngError::Unsupported("indexed PNG without PLTE".into()))?
+        .ok_or_else(|| {
+            PngError::Unsupported(
+                "PNG has no palette (PLTE)",
+                "The PNG is indexed but has no PLTE chunk with its colours.".into(),
+            )
+        })?
         .to_vec();
     let trns = info.trns.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
-    let mut buf = vec![
-        0;
-        reader
-            .output_buffer_size()
-            .ok_or_else(|| PngError::Unsupported("picture too large".into()))?
-    ];
+    let mut buf = vec![0; reader.output_buffer_size().ok_or_else(too_large)?];
     let frame = reader.next_frame(&mut buf).map_err(PngError::Decode)?;
     let (w, h) = (frame.width as usize, frame.height as usize);
     let mut pixels = Vec::with_capacity(w * h);
@@ -105,14 +138,18 @@ pub fn read_png(bytes: &[u8]) -> Result<PngImage, PngError> {
         .iter()
         .map(|c| Rgb8::new(c[0], c[1], c[2]))
         .collect();
-    let palette = Palette::new(colors).map_err(|e| PngError::Unsupported(format!("PLTE: {e}")))?;
+    let palette = Palette::new(colors)
+        .map_err(|e| PngError::Unsupported("PNG palette is invalid", format!("PLTE: {e}.")))?;
     if let Some(&max) = pixels.iter().max()
         && usize::from(max) >= palette.len()
     {
-        return Err(PngError::Unsupported(format!(
-            "pixel index {max} outside the {}-entry PLTE",
-            palette.len()
-        )));
+        return Err(PngError::Unsupported(
+            "PNG pixel outside its palette",
+            format!(
+                "Pixel colour {max} is outside the {}-entry PLTE.",
+                palette.len()
+            ),
+        ));
     }
     let transparent_entries = trns
         .iter()
@@ -132,26 +169,22 @@ fn read_true_color(bytes: &[u8]) -> Result<RgbaImage, PngError> {
     let mut decoder = decoder(bytes);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(PngError::Decode)?;
-    let mut buf = vec![
-        0;
-        reader
-            .output_buffer_size()
-            .ok_or_else(|| PngError::Unsupported("picture too large".into()))?
-    ];
+    let mut buf = vec![0; reader.output_buffer_size().ok_or_else(too_large)?];
     let frame = reader.next_frame(&mut buf).map_err(PngError::Decode)?;
     let (w, h) = (frame.width as usize, frame.height as usize);
+    let internal = |what: String| PngError::Unsupported("PNG decoding failed", what);
     let channels = match frame.color_type {
         png::ColorType::Grayscale => 1,
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgb => 3,
         png::ColorType::Rgba => 4,
         png::ColorType::Indexed => {
-            return Err(PngError::Unsupported("unexpected indexed output".into()));
+            return Err(internal("Unexpected indexed decoder output.".into()));
         }
     };
     if frame.bit_depth != png::BitDepth::Eight {
-        return Err(PngError::Unsupported(format!(
-            "unexpected {:?} output",
+        return Err(internal(format!(
+            "Unexpected {:?} decoder output.",
             frame.bit_depth
         )));
     }
@@ -168,7 +201,14 @@ fn read_true_color(bytes: &[u8]) -> Result<RgbaImage, PngError> {
         }
     }
     RgbaImage::from_pixels(frame.width, frame.height, pixels)
-        .ok_or_else(|| PngError::Unsupported("truncated picture data".into()))
+        .ok_or_else(|| internal("The decoded rows are shorter than the picture.".into()))
+}
+
+fn too_large() -> PngError {
+    PngError::Unsupported(
+        "PNG picture is too large",
+        "The decoder cannot size its output buffer.".into(),
+    )
 }
 
 /// Writes an 8-bit indexed PNG with the full palette in PLTE.
@@ -364,6 +404,31 @@ mod tests {
     #[test]
     fn garbage_is_a_decode_error() {
         assert!(matches!(read_png(b"not a png"), Err(PngError::Decode(_))));
+    }
+
+    #[test]
+    fn broken_files_say_what_is_wrong() {
+        let (img, pal) = sample(8, 4, 4);
+        let good = write_png(&img, &pal).unwrap();
+        // Cut off in the middle of the picture data.
+        let e = read_png(&good[..good.len() - 20]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "PNG file is cut off\nThe PNG decoder reports: unexpected end of file"
+        );
+        // A flipped byte in the IHDR chunk: its checksum no longer matches.
+        let mut bad = good.clone();
+        bad[20] ^= 0x01;
+        let e = read_png(&bad).unwrap_err();
+        assert_eq!(e.summary(), "PNG file is damaged");
+        assert!(
+            e.details()
+                .starts_with("The PNG decoder reports: CRC error"),
+            "{e}"
+        );
+        for e in [e, read_png(b"not a png").unwrap_err()] {
+            assert!(e.summary().len() <= 34, "{e}");
+        }
     }
 
     #[test]

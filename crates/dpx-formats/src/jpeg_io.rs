@@ -5,6 +5,7 @@ use std::fmt;
 
 use dpx_core::{Rgba8, RgbaImage};
 use zune_jpeg::JpegDecoder;
+use zune_jpeg::errors::DecodeErrors;
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -12,21 +13,55 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 /// Maximum accepted picture size in pixels (64 megapixels).
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 
-/// Errors from [`read_jpeg`].
+/// Errors from [`read_jpeg`]. They display as a short first line (at most 34 characters, for
+/// the file requester) followed by the details (ADR-17).
 #[derive(Debug)]
 pub enum JpegError {
-    /// The data is not a decodable JPEG.
+    /// The data is not a decodable JPEG; holds the decoder's reason.
     Decode(String),
-    /// The JPEG is valid but outside what we accept (e.g. too large).
-    Unsupported(String),
+    /// The file ends before the decoder has what it needs; holds the decoder's reason.
+    Truncated(String),
+    /// The JPEG is valid but outside what we accept: short summary and details.
+    Unsupported(&'static str, String),
+}
+
+impl JpegError {
+    /// The short first line.
+    pub fn summary(&self) -> &'static str {
+        match self {
+            JpegError::Decode(_) => "JPEG cannot be decoded",
+            JpegError::Truncated(_) => "JPEG file is cut off",
+            JpegError::Unsupported(summary, _) => summary,
+        }
+    }
+
+    /// What exactly is wrong.
+    pub fn details(&self) -> String {
+        match self {
+            JpegError::Decode(m) | JpegError::Truncated(m) => {
+                format!("The JPEG decoder reports: {m}")
+            }
+            JpegError::Unsupported(_, details) => details.clone(),
+        }
+    }
+}
+
+/// Sorts the decoder's errors into cut-off files, unsupported variants and the rest.
+fn decoder_error(e: DecodeErrors) -> JpegError {
+    let reason = e.to_string().trim_end().to_string();
+    match e {
+        DecodeErrors::ExhaustedData | DecodeErrors::IoErrors(_) => JpegError::Truncated(reason),
+        DecodeErrors::Unsupported(_) => JpegError::Unsupported(
+            "JPEG variant not supported",
+            format!("The JPEG decoder reports: {reason}"),
+        ),
+        _ => JpegError::Decode(reason),
+    }
 }
 
 impl fmt::Display for JpegError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JpegError::Decode(m) => write!(f, "JPEG decode error: {m}"),
-            JpegError::Unsupported(m) => write!(f, "unsupported JPEG: {m}"),
-        }
+        write!(f, "{}\n{}", self.summary(), self.details())
     }
 }
 
@@ -37,19 +72,19 @@ impl std::error::Error for JpegError {}
 pub fn read_jpeg(bytes: &[u8]) -> Result<RgbaImage, JpegError> {
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    dec.decode_headers()
-        .map_err(|e| JpegError::Decode(e.to_string()))?;
+    dec.decode_headers().map_err(decoder_error)?;
     let info = dec
         .info()
         .ok_or_else(|| JpegError::Decode("missing image header".into()))?;
     let (w, h) = (u32::from(info.width), u32::from(info.height));
     if u64::from(w) * u64::from(h) > MAX_PIXELS {
-        return Err(JpegError::Unsupported(format!(
-            "{w}x{h} exceeds the 64 megapixel limit"
-        )));
+        return Err(JpegError::Unsupported(
+            "JPEG picture is too large",
+            format!("{w}x{h} pixels exceed the 64 megapixel limit."),
+        ));
     }
     let orientation = dec.exif().map_or(1, |e| exif_orientation(e));
-    let raw = dec.decode().map_err(|e| JpegError::Decode(e.to_string()))?;
+    let raw = dec.decode().map_err(decoder_error)?;
     let expected = w as usize * h as usize * 3;
     if raw.len() != expected {
         return Err(JpegError::Decode(format!(
@@ -284,11 +319,29 @@ mod tests {
     #[test]
     fn garbage_is_decode_error() {
         let junk: Vec<u8> = (0..300u32).map(|i| (i * 7919 % 251) as u8).collect();
-        assert!(matches!(read_jpeg(&junk), Err(JpegError::Decode(_))));
-        assert!(matches!(read_jpeg(&[]), Err(JpegError::Decode(_))));
-        assert!(matches!(
-            read_jpeg(&RED_BLUE[..40]),
-            Err(JpegError::Decode(_))
-        ));
+        for bytes in [&junk[..], &[], &RED_BLUE[..40]] {
+            let e = read_jpeg(bytes).unwrap_err();
+            assert!(
+                matches!(e, JpegError::Decode(_) | JpegError::Truncated(_)),
+                "{e}"
+            );
+            assert!(e.summary().len() <= 34);
+        }
+    }
+
+    #[test]
+    fn decode_errors_keep_the_decoder_reason() {
+        let e = read_jpeg(&RED_BLUE[..40]).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "JPEG file is cut off\nThe JPEG decoder reports: I/O errors Not enough bytes, \
+             expected 64 but found 15"
+        );
+        let junk: Vec<u8> = (0..300u32).map(|i| (i * 7919 % 251) as u8).collect();
+        let text = read_jpeg(&junk).unwrap_err().to_string();
+        assert!(
+            text.starts_with("JPEG cannot be decoded\nThe JPEG decoder reports: "),
+            "{text}"
+        );
     }
 }
