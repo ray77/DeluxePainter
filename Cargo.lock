@@ -902,7 +902,11 @@ dependencies = [
 name = "dpx-mcp"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "dpx-core",
+ "dpx-formats",
+ "dpx-iff",
+ "png",
  "rmcp",
  "schemars",
  "serde",

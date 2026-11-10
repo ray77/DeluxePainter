@@ -12,7 +12,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.23"
 dpx-core.workspace = true
+dpx-formats.workspace = true
+dpx-iff.workspace = true
+png.workspace = true
 rmcp = { version = "3.9", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 serde.workspace = true

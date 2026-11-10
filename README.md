@@ -95,14 +95,14 @@ Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu 
 
 ## MCP server (spike)
 
-`deluxepainter mcp` runs a headless [MCP](https://modelcontextprotocol.io) server on stdin/stdout (rmcp; stdout carries protocol messages only, logs go to stderr). It is off unless a client starts it. Tools so far: `app_status`, `new_document`, `get_document_state` (ADR-21). Example client configuration:
+`deluxepainter mcp` runs a headless [MCP](https://modelcontextprotocol.io) server on stdin/stdout (rmcp; stdout carries protocol messages only, logs go to stderr). It is off unless a client starts it. Tools: `app_status`, `new_document`, `get_document_state` (ADR-21), `execute_command` (any engine command as JSON, with `expected_revision` and `dry_run`), `undo`, `redo`, `get_palette`, `get_pixels`, `render_png` (the page as an image, so an agent can look at its work), `open_picture` and `save_picture` (ADR-24). The file tools work only inside directories you approve with `--allow-dir DIR` (repeatable); without it they fail with `FILE_ACCESS_OFF`. They read and write indexed IFF ILBM and indexed PNG; true-colour PNG and JPEG are not opened over MCP. Example client configuration:
 
 ```json
 {
   "mcpServers": {
     "deluxepainter": {
       "command": "/path/to/deluxepainter",
-      "args": ["mcp"]
+      "args": ["mcp", "--allow-dir", "/path/to/pictures"]
     }
   }
 }
