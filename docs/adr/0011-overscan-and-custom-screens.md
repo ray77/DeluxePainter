@@ -1,0 +1,39 @@
+# ADR-11: Overscan and custom screen sizes
+
+- Status: accepted (Phase 2, 2026-11-10)
+- Context: The DeluxePaint IV AGA Screen Format requester has a **Screen Size** cycle gadget with width/height boxes next to it.
+  - Its CUSTOM option "allows you to choose between the minimum and maximum sizes allowed for the chosen screen format". The maximum comes from the Workbench overscan preferences (AGA addendum p.iii–iv).
+  - DeluxePaint 4.0 offered Overscan Off / Std / Max.
+  - The reference screenshot shows "Standard" with the boxes 640/256 and an information line "Max Size = …".
+  - The full list of cycle values and the exact limits are not documented in our sources.
+- Decision:
+  - **Model:** `Target` carries `screen: (u32, u32)`. `Target::new(chipset, mode)` uses the mode's standard size. `DisplayMode::size()` stays the standard size.
+  - **Limits (`DisplayMode::screen_limits` / `screen_fits`):**
+    - The minimum is the standard width with NTSC height (200, laced 400), so a PAL screen may be NTSC-sized.
+    - The maximum is the video overscan size: 368/736/1472 × 241 (NTSC) or 283 (PAL), laced 482/566.
+    - Sizes must be whole UI pixels: HiRes widths even, SuperHiRes widths multiples of 4, laced heights even.
+    - Laced overscan heights are even. The sources quote 483/567, counting a half line; the Page Size Overscan preset uses the same even values now.
+    - The 362 vs 368 overscan width question (HARDWARE_MODES.md open point 9) is decided for 368, which also appears in DeluxePaint's Set Page Size figure.
+    - There are no Workbench preferences, so these fixed limits stand in for them.
+  - **Screen Size cycle:**
+    - **Standard / Overscan / Custom.** This is our choice; the original's list is unknown.
+    - In Custom the width/height boxes become editable (digits, Tab, Enter = Use). Otherwise they show the size.
+    - Changing the mode keeps a custom size that still fits, else it resets to the mode's standard size.
+    - The information panel shows "Size" (the chosen screen) and "Max Size" (the overscan size).
+    - `Command::SetFormat` gained `screen: Option<(u32, u32)>` (omitted = standard). It refuses screens that don't fit and pages smaller than the screen.
+  - **Pages:** pages are never smaller than the screen (ADR-10), so the minimum page, the Page Size "Standard" preset and the requester's "Screen" page choice all follow the screen size. Full Page uses the screen width.
+  - **Opening pictures:**
+    - The mode is guessed as before (ADR-7).
+    - The screen comes from the ILBM BMHD page fields if they form a valid screen for that mode (DeluxePaint writes its screen size there).
+    - Otherwise it comes from the picture size: standard if the picture fits, else the picture size rounded up to whole UI pixels, up to the overscan size.
+    - Example: a 352×272 picture opens on a 352×272 PAL LoRes screen; a 640×512 LoRes page with page fields 320×256 keeps the 320×256 screen and scrolls.
+  - **Saving:** ILBM page fields are the screen size.
+  - **True-colour import (ADR-9):** big pictures are scaled to the current screen size (overscan or custom included). Pictures that fit a standard format get their screen as above.
+  - **Display:** the window shows the screen at its size with the mode's pixel shape. The interface keeps its LoRes geometry, and the toolbox moves to the right edge of the wider screen.
+- Verified:
+  - Unit tests: limits, fit rules and picture screens in dpx-core; SetFormat with screens and JSON without `screen`; the requester cycle, typing, mode change, Keep Same and the info panel.
+  - App tests: requester → Overscan → Use → view and page 368×283 → undo.
+  - Files: an overscan ILBM opens and saves with 368×283 page fields; a 352×272 PNG gets a custom screen.
+  - Snapshots of a self-made 368×283 picture and of the requester in Custom; the GUI starts.
+  - Not verified: real Amiga overscan behaviour and DeluxePaint's own limits.
+- Consequences: The Ctrl+arrows screen position, Workbench overscan preferences and display-database modes stay out of scope. HAM/EHB arrive in Phase 5 with the same screen model.

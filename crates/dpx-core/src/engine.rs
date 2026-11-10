@@ -372,6 +372,7 @@ mod tests {
                 width: 640,
                 height: 256,
                 retain: true,
+                screen: None,
             })
             .unwrap();
         assert!(out.format_changed && out.palette_changed);
@@ -392,6 +393,7 @@ mod tests {
                 width: 640,
                 height: 256,
                 retain: true,
+                screen: None,
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
@@ -403,6 +405,7 @@ mod tests {
                 width: 100,
                 height: 50,
                 retain: false,
+                screen: None,
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -413,6 +416,7 @@ mod tests {
             width: 640,
             height: 300,
             retain: false,
+            screen: None,
         })
         .unwrap();
         assert_eq!(e.document().page(), &IndexedImage::new(640, 300, 0));
@@ -430,10 +434,7 @@ mod tests {
     #[test]
     fn set_format_respects_chipset_limits() {
         use crate::{Chipset, DisplayMode, Resolution, Target, Video};
-        let ocs = Target {
-            chipset: Chipset::Ocs,
-            mode: DisplayMode::PAL_LORES,
-        };
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
         let mut e = Engine::new(Document::from_picture(
             IndexedImage::new(8, 8, 0),
             Palette::dpaint_default_32(),
@@ -445,6 +446,7 @@ mod tests {
             width: mode.size().0,
             height: mode.size().1,
             retain: false,
+            screen: None,
         };
         let hires = DisplayMode::new(Video::Pal, Resolution::Hi, false);
         let shires = DisplayMode::new(Video::Pal, Resolution::SuperHi, false);
@@ -548,5 +550,49 @@ mod tests {
         e.undo().unwrap();
         e.undo().unwrap();
         assert_eq!(e.document().page(), &page);
+    }
+
+    #[test]
+    fn set_format_with_an_overscan_screen() {
+        use crate::{DisplayMode, Target};
+        let mut e = Engine::new(Document::from_picture(
+            IndexedImage::new(320, 256, 0),
+            Palette::dpaint_default_32(),
+            Target::default(),
+        ));
+        let fmt = |screen, width, height| Command::SetFormat {
+            mode: DisplayMode::PAL_LORES,
+            colors: 32,
+            width,
+            height,
+            retain: true,
+            screen,
+        };
+        e.execute(fmt(Some((368, 283)), 368, 283)).unwrap();
+        assert_eq!(e.document().target().screen, (368, 283));
+        assert_eq!(e.document().page().width(), 368);
+        // The page must cover the screen; the screen must fit the mode.
+        for bad in [
+            fmt(Some((368, 283)), 320, 256),
+            fmt(Some((400, 256)), 400, 256),
+            fmt(Some((320, 199)), 320, 256),
+        ] {
+            assert_eq!(e.execute(bad).unwrap_err().code, ErrorCode::InvalidArgument);
+        }
+        // Page Size now starts at the screen size.
+        let err = e
+            .execute(Command::SetPageSize {
+                width: 320,
+                height: 256,
+                fill: 0,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        e.undo().unwrap();
+        assert_eq!(e.document().target(), Target::default());
+        // JSON: the screen field is optional.
+        let json = r#"{"op":"set_format","mode":{"video":"pal","resolution":"lo","interlace":false},"colors":32,"width":320,"height":256,"retain":true}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, Command::SetFormat { screen: None, .. }));
     }
 }

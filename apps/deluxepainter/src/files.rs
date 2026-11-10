@@ -213,10 +213,11 @@ pub fn reduce_true_color(img: &RgbaImage, format: &str, current: Target) -> Redu
     let mut notes = Vec::new();
     let (target, scaled) = if fits {
         let mode = DisplayMode::guess(None, w, h);
-        (Target { mode, ..default }, None)
+        let (sw, sh) = mode.screen_for_picture(w, h);
+        (Target::new(default.chipset, mode).with_screen(sw, sh), None)
     } else {
         let mode = current.mode;
-        let (sw, sh) = mode.size();
+        let (sw, sh) = current.screen;
         let (nw, nh) = resample::fit_size(w, h, sw, sh, mode.pixel_shape());
         notes.push(format!(
             "{format} picture {w}x{h} is larger than any screen: scaled to {nw}x{nh} for {}",
@@ -276,10 +277,17 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
     let (w, h) = picture
         .indexed()
         .map_or((0, 0), |(i, _)| (i.width(), i.height()));
-    let target = Target {
-        mode: DisplayMode::guess(picture.camg(), w, h),
-        ..Target::default()
+    let mode = DisplayMode::guess(picture.camg(), w, h);
+    // The screen: the ILBM's page fields (DeluxePaint writes its screen size there) if they
+    // are a valid screen for the mode, else from the picture size (ADR-11).
+    let page_fields = match &picture {
+        Picture::Ilbm(i) => Some((i.page_width.max(0) as u32, i.page_height.max(0) as u32)),
+        _ => None,
     };
+    let (sw, sh) = page_fields
+        .filter(|&(pw, ph)| mode.screen_fits(pw, ph))
+        .unwrap_or_else(|| mode.screen_for_picture(w, h));
+    let target = Target::new(Target::default().chipset, mode).with_screen(sw, sh);
     let mut extras = PictureExtras::default();
     let mut notes = Vec::new();
     let (image, palette) = match picture {
@@ -318,7 +326,7 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
 /// Returns a note when the page grew. Used when the GUI opens a picture; `convert` keeps the
 /// picture's own size.
 pub fn page_at_least_screen(doc: Document) -> (Document, Option<String>) {
-    let (sw, sh) = doc.target().mode.size();
+    let (sw, sh) = doc.target().screen;
     let (pw, ph) = (doc.page().width(), doc.page().height());
     if pw >= sw && ph >= sh {
         return (doc, None);
@@ -384,7 +392,7 @@ pub fn encode_document(
             let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
             out.camg = Some(doc.target().camg());
             (out.x_aspect, out.y_aspect) = mode.aspect();
-            let (sw, sh) = mode.size();
+            let (sw, sh) = doc.target().screen;
             out.page_width = sw as i16;
             out.page_height = sh as i16;
             out.ranges = ranges;
@@ -798,10 +806,10 @@ mod tests {
         use dpx_core::{Resolution, Video};
         let img = photo(2000, 1500);
         // An OCS HiRes screen: 16 colours, 12-bit palette, tall pixels (1:2).
-        let current = Target {
-            chipset: Chipset::Ocs,
-            mode: DisplayMode::new(Video::Pal, Resolution::Hi, false),
-        };
+        let current = Target::new(
+            Chipset::Ocs,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        );
         let r = reduce_true_color(&img, "JPEG", current);
         assert_eq!(r.target, current);
         // 640 wide; 4:3 shown with 1:2 pixels → 480 display units = 240 lines.
@@ -886,6 +894,50 @@ mod tests {
                 .unwrap_err()
                 .contains("import-only")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn overscan_pictures_open_on_overscan_screens() {
+        let dir = std::env::temp_dir().join(format!("dpx-files-os-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A PAL LoRes overscan ILBM as DeluxePaint writes it: page fields = screen size.
+        let mut img = IndexedImage::new(368, 283, 0);
+        img.set(367, 282, 5);
+        let mut src = Ilbm::from_indexed(img.clone(), Palette::dpaint_default_32());
+        src.camg = Some(DisplayMode::PAL_LORES.mode_id());
+        (src.page_width, src.page_height) = (368, 283);
+        let (doc, _, _) = open_picture(Picture::Ilbm(Box::new(src.clone())), Target::default());
+        assert_eq!(doc.target().mode, DisplayMode::PAL_LORES);
+        assert_eq!(doc.target().screen, (368, 283));
+        // Saving writes the screen size into the page fields again.
+        let path = dir.join("overscan.iff");
+        let (bytes, _) = encode_document(&doc, &PictureExtras::default(), &path).unwrap();
+        let back = ilbm::read(&bytes).unwrap();
+        assert_eq!((back.page_width, back.page_height), (368, 283));
+        assert_eq!(back.image, img);
+
+        // Page fields that are no valid screen: the screen comes from the picture size.
+        (src.page_width, src.page_height) = (0, 0);
+        let (doc, _, _) = open_picture(Picture::Ilbm(Box::new(src.clone())), Target::default());
+        assert_eq!(doc.target().screen, (368, 283));
+        // Standard pictures keep the standard screen; bigger pages scroll.
+        let mut big = Ilbm::from_indexed(IndexedImage::new(640, 512, 0), src.palette.clone());
+        big.camg = src.camg;
+        (big.page_width, big.page_height) = (320, 256);
+        let (doc, _, _) = open_picture(Picture::Ilbm(Box::new(big)), Target::default());
+        assert_eq!(doc.target().screen, (320, 256));
+
+        // An indexed PNG of 352x272: PAL LoRes with a custom 352x272 screen.
+        let png_path = dir.join("custom.png");
+        std::fs::write(
+            &png_path,
+            dpx_formats::write_png(&IndexedImage::new(352, 272, 1), &src.palette).unwrap(),
+        )
+        .unwrap();
+        let (doc, _, _) = open_picture(load(&png_path).unwrap().picture, Target::default());
+        assert_eq!(doc.target().mode, DisplayMode::PAL_LORES);
+        assert_eq!(doc.target().screen, (352, 272));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

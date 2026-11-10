@@ -10,7 +10,7 @@
     - `SetFormat` now also refuses pages smaller than the new screen.
   - **Presets:**
     - **Standard** is the screen size.
-    - **Overscan** is the full video size: 368/736/1472 × 241/283 lines, laced 483/567 (HARDWARE_MODES.md §2; SuperHiRes is derived).
+    - **Overscan** is the full video size: 368/736/1472 × 241/283 lines, laced 482/566 since ADR-11 (HARDWARE_MODES.md §2 quotes 483/567; SuperHiRes is derived).
     - **Full Page** is the screen width, with the height that gives the proportions of the manual's NTSC LoRes 320×340 under the mode's pixel aspect. Example: PAL LoRes 320×316. Values for modes other than NTSC LoRes are derived, not verified.
   - **Page Size requester (`dpx_ui::page_size_requester`):**
     - Drawn on the paint screen like the file requester, using the shared `dpx_ui::widgets`. The layout follows the manual figure; the measurements are ours.
@@ -42,5 +42,5 @@
   - Not tested by hand: real key, wheel and trackpad input in the window.
 - Consequences:
   - The text tool's page scrolling, Spare ▸ Copy to Spare of the visible part and Magnify's scrolling arrive with those features.
-  - **Overscan screens** and custom screen sizes (the Screen Format requester's Screen Size cycle) are the next step. They change the screen size, not only the page.
+  - Overscan screens and custom screen sizes followed in ADR-11; page limits and presets now follow the screen size.
   - Ctrl+arrows (screen position) are not modelled.

@@ -10,6 +10,7 @@ use dpx_core::{Chipset, Command, DisplayMode, IndexedImage, Palette, Target};
 use crate::bitmap::{self, Bitmap};
 use crate::font::{Font, glyph};
 use crate::pens::Pens;
+use crate::widgets::{TextField, draw_field};
 
 /// Requester screen: PAL HiRes.
 pub const SCREEN: DisplayMode =
@@ -75,6 +76,17 @@ pub enum PageChoice {
     KeepSame,
 }
 
+/// The Screen Size cycle gadget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenChoice {
+    /// The mode's standard size.
+    Standard,
+    /// The mode's overscan size.
+    Overscan,
+    /// A size typed into the two number boxes.
+    Custom,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReqKey {
     Up,
@@ -133,6 +145,12 @@ pub struct ScreenFormatRequester {
     selected: usize,
     scroll: usize,
     page: PageChoice,
+    screen_choice: ScreenChoice,
+    /// Custom screen width / height.
+    field_w: TextField,
+    field_h: TextField,
+    /// Active number box (0 = width, 1 = height) while Custom.
+    active: Option<usize>,
     /// Palette size as a power of two (1 = 2 colours … 8 = 256).
     colors_log2: u32,
     retain: bool,
@@ -157,6 +175,10 @@ impl ScreenFormatRequester {
             selected,
             scroll: 0,
             page: PageChoice::Screen,
+            screen_choice: ScreenChoice::Standard,
+            field_w: TextField::new(4),
+            field_h: TextField::new(4),
+            active: None,
             colors_log2: colors.max(2).next_power_of_two().trailing_zeros(),
             retain: true,
             current_page: page,
@@ -166,7 +188,55 @@ impl ScreenFormatRequester {
         };
         r.clamp_colors();
         r.reveal_selected();
+        let mode = r.mode();
+        r.screen_choice = if target.screen == mode.size() {
+            ScreenChoice::Standard
+        } else if target.screen == mode.overscan_size() {
+            ScreenChoice::Overscan
+        } else {
+            ScreenChoice::Custom
+        };
+        r.set_fields(target.screen);
         r
+    }
+
+    fn set_fields(&mut self, (w, h): (u32, u32)) {
+        self.field_w.set(&w.to_string());
+        self.field_h.set(&h.to_string());
+    }
+
+    pub fn screen_choice(&self) -> ScreenChoice {
+        self.screen_choice
+    }
+
+    /// The screen size that "Use" would set.
+    pub fn screen_size(&self) -> (u32, u32) {
+        let std = self.mode().size();
+        match self.screen_choice {
+            ScreenChoice::Standard => std,
+            ScreenChoice::Overscan => self.mode().overscan_size(),
+            ScreenChoice::Custom => {
+                let parse = |f: &TextField, d: u32| match f.text().parse::<u32>() {
+                    Ok(v) if v > 0 => v,
+                    _ => d,
+                };
+                (parse(&self.field_w, std.0), parse(&self.field_h, std.1))
+            }
+        }
+    }
+
+    fn cycle_screen(&mut self) {
+        let shown = self.screen_size();
+        self.screen_choice = match self.screen_choice {
+            ScreenChoice::Standard => ScreenChoice::Overscan,
+            ScreenChoice::Overscan => ScreenChoice::Custom,
+            ScreenChoice::Custom => ScreenChoice::Standard,
+        };
+        self.active = None;
+        if self.screen_choice == ScreenChoice::Custom {
+            self.set_fields(shown);
+        }
+        self.message = None;
     }
 
     pub fn mode(&self) -> DisplayMode {
@@ -200,11 +270,18 @@ impl ScreenFormatRequester {
         self.clamp_colors();
         self.reveal_selected();
         self.message = None;
+        if self.screen_choice == ScreenChoice::Custom {
+            let (w, h) = self.screen_size();
+            if !self.mode().screen_fits(w, h) {
+                let std = self.mode().size();
+                self.set_fields(std);
+            }
+        }
     }
 
     /// Page size that "Use" would set.
     pub fn page_size(&self) -> (u32, u32) {
-        let (w, h) = self.mode().size();
+        let (w, h) = self.screen_size();
         match self.page {
             PageChoice::Screen => (w, h),
             PageChoice::KeepSame => (self.current_page.0.max(w), self.current_page.1.max(h)),
@@ -220,6 +297,7 @@ impl ScreenFormatRequester {
             width,
             height,
             retain: self.retain,
+            screen: Some(self.screen_size()),
         }
     }
 
@@ -259,6 +337,26 @@ impl ScreenFormatRequester {
                 }
                 ReqKey::Enter => self.activate(Button::Use),
                 ReqKey::Escape => self.activate(Button::Cancel),
+                ReqKey::Tab if self.screen_choice == ScreenChoice::Custom => {
+                    self.active = Some(match self.active {
+                        Some(0) => 1,
+                        _ => 0,
+                    });
+                    ReqResponse::Continue
+                }
+                ReqKey::Char(c) if self.active.is_some() && c.is_ascii_digit() => {
+                    self.edit(k);
+                    ReqResponse::Continue
+                }
+                ReqKey::Backspace
+                | ReqKey::Delete
+                | ReqKey::Left
+                | ReqKey::Right
+                | ReqKey::Home
+                | ReqKey::End => {
+                    self.edit(k);
+                    ReqResponse::Continue
+                }
                 ReqKey::Char(c) => match c.to_ascii_lowercase() {
                     'u' => self.activate(Button::Use),
                     'c' => self.activate(Button::Cancel),
@@ -276,6 +374,18 @@ impl ScreenFormatRequester {
                 ReqResponse::Continue
             }
         }
+    }
+
+    fn edit(&mut self, k: ReqKey) {
+        if self.screen_choice != ScreenChoice::Custom {
+            return;
+        }
+        match self.active {
+            Some(0) => self.field_w.key(k),
+            Some(1) => self.field_h.key(k),
+            _ => {}
+        }
+        self.message = None;
     }
 
     fn activate(&self, b: Button) -> ReqResponse {
@@ -304,6 +414,16 @@ impl ScreenFormatRequester {
             if self.scroll + row < self.modes.len() {
                 self.select(self.scroll + row);
             }
+        } else if cycle_rect(geom::SCREEN_SIZE_Y).contains(p) {
+            self.cycle_screen();
+        } else if self.screen_choice == ScreenChoice::Custom
+            && number_rect(geom::NUM_W_X, geom::SCREEN_SIZE_Y).contains(p)
+        {
+            self.active = Some(0);
+        } else if self.screen_choice == ScreenChoice::Custom
+            && number_rect(geom::NUM_H_X, geom::SCREEN_SIZE_Y).contains(p)
+        {
+            self.active = Some(1);
         } else if cycle_rect(geom::PAGE_SIZE_Y).contains(p) {
             self.page = match self.page {
                 PageChoice::Screen => PageChoice::KeepSame,
@@ -445,23 +565,44 @@ impl ScreenFormatRequester {
             "Screen Size",
             pens.shine,
         );
-        cycle(&mut img, geom::SCREEN_SIZE_Y, "Standard", &pens);
-        number(
-            &mut img,
-            geom::NUM_W_X,
-            geom::SCREEN_SIZE_Y,
-            w,
-            false,
-            &pens,
-        );
-        number(
-            &mut img,
-            geom::NUM_H_X,
-            geom::SCREEN_SIZE_Y,
-            h,
-            false,
-            &pens,
-        );
+        let (sw, sh) = self.screen_size();
+        let screen_label = match self.screen_choice {
+            ScreenChoice::Standard => "Standard",
+            ScreenChoice::Overscan => "Overscan",
+            ScreenChoice::Custom => "Custom",
+        };
+        cycle(&mut img, geom::SCREEN_SIZE_Y, screen_label, &pens);
+        if self.screen_choice == ScreenChoice::Custom {
+            for (i, (x, f)) in [
+                (geom::NUM_W_X, &self.field_w),
+                (geom::NUM_H_X, &self.field_h),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let r = number_rect(x, geom::SCREEN_SIZE_Y);
+                raised(&mut img, r, &pens);
+                let core = dpx_core::Rect::new(r.x + 3, r.y + 2, r.w - 6, r.h - 4);
+                draw_field(&mut img, core, f, self.active == Some(i), &pens);
+            }
+        } else {
+            number(
+                &mut img,
+                geom::NUM_W_X,
+                geom::SCREEN_SIZE_Y,
+                sw,
+                false,
+                &pens,
+            );
+            number(
+                &mut img,
+                geom::NUM_H_X,
+                geom::SCREEN_SIZE_Y,
+                sh,
+                false,
+                &pens,
+            );
+        }
         centred(
             &mut img,
             geom::CYCLE_X,
@@ -533,6 +674,7 @@ impl ScreenFormatRequester {
             Chipset::Ocs => "4096",
             Chipset::Aga => "16777216",
         };
+        let (ow, oh) = m.overscan_size();
         let (ax, ay) = m.aspect();
         let (fx, fy) = m.pixel_shape();
         let lines = [
@@ -544,7 +686,8 @@ impl ScreenFormatRequester {
                 }
             ),
             format!("Max Colors = {max} of {depth}"),
-            format!("Size = {w}x{h}"),
+            format!("Size = {sw}x{sh}"),
+            format!("Max Size = {ow}x{oh}"),
             format!("Pixel Shape = {fx}:{fy}"),
             format!("Aspect = {ax}:{ay}"),
         ];
@@ -552,7 +695,7 @@ impl ScreenFormatRequester {
             font.draw(
                 &mut img,
                 info.x + 6,
-                info.y + 3 + i as i32 * 10,
+                info.y + 2 + i as i32 * 9,
                 line,
                 pens.dark,
             );
@@ -667,6 +810,10 @@ fn cycle_rect(y: i32) -> Rect {
     Rect::new(geom::CYCLE_X, y, geom::CYCLE_W, geom::GADGET_H)
 }
 
+fn number_rect(x: i32, y: i32) -> Rect {
+    Rect::new(x, y, geom::NUM_W, geom::GADGET_H)
+}
+
 fn slider_rect() -> Rect {
     Rect::new(
         geom::SLIDER_X,
@@ -744,7 +891,7 @@ fn cycle(img: &mut IndexedImage, y: i32, text: &str, pens: &Pens) {
 
 /// A number field; `editable = false` draws it ghosted (fixed by the current choice).
 fn number(img: &mut IndexedImage, x: i32, y: i32, value: u32, editable: bool, pens: &Pens) {
-    let r = Rect::new(x, y, geom::NUM_W, geom::GADGET_H);
+    let r = number_rect(x, y);
     raised(img, r, pens);
     centred(img, r.x, r.w, r.y + 3, &value.to_string(), pens.dark);
     if !editable {
@@ -816,6 +963,7 @@ mod tests {
                 width: 320,
                 height: 256,
                 retain: true,
+                screen: Some((320, 256)),
             }
         );
         // The selected row is visible.
@@ -857,6 +1005,7 @@ mod tests {
                 width: 640,
                 height: 256,
                 retain: false,
+                screen: Some((640, 200)),
             })
         );
     }
@@ -883,10 +1032,7 @@ mod tests {
 
     #[test]
     fn ocs_limits_modes_and_colours() {
-        let ocs = Target {
-            chipset: Chipset::Ocs,
-            mode: DisplayMode::PAL_LORES,
-        };
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
         let mut r = ScreenFormatRequester::new(ocs, (320, 256), 32);
         assert_eq!(r.modes.len(), 8, "no SuperHiRes on OCS");
         // PAL:High Res (16 colours max) clamps the palette.
@@ -924,5 +1070,137 @@ mod tests {
         assert_eq!(img.get(geom::LEFT_X + 2, y + 9), Some(pens.select));
         // Section labels are drawn in the shine pen.
         assert!((20..28).any(|yy| (28..372).any(|xx| img.get(xx, yy) == Some(pens.shine))));
+    }
+
+    fn press_cycle(r: &mut ScreenFormatRequester) {
+        r.handle(ReqEvent::Press(geom::CYCLE_X + 50, geom::SCREEN_SIZE_Y + 5));
+        r.handle(ReqEvent::Release);
+    }
+
+    fn type_str(r: &mut ScreenFormatRequester, s: &str) {
+        for c in s.chars() {
+            r.handle(ReqEvent::Key(ReqKey::Char(c)));
+        }
+    }
+
+    #[test]
+    fn initial_screen_choice() {
+        assert_eq!(req().screen_choice(), ScreenChoice::Standard);
+        let o = ScreenFormatRequester::new(Target::default().with_screen(368, 283), (320, 256), 32);
+        assert_eq!(o.screen_choice(), ScreenChoice::Overscan);
+        assert_eq!(o.screen_size(), (368, 283));
+        let c = ScreenFormatRequester::new(Target::default().with_screen(352, 272), (320, 256), 32);
+        assert_eq!(c.screen_choice(), ScreenChoice::Custom);
+        assert_eq!(c.screen_size(), (352, 272));
+        assert_eq!(c.field_w.text(), "352");
+        assert_eq!(c.field_h.text(), "272");
+    }
+
+    #[test]
+    fn screen_size_cycles() {
+        let mut r = req();
+        assert_eq!(r.screen_size(), (320, 256));
+        press_cycle(&mut r);
+        assert_eq!(r.screen_choice(), ScreenChoice::Overscan);
+        assert_eq!(r.screen_size(), (368, 283));
+        press_cycle(&mut r);
+        assert_eq!(r.screen_choice(), ScreenChoice::Custom);
+        assert_eq!(
+            r.screen_size(),
+            (368, 283),
+            "fields start from the overscan size"
+        );
+        assert_eq!(r.field_w.text(), "368");
+        press_cycle(&mut r);
+        assert_eq!(r.screen_choice(), ScreenChoice::Standard);
+        assert_eq!(r.screen_size(), (320, 256));
+    }
+
+    #[test]
+    fn typing_a_custom_size() {
+        let mut r = req();
+        press_cycle(&mut r);
+        press_cycle(&mut r);
+        r.handle(ReqEvent::Press(geom::NUM_W_X + 10, geom::SCREEN_SIZE_Y + 5));
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Backspace));
+        }
+        type_str(&mut r, "352");
+        r.handle(ReqEvent::Key(ReqKey::Char('x')));
+        r.handle(ReqEvent::Key(ReqKey::Tab));
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Backspace));
+        }
+        type_str(&mut r, "272");
+        assert_eq!(r.screen_size(), (352, 272));
+        assert_eq!(r.page_size(), (352, 272));
+        match r.command() {
+            Command::SetFormat {
+                screen,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!(screen, Some((352, 272)));
+                assert_eq!((width, height), (352, 272));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Empty field falls back to the standard size.
+        r.handle(ReqEvent::Key(ReqKey::Home));
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Delete));
+        }
+        assert_eq!(r.screen_size(), (352, 256));
+    }
+
+    #[test]
+    fn mode_change_while_custom() {
+        let mut r =
+            ScreenFormatRequester::new(Target::default().with_screen(330, 230), (320, 256), 32);
+        assert_eq!(r.screen_choice(), ScreenChoice::Custom);
+        // NTSC LoRes (200..241 lines) also takes 330x230.
+        let fits = r
+            .modes
+            .iter()
+            .position(|m| m.screen_fits(330, 230) && *m != r.mode())
+            .expect("a mode that fits");
+        r.select(fits);
+        assert_eq!(r.screen_size(), (330, 230));
+        let nofit = r
+            .modes
+            .iter()
+            .position(|m| !m.screen_fits(330, 230))
+            .expect("a mode that does not fit");
+        r.select(nofit);
+        assert_eq!(r.screen_size(), r.mode().size());
+        assert_eq!(r.field_w.text(), r.mode().size().0.to_string());
+    }
+
+    #[test]
+    fn keep_same_grows_to_the_overscan_screen() {
+        let mut r = req();
+        press_cycle(&mut r);
+        r.handle(ReqEvent::Press(geom::CYCLE_X + 50, geom::PAGE_SIZE_Y + 5));
+        assert_eq!(r.page_size(), (368, 283));
+    }
+
+    #[test]
+    fn info_panel_shows_size_lines() {
+        let a = req();
+        let mut b = req();
+        press_cycle(&mut b);
+        let (ia, ib) = (a.render(), b.render());
+        assert_eq!((ib.width(), ib.height()), (640, 256));
+        let differs = (geom::INFO_Y..geom::INFO_Y + geom::INFO_H).any(|y| {
+            (geom::RIGHT_X..geom::RIGHT_X + geom::RIGHT_W).any(|x| ia.get(x, y) != ib.get(x, y))
+        });
+        assert!(differs);
+        // Custom rendering with an active field also works.
+        let mut c = req();
+        press_cycle(&mut c);
+        press_cycle(&mut c);
+        c.handle(ReqEvent::Key(ReqKey::Tab));
+        assert_eq!(c.render().width(), 640);
     }
 }

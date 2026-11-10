@@ -58,8 +58,17 @@ struct View {
 }
 
 impl View {
+    /// A display mode at its standard screen size.
     fn of(mode: DisplayMode) -> Self {
-        let (w, h) = mode.size();
+        Self::screen(mode, mode.size())
+    }
+
+    /// The document's screen: its mode at its (standard, overscan or custom) size.
+    fn of_target(target: Target) -> Self {
+        Self::screen(target.mode, target.screen)
+    }
+
+    fn screen(mode: DisplayMode, (w, h): (u32, u32)) -> Self {
         let (ux, uy) = mode.ui_scale();
         let (fx, fy) = mode.pixel_shape();
         Self {
@@ -193,7 +202,7 @@ fn main() -> eframe::Result {
             }
         }
         let doc = engine.document().clone();
-        let view = View::of(doc.target().mode);
+        let view = View::of_target(doc.target());
         let scroll = arg_value(&args, "--scroll")
             .and_then(|s| {
                 let (x, y) = s.split_once(',')?;
@@ -336,22 +345,23 @@ fn main() -> eframe::Result {
 }
 
 /// Picture ▸ Page Size for `doc`: its page size in the fields and the mode's presets.
+/// Standard is the screen size (also an overscan or custom screen), as in DeluxePaint.
 fn page_size_requester(doc: &Document) -> PageSizeRequester {
-    let mode = doc.target().mode;
+    let target = doc.target();
     PageSizeRequester::new(
         (doc.page().width(), doc.page().height()),
         [
             Preset {
                 label: "Standard",
-                size: mode.size(),
+                size: target.screen,
             },
             Preset {
                 label: "Full Page",
-                size: mode.full_page_size(),
+                size: target.full_page_size(),
             },
             Preset {
                 label: "Overscan",
-                size: mode.overscan_size(),
+                size: target.mode.overscan_size(),
             },
         ],
     )
@@ -407,7 +417,7 @@ fn snapshot(
     scroll: (i32, i32),
     ui: &UiState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let view = View::of(doc.target().mode);
+    let view = View::of_target(doc.target());
     let screen = view.compose(doc.page(), scroll, doc.palette(), ui);
     let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
     let rgba = to_rgba(&screen, doc.palette(), sx, sy);
@@ -587,7 +597,7 @@ impl PainterApp {
                     self.ui.page_size_requester = None;
                     return;
                 }
-                let ((min_w, min_h), (max_w, max_h)) = doc.target().mode.page_limits();
+                let ((min_w, min_h), (max_w, max_h)) = doc.target().page_limits();
                 let command = Command::SetPageSize {
                     width,
                     height,
@@ -765,7 +775,7 @@ impl PainterApp {
         if self.requester.is_some() {
             View::of(requester::SCREEN)
         } else {
-            View::of(self.engine.document().target().mode)
+            View::of_target(self.engine.document().target())
         }
     }
 
@@ -1177,20 +1187,36 @@ impl PainterApp {
         } else if !down && self.req_pointer.take().is_some() {
             self.requester_event(ReqEvent::Release);
         }
+        // Letters (U, C, R shortcuts) and digits (custom screen size) arrive as text.
         let keys: Vec<ReqKey> = ctx.input(|i| {
-            [
-                (egui::Key::ArrowUp, ReqKey::Up),
-                (egui::Key::ArrowDown, ReqKey::Down),
-                (egui::Key::Enter, ReqKey::Enter),
-                (egui::Key::Escape, ReqKey::Escape),
-                (egui::Key::U, ReqKey::Char('u')),
-                (egui::Key::C, ReqKey::Char('c')),
-                (egui::Key::R, ReqKey::Char('r')),
-            ]
-            .into_iter()
-            .filter(|(k, _)| i.key_pressed(*k))
-            .map(|(_, r)| r)
-            .collect()
+            let mut keys = Vec::new();
+            for event in &i.events {
+                match event {
+                    egui::Event::Text(text) => keys.extend(
+                        text.chars()
+                            .filter(char::is_ascii_alphanumeric)
+                            .map(|c| ReqKey::Char(c.to_ascii_lowercase())),
+                    ),
+                    egui::Event::Key {
+                        key, pressed: true, ..
+                    } => keys.extend(match key {
+                        egui::Key::ArrowUp => Some(ReqKey::Up),
+                        egui::Key::ArrowDown => Some(ReqKey::Down),
+                        egui::Key::ArrowLeft => Some(ReqKey::Left),
+                        egui::Key::ArrowRight => Some(ReqKey::Right),
+                        egui::Key::Home => Some(ReqKey::Home),
+                        egui::Key::End => Some(ReqKey::End),
+                        egui::Key::Backspace => Some(ReqKey::Backspace),
+                        egui::Key::Delete => Some(ReqKey::Delete),
+                        egui::Key::Tab => Some(ReqKey::Tab),
+                        egui::Key::Enter => Some(ReqKey::Enter),
+                        egui::Key::Escape => Some(ReqKey::Escape),
+                        _ => None,
+                    }),
+                    _ => {}
+                }
+            }
+            keys
         });
         for k in keys {
             self.requester_event(ReqEvent::Key(k));
@@ -1864,5 +1890,31 @@ mod tests {
         let (same, note) = files::page_at_least_screen(doc.clone());
         assert_eq!(same, doc);
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn screen_format_sets_an_overscan_screen() {
+        use dpx_ui::requester::ScreenChoice;
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.run_action(Action::Command("picture.screen_format"), &ctx);
+        // The Screen Size cycle gadget (requester screen pixels): Standard → Overscan.
+        app.requester_event(ReqEvent::Press(60, 118));
+        app.requester_event(ReqEvent::Release);
+        let req = app.requester.as_ref().unwrap();
+        assert_eq!(req.screen_choice(), ScreenChoice::Overscan);
+        app.requester_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.requester.is_none());
+        let target = app.engine.document().target();
+        assert_eq!(target.screen, (368, 283));
+        assert_eq!((app.page().width(), app.page().height()), (368, 283));
+        let view = app.view();
+        assert_eq!((view.screen_w, view.screen_h), (368, 283));
+        // The Page Size requester's Standard is the screen size now.
+        app.run_action(Action::Command("picture.page_size"), &ctx);
+        app.page_size_event(ReqEvent::Key(ReqKey::Escape));
+        app.undo();
+        assert_eq!(app.engine.document().target(), Target::default());
+        assert_eq!(app.view(), View::of(DisplayMode::PAL_LORES));
     }
 }

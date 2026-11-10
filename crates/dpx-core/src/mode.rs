@@ -1,8 +1,9 @@
 //! Amiga display modes and the document's hardware target (`docs/HARDWARE_MODES.md`).
 //!
-//! A mode is video standard × resolution × interlace. Sizes are the standard
-//! (non-overscan) screen sizes; overscan screens and custom sizes follow later. Pages may be
-//! larger than the screen within [`DisplayMode::page_limits`] (ADR-10).
+//! A mode is video standard × resolution × interlace. [`DisplayMode::size`] is the standard
+//! (non-overscan) screen size; a [`Target`] carries the actual screen size, which may be an
+//! overscan or custom size within [`DisplayMode::screen_limits`] (ADR-11). Pages may be
+//! larger than the screen within [`Target::page_limits`] (ADR-10).
 
 use serde::{Deserialize, Serialize};
 
@@ -108,52 +109,53 @@ impl DisplayMode {
         (w, if self.interlace { h * 2 } else { h })
     }
 
-    /// Full video ("Overscan") size, used by the Page Size preset: 368/736/1472 pixels wide,
-    /// 241 (NTSC) or 283 (PAL) lines, laced 483/567 (HARDWARE_MODES.md §2; the NTSC LoRes
-    /// value 368×241 also appears in DeluxePaint's Set Page Size requester). SuperHiRes is
-    /// derived (four times LoRes), not verified.
+    /// Full video ("Overscan") size: 368/736/1472 pixels wide, 241 (NTSC) or 283 (PAL)
+    /// lines, laced twice that (HARDWARE_MODES.md §2; the NTSC LoRes value 368×241 also
+    /// appears in DeluxePaint's Set Page Size requester). Laced heights are kept even (the
+    /// sources quote 483/567, counting a half line); SuperHiRes is derived, not verified.
+    /// Used for the Overscan screen size and the Page Size preset.
     pub fn overscan_size(self) -> (u32, u32) {
         let w = match self.resolution {
             Resolution::Lo => 368,
             Resolution::Hi => 736,
             Resolution::SuperHi => 1472,
         };
-        let h = match (self.video, self.interlace) {
-            (Video::Ntsc, false) => 241,
-            (Video::Pal, false) => 283,
-            (Video::Ntsc, true) => 483,
-            (Video::Pal, true) => 567,
+        let lines = match self.video {
+            Video::Ntsc => 241,
+            Video::Pal => 283,
         };
-        (w, h)
+        (w, if self.interlace { lines * 2 } else { lines })
     }
 
-    /// "Full Page" preset: the screen width and the height that shows the proportions of
-    /// DeluxePaint's NTSC LoRes Full Page (320×340 with 10:11 pixels, read from the manual
-    /// figure) with this mode's pixel aspect. Other modes are derived, not verified.
-    pub fn full_page_size(self) -> (u32, u32) {
+    /// Smallest and largest screen (ADR-11): from the standard width with NTSC height (a
+    /// PAL screen may be as short as an NTSC one) up to the overscan size.
+    pub fn screen_limits(self) -> ((u32, u32), (u32, u32)) {
         let (w, _) = self.size();
-        let (ax, ay) = self.aspect();
-        // h = w · ax/ay · (340·11)/(320·10), rounded.
-        let num = u64::from(w) * u64::from(ax) * 340 * 11;
-        let den = u64::from(ay) * 320 * 10;
-        let h = ((num + den / 2) / den) as u32;
-        let ((min_w, min_h), (max_w, max_h)) = self.page_limits();
-        (w.clamp(min_w, max_w), h.clamp(min_h, max_h))
+        let min_h = if self.interlace { 400 } else { 200 };
+        ((w, min_h), self.overscan_size())
     }
 
-    /// Smallest and largest page: never smaller than the screen; DeluxePaint IV recognises
-    /// pages up to 1008×1024 (AGA manual p.236). Wider overscan pages (SuperHiRes) are allowed
-    /// up to the overscan size — a DeluxePainter extension, as the manual names no AGA limit.
-    pub fn page_limits(self) -> ((u32, u32), (u32, u32)) {
+    /// True if `width`×`height` is a valid screen for this mode: within the limits and whole
+    /// UI pixels (HiRes widths even, SuperHiRes widths multiples of 4, laced heights even).
+    pub fn screen_fits(self, width: u32, height: u32) -> bool {
+        let ((min_w, min_h), (max_w, max_h)) = self.screen_limits();
+        let (ux, uy) = self.ui_scale();
+        (min_w..=max_w).contains(&width)
+            && (min_h..=max_h).contains(&height)
+            && width.is_multiple_of(ux)
+            && height.is_multiple_of(uy)
+    }
+
+    /// The screen for a picture of `width`×`height` in this mode: the standard size if the
+    /// picture fits it, else the picture size (rounded up to whole UI pixels) up to the
+    /// overscan size.
+    pub fn screen_for_picture(self, width: u32, height: u32) -> (u32, u32) {
         let (sw, sh) = self.size();
-        let (ow, oh) = self.overscan_size();
-        ((sw, sh), (ow.max(1008), oh.max(1024)))
-    }
-
-    /// True if a `width`×`height` page is allowed in this mode.
-    pub fn page_fits(self, width: u32, height: u32) -> bool {
-        let ((min_w, min_h), (max_w, max_h)) = self.page_limits();
-        (min_w..=max_w).contains(&width) && (min_h..=max_h).contains(&height)
+        let (_, (max_w, max_h)) = self.screen_limits();
+        let (ux, uy) = self.ui_scale();
+        let w = width.div_ceil(ux) * ux;
+        let h = height.div_ceil(uy) * uy;
+        (w.clamp(sw, max_w), h.clamp(sh, max_h))
     }
 
     /// Shape of one pixel as integer display factors (width, height), reduced: LoRes 1×1,
@@ -274,9 +276,57 @@ fn gcd(a: u32, b: u32) -> u32 {
 pub struct Target {
     pub chipset: Chipset,
     pub mode: DisplayMode,
+    /// Screen size in pixels: the mode's standard size, its overscan size or a custom size
+    /// between ([`DisplayMode::screen_fits`]; ADR-11).
+    pub screen: (u32, u32),
 }
 
 impl Target {
+    /// A target with the mode's standard screen size.
+    pub fn new(chipset: Chipset, mode: DisplayMode) -> Self {
+        Self {
+            chipset,
+            mode,
+            screen: mode.size(),
+        }
+    }
+
+    /// The same target with another screen size.
+    pub fn with_screen(self, width: u32, height: u32) -> Self {
+        Self {
+            screen: (width, height),
+            ..self
+        }
+    }
+
+    /// Smallest and largest page: never smaller than the screen; DeluxePaint IV recognises
+    /// pages up to 1008×1024 (AGA manual p.236). Wider or taller overscan pages are allowed up
+    /// to the overscan size — a DeluxePainter extension, as the manual names no AGA limit.
+    pub fn page_limits(self) -> ((u32, u32), (u32, u32)) {
+        let (ow, oh) = self.mode.overscan_size();
+        (self.screen, (ow.max(1008), oh.max(1024)))
+    }
+
+    /// True if a `width`×`height` page is allowed.
+    pub fn page_fits(self, width: u32, height: u32) -> bool {
+        let ((min_w, min_h), (max_w, max_h)) = self.page_limits();
+        (min_w..=max_w).contains(&width) && (min_h..=max_h).contains(&height)
+    }
+
+    /// "Full Page" preset: the screen width and the height that shows the proportions of
+    /// DeluxePaint's NTSC LoRes Full Page (320×340 with 10:11 pixels, read from the manual
+    /// figure) with the mode's pixel aspect. Other modes are derived, not verified.
+    pub fn full_page_size(self) -> (u32, u32) {
+        let w = self.screen.0;
+        let (ax, ay) = self.mode.aspect();
+        // h = w · ax/ay · (340·11)/(320·10), rounded.
+        let num = u64::from(w) * u64::from(ax) * 340 * 11;
+        let den = u64::from(ay) * 320 * 10;
+        let h = ((num + den / 2) / den) as u32;
+        let ((min_w, min_h), (max_w, max_h)) = self.page_limits();
+        (w.clamp(min_w, max_w), h.clamp(min_h, max_h))
+    }
+
     /// The ILBM CAMG value to write. AGA documents get the full 32-bit mode id with its
     /// monitor (PAL/NTSC) bits; OCS documents get the classic 16-bit view modes, which old
     /// readers understand, so PAL/NTSC is then only implied by the page height.
@@ -292,10 +342,7 @@ impl Target {
 impl Default for Target {
     /// DeluxePaint IV AGA on a PAL machine.
     fn default() -> Self {
-        Self {
-            chipset: Chipset::Aga,
-            mode: DisplayMode::PAL_LORES,
-        }
+        Self::new(Chipset::Aga, DisplayMode::PAL_LORES)
     }
 }
 
@@ -308,7 +355,7 @@ mod tests {
         for mode in DisplayMode::all() {
             let (w, h) = mode.size();
             for chipset in [Chipset::Aga, Chipset::Ocs] {
-                let camg = Target { chipset, mode }.camg();
+                let camg = Target::new(chipset, mode).camg();
                 assert_eq!(
                     DisplayMode::guess(Some(camg), w, h),
                     mode,
@@ -317,15 +364,9 @@ mod tests {
             }
         }
         let pal_hi_lace = DisplayMode::new(Video::Pal, Resolution::Hi, true);
-        let ocs = Target {
-            chipset: Chipset::Ocs,
-            mode: pal_hi_lace,
-        };
+        let ocs = Target::new(Chipset::Ocs, pal_hi_lace);
         assert_eq!(ocs.camg(), 0x8004);
-        let aga = Target {
-            chipset: Chipset::Aga,
-            mode: pal_hi_lace,
-        };
+        let aga = Target::new(Chipset::Aga, pal_hi_lace);
         assert_eq!(aga.camg(), 0x0002_9004);
     }
 
@@ -413,31 +454,80 @@ mod tests {
 
     #[test]
     fn page_presets_and_limits() {
-        let ntsc_lo = DisplayMode::new(Video::Ntsc, Resolution::Lo, false);
+        let ntsc_lo = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Ntsc, Resolution::Lo, false),
+        );
         // The values in DeluxePaint's Set Page Size figure (NTSC LoRes).
-        assert_eq!(ntsc_lo.size(), (320, 200));
+        assert_eq!(ntsc_lo.screen, (320, 200));
         assert_eq!(ntsc_lo.full_page_size(), (320, 340));
-        assert_eq!(ntsc_lo.overscan_size(), (368, 241));
+        assert_eq!(ntsc_lo.mode.overscan_size(), (368, 241));
         assert_eq!(ntsc_lo.page_limits(), ((320, 200), (1008, 1024)));
         // Derived for the other modes.
-        assert_eq!(DisplayMode::PAL_LORES.full_page_size(), (320, 316));
-        assert_eq!(DisplayMode::PAL_LORES.overscan_size(), (368, 283));
-        let ntsc_hi = DisplayMode::new(Video::Ntsc, Resolution::Hi, false);
-        assert_eq!(ntsc_hi.full_page_size(), (640, 340));
-        let ntsc_lo_lace = DisplayMode::new(Video::Ntsc, Resolution::Lo, true);
+        let pal_lo = Target::default();
+        assert_eq!(pal_lo.full_page_size(), (320, 316));
+        assert_eq!(pal_lo.mode.overscan_size(), (368, 283));
+        let hi =
+            |video, lace| Target::new(Chipset::Aga, DisplayMode::new(video, Resolution::Hi, lace));
+        assert_eq!(hi(Video::Ntsc, false).full_page_size(), (640, 340));
+        let ntsc_lo_lace = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Ntsc, Resolution::Lo, true),
+        );
         assert_eq!(ntsc_lo_lace.full_page_size(), (320, 680));
-        let pal_super_lace = DisplayMode::new(Video::Pal, Resolution::SuperHi, true);
-        assert_eq!(pal_super_lace.overscan_size(), (1472, 567));
+        let pal_super_lace = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Pal, Resolution::SuperHi, true),
+        );
+        assert_eq!(pal_super_lace.mode.overscan_size(), (1472, 566));
         assert_eq!(pal_super_lace.page_limits(), ((1280, 512), (1472, 1024)));
+        // An overscan screen raises the smallest page.
+        let over = pal_lo.with_screen(368, 283);
+        assert_eq!(over.page_limits().0, (368, 283));
+        assert_eq!(over.full_page_size().0, 368);
+        assert!(!over.page_fits(320, 256));
+        for m in DisplayMode::all() {
+            let t = Target::new(Chipset::Aga, m);
+            let (w, h) = m.size();
+            assert!(t.page_fits(w, h), "{}", m.name());
+            let (fw, fh) = t.full_page_size();
+            assert!(t.page_fits(fw, fh), "{}", m.name());
+            let (ow, oh) = m.overscan_size();
+            assert!(t.page_fits(ow, oh), "{}", m.name());
+            assert!(!t.page_fits(w - 1, h));
+            assert!(!t.page_fits(w, 1025));
+        }
+    }
+
+    #[test]
+    fn screen_sizes() {
+        let pal_lo = DisplayMode::PAL_LORES;
+        assert_eq!(pal_lo.screen_limits(), ((320, 200), (368, 283)));
+        assert!(pal_lo.screen_fits(320, 256));
+        assert!(pal_lo.screen_fits(352, 272));
+        assert!(pal_lo.screen_fits(320, 200), "NTSC height on PAL");
+        assert!(!pal_lo.screen_fits(319, 256));
+        assert!(!pal_lo.screen_fits(370, 256));
+        let hi_lace = DisplayMode::new(Video::Pal, Resolution::Hi, true);
+        assert_eq!(hi_lace.screen_limits(), ((640, 400), (736, 566)));
+        assert!(!hi_lace.screen_fits(641, 512), "HiRes widths are even");
+        assert!(!hi_lace.screen_fits(640, 511), "laced heights are even");
+        let shi = DisplayMode::new(Video::Ntsc, Resolution::SuperHi, false);
+        assert!(
+            !shi.screen_fits(1282, 200),
+            "SuperHiRes widths are multiples of 4"
+        );
+        assert!(shi.screen_fits(1284, 241));
+        // Pictures: standard if they fit, else their own size up to the overscan.
+        assert_eq!(pal_lo.screen_for_picture(320, 200), (320, 256));
+        assert_eq!(pal_lo.screen_for_picture(352, 272), (352, 272));
+        assert_eq!(pal_lo.screen_for_picture(400, 300), (368, 283));
+        assert_eq!(hi_lace.screen_for_picture(701, 513), (702, 514));
         for m in DisplayMode::all() {
             let (w, h) = m.size();
-            assert!(m.page_fits(w, h), "{}", m.name());
-            let (fw, fh) = m.full_page_size();
-            assert!(m.page_fits(fw, fh), "{}", m.name());
+            assert!(m.screen_fits(w, h), "{}", m.name());
             let (ow, oh) = m.overscan_size();
-            assert!(m.page_fits(ow, oh), "{}", m.name());
-            assert!(!m.page_fits(w - 1, h));
-            assert!(!m.page_fits(w, 1025));
+            assert!(m.screen_fits(ow, oh), "{}", m.name());
         }
     }
 }

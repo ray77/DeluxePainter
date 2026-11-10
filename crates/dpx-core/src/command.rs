@@ -65,6 +65,9 @@ pub enum Command {
         width: u32,
         height: u32,
         retain: bool,
+        /// Screen size; `None` = the mode's standard size (ADR-11).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        screen: Option<(u32, u32)>,
     },
     /// Picture ▸ Page Size: the picture stays top-left; new area gets `fill` (the BG colour),
     /// a smaller page crops (ADR-10).
@@ -143,6 +146,7 @@ impl Command {
                 width,
                 height,
                 retain,
+                screen,
             } => {
                 let max = mode.max_colors(doc.target.chipset).ok_or_else(|| {
                     CommandError::new(
@@ -168,7 +172,14 @@ impl Command {
                         "page {width}x{height} is outside 1..={MAX_PAGE_SIDE}"
                     )));
                 }
-                let (sw, sh) = mode.size();
+                let (sw, sh) = screen.unwrap_or(mode.size());
+                if !mode.screen_fits(sw, sh) {
+                    let ((a, b), (c, d)) = mode.screen_limits();
+                    return Err(CommandError::invalid(format!(
+                        "screen {sw}x{sh}: {} allows {a}x{b} to {c}x{d} in whole UI pixels",
+                        mode.name()
+                    )));
+                }
                 if *width < sw || *height < sh {
                     return Err(CommandError::invalid(format!(
                         "page {width}x{height} is smaller than the {sw}x{sh} screen"
@@ -198,11 +209,10 @@ impl Command {
                 fill,
             } => {
                 color(*fill)?;
-                let mode = doc.target.mode;
-                if mode.page_fits(*width, *height) {
+                if doc.target.page_fits(*width, *height) {
                     Ok(())
                 } else {
-                    let ((min_w, min_h), (max_w, max_h)) = mode.page_limits();
+                    let ((min_w, min_h), (max_w, max_h)) = doc.target.page_limits();
                     Err(CommandError::invalid(format!(
                         "Page must be {min_w}x{min_h} to {max_w}x{max_h}"
                     )))
@@ -268,6 +278,7 @@ impl Command {
                 width,
                 height,
                 retain,
+                screen,
             } => {
                 let mut new_page = IndexedImage::new(*width, *height, 0);
                 if *retain {
@@ -276,6 +287,7 @@ impl Command {
                 doc.page = new_page;
                 doc.palette = resized_palette(&doc.palette, usize::from(*colors));
                 doc.target.mode = *mode;
+                doc.target.screen = screen.unwrap_or(mode.size());
             }
             Command::SetPageSize {
                 width,
