@@ -549,6 +549,10 @@ pub struct MenuContext {
     pub ham: bool,
     /// Prefs ▸ Pixel Size.
     pub pixel_size: PixelSize,
+    /// A custom brush is current (enables the Brush menu's operations).
+    pub has_brush: bool,
+    /// There is a picked-up brush to go back to (enables Brush ▸ Restore).
+    pub can_restore: bool,
 }
 
 impl Action {
@@ -568,10 +572,22 @@ impl Action {
         match self {
             Action::Mode(PaintMode::HBrite) => ctx.ehb,
             Action::Command(id) => {
-                IMPLEMENTED.contains(&id) && (id != "color.recompute" || ctx.ham)
+                IMPLEMENTED.contains(&id)
+                    && (id != "color.recompute" || ctx.ham)
+                    && brush_item_usable(id, ctx)
             }
             _ => true,
         }
+    }
+}
+
+/// Brush items need a brush: only Load.. works without one and Restore needs a picked-up one.
+fn brush_item_usable(id: &str, ctx: &MenuContext) -> bool {
+    match id {
+        "brush.load" => true,
+        "brush.restore" => ctx.can_restore,
+        _ if id.starts_with("brush.") => ctx.has_brush,
+        _ => true,
     }
 }
 
@@ -608,6 +624,25 @@ pub const IMPLEMENTED: &[&str] = &[
     "background.free",
     // Prefs
     "view.largest_pixel_size",
+    // Brush menu (ADR-19); the interactive items (Stretch, Any Angle, Shear, Bend, Place,
+    // Remap, Spare, Metamorph) stay ghosted.
+    "brush.load",
+    "brush.save",
+    "brush.restore",
+    "brush.halve",
+    "brush.double",
+    "brush.double_horizontal",
+    "brush.double_vertical",
+    "brush.flip_horizontal",
+    "brush.flip_vertical",
+    "brush.outline",
+    "brush.trim",
+    "brush.rotate_90",
+    "brush.handle_center",
+    "brush.handle_corner",
+    "brush.bg_to_fg",
+    "brush.swap_bg_fg",
+    "brush.change_transparency",
 ];
 
 impl Item {
@@ -1020,6 +1055,8 @@ mod tests {
             ehb: false,
             ham: false,
             pixel_size: PixelSize::default(),
+            has_brush: false,
+            can_restore: false,
         }
     }
 
@@ -1272,7 +1309,23 @@ mod tests {
         assert!(Action::PixelSize(PixelSize(4)).enabled(&c));
         // Menus and submenus with nothing enabled are ghosted as a whole.
         let menu = |t: &str| MENUS.iter().position(|m| m.title == t).unwrap();
-        assert!(!menu_enabled(menu("Brush"), &c));
+        // Brush: only Load.. works without a brush; Restore needs a picked-up one.
+        assert!(menu_enabled(menu("Brush"), &c));
+        assert!(Action::Command("brush.load").enabled(&c));
+        assert!(!Action::Command("brush.flip_horizontal").enabled(&c));
+        assert!(!Action::Command("brush.restore").enabled(&c));
+        assert!(!Action::Command("brush.bg_to_fg").enabled(&c));
+        let with = MenuContext {
+            has_brush: true,
+            can_restore: true,
+            ..c
+        };
+        assert!(Action::Command("brush.flip_horizontal").enabled(&with));
+        assert!(Action::Command("brush.restore").enabled(&with));
+        assert!(
+            !Action::Command("brush.stretch").enabled(&with),
+            "interactive: ghosted"
+        );
         assert!(!menu_enabled(menu("Anim"), &c));
         assert!(menu_enabled(menu("Picture"), &c));
         let effect = &MENUS[menu("Effect")];

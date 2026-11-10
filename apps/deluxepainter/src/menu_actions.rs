@@ -425,6 +425,9 @@ impl PainterApp {
             FileKind::LoadPalette => self.load_palette(path),
             FileKind::SavePalette => self.save_palette(path, overwrite),
             FileKind::LoadPicture | FileKind::SavePicture => {}
+            FileKind::LoadBrush | FileKind::SaveBrush => {
+                self.brush_file_accept(kind, path, overwrite)
+            }
         }
     }
 

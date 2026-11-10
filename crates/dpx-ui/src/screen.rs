@@ -95,6 +95,10 @@ pub struct UiState {
     pub note_requester: Option<NoteRequester>,
     /// Color ▸ Palette ▸ Mixer (the Color Mixer) while it is open.
     pub palette_requester: Option<crate::palette_requester::PaletteRequester>,
+    /// A custom brush is current; the app keeps it in sync (ghosts Brush menu items).
+    pub has_brush: bool,
+    /// A picked-up brush exists (Brush ▸ Restore).
+    pub can_restore: bool,
 }
 
 impl UiState {
@@ -107,6 +111,8 @@ impl UiState {
             // EHB/HAM display modes arrive with the hardware profiles (roadmap phase 5).
             ehb: false,
             ham: false,
+            has_brush: self.has_brush,
+            can_restore: self.can_restore,
         }
     }
 }
@@ -130,6 +136,8 @@ impl Default for UiState {
             page_size_requester: None,
             note_requester: None,
             palette_requester: None,
+            has_brush: false,
+            can_restore: false,
         }
     }
 }
