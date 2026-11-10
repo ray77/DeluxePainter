@@ -23,6 +23,7 @@
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
 mod browse;
+mod brush_menu;
 mod files;
 mod menu_actions;
 mod tools;
@@ -829,6 +830,9 @@ impl PainterApp {
                 match kind {
                     FileKind::LoadPicture => self.load_picture(path),
                     FileKind::SavePicture => self.save_picture(path, overwrite),
+                    FileKind::LoadBrush | FileKind::SaveBrush => {
+                        self.brush_file_accept(kind, &path, overwrite)
+                    }
                     other => self.menu_file_accept(other, &path, overwrite),
                 }
             }
@@ -1159,6 +1163,8 @@ impl PainterApp {
                 "palette.save" => self.open_file_requester(FileKind::SavePalette),
                 "background.fix" => self.fix_background(),
                 "background.free" => self.free_background(),
+                // ADR-19 (brush_menu.rs).
+                id if id.starts_with("brush.") => self.brush_action(id),
                 _ => {}
             },
         }
@@ -1169,6 +1175,8 @@ impl PainterApp {
 impl eframe::App for PainterApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.ui.has_brush = self.custom_brush.is_some();
+        self.ui.can_restore = self.picked_brush.is_some();
         let ppp = ctx.pixels_per_point();
         let area = ctx.content_rect();
         let window = Window {

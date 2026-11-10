@@ -5,6 +5,7 @@
 //! [`Command`]s with multi-level undo/redo). Layers and frames follow (see
 //! `docs/ARCHITECTURE.md`).
 
+pub mod brush_ops;
 pub mod command;
 pub mod document;
 pub mod engine;

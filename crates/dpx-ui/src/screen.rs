@@ -97,6 +97,10 @@ pub struct UiState {
     pub palette_requester: Option<crate::palette_requester::PaletteRequester>,
     /// Color ▸ Ranges.. (the Range requester) while it is open.
     pub range_requester: Option<crate::range_requester::RangeRequester>,
+    /// A custom brush is current; the app keeps it in sync (ghosts Brush menu items).
+    pub has_brush: bool,
+    /// A picked-up brush exists (Brush ▸ Restore).
+    pub can_restore: bool,
 }
 
 impl UiState {
@@ -109,6 +113,8 @@ impl UiState {
             // EHB/HAM display modes arrive with the hardware profiles (roadmap phase 5).
             ehb: false,
             ham: false,
+            has_brush: self.has_brush,
+            can_restore: self.can_restore,
         }
     }
 }
@@ -133,6 +139,8 @@ impl Default for UiState {
             note_requester: None,
             palette_requester: None,
             range_requester: None,
+            has_brush: false,
+            can_restore: false,
         }
     }
 }

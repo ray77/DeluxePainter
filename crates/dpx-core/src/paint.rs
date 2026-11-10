@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::image::IndexedImage;
-use crate::palette::Palette;
+use crate::palette::{Palette, Rgb8};
 
 /// A custom brush: indexed pixels with a handle (the pixel under the pointer) and an
 /// optional transparent colour.
@@ -120,7 +120,9 @@ pub struct PaintContext<'a> {
 /// and pixels whose current colour the stencil protects are left alone.
 ///
 /// Matte, Color and Replace set the pixel to `color` (the caller has already chosen FG, BG or
-/// the brush's own colour). The other modes are not implemented yet and also set the pixel.
+/// the brush's own colour). The other modes (ADR-19) ignore `color` unless noted and read the
+/// colour under the brush from `ctx.before`, so a gesture changes a pixel at most one step
+/// however often the brush passes over it. A mode that has nothing to do leaves the pixel.
 pub fn plot(
     page: &mut IndexedImage,
     x: i32,
@@ -138,8 +140,84 @@ pub fn plot(
     {
         return;
     }
-    let _ = mode;
-    page.set(x, y, color);
+    let before = ctx.before.get(x, y).unwrap_or(under);
+    let new = match mode {
+        DrawMode::Matte | DrawMode::Color | DrawMode::Replace => Some(color),
+        DrawMode::Smear => page.get(x - ctx.motion.0, y - ctx.motion.1),
+        DrawMode::Shade => step_in_range(before, ctx, false),
+        DrawMode::Cycle => match ctx.range {
+            // FG in no range: Cycle paints plain FG (manual notes).
+            None => Some(color),
+            Some(_) => step_in_range(before, ctx, true),
+        },
+        DrawMode::Blend => mix(ctx, before, color, 1, 2),
+        DrawMode::Mix => mix(ctx, before, color, 1, 4),
+        DrawMode::Smooth => smooth(ctx, x, y),
+        DrawMode::HBrite => (before < 32 && ctx.palette.len() == 64).then_some(before + 32),
+    };
+    if let Some(c) = new {
+        page.set(x, y, c);
+    }
+}
+
+/// Shade / Cycle: the colour one step along the range (up, or down with the right button),
+/// clamped (Shade) or wrapped (Cycle); `None` when `c` is outside the range.
+fn step_in_range(c: u8, ctx: &PaintContext, wrap: bool) -> Option<u8> {
+    let (lo, hi) = ctx.range?;
+    let (lo, hi) = (lo.min(hi), lo.max(hi));
+    if c < lo || c > hi {
+        return None;
+    }
+    Some(if ctx.right {
+        if c > lo {
+            c - 1
+        } else if wrap {
+            hi
+        } else {
+            lo
+        }
+    } else if c < hi {
+        c + 1
+    } else if wrap {
+        lo
+    } else {
+        hi
+    })
+}
+
+/// Nearest palette colour to `under` mixed with `color`; `num / den` is the weight of `color`.
+fn mix(ctx: &PaintContext, under: u8, color: u8, num: u32, den: u32) -> Option<u8> {
+    let (a, b) = (ctx.palette.get(under)?, ctx.palette.get(color)?);
+    let ch =
+        |p: u8, q: u8| ((u32::from(p) * (den - num) + u32::from(q) * num + den / 2) / den) as u8;
+    Some(
+        ctx.palette
+            .nearest(Rgb8::new(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b))),
+    )
+}
+
+/// Smooth: the palette colour nearest to the average of the 3x3 neighbourhood in `before`.
+fn smooth(ctx: &PaintContext, x: i32, y: i32) -> Option<u8> {
+    let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if let Some(c) = ctx
+                .before
+                .get(x + dx, y + dy)
+                .and_then(|i| ctx.palette.get(i))
+            {
+                r += u32::from(c.r);
+                g += u32::from(c.g);
+                b += u32::from(c.b);
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let avg = |v: u32| ((v + n / 2) / n) as u8;
+    Some(ctx.palette.nearest(Rgb8::new(avg(r), avg(g), avg(b))))
 }
 
 #[cfg(test)]
@@ -179,5 +257,155 @@ mod tests {
         plot(&mut page, 1, 1, 7, DrawMode::Matte, &ctx);
         plot(&mut page, -1, 9, 7, DrawMode::Matte, &ctx);
         assert_eq!(page.get(1, 1), Some(7));
+    }
+
+    fn ctx<'a>(pal: &'a Palette, before: &'a IndexedImage) -> PaintContext<'a> {
+        PaintContext {
+            palette: pal,
+            range: None,
+            stencil: None,
+            before,
+            motion: (0, 0),
+            right: false,
+        }
+    }
+
+    fn bw() -> Palette {
+        Palette::new(vec![
+            Rgb8::new(0, 0, 0),
+            Rgb8::new(255, 255, 255),
+            Rgb8::new(128, 128, 128),
+            Rgb8::new(64, 64, 64),
+        ])
+        .unwrap()
+    }
+
+    fn one(mode: DrawMode, page: &IndexedImage, c: &PaintContext, color: u8) -> Option<u8> {
+        let mut p = page.clone();
+        plot(&mut p, 1, 1, color, mode, c);
+        p.get(1, 1)
+    }
+
+    #[test]
+    fn shade_steps_within_range_and_clamps() {
+        let pal = Palette::dpaint_default_32();
+        let img = IndexedImage::new(3, 3, 5);
+        let mut c = ctx(&pal, &img);
+        c.range = Some((4, 6));
+        assert_eq!(one(DrawMode::Shade, &img, &c, 1), Some(6));
+        c.right = true;
+        assert_eq!(one(DrawMode::Shade, &img, &c, 1), Some(4));
+        let top = IndexedImage::new(3, 3, 6);
+        c.right = false;
+        let c2 = PaintContext { before: &top, ..c };
+        assert_eq!(one(DrawMode::Shade, &top, &c2, 1), Some(6), "clamped");
+        let out = IndexedImage::new(3, 3, 9);
+        let c3 = PaintContext { before: &out, ..c };
+        assert_eq!(one(DrawMode::Shade, &out, &c3, 1), Some(9), "outside range");
+        let c4 = PaintContext { range: None, ..c };
+        assert_eq!(one(DrawMode::Shade, &img, &c4, 1), Some(5), "no range");
+    }
+
+    #[test]
+    fn shade_reads_before_so_a_gesture_moves_one_step() {
+        let pal = Palette::dpaint_default_32();
+        let before = IndexedImage::new(3, 3, 5);
+        let mut page = before.clone();
+        let mut c = ctx(&pal, &before);
+        c.range = Some((4, 8));
+        for _ in 0..3 {
+            plot(&mut page, 1, 1, 1, DrawMode::Shade, &c);
+        }
+        assert_eq!(page.get(1, 1), Some(6));
+    }
+
+    #[test]
+    fn cycle_wraps_and_paints_plain_colour_without_range() {
+        let pal = Palette::dpaint_default_32();
+        let top = IndexedImage::new(3, 3, 8);
+        let mut c = ctx(&pal, &top);
+        c.range = Some((4, 8));
+        assert_eq!(one(DrawMode::Cycle, &top, &c, 1), Some(4));
+        c.right = true;
+        let bottom = IndexedImage::new(3, 3, 4);
+        let c2 = PaintContext {
+            before: &bottom,
+            ..c
+        };
+        assert_eq!(one(DrawMode::Cycle, &bottom, &c2, 1), Some(8));
+        let c3 = PaintContext { range: None, ..c };
+        assert_eq!(one(DrawMode::Cycle, &top, &c3, 7), Some(7));
+    }
+
+    #[test]
+    fn blend_and_mix_pick_the_nearest_palette_colour() {
+        let pal = bw();
+        let page = IndexedImage::new(3, 3, 0);
+        let c = ctx(&pal, &page);
+        // 50 % of white over black is 128 grey = index 2.
+        assert_eq!(one(DrawMode::Blend, &page, &c, 1), Some(2));
+        // Mix keeps 75 % of the page: 64 grey = index 3.
+        assert_eq!(one(DrawMode::Mix, &page, &c, 1), Some(3));
+    }
+
+    #[test]
+    fn smooth_averages_the_neighbourhood() {
+        let pal = bw();
+        let mut img = IndexedImage::new(3, 3, 0);
+        for x in 0..3 {
+            img.set(x, 0, 1);
+        }
+        img.set(0, 1, 1);
+        // Centre pixel: 4 white of 9 = 113 -> nearest of {0,64,128,255} is 128 (index 2).
+        let c = ctx(&pal, &img);
+        assert_eq!(one(DrawMode::Smooth, &img, &c, 1), Some(2));
+        let flat = IndexedImage::new(3, 3, 1);
+        let c = ctx(&pal, &flat);
+        assert_eq!(one(DrawMode::Smooth, &flat, &c, 0), Some(1));
+    }
+
+    #[test]
+    fn smear_drags_the_colour_behind_the_brush() {
+        let pal = bw();
+        let mut img = IndexedImage::new(4, 3, 0);
+        img.set(0, 1, 1);
+        let mut c = ctx(&pal, &img);
+        c.motion = (1, 0);
+        let mut page = img.clone();
+        plot(&mut page, 1, 1, 3, DrawMode::Smear, &c);
+        assert_eq!(page.get(1, 1), Some(1));
+        // Behind the page edge: unchanged.
+        plot(&mut page, 0, 1, 3, DrawMode::Smear, &c);
+        assert_eq!(page.get(0, 1), Some(1));
+        c.motion = (0, 0);
+        let mut page = img.clone();
+        plot(&mut page, 2, 1, 3, DrawMode::Smear, &c);
+        assert_eq!(page.get(2, 1), Some(0));
+    }
+
+    #[test]
+    fn hbrite_needs_64_colours() {
+        let pal64 = Palette::new(vec![Rgb8::new(200, 100, 50); 64]).unwrap();
+        let img = IndexedImage::new(3, 3, 5);
+        let c = ctx(&pal64, &img);
+        assert_eq!(one(DrawMode::HBrite, &img, &c, 1), Some(37));
+        let high = IndexedImage::new(3, 3, 40);
+        let c = ctx(&pal64, &high);
+        assert_eq!(one(DrawMode::HBrite, &high, &c, 1), Some(40));
+        let pal32 = Palette::dpaint_default_32();
+        let c = ctx(&pal32, &img);
+        assert_eq!(one(DrawMode::HBrite, &img, &c, 1), Some(5));
+    }
+
+    #[test]
+    fn modes_respect_the_stencil() {
+        let pal = Palette::dpaint_default_32();
+        let img = IndexedImage::new(3, 3, 5);
+        let mut stencil = vec![false; 32];
+        stencil[5] = true;
+        let mut c = ctx(&pal, &img);
+        c.range = Some((4, 8));
+        c.stencil = Some(&stencil);
+        assert_eq!(one(DrawMode::Shade, &img, &c, 1), Some(5));
     }
 }

@@ -48,11 +48,11 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Airbrush, spacing (N total / every Nth / airbrush / continuous) | Spacing requester; airbrush done (ADR-14), spacing open |
 | P0 | Pipette (pick colour) | |
 | P1 | Brush pick-up (rectangle, lasso), last brush, custom brush stamping | |
-| P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | |
+| P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | flip, rotate 90, halve/double, outline/trim, handle centre/corner, BG/FG colour items, load/save brush files (ILBM) done (ADR-19); stretch, any angle, shear, bend, place handle open |
 | P1 | Text tool with bitmap fonts | original fonts only; UI font done (ADR-14), Choose Font open |
 | P1 | Grid snap, symmetry (point/mirror, N-fold) | 16×16 grid and 6-fold cyclic symmetry done (ADR-14); requesters, mirror, tile open |
 | P1 | Stencil (protect colours) | |
-| P1 | Paint modes (F1–F8 + menu): Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite | |
+| P1 | Paint modes (F1–F8 + menu): Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite | implemented in `paint::plot` (ADR-19, Mix is a guess); the tools call it once custom brushes are wired |
 | P2 | Effects: Translucency, Process, AntiAlias (off/low/high, off by default), fixed Background | Effect menu |
 | P0 | Antialiasing **off** by default for all tools | |
 | P3 | Perspective, bend/shear, metamorph | |
