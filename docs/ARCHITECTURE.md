@@ -55,6 +55,7 @@ struct Document {
 }
 ```
 
+- **Frames (ADR-28, implemented)**: `Document` holds 1..N frames of one size, one page each; the current frame is `page()` and every page command acts on it; the other frames sit behind `Arc` (shared by undo snapshots and copies). Frame commands are undo steps; `GotoFrame`/`SetFrameRate` are settings without one.
 - **Palette is per document** in V1 (DPaint behaviour). Per-frame palettes are an ANIM-import concern and are deferred; the data model reserves `Frame::palette_override: Option<PaletteId>`.
 - **Pixel buffers** are either `Indexed` (u8 index + 1-bit transparency mask) or `Rgba8` (imported references). Indexed is the normal painting format so palette edits and colour cycling stay live.
 - Buffers are stored as **64×64 tiles behind `Arc`** (copy-on-write). Duplicating a frame or snapshotting for undo copies pointers, not pixels.

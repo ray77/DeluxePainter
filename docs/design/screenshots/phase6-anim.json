@@ -1,0 +1,14 @@
+[
+{"op":"goto_frame","frame":0},
+{"op":"shape","shape":{"kind":"rect","from":[0,196],"to":[319,255]},"color":7,"filled":true},
+{"op":"shape","shape":{"kind":"line","from":[0,196],"to":[319,196]},"color":6,"brush":[[0,0]]},
+{"op":"copy_frame","first":0,"last":2},
+{"op":"shape","shape":{"kind":"ellipse","center":[70,170],"radius":[16,16]},"color":2,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[64,164],"radius":[4,4]},"color":3,"filled":true},
+{"op":"goto_frame","frame":1},
+{"op":"shape","shape":{"kind":"ellipse","center":[140,80],"radius":[16,16]},"color":2,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[134,74],"radius":[4,4]},"color":3,"filled":true},
+{"op":"goto_frame","frame":2},
+{"op":"shape","shape":{"kind":"ellipse","center":[210,170],"radius":[16,16]},"color":2,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[204,164],"radius":[4,4]},"color":3,"filled":true}
+]

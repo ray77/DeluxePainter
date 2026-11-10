@@ -19,11 +19,17 @@
 //!     [--palette-requester]             show the Color Mixer (selected colour = `--fg`)
 //!     [--range-requester]               show the Range requester (ranges of `--open`, else the defaults)
 //!     [--notes]                         show the notes of `--open` in the note requester
+//!     [--frames N] [--frame I]          make N animation frames (before `--commands`), then
+//!                                       show frame I (from 1) (ADR-28)
+//!     [--light-table [LIST]]            Light Table on (previous,next,two_back,spare,dim)
+//!     [--anim-requester KIND]           show an Anim requester: count, add, copy, delete,
+//!                                       goto or rate
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
+mod anim;
 mod browse;
 mod brush_menu;
 mod files;
@@ -268,6 +274,14 @@ fn main() -> eframe::Result {
                 std::process::exit(2);
             }
         }
+        // ADR-28: animation frames before the commands, which may go to frames themselves.
+        if let Some(n) = arg_value(&args, "--frames") {
+            let count = n.parse().unwrap_or(0);
+            if let Err(e) = engine.execute(Command::SetFrameCount { count }) {
+                eprintln!("--frames {n}: {}", e.message);
+                std::process::exit(2);
+            }
+        }
         if let Some(file) = arg_value(&args, "--commands")
             && let Err(e) = tools::run_command_file(&mut engine, &file)
         {
@@ -288,6 +302,13 @@ fn main() -> eframe::Result {
             };
             if let Err(e) = tools::run_brush_command_file(&mut engine, &file, brush) {
                 eprintln!("--brush-commands {e}");
+                std::process::exit(2);
+            }
+        }
+        if let Some(i) = arg_value(&args, "--frame") {
+            let frame = i.parse::<u32>().unwrap_or(0).saturating_sub(1);
+            if let Err(e) = engine.execute(Command::GotoFrame { frame }) {
+                eprintln!("--frame {i}: {}", e.message);
                 std::process::exit(2);
             }
         }
@@ -390,6 +411,29 @@ fn main() -> eframe::Result {
         if args.iter().any(|a| a == "--page-size-requester") {
             ui.page_size_requester = Some(page_size_requester(&doc));
         }
+        // ADR-28: frame counter, Anim requesters and the Light Table.
+        let count = doc.frame_count();
+        ui.frame_counter = (count > 1).then_some((doc.current_frame() + 1, count));
+        if let Some(kind) = arg_value(&args, "--anim-requester") {
+            match anim::snapshot_requester(&kind, &doc) {
+                Some(req) => ui.anim_requester = Some(req),
+                None => {
+                    eprintln!("--anim-requester expects count, add, copy, delete, goto or rate");
+                    std::process::exit(2);
+                }
+            }
+        }
+        let doc = if args.iter().any(|a| a == "--light-table") {
+            let spec = arg_value(&args, "--light-table").filter(|v| !v.starts_with("--"));
+            let light = anim::parse_light_table(spec.as_deref()).unwrap_or_else(|e| {
+                eprintln!("--light-table: {e}");
+                std::process::exit(2);
+            });
+            let page = anim::light_table_page(&doc, doc.page(), light, None, ui.bg, light.dim);
+            Document::from_picture(page, doc.palette().clone(), doc.target())
+        } else {
+            doc
+        };
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
@@ -692,6 +736,8 @@ struct PainterApp {
     picked_brush: Option<dpx_core::BrushImage>,
     /// Effect ▸ Stencil: `stencil[c]` protects colour `c` from painting; `None` = off.
     stencil: Option<Vec<bool>>,
+    /// Light Table and playback (ADR-28, anim.rs).
+    anim: anim::AnimState,
 }
 
 impl PainterApp {
@@ -724,6 +770,7 @@ impl PainterApp {
             custom_brush: None,
             picked_brush: None,
             stencil: None,
+            anim: anim::AnimState::default(),
         }
     }
 
@@ -731,6 +778,7 @@ impl PainterApp {
     fn set_picture(&mut self, doc: Document, extras: files::PictureExtras, path: PathBuf) {
         self.menu_data.loaded_palette = Some(doc.palette().clone());
         self.stroke = None;
+        self.anim.playing = None;
         self.engine = Engine::new(doc);
         self.extras = extras;
         self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
@@ -1114,8 +1162,12 @@ impl PainterApp {
         self.dirty = true;
     }
 
-    /// The page as shown: the stroke preview while painting, else the document page.
+    /// The page as shown: while the screen is composed the Light Table picture or the playing
+    /// frame (ADR-28), else the stroke preview while painting, else the document page.
     fn page(&self) -> &IndexedImage {
+        if let Some(shown) = &self.anim.shown {
+            return shown;
+        }
         self.stroke
             .as_ref()
             .map_or(self.engine.document().page(), |s| &s.preview)
@@ -1258,6 +1310,11 @@ impl PainterApp {
                 "palette.save" => self.open_file_requester(FileKind::SavePalette),
                 "background.fix" => self.fix_background(),
                 "background.free" => self.free_background(),
+                // ADR-28 (anim.rs).
+                id if id.starts_with("anim.") || id.starts_with("light_table.") => {
+                    self.anim_action(id, ctx.input(|i| i.time));
+                    ctx.request_repaint();
+                }
                 // ADR-19 (brush_menu.rs).
                 id if id.starts_with("brush.") => self.brush_action(id),
                 _ => {}
@@ -1321,6 +1378,17 @@ impl eframe::App for PainterApp {
         }
         if self.ui.tool_requester.is_some() {
             self.tool_requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-28: playback and the Anim requesters are modal.
+        if self.anim.playing.is_some() {
+            self.playback_input(&ctx);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.ui.anim_requester.is_some() {
+            self.anim_requester_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -1491,6 +1559,7 @@ impl eframe::App for PainterApp {
         });
         self.window_keys(&ctx);
         self.menu_keys(&ctx);
+        self.anim_keys(&ctx);
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
         if undo_key && !self.typing() {
@@ -1991,6 +2060,7 @@ impl PainterApp {
     ) {
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
+            self.prepare_anim_view();
             let (screen, rgba) = match (&self.requester, &self.show_page) {
                 (Some(req), _) => {
                     let screen = req.render();
@@ -2008,6 +2078,7 @@ impl PainterApp {
                     (screen, rgba)
                 }
             };
+            self.anim.shown = None;
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [screen.width() as usize, screen.height() as usize],
                 &rgba,

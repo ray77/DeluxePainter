@@ -632,6 +632,26 @@ pub const IMPLEMENTED: &[&str] = &[
     "stencil.free",
     // Prefs
     "view.largest_pixel_size",
+    // Anim > Frames and Control, Effect > LightTable (ADR-28); AnimBrush, Load, Save, Move,
+    // Panel, Set Range and Method stay ghosted.
+    "anim.set_frame_count",
+    "anim.add_frames",
+    "anim.copy_frames",
+    "anim.delete_frames",
+    "anim.set_rate",
+    "anim.previous",
+    "anim.next",
+    "anim.goto",
+    "anim.play",
+    "anim.play_once",
+    "anim.ping_pong",
+    "light_table.toggle",
+    "light_table.merge",
+    "light_table.dim",
+    "light_table.two_back",
+    "light_table.previous",
+    "light_table.next",
+    "light_table.spare",
     // Range requester (ADR-22)
     "color.ranges",
     // Brush menu (ADR-19); the interactive items (Stretch, Any Angle, Shear, Bend, Place,
@@ -1338,12 +1358,14 @@ mod tests {
             !Action::Command("brush.stretch").enabled(&with),
             "interactive: ghosted"
         );
-        assert!(!menu_enabled(menu("Anim"), &c));
+        assert!(menu_enabled(menu("Anim"), &c), "frames work (ADR-28)");
+        assert!(!Action::Command("anim.move").enabled(&c));
         assert!(menu_enabled(menu("Picture"), &c));
         let effect = &MENUS[menu("Effect")];
         let item = |label: &str| effect.items.iter().find(|i| i.label == label).unwrap();
         assert!(item("Stencil").enabled(&c), "some Stencil items work");
-        assert!(!item("LightTable").enabled(&c));
+        assert!(item("LightTable").enabled(&c));
+        assert!(!item("Perspective").enabled(&c));
         assert!(item("Background").enabled(&c));
     }
 
@@ -1369,9 +1391,9 @@ mod tests {
             };
             submenu_box(&b, item, items, 320, 256)
         };
-        // LightTable (item 1) is ghosted: nothing opens; Background (item 2) opens.
-        let s = sub(1);
-        assert_eq!(draw_with(1).get(s.x + s.w / 2, s.y + s.h - 1), Some(200));
+        // Perspective (item 6) is ghosted: nothing opens; Background (item 2) opens.
+        let s = sub(6);
+        assert_eq!(draw_with(6).get(s.x + s.w / 2, s.y + s.h - 1), Some(200));
         let s = sub(2);
         assert_eq!(
             draw_with(2).get(s.x + s.w / 2, s.y + s.h - 1),

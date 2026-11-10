@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::Document;
+use crate::document::{Document, check_frame_count};
 use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
 use crate::mode::DisplayMode;
@@ -145,6 +145,51 @@ pub enum Command {
         front: bool,
         transparent: u8,
     },
+    // ---- Animation frames (ADR-28). Frame numbers start at 0 (the interface shows them
+    // from 1). Every page command above acts on the current frame; SetFormat and
+    // SetPageSize change all frames. Frame commands are one undo step each; GotoFrame and
+    // SetFrameRate are settings that change no pixels and are no undo step.
+    /// Anim ▸ Frames ▸ Set #..: more frames are copies of the current frame inserted after
+    /// it; fewer frames delete from the current frame on (DeluxePaint, AGA p.236).
+    SetFrameCount { count: u32 },
+    /// Anim ▸ Frames ▸ Add Frames..: `count` copies of the current frame after it; the last
+    /// copy becomes the current frame (AGA p.237).
+    AddFrames { count: u32 },
+    /// Anim ▸ Frames ▸ Copy Frames.. "Current Frame to": frames `first..=last` become copies
+    /// of the current frame (all frames: Copy to All).
+    CopyFrame { first: u32, last: u32 },
+    /// Copy Frames.. "Range … Insert Before Frame": copies of frames `first..=last` go in
+    /// before frame `before` (the frame count = at the end); the current picture stays current.
+    InsertFrameCopies { first: u32, last: u32, before: u32 },
+    /// Anim ▸ Frames ▸ Delete Frames..: removes frames `first..=last`; the frame after them
+    /// becomes current if the current one goes (the one before at the end, AGA p.237).
+    /// Deleting every frame leaves one frame in the `fill` (BG) colour.
+    DeleteFrames {
+        first: u32,
+        last: u32,
+        #[serde(default)]
+        fill: u8,
+    },
+    /// Anim ▸ Control ▸ Previous / Next / Goto..: makes `frame` the current frame.
+    GotoFrame { frame: u32 },
+    /// Anim ▸ Control ▸ Set Rate..: playback rate, 1 to 60 frames per second.
+    SetFrameRate { fps: u8 },
+}
+
+impl Command {
+    /// True for the commands of ADR-28 that work on frames.
+    fn is_frame_command(&self) -> bool {
+        matches!(
+            self,
+            Command::SetFrameCount { .. }
+                | Command::AddFrames { .. }
+                | Command::CopyFrame { .. }
+                | Command::InsertFrameCopies { .. }
+                | Command::DeleteFrames { .. }
+                | Command::GotoFrame { .. }
+                | Command::SetFrameRate { .. }
+        )
+    }
 }
 
 /// What a command changes; decides what the engine snapshots for undo.
@@ -155,11 +200,18 @@ pub(crate) enum Footprint {
     Palette,
     /// Page size, palette and target may all change.
     Document,
+    /// The frames (number, order, contents, current one) change; size and palette stay.
+    Frames,
+    /// A setting (current frame, rate): applied without an undo step (ADR-28).
+    Setting,
 }
 
 impl Command {
     /// Checks the command against the document without changing anything.
     pub(crate) fn validate(&self, doc: &Document) -> Result<(), CommandError> {
+        if self.is_frame_command() {
+            return crate::frame_ops::validate(self, doc);
+        }
         let colors = doc.palette.len();
         let color = |c: u8| {
             if usize::from(c) < colors {
@@ -295,11 +347,15 @@ impl Command {
                         "page {width}x{height} is smaller than the {sw}x{sh} screen"
                     )));
                 }
+                // All frames take the new size (ADR-28).
+                check_frame_count(doc.frame_count(), *width, *height)?;
                 if *retain {
-                    let kept = doc
-                        .page
-                        .crop(Rect::new(0, 0, *width as i32, *height as i32));
-                    if let Some(&max_used) = kept.pixels().iter().max()
+                    let kept = Rect::new(0, 0, *width as i32, *height as i32);
+                    let max_used = doc
+                        .frames()
+                        .filter_map(|f| f.crop(kept).pixels().iter().max().copied())
+                        .max();
+                    if let Some(max_used) = max_used
                         && u16::from(max_used) >= *n
                     {
                         return Err(CommandError::new(
@@ -319,6 +375,7 @@ impl Command {
                 fill,
             } => {
                 color(*fill)?;
+                check_frame_count(doc.frame_count(), *width, *height)?;
                 if doc.target.page_fits(*width, *height) {
                     Ok(())
                 } else {
@@ -335,6 +392,15 @@ impl Command {
             } => {
                 other_page(*width, *height, pixels, colors)?;
                 let same = (*width, *height) == (doc.page.width(), doc.page.height());
+                if !same && doc.frame_count() > 1 {
+                    // All frames share one size (ADR-28); Page Size changes them together.
+                    return Err(CommandError::invalid(format!(
+                        "page {width}x{height}: all {} frames are {}x{}",
+                        doc.frame_count(),
+                        doc.page.width(),
+                        doc.page.height()
+                    )));
+                }
                 if same || doc.target.page_fits(*width, *height) {
                     Ok(())
                 } else {
@@ -364,6 +430,13 @@ impl Command {
                     )))
                 }
             }
+            Command::SetFrameCount { .. }
+            | Command::AddFrames { .. }
+            | Command::CopyFrame { .. }
+            | Command::InsertFrameCopies { .. }
+            | Command::DeleteFrames { .. }
+            | Command::GotoFrame { .. }
+            | Command::SetFrameRate { .. } => unreachable!("frame commands are checked above"),
         }
     }
 
@@ -393,11 +466,20 @@ impl Command {
             Command::MergePage { width, height, .. } => {
                 Footprint::Pixels(page.intersect(Rect::new(0, 0, *width as i32, *height as i32)))
             }
+            Command::SetFrameCount { .. }
+            | Command::AddFrames { .. }
+            | Command::CopyFrame { .. }
+            | Command::InsertFrameCopies { .. }
+            | Command::DeleteFrames { .. } => Footprint::Frames,
+            Command::GotoFrame { .. } | Command::SetFrameRate { .. } => Footprint::Setting,
         }
     }
 
     /// Applies the command. Call only after [`Self::validate`].
     pub(crate) fn apply(&self, doc: &mut Document) {
+        if self.is_frame_command() {
+            return crate::frame_ops::apply(self, doc);
+        }
         let page = &mut doc.page;
         match self {
             Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
@@ -427,11 +509,13 @@ impl Command {
                 retain,
                 screen,
             } => {
-                let mut new_page = IndexedImage::new(*width, *height, 0);
-                if *retain {
-                    new_page.blit(&doc.page, 0, 0);
-                }
-                doc.page = new_page;
+                doc.for_each_frame(|frame| {
+                    let mut new_page = IndexedImage::new(*width, *height, 0);
+                    if *retain {
+                        new_page.blit(frame, 0, 0);
+                    }
+                    *frame = new_page;
+                });
                 doc.palette = resized_palette(&doc.palette, usize::from(*colors));
                 doc.target.mode = *mode;
                 doc.target.screen = screen.unwrap_or(mode.size());
@@ -441,9 +525,11 @@ impl Command {
                 height,
                 fill,
             } => {
-                let mut new_page = IndexedImage::new(*width, *height, *fill);
-                new_page.blit(&doc.page, 0, 0);
-                doc.page = new_page;
+                doc.for_each_frame(|frame| {
+                    let mut new_page = IndexedImage::new(*width, *height, *fill);
+                    new_page.blit(frame, 0, 0);
+                    *frame = new_page;
+                });
             }
             Command::SetPage {
                 width,
@@ -476,6 +562,13 @@ impl Command {
                 *page = IndexedImage::from_pixels(page.width(), page.height(), merged)
                     .expect("same size");
             }
+            Command::SetFrameCount { .. }
+            | Command::AddFrames { .. }
+            | Command::CopyFrame { .. }
+            | Command::InsertFrameCopies { .. }
+            | Command::DeleteFrames { .. }
+            | Command::GotoFrame { .. }
+            | Command::SetFrameRate { .. } => unreachable!("frame commands are applied above"),
         }
     }
 }

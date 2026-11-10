@@ -97,6 +97,9 @@ pub struct DocumentState {
     pub revision: u64,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// Animation frames (ADR-28): how many, and the current one (counted from 0).
+    pub frames: usize,
+    pub current_frame: usize,
 }
 
 /// Result of `app_status`.
@@ -128,6 +131,8 @@ fn describe(engine: &Engine) -> DocumentState {
         revision: doc.revision(),
         can_undo: engine.can_undo(),
         can_redo: engine.can_redo(),
+        frames: doc.frame_count(),
+        current_frame: doc.current_frame(),
     }
 }
 
@@ -144,7 +149,10 @@ pub struct ExecuteArgs {
     /// {axis: horizontal|vertical}, `replace_color` {from, to}, `swap_colors` {a, b},
     /// `set_palette` {colors:[{r,g,b}]}, `set_format` {mode, colors, width, height, retain,
     /// screen}, `set_page_size` {width, height, fill}, `set_page` {width, height, pixels},
-    /// `merge_page` {width, height, pixels, front, transparent}. Points and brush pixels are
+    /// `merge_page` {width, height, pixels, front, transparent}; frames (ADR-28, numbered
+    /// from 0, page ops act on the current frame): `set_frame_count` {count}, `add_frames`
+    /// {count}, `copy_frame` {first, last}, `insert_frame_copies` {first, last, before},
+    /// `delete_frames` {first, last, fill}, `goto_frame` {frame}, `set_frame_rate` {fps}. Points and brush pixels are
     /// [x, y] pairs; a one-pixel brush is [[0, 0]]. Example: {"op":"shape","shape":{"kind":
     /// "rect","from":[10,10],"to":[50,40]},"brush":[[0,0]],"color":5,"filled":true}.
     pub command: serde_json::Value,
