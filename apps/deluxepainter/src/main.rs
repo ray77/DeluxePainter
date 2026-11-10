@@ -12,6 +12,8 @@
 //!     [--drawer-as TEXT]                … showing TEXT in the Drawer field (doc screenshots)
 //!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
 //!     [--commands FILE.json]            apply a JSON array of commands first (ADR-14)
+//!     [--pick X,Y,W,H]                  then pick up that part of the page as custom brush
+//!     [--brush-commands FILE.json]      … and apply commands that stamp it (ADR-18)
 //!     [--show-page]                     show the Show Page view
 //!     [--page-size-requester]           show the Page Size requester
 //!     [--palette-requester]             show the Color Mixer (selected colour = `--fg`)
@@ -268,6 +270,23 @@ fn main() -> eframe::Result {
             eprintln!("--commands {e}");
             std::process::exit(2);
         }
+        // ADR-18: pick up a custom brush, then paint with it.
+        let picked = arg_value(&args, "--pick").map(|spec| {
+            tools::pick_spec(engine.document().page(), &spec).unwrap_or_else(|e| {
+                eprintln!("--pick {e}");
+                std::process::exit(2);
+            })
+        });
+        if let Some(file) = arg_value(&args, "--brush-commands") {
+            let Some(brush) = &picked else {
+                eprintln!("--brush-commands needs --pick");
+                std::process::exit(2);
+            };
+            if let Err(e) = tools::run_brush_command_file(&mut engine, &file, brush) {
+                eprintln!("--brush-commands {e}");
+                std::process::exit(2);
+            }
+        }
         let doc = engine.document().clone();
         let view = View::of_target(doc.target());
         let scroll = arg_value(&args, "--scroll")
@@ -282,6 +301,10 @@ fn main() -> eframe::Result {
         let mut ui = UiState::default();
         if let Some(fg) = arg_value(&args, "--fg").and_then(|s| s.parse().ok()) {
             ui.fg = fg;
+        }
+        if picked.is_some() {
+            // As after a pick-up in the program.
+            ui.mode = PaintMode::Matte;
         }
         if let Some(spec) = arg_value(&args, "--tool") {
             let (name, filled) = spec
@@ -395,7 +418,7 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        if let Err(e) = snapshot(path, scale, &doc, view, scroll, &ui) {
+        if let Err(e) = snapshot(path, scale, &doc, view, scroll, &ui, picked.is_some()) {
             eprintln!("snapshot failed: {e}");
             std::process::exit(1);
         }
@@ -500,7 +523,8 @@ fn exit_with(result: Result<(), String>) -> ! {
 }
 
 /// Renders `view` of `doc` headless; each screen pixel becomes `scale` × its displayed shape
-/// (e.g. HiRes pixels are twice as tall as wide).
+/// (e.g. HiRes pixels are twice as tall as wide). `custom_brush`: a custom brush is the brush,
+/// so no built-in brush is shown selected.
 fn snapshot(
     path: &str,
     scale: usize,
@@ -508,8 +532,14 @@ fn snapshot(
     view: View,
     scroll: (i32, i32),
     ui: &UiState,
+    custom_brush: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let screen = view.compose(doc.page(), scroll, doc.palette(), ui);
+    let mut screen = view.compose(doc.page(), scroll, doc.palette(), ui);
+    if custom_brush && ui.toolbox_visible {
+        let pens = Pens::from_palette(doc.palette());
+        let x0 = view.ui_screen().toolbox_x();
+        dpx_ui::toolbox::draw_brush_unselected(&mut screen, x0, ui.brush, &pens, view.ux, view.uy);
+    }
     let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
     let rgba = to_rgba(&screen, doc.palette(), sx, sy);
     write_png(
@@ -1075,11 +1105,13 @@ impl PainterApp {
             Hit::Tool {
                 tool: Tool::Zoom, ..
             } if right => self.zoom(-1),
+            // Right-click on the Brush Selector: last custom brush on/off (ADR-18).
+            Hit::Tool {
+                tool: Tool::BrushSelect,
+                ..
+            } if right => self.toggle_custom_brush(),
             Hit::Tool { tool, filled_half } => self.select_tool(tool, filled_half),
-            Hit::Brush(i) => {
-                self.ui.brush = i;
-                self.dirty = true;
-            }
+            Hit::Brush(i) => self.select_builtin_brush(i),
             Hit::PaletteCell(i) => {
                 if right {
                     self.ui.bg = i;
@@ -1313,7 +1345,11 @@ impl eframe::App for PainterApp {
                 }
             } else if let Some(Hit::Page { x, y }) = hit {
                 self.handle_hover(x, y);
+            } else if !(down_l || down_r) {
+                self.hover_brush(None);
             }
+        } else {
+            self.hover_brush(None);
         }
         if !(down_l || down_r) {
             self.release();

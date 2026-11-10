@@ -280,6 +280,37 @@ pub fn draw_toggle_on(
     }
 }
 
+/// Draws built-in brush `index` as not selected (dark pixels on the face, the block's shine
+/// edge where its highlight box covers it), for a screen where a custom brush is the brush
+/// (ADR-18). `toolbox_x` is the toolbox's left edge in UI pixels; each UI pixel covers
+/// `ux`×`uy` pixels of `img`.
+pub fn draw_brush_unselected(
+    img: &mut dpx_core::IndexedImage,
+    toolbox_x: i32,
+    index: usize,
+    pens: &crate::Pens,
+    ux: i32,
+    uy: i32,
+) {
+    use crate::screen::geom;
+    let Some(b) = BUILTIN_BRUSHES.get(index) else {
+        return;
+    };
+    let (bx, by, bw, bh) = b.select_box;
+    for y in by..by + bh {
+        for x in bx..bx + bw {
+            let pen = if y == geom::BRUSH_BLOCK_Y || x == 0 {
+                pens.shine
+            } else if b.pixels.contains(&(x, y)) {
+                pens.dark
+            } else {
+                pens.face
+            };
+            img.fill_rect((toolbox_x + x) * ux, y * uy, ux, uy, pen);
+        }
+    }
+}
+
 /// The ten built-in brushes in the block at the top of the toolbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltinBrush {
@@ -509,6 +540,32 @@ mod tests {
         for y in by..by + 11 {
             for x in bx..bx + 11 {
                 assert_eq!(got.get(x, y), want.get(x, y), "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unselected_brush_looks_like_it_does_when_another_is_selected() {
+        use crate::screen::{Screen, UiState};
+        use dpx_core::Palette;
+        let palette = Palette::dpaint_default_32();
+        let pens = crate::Pens::from_palette(&palette);
+        let screen = Screen::new(320, 256);
+        let page = dpx_core::IndexedImage::new(320, 256, 0);
+        // Brush 3's box covers the shine edge at the top of the block.
+        for index in [0, 3, 9] {
+            let ui = |brush| UiState {
+                brush,
+                ..UiState::default()
+            };
+            let mut got = screen.render(&page, &palette, &ui(index));
+            draw_brush_unselected(&mut got, screen.toolbox_x(), index, &pens, 1, 1);
+            let want = screen.render(&page, &palette, &ui((index + 1) % 10));
+            let (bx, by, bw, bh) = BUILTIN_BRUSHES[index].select_box;
+            for y in by..by + bh {
+                for x in screen.toolbox_x() + bx..screen.toolbox_x() + bx + bw {
+                    assert_eq!(got.get(x, y), want.get(x, y), "brush {index} ({x},{y})");
+                }
             }
         }
     }

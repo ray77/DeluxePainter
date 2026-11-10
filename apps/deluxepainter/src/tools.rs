@@ -3,11 +3,16 @@
 //! into a copy of the page with the same dpx-core code the engine uses, so the preview is the
 //! committed result. Also the toolbox toggles (Grid, Symmetry, Magnify, Zoom), the tool keys
 //! and `--commands`.
+//!
+//! Custom brushes (ADR-18): the Brush Selector picks up part of the page; every drawing tool
+//! then stamps it, in the Mode menu's drawing mode, and it follows the pointer as a preview.
 
 use dpx_core::shapes::MAX_SHAPE_POINTS;
-use dpx_core::{Command, Engine, IndexedImage, Rect, Shape, Symmetry, raster};
+use dpx_core::{
+    BrushImage, Command, DrawMode, Engine, IndexedImage, Palette, Rect, Shape, Symmetry, raster,
+};
 use dpx_ui::font::{self, Font};
-use dpx_ui::{Pens, Pref, Tool, toolbox};
+use dpx_ui::{PaintMode, Pens, Pref, Prefs, Tool, UiState, toolbox};
 use eframe::egui;
 
 use crate::{PainterApp, View};
@@ -44,6 +49,8 @@ pub struct ToolState {
     pub shift: bool,
     /// Airbrush random state (xorshift); the sprayed points end up in the command.
     rng: u32,
+    /// The tool (and its filled half) to go back to after a Brush Selector pick-up.
+    pick_return: Option<(Tool, bool)>,
 }
 
 impl Default for ToolState {
@@ -55,6 +62,7 @@ impl Default for ToolState {
             zoom: DEFAULT_ZOOM,
             shift: false,
             rng: 0x2545_F491,
+            pick_return: None,
         }
     }
 }
@@ -70,14 +78,39 @@ impl ToolState {
     }
 }
 
+/// What a gesture paints with (ADR-18): the fields its commands carry besides the geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ink {
+    /// FG, or BG with the right button.
+    color: u8,
+    /// The built-in brush (unused while `custom` is set).
+    brush: Vec<(i32, i32)>,
+    custom: Option<BrushImage>,
+    mode: DrawMode,
+    range: Option<(u8, u8)>,
+    stencil: Option<Vec<bool>>,
+    right: bool,
+}
+
+impl Ink {
+    /// Whether parts of a stroke may be painted on top of each other: the modes that only set
+    /// colours. The others depend on the order and motion of every stamp, so the preview is
+    /// painted again as a whole.
+    fn paints_in_parts(&self) -> bool {
+        matches!(
+            self.mode,
+            DrawMode::Matte | DrawMode::Color | DrawMode::Replace
+        )
+    }
+}
+
 /// A gesture in progress (named after the freehand stroke it started as).
 pub struct Stroke {
     /// The page with the candidate command painted on it.
     pub preview: IndexedImage,
     /// The part of `preview` that may differ from the document page.
     drawn: Rect,
-    color: u8,
-    brush: Vec<(i32, i32)>,
+    ink: Ink,
     filled: bool,
     symmetry: Option<Symmetry>,
     /// The button that started the gesture is still held.
@@ -133,6 +166,16 @@ enum Kind {
     Text {
         at: (i32, i32),
         lines: Vec<String>,
+    },
+    /// Brush Selector: the frame from `from` to `to` (corners inclusive) while dragging; the
+    /// right button cuts.
+    Pick {
+        from: (i32, i32),
+        to: (i32, i32),
+    },
+    /// No button held: the custom brush shown at the pointer, never committed.
+    Hover {
+        at: (i32, i32),
     },
 }
 
@@ -203,30 +246,109 @@ fn text_pixels(at: (i32, i32), lines: &[String]) -> Vec<(i32, i32)> {
     out
 }
 
+/// The Mode menu's mode as the drawing mode the commands carry.
+pub fn draw_mode(mode: PaintMode) -> DrawMode {
+    match mode {
+        PaintMode::Matte => DrawMode::Matte,
+        PaintMode::Color => DrawMode::Color,
+        PaintMode::Replace => DrawMode::Replace,
+        PaintMode::Smear => DrawMode::Smear,
+        PaintMode::Shade => DrawMode::Shade,
+        PaintMode::Blend => DrawMode::Blend,
+        PaintMode::Cycle => DrawMode::Cycle,
+        PaintMode::Smooth => DrawMode::Smooth,
+        PaintMode::Mix => DrawMode::Mix,
+        PaintMode::HBrite => DrawMode::HBrite,
+    }
+}
+
+/// The rectangle with the opposite corners `a` and `b` (both inclusive).
+fn rect_between(a: (i32, i32), b: (i32, i32)) -> Rect {
+    Rect::new(
+        a.0.min(b.0),
+        a.1.min(b.1),
+        (a.0 - b.0).abs() + 1,
+        (a.1 - b.1).abs() + 1,
+    )
+}
+
+/// The Brush Selector's frame: the outline of `r` in the complementary colour of each page
+/// pixel (XOR style, visible on any picture), clipped to `img`.
+fn draw_frame(img: &mut IndexedImage, page: &IndexedImage, r: Rect, colors: usize) {
+    let top = (colors.clamp(1, 256) - 1) as u8;
+    let mut flip = |x: i32, y: i32| {
+        if let Some(p) = page.get(x, y) {
+            img.set(x, y, top.saturating_sub(p));
+        }
+    };
+    let (x1, y1) = (r.x + r.w - 1, r.y + r.h - 1);
+    let (cx0, cx1) = (r.x.max(0), x1.min(page.width() as i32 - 1));
+    let (cy0, cy1) = (r.y.max(0), y1.min(page.height() as i32 - 1));
+    for x in cx0..=cx1 {
+        flip(x, r.y);
+        if y1 != r.y {
+            flip(x, y1);
+        }
+    }
+    for y in (cy0..=cy1).filter(|&y| y != r.y && y != y1) {
+        flip(r.x, y);
+        if x1 != r.x {
+            flip(x1, y);
+        }
+    }
+}
+
+/// The transparent colour of a brush picked up as `img`: the BG colour, or with Prefs ▸
+/// AutoTransp the colour all four corners share (manual: "else BG").
+fn pick_transparent(img: &IndexedImage, prefs: Prefs, bg: u8) -> u8 {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].map(|(x, y)| img.get(x, y));
+    match corners[0] {
+        Some(c) if prefs.get(Pref::AutoTransp) && corners.iter().all(|&k| k == Some(c)) => c,
+        _ => bg,
+    }
+}
+
 impl Stroke {
     fn shape(&self, shape: Shape, filled: bool) -> Command {
         let solid = filled && !matches!(shape, Shape::Dots { .. });
+        let ink = &self.ink;
         Command::Shape {
             shape,
-            brush: if solid {
+            brush: if solid || ink.custom.is_some() {
                 Vec::new()
             } else {
-                self.brush.clone()
+                ink.brush.clone()
             },
-            color: self.color,
+            color: ink.color,
             filled: solid,
             symmetry: self.symmetry,
+            custom: if solid { None } else { ink.custom.clone() },
+            mode: ink.mode,
+            range: ink.range,
+            stencil: ink.stencil.clone(),
+            right: ink.right,
         }
     }
 
     /// Freehand points as a command: a plain [`Command::Stroke`] without symmetry.
     fn freehand(&self, points: Vec<(i32, i32)>, continuous: bool) -> Command {
+        let ink = &self.ink;
         match (self.symmetry, continuous) {
             (None, _) => Command::Stroke {
-                brush: self.brush.clone(),
-                color: self.color,
+                brush: if ink.custom.is_some() {
+                    Vec::new()
+                } else {
+                    ink.brush.clone()
+                },
+                color: ink.color,
                 points,
                 continuous,
+                custom: ink.custom.clone(),
+                mode: ink.mode,
+                range: ink.range,
+                stencil: ink.stencil.clone(),
+                right: ink.right,
             },
             (Some(_), true) => self.shape(
                 Shape::Polygon {
@@ -239,13 +361,19 @@ impl Stroke {
         }
     }
 
-    /// A 1-pixel outline (filled freehand and polygons while they are drawn).
+    /// A 1-pixel outline in plain colour (feedback for filled freehand and polygons while they
+    /// are drawn).
     fn outline(&self, points: Vec<(i32, i32)>) -> Command {
         Command::Stroke {
             brush: vec![(0, 0)],
-            color: self.color,
+            color: self.ink.color,
             points,
             continuous: true,
+            custom: None,
+            mode: DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right: false,
         }
     }
 
@@ -342,35 +470,62 @@ impl Stroke {
                 if points.is_empty() {
                     return None;
                 }
+                // Text is set in the font's pixels, never with the brush.
                 Command::Shape {
                     shape: Shape::Dots { points },
                     brush: vec![(0, 0)],
-                    color: self.color,
+                    color: self.ink.color,
                     filled: false,
                     symmetry: None,
+                    custom: None,
+                    mode: self.ink.mode,
+                    range: self.ink.range,
+                    stencil: self.ink.stencil.clone(),
+                    right: self.ink.right,
                 }
             }
+            // The pick-up is no page command; its frame is drawn by `redraw`.
+            Kind::Pick { .. } => return None,
+            Kind::Hover { .. } if commit => return None,
+            Kind::Hover { at } => self.shape(Shape::Dots { points: vec![*at] }, false),
         })
     }
 
-    /// Paints part of the gesture on top of the preview (freehand, airbrush).
-    fn paint_more(&mut self, cmd: &Command) {
+    /// Paints part of the gesture on top of the preview (freehand, airbrush). `page` is the
+    /// document page (the page before the gesture).
+    fn paint_more(&mut self, cmd: &Command, page: &IndexedImage, palette: &Palette) {
         if let Some(r) = cmd.paint_bounds(&self.preview) {
             self.drawn = self.drawn.union(r);
         }
-        cmd.paint(&mut self.preview);
+        cmd.paint(&mut self.preview, page, palette);
+    }
+
+    /// A new part of a freehand stroke or spray: painted on top, or in the modes that need the
+    /// whole stroke ([`Ink::paints_in_parts`]) the whole preview again.
+    fn add_part(&mut self, part: &Command, page: &IndexedImage, palette: &Palette) {
+        if self.ink.paints_in_parts() {
+            self.paint_more(part, page, palette);
+        } else {
+            self.redraw(page, palette);
+        }
     }
 
     /// Repaints the preview from the document page and the current candidate.
-    fn redraw(&mut self, page: &IndexedImage) {
+    fn redraw(&mut self, page: &IndexedImage, palette: &Palette) {
         if !self.drawn.is_empty() {
             self.preview
                 .blit(&page.crop(self.drawn), self.drawn.x, self.drawn.y);
         }
         self.drawn = Rect::default();
+        if let Kind::Pick { from, to } = self.kind {
+            let r = rect_between(from, to);
+            draw_frame(&mut self.preview, page, r, palette.len());
+            self.drawn = r.intersect(page.bounds());
+            return;
+        }
         if let Some(cmd) = self.candidate(false) {
             self.drawn = cmd.paint_bounds(page).unwrap_or_default();
-            cmd.paint(&mut self.preview);
+            cmd.paint(&mut self.preview, page, palette);
         }
     }
 }
@@ -409,6 +564,7 @@ impl PainterApp {
                 | Tool::Rectangle
                 | Tool::Circle
                 | Tool::Ellipse
+                | Tool::BrushSelect
                 | Tool::Text
         );
         if self.tools.grid && obeys {
@@ -421,7 +577,9 @@ impl PainterApp {
 
     /// Symmetry for a new gesture: around the centre of the screen.
     fn symmetry(&self) -> Option<Symmetry> {
-        if !self.tools.symmetry || matches!(self.ui.tool, Tool::Text | Tool::Fill) {
+        if !self.tools.symmetry
+            || matches!(self.ui.tool, Tool::Text | Tool::Fill | Tool::BrushSelect)
+        {
             return None;
         }
         let v = self.view();
@@ -434,6 +592,178 @@ impl PainterApp {
             order: SYMMETRY_ORDER,
             aspect: (fx as u8, fy as u8),
         })
+    }
+
+    /// The colour range (CRNG, loaded with the picture or a palette) that holds the FG colour,
+    /// for Shade and Cycle; ranges outside the palette are skipped.
+    fn fg_range(&self) -> Option<(u8, u8)> {
+        let colors = self.engine.document().palette().len();
+        let fg = self.ui.fg;
+        self.extras
+            .ranges
+            .iter()
+            .find(|r| r.low <= fg && fg <= r.high && usize::from(r.high) < colors)
+            .map(|r| (r.low, r.high))
+    }
+
+    /// What a new gesture paints with: FG (BG with `right`), the custom brush if there is one
+    /// (else the built-in brush), the Mode menu's mode, the range holding FG and the stencil.
+    /// A custom brush with colours the palette no longer has (after a Screen Format change)
+    /// is not used.
+    fn ink(&self, right: bool) -> Ink {
+        let colors = self.engine.document().palette().len();
+        let fits = |c: u8| usize::from(c) < colors;
+        Ink {
+            color: if right { self.ui.bg } else { self.ui.fg },
+            brush: toolbox::BUILTIN_BRUSHES[self.ui.brush].footprint(),
+            custom: self
+                .custom_brush
+                .clone()
+                .filter(|b| b.pixels.iter().all(|&c| fits(c)) && b.transparent.is_none_or(fits)),
+            mode: draw_mode(self.ui.mode),
+            range: self.fg_range(),
+            stencil: self.stencil.clone(),
+            right,
+        }
+    }
+
+    /// Whether the selected tool stamps the brush (outlines, freehand, airbrush).
+    fn stamps_brush(&self) -> bool {
+        match self.ui.tool {
+            Tool::DottedFreehand | Tool::Line | Tool::Curve | Tool::Airbrush => true,
+            Tool::ContinuousFreehand
+            | Tool::Rectangle
+            | Tool::Circle
+            | Tool::Ellipse
+            | Tool::Polygon => !self.ui.filled,
+            _ => false,
+        }
+    }
+
+    /// The custom brush at the pointer (`at`; `None` = off the page) while a tool that stamps
+    /// it is selected and no gesture is in progress. Shown in the preview, never committed.
+    pub(crate) fn hover_brush(&mut self, at: Option<(i32, i32)>) {
+        let idle = self.stroke.is_none() && self.custom_brush.is_none();
+        if idle
+            || self
+                .stroke
+                .as_ref()
+                .is_some_and(|s| !matches!(s.kind, Kind::Hover { .. }))
+        {
+            return;
+        }
+        let ink = self.ink(false);
+        let at = at
+            .filter(|_| ink.custom.is_some() && self.stamps_brush())
+            .map(|p| self.snap(p));
+        let Some(at) = at else {
+            if self.stroke.take().is_some() {
+                self.dirty = true;
+            }
+            return;
+        };
+        let doc = self.engine.document();
+        if let Some(s) = &mut self.stroke {
+            if matches!(s.kind, Kind::Hover { at: a } if a == at) && s.ink == ink {
+                return;
+            }
+            s.kind = Kind::Hover { at };
+            s.ink = ink;
+            s.redraw(doc.page(), doc.palette());
+        } else {
+            let mut s = Stroke {
+                preview: doc.page().clone(),
+                drawn: Rect::default(),
+                ink,
+                filled: false,
+                symmetry: None,
+                held: false,
+                kind: Kind::Hover { at },
+            };
+            s.redraw(doc.page(), doc.palette());
+            self.stroke = Some(s);
+        }
+        self.dirty = true;
+    }
+
+    /// The Brush Selector was released: the framed part of the page becomes the custom brush
+    /// (BG colour transparent, handle in the centre) and the mode Matte. A right-button drag
+    /// cuts: the part is filled with BG in one undoable command. Then the tool used before
+    /// the Brush Selector comes back.
+    fn pick_up(&mut self) {
+        let Some(Stroke {
+            kind: Kind::Pick { from, to },
+            ink,
+            ..
+        }) = self.stroke.take()
+        else {
+            return;
+        };
+        self.dirty = true;
+        let page = self.engine.document().page();
+        let mut r = rect_between(from, to);
+        // ExclBrush: with the grid on, leave out the right and bottom border.
+        if self.tools.grid && self.ui.prefs.get(Pref::ExclBrush) {
+            r.w = (r.w - 1).max(1);
+            r.h = (r.h - 1).max(1);
+        }
+        let r = r.intersect(page.bounds());
+        if r.is_empty() {
+            return;
+        }
+        let img = page.crop(r);
+        let transparent = pick_transparent(&img, self.ui.prefs, self.ui.bg);
+        let brush = BrushImage::from_image(&img, Some(transparent));
+        if ink.right {
+            self.execute(Command::Shape {
+                shape: Shape::Rect {
+                    from: (r.x, r.y),
+                    to: (r.x + r.w - 1, r.y + r.h - 1),
+                },
+                brush: Vec::new(),
+                color: self.ui.bg,
+                filled: true,
+                symmetry: None,
+                custom: None,
+                mode: DrawMode::Matte,
+                range: None,
+                stencil: None,
+                right: true,
+            });
+        }
+        self.custom_brush = Some(brush.clone());
+        self.picked_brush = Some(brush);
+        self.ui.mode = PaintMode::Matte;
+        let (tool, filled) = self
+            .tools
+            .pick_return
+            .take()
+            .unwrap_or((UiState::default().tool, false));
+        self.select_tool(tool, filled);
+    }
+
+    /// `B` (Brush ▸ Restore): the brush last picked up becomes the brush again.
+    pub(crate) fn restore_custom_brush(&mut self) {
+        if let Some(b) = &self.picked_brush {
+            self.custom_brush = Some(b.clone());
+            self.dirty = true;
+        }
+    }
+
+    /// Right-click on the Brush Selector: back to the last custom brush, or (while it is the
+    /// brush) to the built-in brush.
+    pub(crate) fn toggle_custom_brush(&mut self) {
+        if self.custom_brush.take().is_none() {
+            self.restore_custom_brush();
+        }
+        self.dirty = true;
+    }
+
+    /// A built-in brush was clicked: it replaces the custom brush.
+    pub(crate) fn select_builtin_brush(&mut self, i: usize) {
+        self.ui.brush = i.min(toolbox::BUILTIN_BRUSHES.len() - 1);
+        self.custom_brush = None;
+        self.dirty = true;
     }
 
     /// A press on the page (`right` = BG colour).
@@ -465,7 +795,8 @@ impl PainterApp {
                     }
                     *cursor = None;
                     s.held = true;
-                    s.redraw(self.engine.document().page());
+                    let doc = self.engine.document();
+                    s.redraw(doc.page(), doc.palette());
                     self.dirty = true;
                     return;
                 }
@@ -511,18 +842,19 @@ impl PainterApp {
                 at: p,
                 lines: vec![String::new()],
             },
+            Tool::BrushSelect => Kind::Pick { from: p, to: p },
             Tool::Fill => {
                 self.run(Command::FloodFill { x, y, color });
                 return;
             }
             _ => return,
         };
-        let page = self.engine.document().page();
+        let doc = self.engine.document();
+        let (page, palette) = (doc.page(), doc.palette());
         let mut s = Stroke {
             preview: page.clone(),
             drawn: Rect::default(),
-            color,
-            brush: dpx_ui::toolbox::BUILTIN_BRUSHES[self.ui.brush].footprint(),
+            ink: self.ink(right),
             filled: self.ui.filled && self.ui.tool.is_split(),
             symmetry: self.symmetry(),
             held: true,
@@ -531,13 +863,13 @@ impl PainterApp {
         match &s.kind {
             Kind::Freehand { continuous, .. } => {
                 let first = s.freehand(vec![p], *continuous);
-                s.paint_more(&first);
+                s.add_part(&first, page, palette);
             }
             Kind::Lasso { .. } => {
                 let first = s.outline(vec![p]);
-                s.paint_more(&first);
+                s.paint_more(&first, page, palette);
             }
-            _ => s.redraw(page),
+            _ => s.redraw(page, palette),
         }
         self.stroke = Some(s);
         if self.ui.tool == Tool::Airbrush {
@@ -551,7 +883,8 @@ impl PainterApp {
         let p = self.snap((x, y));
         let aspect = self.aspect();
         let shift = self.tools.shift;
-        let page = self.engine.document().page();
+        let doc = self.engine.document();
+        let (page, palette) = (doc.page(), doc.palette());
         let Some(s) = &mut self.stroke else {
             return;
         };
@@ -568,7 +901,7 @@ impl PainterApp {
                 let continuous = *continuous;
                 let part = if continuous { vec![last, p] } else { vec![p] };
                 let cmd = s.freehand(part, continuous);
-                s.paint_more(&cmd);
+                s.add_part(&cmd, page, palette);
             }
             Kind::Lasso { points } => {
                 let last = *points.last().expect("a stroke starts with one point");
@@ -577,7 +910,7 @@ impl PainterApp {
                 }
                 points.push(p);
                 let cmd = s.outline(vec![last, p]);
-                s.paint_more(&cmd);
+                s.paint_more(&cmd, page, palette);
             }
             Kind::Line { from, to }
             | Kind::Curve {
@@ -590,30 +923,39 @@ impl PainterApp {
                 } else {
                     p
                 };
-                s.redraw(page);
+                s.redraw(page, palette);
             }
-            Kind::Rect { from, to } => {
+            Kind::Rect { from, to } | Kind::Pick { from, to } => {
                 *to = if shift { square(*from, p, aspect) } else { p };
-                s.redraw(page);
+                s.redraw(page, palette);
             }
             Kind::Circle { to, .. } | Kind::Ellipse { to, .. } => {
                 *to = p;
-                s.redraw(page);
+                s.redraw(page, palette);
             }
             Kind::Polygon { cursor, .. } => {
                 *cursor = Some((x, y));
-                s.redraw(page);
+                s.redraw(page, palette);
             }
             Kind::Airbrush { at, .. } => *at = p,
-            Kind::Curve { .. } | Kind::Text { .. } => return,
+            Kind::Curve { .. } | Kind::Text { .. } | Kind::Hover { .. } => return,
         }
         self.dirty = true;
     }
 
     /// The pointer moved over the page with no button held: the curve's bend and the
-    /// polygon's rubber band follow it.
+    /// polygon's rubber band follow it, else a custom brush does ([`Self::hover_brush`]).
     pub(crate) fn handle_hover(&mut self, x: i32, y: i32) {
-        let page = self.engine.document().page();
+        if self
+            .stroke
+            .as_ref()
+            .is_none_or(|s| matches!(s.kind, Kind::Hover { .. }))
+        {
+            self.hover_brush(Some((x, y)));
+            return;
+        }
+        let doc = self.engine.document();
+        let (page, palette) = (doc.page(), doc.palette());
         let Some(s) = &mut self.stroke else {
             return;
         };
@@ -627,14 +969,16 @@ impl PainterApp {
             Kind::Polygon { cursor, .. } if *cursor != Some((x, y)) => *cursor = Some((x, y)),
             _ => return,
         }
-        s.redraw(page);
+        s.redraw(page, palette);
         self.dirty = true;
     }
 
     /// No button is held (any more): a held gesture ends. Curves go on to their bend,
-    /// polygons to the next corner, text to typing; everything else is committed.
+    /// polygons to the next corner, text to typing, the Brush Selector picks up; everything
+    /// else is committed.
     pub(crate) fn release(&mut self) {
-        let page = self.engine.document().page();
+        let doc = self.engine.document();
+        let (page, palette) = (doc.page(), doc.palette());
         let Some(s) = &mut self.stroke else {
             return;
         };
@@ -653,7 +997,7 @@ impl PainterApp {
                     self.stroke = None;
                 } else {
                     *through = Some(((from.0 + to.0) / 2, (from.1 + to.1) / 2));
-                    s.redraw(page);
+                    s.redraw(page, palette);
                 }
             }
             Kind::Polygon { points, cursor, .. } => {
@@ -663,9 +1007,10 @@ impl PainterApp {
                 {
                     points.push(c);
                 }
-                s.redraw(page);
+                s.redraw(page, palette);
             }
             Kind::Text { .. } => {}
+            Kind::Pick { .. } => self.pick_up(),
             _ => self.finish_stroke(),
         }
         self.dirty = true;
@@ -711,6 +1056,7 @@ impl PainterApp {
                 new.push((at.0 + dx, at.1 + dy));
             }
         }
+        let doc = self.engine.document();
         let Some(s) = &mut self.stroke else {
             return;
         };
@@ -718,7 +1064,7 @@ impl PainterApp {
             points.extend_from_slice(&new);
         }
         let cmd = s.shape(Shape::Dots { points: new }, false);
-        s.paint_more(&cmd);
+        s.add_part(&cmd, doc.page(), doc.palette());
         self.dirty = true;
     }
 
@@ -749,6 +1095,9 @@ impl PainterApp {
             Tool::Zoom => self.zoom(1),
             _ => {
                 self.finish_stroke();
+                if tool == Tool::BrushSelect && self.ui.tool != Tool::BrushSelect {
+                    self.tools.pick_return = Some((self.ui.tool, self.ui.filled));
+                }
                 self.ui.tool = tool;
                 self.ui.filled = filled_half && tool.is_split();
             }
@@ -875,10 +1224,21 @@ impl PainterApp {
             for (tool, _) in on.iter().filter(|(_, on)| *on) {
                 toolbox::draw_toggle_on(&mut screen, x0, *tool, &pens, view.ux, view.uy);
             }
+            // While a custom brush is the brush, no built-in brush is selected.
+            if self.custom_brush.is_some() {
+                toolbox::draw_brush_unselected(
+                    &mut screen,
+                    x0,
+                    self.ui.brush,
+                    &pens,
+                    view.ux,
+                    view.uy,
+                );
+            }
         }
         if let Some(Stroke {
             kind: Kind::Text { at, lines },
-            color,
+            ink: Ink { color, .. },
             ..
         }) = &self.stroke
         {
@@ -969,9 +1329,9 @@ impl PainterApp {
                 }
                 _ => return,
             }
-            let page = self.engine.document().page();
+            let doc = self.engine.document();
             if let Some(s) = &mut self.stroke {
-                s.redraw(page);
+                s.redraw(doc.page(), doc.palette());
             }
             self.dirty = true;
             return;
@@ -991,6 +1351,7 @@ impl PainterApp {
             ToolKey::Char('e') => tool(Tool::Ellipse, false),
             ToolKey::Char('E') => tool(Tool::Ellipse, true),
             ToolKey::Char('t') => tool(Tool::Text, false),
+            ToolKey::Char('b') => tool(Tool::BrushSelect, false),
             ToolKey::Char('g' | 'G') => tool(Tool::Grid, false),
             ToolKey::Char('/') => tool(Tool::Symmetry, false),
             ToolKey::Char('K') => tool(Tool::Clear, false),
@@ -1001,6 +1362,7 @@ impl PainterApp {
             return;
         }
         match key {
+            ToolKey::Char('B') => self.restore_custom_brush(),
             ToolKey::Char('m') => self.toggle_magnify(self.pointer_page),
             ToolKey::Char('>') => self.zoom(1),
             ToolKey::Char('<') => self.zoom(-1),
@@ -1031,14 +1393,59 @@ impl PainterApp {
 
 /// `--commands FILE`: executes a JSON array of commands; returns how many.
 pub fn run_command_file(engine: &mut Engine, path: &str) -> Result<usize, String> {
+    run_commands(engine, path, None)
+}
+
+/// `--brush-commands FILE`: like [`run_command_file`], but every stroke and shape outline
+/// without a custom brush of its own paints with `brush`.
+pub fn run_brush_command_file(
+    engine: &mut Engine,
+    path: &str,
+    brush: &BrushImage,
+) -> Result<usize, String> {
+    run_commands(engine, path, Some(brush))
+}
+
+fn run_commands(
+    engine: &mut Engine,
+    path: &str,
+    brush: Option<&BrushImage>,
+) -> Result<usize, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let commands: Vec<Command> = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
-    for (i, cmd) in commands.iter().enumerate() {
+    for (i, mut cmd) in commands.iter().cloned().enumerate() {
+        if let (
+            Some(b),
+            Command::Stroke { custom, .. }
+            | Command::Shape {
+                custom,
+                filled: false,
+                ..
+            },
+        ) = (brush, &mut cmd)
+            && custom.is_none()
+        {
+            *custom = Some(b.clone());
+        }
         engine
-            .execute(cmd.clone())
+            .execute(cmd)
             .map_err(|e| format!("{path}: command {i}: {e}"))?;
     }
     Ok(commands.len())
+}
+
+/// `--pick X,Y,W,H`: that part of `page` as a custom brush, picked up like the Brush
+/// Selector does (colour 0, the default BG, transparent; handle in the centre).
+pub fn pick_spec(page: &IndexedImage, spec: &str) -> Result<BrushImage, String> {
+    let nums: Option<Vec<i32>> = spec.split(',').map(|s| s.trim().parse().ok()).collect();
+    let Some(&[x, y, w, h]) = nums.as_deref() else {
+        return Err(format!("'{spec}': expected X,Y,W,H"));
+    };
+    let r = Rect::new(x, y, w, h).intersect(page.bounds());
+    if w <= 0 || h <= 0 || r.is_empty() {
+        return Err(format!("'{spec}' lies outside the page"));
+    }
+    Ok(BrushImage::from_image(&page.crop(r), Some(0)))
 }
 
 #[cfg(test)]
@@ -1367,6 +1774,298 @@ mod tests {
         app.select_tool(Tool::Magnify, false);
         assert!(app.tools.magnify.is_none());
         assert_eq!(app.screen_to_page(view, (200, 20)), Some((200, 20)));
+    }
+
+    /// A page with a 10×5 block of colour 5 at (10, 10) holding one pixel of colour 7 at
+    /// (12, 11); then the Brush Selector picks up (8, 8)–(21, 16) (14×9, a colour-0 border)
+    /// with the given button, coming from `tool`.
+    fn picked(tool: Tool, right: bool) -> PainterApp {
+        let mut app = app(Tool::Rectangle, true);
+        app.ui.fg = 5;
+        press(&mut app, 10, 10);
+        app.handle_drag(19, 14);
+        app.release();
+        app.select_tool(Tool::DottedFreehand, false);
+        app.ui.fg = 7;
+        press(&mut app, 12, 11);
+        app.release();
+        app.ui.fg = 2;
+        app.select_tool(tool, false);
+        app.tool_key(ToolKey::Char('b'));
+        assert_eq!(app.ui.tool, Tool::BrushSelect);
+        app.handle_press(Hit::Page { x: 8, y: 8 }, right);
+        app.handle_drag(21, 16);
+        app
+    }
+
+    #[test]
+    fn the_brush_selector_picks_up_a_brush_and_returns_to_the_tool() {
+        let mut app = picked(Tool::Line, false);
+        // While dragging: a frame in the complementary colour, nothing committed.
+        assert_eq!(app.page().get(8, 8), Some(31), "frame over colour 0");
+        assert_eq!(app.page().get(10, 16), Some(31));
+        assert_eq!(app.page().get(12, 11), Some(7), "inside unchanged");
+        assert_eq!(app.engine.document().revision(), 2);
+        app.release();
+        assert!(app.stroke.is_none());
+        assert_eq!(
+            app.engine.document().revision(),
+            2,
+            "a copy changes nothing"
+        );
+        assert_eq!(app.page().get(8, 8), Some(0), "frame gone");
+        let b = app.custom_brush.clone().expect("picked up");
+        assert_eq!((b.width, b.height), (14, 9));
+        assert_eq!(b.handle, (7, 4), "handle in the centre");
+        assert_eq!(b.transparent, Some(0), "BG is transparent");
+        assert_eq!(b.get(4, 3), Some(7));
+        assert_eq!(app.picked_brush.as_ref(), Some(&b));
+        assert_eq!(app.ui.mode, PaintMode::Matte);
+        assert_eq!(app.ui.tool, Tool::Line, "back to the tool before");
+        // Shift makes the frame square; a pick-up off the page picks nothing.
+        let mut app = picked(Tool::DottedFreehand, false);
+        app.cancel_stroke();
+        app.tools.shift = true;
+        app.select_tool(Tool::BrushSelect, false);
+        press(&mut app, 8, 8);
+        app.handle_drag(21, 12);
+        app.release();
+        let b = app.custom_brush.clone().unwrap();
+        assert_eq!((b.width, b.height), (14, 14));
+    }
+
+    #[test]
+    fn a_right_button_drag_cuts_in_one_undo_step() {
+        let mut app = picked(Tool::DottedFreehand, true);
+        let before = app.engine.document().page().clone();
+        app.ui.bg = 4;
+        app.release();
+        assert_eq!(app.engine.document().revision(), 3, "one command");
+        let page = app.engine.document().page().clone();
+        assert_eq!(page.get(12, 11), Some(4), "BG left behind");
+        assert_eq!(page.get(21, 16), Some(4));
+        assert_eq!(page.get(22, 16), Some(0), "only the framed part");
+        let b = app.custom_brush.clone().unwrap();
+        assert_eq!(b.get(4, 3), Some(7), "the brush has the old pixels");
+        assert_eq!(b.transparent, Some(4), "BG at pick-up time");
+        app.undo();
+        assert_eq!(
+            app.engine.document().page(),
+            &before,
+            "undo restores the cut"
+        );
+        assert!(app.custom_brush.is_some(), "the brush stays");
+    }
+
+    #[test]
+    fn auto_transp_uses_the_shared_corner_colour() {
+        let img = IndexedImage::from_pixels(3, 2, vec![6, 1, 6, 6, 2, 6]).unwrap();
+        let mut prefs = Prefs::default();
+        assert_eq!(pick_transparent(&img, prefs, 0), 0, "off: BG");
+        prefs.set(Pref::AutoTransp, true);
+        assert_eq!(pick_transparent(&img, prefs, 0), 6);
+        let mixed = IndexedImage::from_pixels(2, 1, vec![6, 1]).unwrap();
+        assert_eq!(pick_transparent(&mixed, prefs, 0), 0, "corners differ: BG");
+    }
+
+    #[test]
+    fn a_custom_brush_stamps_in_matte_color_and_replace() {
+        let mut app = picked(Tool::DottedFreehand, false);
+        app.release();
+        app.run(Command::Clear { color: 3 });
+        let rev = app.engine.document().revision();
+        // Matte: own colours; the colour-0 border is transparent. Handle (7, 4).
+        press(&mut app, 100, 100);
+        app.release();
+        let page = app.page().clone();
+        assert_eq!(page.get(95, 98), Some(5));
+        assert_eq!(page.get(97, 99), Some(7));
+        assert_eq!(page.get(93, 96), Some(3), "transparent");
+        // Color: the shape in FG.
+        app.ui.mode = PaintMode::Color;
+        press(&mut app, 200, 100);
+        app.release();
+        assert_eq!(app.page().get(195, 98), Some(2));
+        assert_eq!(app.page().get(197, 99), Some(2));
+        assert_eq!(app.page().get(193, 96), Some(3));
+        // Replace: the whole rectangle, the border in its own colour 0.
+        app.ui.mode = PaintMode::Replace;
+        press(&mut app, 150, 150);
+        app.release();
+        assert_eq!(app.page().get(143, 146), Some(0));
+        assert_eq!(app.page().get(145, 148), Some(5));
+        assert_eq!(
+            app.engine.document().revision(),
+            rev + 3,
+            "one command each"
+        );
+        // Outline tools stamp it too; the preview is the committed result.
+        app.ui.mode = PaintMode::Matte;
+        app.select_tool(Tool::Line, false);
+        press(&mut app, 40, 200);
+        app.handle_drag(90, 220);
+        let preview = app.page().clone();
+        app.release();
+        assert_eq!(app.engine.document().page(), &preview);
+        assert_eq!(preview.get(35, 198), Some(5), "brush at the start");
+        assert_eq!(preview.get(85, 218), Some(5), "brush at the end");
+        app.undo();
+        assert_eq!(app.engine.document().page().get(85, 218), Some(3));
+    }
+
+    #[test]
+    fn the_custom_brush_follows_the_pointer_without_being_committed() {
+        let mut app = picked(Tool::DottedFreehand, false);
+        app.release();
+        app.run(Command::Clear { color: 3 });
+        let rev = app.engine.document().revision();
+        app.handle_hover(100, 100);
+        assert_eq!(app.page().get(95, 98), Some(5), "shown at the pointer");
+        assert_eq!(app.engine.document().page().get(95, 98), Some(3));
+        app.handle_hover(120, 100);
+        assert_eq!(app.page().get(95, 98), Some(3), "moved on");
+        assert_eq!(app.page().get(115, 98), Some(5));
+        // Leaving the page hides it; nothing was committed.
+        app.hover_brush(None);
+        assert!(app.stroke.is_none());
+        assert_eq!(app.page(), app.engine.document().page());
+        assert_eq!(app.engine.document().revision(), rev);
+        // A click while it is shown paints exactly one stamp.
+        app.handle_hover(100, 100);
+        press(&mut app, 100, 100);
+        app.release();
+        assert_eq!(app.engine.document().revision(), rev + 1);
+        assert_eq!(app.engine.document().page().get(95, 98), Some(5));
+        // Tools that do not stamp the brush show nothing.
+        for (tool, filled) in [
+            (Tool::Fill, false),
+            (Tool::Rectangle, true),
+            (Tool::Text, false),
+        ] {
+            app.select_tool(tool, filled);
+            app.handle_hover(60, 60);
+            assert!(app.stroke.is_none(), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn a_built_in_brush_drops_the_custom_brush_and_b_restores_it() {
+        let mut app = picked(Tool::DottedFreehand, false);
+        app.release();
+        let pens = Pens::from_palette(app.palette());
+        let x0 = app.view().ui_screen().toolbox_x();
+        assert_eq!(
+            app.compose_screen().get(x0 + 1, 12),
+            Some(pens.face),
+            "no built-in brush selected"
+        );
+        app.handle_press(Hit::Brush(2), false);
+        assert!(app.custom_brush.is_none());
+        assert_eq!(app.ui.brush, 2);
+        app.ui.fg = 2;
+        press(&mut app, 100, 100);
+        app.release();
+        assert_eq!(app.page().get(100, 100), Some(2), "built-in brush in FG");
+        assert_eq!(app.page().get(95, 98), Some(0));
+        app.tool_key(ToolKey::Char('B'));
+        assert_eq!(app.custom_brush, app.picked_brush);
+        // Right-click on the Brush Selector toggles the custom brush.
+        let right_click = Hit::Tool {
+            tool: Tool::BrushSelect,
+            filled_half: false,
+        };
+        app.handle_press(right_click, true);
+        assert!(app.custom_brush.is_none());
+        app.handle_press(right_click, true);
+        assert!(app.custom_brush.is_some());
+        assert_eq!(app.ui.tool, Tool::DottedFreehand, "the tool stays");
+    }
+
+    #[test]
+    fn mode_range_and_stencil_reach_every_command() {
+        let mut app = app(Tool::Line, false);
+        app.extras.ranges = vec![
+            dpx_iff::ColorRange {
+                rate: 0,
+                flags: 0,
+                low: 8,
+                high: 12,
+            },
+            dpx_iff::ColorRange {
+                rate: 0,
+                flags: 1,
+                low: 1,
+                high: 4,
+            },
+        ];
+        app.ui.mode = PaintMode::Shade;
+        let mut stencil = vec![false; 256];
+        stencil[3] = true;
+        app.stencil = Some(stencil.clone());
+        app.ui.bg = 6;
+        app.handle_press(Hit::Page { x: 10, y: 10 }, true);
+        app.handle_drag(20, 20);
+        let cmd = app.stroke.as_ref().and_then(|s| s.candidate(true));
+        match cmd {
+            Some(Command::Shape {
+                color,
+                mode,
+                range,
+                stencil: s,
+                right,
+                ..
+            }) => {
+                assert_eq!((color, mode, right), (6, DrawMode::Shade, true));
+                assert_eq!(range, Some((1, 4)), "the range holding FG 2");
+                assert_eq!(s, Some(stencil));
+            }
+            other => panic!("a line is a shape: {other:?}"),
+        }
+        app.release();
+        // FG in no range: no range.
+        app.ui.fg = 20;
+        app.ui.mode = PaintMode::Matte;
+        app.select_tool(Tool::DottedFreehand, false);
+        press(&mut app, 5, 5);
+        match app.stroke.as_ref().and_then(|s| s.candidate(true)) {
+            Some(Command::Stroke {
+                range, mode, right, ..
+            }) => assert_eq!((range, mode, right), (None, DrawMode::Matte, false)),
+            other => panic!("freehand is a stroke: {other:?}"),
+        }
+        assert_eq!(draw_mode(PaintMode::Replace), DrawMode::Replace);
+        assert_eq!(draw_mode(PaintMode::HBrite), DrawMode::HBrite);
+    }
+
+    #[test]
+    fn brush_command_files_paint_with_the_picked_brush() {
+        let mut page = IndexedImage::new(8, 8, 0);
+        page.fill_rect(2, 2, 3, 3, 5);
+        let brush = pick_spec(&page, "1,1,5,5").unwrap();
+        assert_eq!((brush.width, brush.height, brush.handle), (5, 5, (2, 2)));
+        assert!(pick_spec(&page, "20,20,2,2").is_err());
+        assert!(pick_spec(&page, "1,2,3").is_err());
+        let dir = std::env::temp_dir().join(format!("dpx-brush-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stamps.json");
+        std::fs::write(
+            &path,
+            r#"[{"op":"shape","shape":{"kind":"dots","points":[[10,10]]},"color":2,"mode":"color"},
+                {"op":"shape","shape":{"kind":"rect","from":[0,0],"to":[1,1]},"color":3,"filled":true}]"#,
+        )
+        .unwrap();
+        let mut engine = Engine::new(dpx_core::Document::new(
+            32,
+            32,
+            dpx_core::Palette::dpaint_default_32(),
+        ));
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(run_brush_command_file(&mut engine, &path, &brush), Ok(2));
+        let p = engine.document().page();
+        assert_eq!(p.get(10, 10), Some(2), "brush shape in FG (Color)");
+        assert_eq!(p.get(8, 8), Some(0), "transparent corner");
+        assert_eq!(p.get(1, 1), Some(3), "filled shapes are not brushes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

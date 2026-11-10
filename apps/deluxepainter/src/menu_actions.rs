@@ -525,6 +525,11 @@ mod tests {
             color,
             points: vec![(x, y)],
             continuous: false,
+            custom: None,
+            mode: dpx_core::DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right: false,
         });
     }
 
