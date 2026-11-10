@@ -1080,9 +1080,10 @@ mod tests {
     #[test]
     fn picture_menu_geometry_matches_reference() {
         let b = menu_box(0, 320, 256);
-        // Box at the left edge, top border on row 9, 11 items: rows 9..=126.
+        // Box at the left edge, top border on row 9. DeluxePaint has 11 items (rows 9..=126);
+        // Export.. (ADR-27) adds one: rows 9..=136.
         assert_eq!((b.x, b.y), (0, 9));
-        assert_eq!(b.h, 118);
+        assert_eq!(b.h, 128);
         assert_eq!(b.item_top(0), 13);
         assert_eq!(b.item_top(1), 23);
     }
@@ -1124,15 +1125,15 @@ mod tests {
         );
         // Over "Flip": a submenu, nothing to select until a sub item is hovered.
         let b = menu_box(0, 320, 256);
-        st.pointer(320, 256, 20, b.item_top(4) + 2);
-        assert_eq!(st.item, Some(4));
+        st.pointer(320, 256, 20, b.item_top(5) + 2);
+        assert_eq!(st.item, Some(5));
         assert_eq!(st.hovered_action(&ctx()), None);
-        let Entry::Submenu(items) = MENUS[0].items[4].entry else {
+        let Entry::Submenu(items) = MENUS[0].items[5].entry else {
             panic!("Flip is a submenu");
         };
-        let s = submenu_box(&b, 4, items, 320, 256);
+        let s = submenu_box(&b, 5, items, 320, 256);
         st.pointer(320, 256, s.x + s.w - 5, s.item_top(1) + 2);
-        assert_eq!(st.item, Some(4), "parent item stays highlighted");
+        assert_eq!(st.item, Some(5), "parent item stays highlighted");
         assert_eq!(
             st.hovered_action(&ctx()),
             Some(Action::Command("picture.flip_vertical"))
