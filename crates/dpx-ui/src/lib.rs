@@ -7,6 +7,7 @@
 pub mod anim_requester;
 pub mod arrange_requester;
 pub mod bitmap;
+pub mod choice_requester;
 pub mod file_requester;
 pub mod font;
 pub(crate) mod form;
@@ -29,6 +30,7 @@ use dpx_core::{IndexedImage, Palette};
 
 pub use anim_requester::{AnimChoice, AnimReqResponse, AnimRequester};
 pub use arrange_requester::ArrangeRequester;
+pub use choice_requester::{ChoiceRequester, ChoiceResponse};
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
 pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};

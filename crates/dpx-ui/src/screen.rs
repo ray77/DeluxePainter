@@ -4,6 +4,7 @@
 
 use dpx_core::{IndexedImage, Palette};
 
+use crate::choice_requester::ChoiceRequester;
 use crate::file_requester::FileRequester;
 use crate::font::Font;
 use crate::menu::{self, MenuContext, MenuState, PixelSize, Pref, Prefs};
@@ -93,6 +94,8 @@ pub struct UiState {
     pub page_size_requester: Option<PageSizeRequester>,
     /// Notes after Load/Save while shown (drawn over everything else).
     pub note_requester: Option<NoteRequester>,
+    /// Recover Picture and Quit without saving? (ADR-34).
+    pub choice_requester: Option<ChoiceRequester>,
     /// Color ▸ Palette ▸ Mixer (the Color Mixer) while it is open.
     pub palette_requester: Option<crate::palette_requester::PaletteRequester>,
     /// Color ▸ Ranges.. (the Range requester) while it is open.
@@ -148,6 +151,7 @@ impl Default for UiState {
             file_requester: None,
             page_size_requester: None,
             note_requester: None,
+            choice_requester: None,
             palette_requester: None,
             range_requester: None,
             has_brush: false,
@@ -300,6 +304,9 @@ impl Screen {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.note_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.choice_requester {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.palette_requester {
