@@ -43,18 +43,25 @@ impl Pens {
 }
 
 /// Picks the ghost pen: the entry closest to a grey 60 % of the way from `dark` to `face`
-/// (owner decision 2026-11-10). It must lie within 30 % of the dark–face distance of that
-/// ideal and at least 25 % away from `face`, so ghosted text stays visible but subdued.
+/// (owner decision 2026-11-10: ghosted options are grey, not a dot pattern). Any entry at
+/// least 25 % of the dark–face distance away from both `face` and `dark` qualifies, so
+/// ghosted text stays visible and differs from normal text. Only palettes without such an
+/// entry (two colours, or all colours near face/dark) get `None` and the dot pattern.
 fn ghost_pen(palette: &Palette, face: u8, dark: u8) -> Option<u8> {
     let (f, d) = (palette.get(face)?, palette.get(dark)?);
     let mix = |a: u8, b: u8| ((u16::from(a) * 2 + u16::from(b) * 3) / 5) as u8;
     let ideal = Rgb8::new(mix(d.r, f.r), mix(d.g, f.g), mix(d.b, f.b));
     let span = u64::from(f.distance_sq(d));
-    let pen = palette.nearest_excluding(ideal, &[face, dark]);
-    let c = palette.get(pen)?;
-    let near_ideal = 100 * u64::from(c.distance_sq(ideal)) <= 9 * span;
-    let off_face = 16 * u64::from(c.distance_sq(f)) >= span;
-    (pen != face && pen != dark && near_ideal && off_face).then_some(pen)
+    let apart = |c: Rgb8| {
+        16 * u64::from(c.distance_sq(f)) >= span && 16 * u64::from(c.distance_sq(d)) >= span
+    };
+    palette
+        .colors()
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| i != usize::from(face) && i != usize::from(dark) && apart(c))
+        .min_by_key(|&(_, &c)| c.distance_sq(ideal))
+        .map(|(i, _)| i as u8)
 }
 
 #[cfg(test)]
@@ -75,12 +82,15 @@ mod tests {
 
     #[test]
     fn ghost_pen_needs_a_real_grey() {
-        // Black/white only: no colour in between, so disabled items use the pattern.
+        // Black/white only: no colour in between, so disabled items use the dot pattern.
         let bw = Palette::from_rgb4(&[0x000, 0xFFF]).unwrap();
         assert_eq!(Pens::from_palette(&bw).ghost, None);
-        // A colour far from the dark–face axis is not used.
-        let vivid = Palette::from_rgb4(&[0x000, 0xAAA, 0x0F0, 0xFFF]).unwrap();
-        assert_eq!(Pens::from_palette(&vivid).ghost, None);
+        // Without a grey, the colour nearest the ideal mid grey is used (no dot pattern).
+        let vivid = Palette::from_rgb4(&[0x000, 0xAAA, 0x05A, 0xFFF]).unwrap();
+        assert_eq!(Pens::from_palette(&vivid).ghost, Some(2));
+        // Colours too close to face or dark do not qualify.
+        let close = Palette::from_rgb4(&[0x000, 0xAAA, 0x111, 0x999]).unwrap();
+        assert_eq!(Pens::from_palette(&close).ghost, None);
         // A mid grey is.
         let grey = Palette::from_rgb4(&[0x000, 0xAAA, 0x666, 0xFFF]).unwrap();
         assert_eq!(Pens::from_palette(&grey).ghost, Some(2));

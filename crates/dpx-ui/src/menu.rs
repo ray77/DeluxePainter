@@ -1181,7 +1181,7 @@ mod tests {
         let mode = MENUS.iter().position(|m| m.title == "Mode").unwrap();
         let items = MENUS[mode].items;
         let hbrite = items.iter().position(|i| i.label == "HBrite").unwrap();
-        let no_grey = Palette::from_rgb4(&[0x000, 0xAAA, 0x05A, 0xFFF]).unwrap();
+        let no_grey = Palette::from_rgb4(&[0x000, 0xAAA, 0x111, 0x999]).unwrap();
         for (pal, has_grey) in [(Palette::dpaint_default_32(), true), (no_grey, false)] {
             let pens = Pens::from_palette(&pal);
             assert_eq!(pens.ghost.is_some(), has_grey);

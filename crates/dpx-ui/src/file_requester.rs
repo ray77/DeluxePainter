@@ -745,31 +745,48 @@ impl FileRequester {
 
         // "# of Frames" exists for Load only; ghosted until animation frames exist.
         if self.kind == FileKind::LoadPicture {
-            font.draw(
-                &mut img,
-                geom::FRAMES_LABEL_X,
-                geom::FRAMES_Y + 1,
-                "# of Frames:",
-                pens.dark,
-            );
             let r = Rect::new(
                 geom::FRAMES_FIELD_X,
                 geom::FRAMES_Y,
                 geom::FRAMES_FIELD_W,
                 geom::FIELD_H,
             );
-            img.fill_rect(r.x, r.y, r.w, r.h, pens.dark);
-            font.draw(&mut img, r.x + 2, r.y + 1, "1", pens.shine);
-            checker(
-                &mut img,
-                Rect::new(
-                    geom::FRAMES_LABEL_X - 2,
-                    geom::FRAMES_Y - 1,
-                    r.x + r.w + 2 - geom::FRAMES_LABEL_X,
-                    r.h + 2,
-                ),
-                pens.face,
-            );
+            match pens.ghost {
+                // Grey label and field (owner decision: ghosted options are grey).
+                Some(g) => {
+                    font.draw(
+                        &mut img,
+                        geom::FRAMES_LABEL_X,
+                        geom::FRAMES_Y + 1,
+                        "# of Frames:",
+                        g,
+                    );
+                    img.fill_rect(r.x, r.y, r.w, r.h, g);
+                    font.draw(&mut img, r.x + 2, r.y + 1, "1", pens.face);
+                }
+                // Two-colour palettes have no grey: thin the dark label with dots.
+                None => {
+                    font.draw(
+                        &mut img,
+                        geom::FRAMES_LABEL_X,
+                        geom::FRAMES_Y + 1,
+                        "# of Frames:",
+                        pens.dark,
+                    );
+                    img.fill_rect(r.x, r.y, r.w, r.h, pens.dark);
+                    font.draw(&mut img, r.x + 2, r.y + 1, "1", pens.shine);
+                    checker(
+                        &mut img,
+                        Rect::new(
+                            geom::FRAMES_LABEL_X - 2,
+                            geom::FRAMES_Y - 1,
+                            r.x + r.w + 2 - geom::FRAMES_LABEL_X,
+                            r.h + 2,
+                        ),
+                        pens.face,
+                    );
+                }
+            }
         }
         if let Some(msg) = &self.message {
             let r = Rect::new(2, geom::SEPARATOR_Y + 2, WIDTH - 4, 15);

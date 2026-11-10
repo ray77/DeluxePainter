@@ -16,9 +16,12 @@ use crate::widgets::{TextField, draw_field};
 pub const SCREEN: DisplayMode =
     DisplayMode::new(dpx_core::Video::Pal, dpx_core::Resolution::Hi, false);
 
-/// Workbench-style colours of the requester screen: grey, black, white, blue.
+/// Workbench-style colours of the requester screen: grey, black, white, blue, plus a darker
+/// grey for ghosted fields (owner decision 2026-11-10: ghosted options are grey). Three
+/// bitplanes; the last three entries repeat the ghost grey.
 pub fn palette() -> Palette {
-    Palette::from_rgb4(&[0xAAA, 0x000, 0xFFF, 0x68B]).expect("4 colours")
+    Palette::from_rgb4(&[0xAAA, 0x000, 0xFFF, 0x68B, 0x666, 0x666, 0x666, 0x666])
+        .expect("8 colours")
 }
 
 /// Version line in the credits panel.
@@ -893,8 +896,17 @@ fn cycle(img: &mut IndexedImage, y: i32, text: &str, pens: &Pens) {
 fn number(img: &mut IndexedImage, x: i32, y: i32, value: u32, editable: bool, pens: &Pens) {
     let r = number_rect(x, y);
     raised(img, r, pens);
-    centred(img, r.x, r.w, r.y + 3, &value.to_string(), pens.dark);
-    if !editable {
+    let ghost = if editable { None } else { pens.ghost };
+    centred(
+        img,
+        r.x,
+        r.w,
+        r.y + 3,
+        &value.to_string(),
+        ghost.unwrap_or(pens.dark),
+    );
+    // Without a grey (two-colour palettes) the number is thinned with dots instead.
+    if !editable && ghost.is_none() {
         for yy in r.y + 2..r.y + r.h - 2 {
             for xx in r.x + 2..r.x + r.w - 2 {
                 if (xx + yy) % 2 == 0 {
@@ -948,6 +960,15 @@ mod tests {
 
     fn row_y(row: i32) -> i32 {
         geom::LIST_Y + 1 + row * geom::ROW_H + 4
+    }
+
+    #[test]
+    fn requester_palette_ghosts_in_grey() {
+        let pens = Pens::from_palette(&palette());
+        assert_eq!(
+            (pens.face, pens.dark, pens.shine, pens.ghost),
+            (0, 1, 2, Some(4))
+        );
     }
 
     #[test]

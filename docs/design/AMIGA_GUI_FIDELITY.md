@@ -22,7 +22,7 @@ Implementation:
 | `dark` | black | text, icons, outlines, bevel shadow |
 | `shine` | white | bevel highlight |
 | `select` | Amiga blue (≈ #0055AA) | highlighted menu item / selected toggle |
-| `ghost` (optional) | grey 60 % from `dark` to `face` (≈ #666666) | text of disabled items; only if the palette has a close grey, else checkerboard fallback |
+| `ghost` (optional) | grey 60 % from `dark` to `face` (≈ #666666) | text of disabled items and fields; the entry nearest that grey that is at least 25 % away from both `face` and `dark`; checkerboard only if no entry qualifies (e.g. 2 colours) |
 
 - Each pen = palette entry nearest to its ideal colour (perceptual distance, deterministic tie-break by lowest index). Recomputed on every palette change.
 - If two pens collapse onto the same entry, fall back so that text stays readable (`dark` must differ from `face`; then `shine` may equal `face`).
@@ -84,7 +84,7 @@ Known deviations:
 - Prefs ▸ Pixel Size (Largest, 1x–8x in half steps) is a DeluxePainter addition at the end of the Prefs menu; DeluxePaint had no such item (ADR-13).
 - Notes after Load/Save appear in our own note requester (ADR-12): title, bulleted word-wrapped notes, one Ok button. DeluxePaint shows messages in small requesters too, but no reference shows their layout.
 - In HiRes, laced and SuperHiRes modes the LoRes interface is drawn with enlarged pixels (2 or 4 screen pixels per UI pixel) instead of DeluxePaint's HiRes artwork (ADR-7).
-- Disabled items are drawn in a solid `ghost` pen instead of Intuition's 1-in-4 dot pattern (0x2222/0x8888), which tore the 2-px strokes of our font (owner decision 2026-11-10). The ghost pen is the palette entry closest to a grey 60 % of the way from `dark` to `face`; if the palette has no such grey, the item is thinned with a 50 % `face` checkerboard instead. No reference shows how DeluxePaint itself ghosts items.
+- Disabled items are drawn in a solid `ghost` pen instead of Intuition's 1-in-4 dot pattern (0x2222/0x8888), which tore the 2-px strokes of our font (owner decision 2026-11-10). The ghost pen is the palette entry closest to a grey 60 % of the way from `dark` to `face`, among entries at least 25 % of the dark–face distance away from both. Menus, the file requester's "# of Frames" and the Screen Format requester's fixed number fields all use it. Only when no entry qualifies (two-colour palettes) is the item thinned with a 50 % `face` checkerboard. The Screen Format requester's own Workbench-style palette gained a 0x666 grey (8 colours) for this. No reference shows how DeluxePaint itself ghosts items.
 - Our font is about 1 px per glyph wider than the original screen font, so menus are wider than in the reference (Picture box 123 instead of 112 px) and title slots use text + 6 instead of text + 8 so that all seven titles fit into 320 px. Owner decision (2026-11-10): keep the current font; the wider menus are accepted.
 - The Right-Amiga key glyph is an original drawing (an "A" cut out of a key cap), not a copy of the system imagery.
 - Color ▸ BG -> FG and BG <-> FG are undoable in DeluxePainter (not in DeluxePaint).
