@@ -101,6 +101,8 @@ pub struct UiState {
     pub has_brush: bool,
     /// A picked-up brush exists (Brush ▸ Restore).
     pub can_restore: bool,
+    /// Gridding, Symmetry, Spacing, Fill Type or Make Stencil while open (ADR-20).
+    pub tool_requester: Option<crate::tool_requesters::ToolRequester>,
 }
 
 impl UiState {
@@ -141,6 +143,7 @@ impl Default for UiState {
             range_requester: None,
             has_brush: false,
             can_restore: false,
+            tool_requester: None,
         }
     }
 }
@@ -292,6 +295,9 @@ impl Screen {
         }
         if let Some(req) = &ui.range_requester {
             req.draw(img, pens);
+        }
+        if let Some(req) = &ui.tool_requester {
+            req.draw(img, pens, palette);
         }
     }
 

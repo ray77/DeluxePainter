@@ -7,6 +7,7 @@
 pub mod bitmap;
 pub mod file_requester;
 pub mod font;
+pub(crate) mod form;
 pub mod menu;
 pub mod note_requester;
 pub mod page_size_requester;
@@ -17,6 +18,8 @@ pub mod range_requester;
 pub mod requester;
 pub mod screen;
 pub mod show_page;
+pub mod stencil_requester;
+pub mod tool_requesters;
 pub mod toolbox;
 pub(crate) mod widgets;
 
@@ -32,6 +35,11 @@ pub use range_requester::{RangeData, RangeRequester, RangeResponse};
 pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 pub use screen::{Hit, PaintMode, Screen, UiState};
 pub use show_page::{ShowPage, ShowPageResponse};
+pub use stencil_requester::StencilRequester;
+pub use tool_requesters::{
+    FillRequester, FillSettings, GridRequester, GridSettings, SpacingMode, SpacingRequester,
+    SpacingSettings, SymmetryRequester, SymmetrySettings, ToolReqResponse, ToolRequester,
+};
 pub use toolbox::Tool;
 
 /// Converts an indexed screen to RGBA8, scaling each pixel by `sx`×`sy` (integer factors).

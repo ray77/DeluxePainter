@@ -622,6 +622,12 @@ pub const IMPLEMENTED: &[&str] = &[
     // Effect
     "background.fix",
     "background.free",
+    // Effect > Stencil (ADR-20); Show, Paint, Load and Save stay ghosted.
+    "stencil.make",
+    "stencil.remake",
+    "stencil.reverse",
+    "stencil.toggle",
+    "stencil.free",
     // Prefs
     "view.largest_pixel_size",
     // Range requester (ADR-22)
@@ -1303,7 +1309,8 @@ mod tests {
         assert!(Action::Command("picture.load").enabled(&c));
         assert!(Action::Command("spare.swap").enabled(&c));
         assert!(!Action::Command("picture.print").enabled(&c));
-        assert!(!Action::Command("stencil.make").enabled(&c));
+        assert!(Action::Command("stencil.make").enabled(&c));
+        assert!(!Action::Command("stencil.show").enabled(&c));
         assert!(!Action::Command("color.recompute").enabled(&c));
         // Mode, Prefs and Pixel Size items stay enabled.
         assert!(Action::Mode(PaintMode::Matte).enabled(&c));
@@ -1332,7 +1339,8 @@ mod tests {
         assert!(menu_enabled(menu("Picture"), &c));
         let effect = &MENUS[menu("Effect")];
         let item = |label: &str| effect.items.iter().find(|i| i.label == label).unwrap();
-        assert!(!item("Stencil").enabled(&c));
+        assert!(item("Stencil").enabled(&c), "some Stencil items work");
+        assert!(!item("LightTable").enabled(&c));
         assert!(item("Background").enabled(&c));
     }
 
@@ -1358,9 +1366,9 @@ mod tests {
             };
             submenu_box(&b, item, items, 320, 256)
         };
-        // Stencil (item 0) is ghosted: nothing opens; Background (item 2) opens.
-        let s = sub(0);
-        assert_eq!(draw_with(0).get(s.x + s.w / 2, s.y + s.h - 1), Some(200));
+        // LightTable (item 1) is ghosted: nothing opens; Background (item 2) opens.
+        let s = sub(1);
+        assert_eq!(draw_with(1).get(s.x + s.w / 2, s.y + s.h - 1), Some(200));
         let s = sub(2);
         assert_eq!(
             draw_with(2).get(s.x + s.w / 2, s.y + s.h - 1),
