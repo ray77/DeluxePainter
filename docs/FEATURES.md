@@ -21,6 +21,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Spare page (swap, copy, merge front/back) | |
 | P1 | Hide/show toolbox and menu bar for full-screen painting | |
 | P0 | Window: snaps to the picture's screen in whole and half pixel-size steps (Prefs ▸ Pixel Size Largest/1x–8x, Cmd/Ctrl +/−/0), full screen centred with Ctrl+Cmd+F / F11 | done (ADR-13); layout C (screen larger than the picture's screen), grey work area, movable requesters and status line dropped |
+| P1 | Settings file: pixel size, Prefs toggles, last drawer, grid/symmetry/spacing/fill, translucency and Light Table choices are remembered in `settings.json` in the config directory (`--no-settings` skips it) | done (ADR-33); full-screen state and window position not saved |
 | P1 | Layout preference "Classic screen": fixed 640×512 (PAL) / 640×400 (NTSC) virtual screen, letterboxed | decided, design option A |
 
 ## 2. Documents & hardware targets

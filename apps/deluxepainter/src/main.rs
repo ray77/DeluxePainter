@@ -26,12 +26,14 @@
 //!                                       goto or rate
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
+//! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
 mod anim;
 mod browse;
 mod brush_menu;
+mod config;
 mod effects;
 mod files;
 mod menu_actions;
@@ -498,10 +500,31 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    // The settings file (ADR-33). Snapshots and the CLI commands returned above and never
+    // touch it; `--no-settings` skips it for the GUI too.
+    let (store, settings) = if args.iter().any(|a| a == "--no-settings") {
+        (None, config::Config::default())
+    } else {
+        match config::default_dir() {
+            Some(dir) => {
+                let (store, c) = config::ConfigStore::open(&dir);
+                (Some(store), c)
+            }
+            None => (None, config::Config::default()),
+        }
+    };
+    let start = if settings.pixel_size == PixelSize::default().0 {
+        egui::vec2(START_W, START_H)
+    } else {
+        window_size(
+            View::of_target(Target::default()).ui_size(),
+            settings.pixel_size,
+        )
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeluxePainter")
-            .with_inner_size([START_W, START_H])
+            .with_inner_size(start)
             .with_min_inner_size([320.0, 200.0])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
@@ -513,6 +536,8 @@ fn main() -> eframe::Result {
             // Cmd/Ctrl + `+`/`−`/`0` set DeluxePainter's pixel size instead of egui's zoom.
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             let mut app = PainterApp::new();
+            settings.apply(&mut app);
+            app.config = store;
             if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
                 app.ui.note_requester = note_requester(LOADED, &notes);
@@ -775,6 +800,8 @@ struct PainterApp {
     stencil: Option<Vec<bool>>,
     /// Light Table and playback (ADR-28, anim.rs).
     anim: anim::AnimState,
+    /// The settings file (ADR-33); `None` in tests, snapshots and with `--no-settings`.
+    config: Option<config::ConfigStore>,
 }
 
 impl PainterApp {
@@ -808,6 +835,7 @@ impl PainterApp {
             picked_brush: None,
             stencil: None,
             anim: anim::AnimState::default(),
+            config: None,
         }
     }
 
@@ -1390,7 +1418,26 @@ impl PainterApp {
     }
 }
 
+impl PainterApp {
+    /// Writes the settings file once they have stopped changing (ADR-33).
+    fn persist_settings(&mut self, ctx: &egui::Context, now: f64) {
+        let Some(mut store) = self.config.take() else {
+            return;
+        };
+        if let Some(wait) = store.update(config::Config::capture(self), now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait + 0.05));
+        }
+        self.config = Some(store);
+    }
+}
+
 impl eframe::App for PainterApp {
+    fn on_exit(&mut self) {
+        if let Some(mut store) = self.config.take() {
+            store.flush(config::Config::capture(self));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.ui.has_brush = self.custom_brush.is_some();
@@ -1424,6 +1471,7 @@ impl eframe::App for PainterApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.clamp_scroll();
+        self.persist_settings(&ctx, now);
 
         // The screen at its pixel size (whole and half steps, ADR-13), centred; each screen
         // pixel is shown fx×fy times `scale` physical pixels (its shape in this mode). When

@@ -79,6 +79,38 @@ pub enum Pref {
 }
 
 impl Pref {
+    /// Every preference, in menu order.
+    pub const ALL: [Pref; 11] = [
+        Pref::Coords,
+        Pref::FastFb,
+        Pref::MultiCycle,
+        Pref::BeSquare,
+        Pref::Workbench,
+        Pref::ExclBrush,
+        Pref::AutoTransp,
+        Pref::NoIcons,
+        Pref::AutoGrid,
+        Pref::OriginUl,
+        Pref::FastAdjust,
+    ];
+
+    /// Stable name used in the settings file; never changes when the enum is reordered.
+    pub fn key(self) -> &'static str {
+        match self {
+            Pref::Coords => "coords",
+            Pref::FastFb => "fast_fb",
+            Pref::MultiCycle => "multi_cycle",
+            Pref::BeSquare => "be_square",
+            Pref::Workbench => "workbench",
+            Pref::ExclBrush => "excl_brush",
+            Pref::AutoTransp => "auto_transp",
+            Pref::NoIcons => "no_icons",
+            Pref::AutoGrid => "auto_grid",
+            Pref::OriginUl => "origin_ul",
+            Pref::FastAdjust => "fast_adjust",
+        }
+    }
+
     fn bit(self) -> u16 {
         1 << self as u16
     }
