@@ -1020,6 +1020,19 @@ pub fn encode(
             ));
         }
     };
+    for (i, f) in frames.iter().enumerate() {
+        if let Some(&max) = f.pixels().iter().max()
+            && usize::from(max) >= palette.len()
+        {
+            return Err(AnimError::invalid(
+                "cannot write ANIM: colour outside the palette",
+                format!(
+                    "frame {i} has pixel colour {max}, the palette has {} colours",
+                    palette.len()
+                ),
+            ));
+        }
+    }
     let planes = ilbm::planes_for(palette.len());
     let dpan = Dpan {
         version: 4,
@@ -1190,5 +1203,13 @@ mod tests {
         for s in all {
             assert!(s.chars().count() <= 34, "{s}");
         }
+    }
+
+    #[test]
+    fn encode_validates_every_frame_against_the_palette() {
+        let pal = Palette::new((0..4).map(|i| Rgb8::new(i * 60, 0, 0)).collect()).unwrap();
+        let frames = vec![img(8, 2, |_, _| 0), img(8, 2, |_, _| 5)];
+        let opts = EncodeOptions::default();
+        assert!(encode(&frames, &pal, &opts).is_err());
     }
 }

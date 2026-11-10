@@ -37,7 +37,7 @@ Entries, in writing order:
 
 - `format` is `"dpxproj"`; `format_version` is a whole number from 1. A newer version is refused with an error naming it.
 - `app_version` is informational (the writing build).
-- `target`: chipset (`ocs`/`aga`), display mode (video `pal`/`ntsc`, resolution `lo`/`hi`/`super_hi`, `interlace`) and screen size in pixels.
+- `target`: chipset (`ocs`/`aga`), display mode (video `pal`/`ntsc`, resolution `lo`/`hi`/`super_hi`, `interlace`) and screen size in pixels (the reader refuses a screen the mode does not allow, e.g. zero or huge).
 - `page`: page size in pixels. It may differ from the screen (the GUI keeps pages at least screen sized, but files from `convert` keep the picture's size).
 - `palette`: 1 to 256 `#RRGGBB` strings; the index is the colour number. 8 bits per channel are kept exactly.
 - `ranges`: colour-cycling ranges as ILBM CRNG stores them (`rate` 16384 = 60 steps/s, `flags` bit 0 active, bit 1 reverse, other bits kept). Ranges outside the palette are kept.
@@ -67,4 +67,4 @@ The reader refuses, with a short summary line and details (ADR-17 style):
 
 ## Compatibility
 
-Version 1 files stay readable, and single-frame documents are still written as version 1 (the test `single_frame_projects_stay_version_1_byte_for_byte` compares with a file written by the version-1 writer), so builds from before ADR-28 read them. Animations are version 2: an older build refuses them with "Project is from a newer version" instead of dropping frames. A later version (e.g. layers) raises `format_version` again; this reader then reports the version instead of guessing.
+Version 1 files stay readable, and single-frame documents at the default 30 fps are still written as version 1; a single frame with another rate is written as version 2 so the rate is not lost (the test `single_frame_projects_stay_version_1_byte_for_byte` compares with a file written by the version-1 writer), so builds from before ADR-28 read them. Animations are version 2: an older build refuses them with "Project is from a newer version" instead of dropping frames. A later version (e.g. layers) raises `format_version` again; this reader then reports the version instead of guessing.

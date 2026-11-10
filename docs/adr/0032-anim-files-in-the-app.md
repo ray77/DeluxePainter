@@ -15,3 +15,5 @@
 - Deviations from DeluxePaint IV: Anim ▸ Load replaces the whole document (as Picture ▸ Load does), DeluxePaint loads into the frame sequence; the "# of Frames" field of the Load requester stays ghosted; what DeluxePaint IV itself writes is unverified (ADR-29).
 - Verified (tests, run twice, green): app round trip through the requesters (3 frames, palette, rate, Load Animation / Save Animation titles, suggested name, Picture ▸ Load and Export with `.anim`, one-frame export), convert anim → dpxproj → anim with identical bytes, info text, timing/rounding notes, refused empty, cut and damaged ANIM files with short first lines, MCP round trip; CLI run by hand on a generated file.
 - Not verified: any real ANIM file from DeluxePaint or an Amiga player (none available); the GUI by hand in the window.
+
+Note: `anim::encode` validates every frame's colours against the palette, not only frame 0.
