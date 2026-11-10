@@ -246,6 +246,40 @@ fn split_icon(tool: Tool) -> Bitmap {
     bmp
 }
 
+/// Draws `tool`'s button icon selected (inverted: face on dark) for the toggles that stay on
+/// while another tool is selected (Grid, Symmetry, Magnify). `toolbox_x` is the toolbox's
+/// left edge in UI pixels; each UI pixel covers `ux`×`uy` pixels of `img`.
+pub fn draw_toggle_on(
+    img: &mut dpx_core::IndexedImage,
+    toolbox_x: i32,
+    tool: Tool,
+    pens: &crate::Pens,
+    ux: i32,
+    uy: i32,
+) {
+    use crate::screen::geom;
+    let Some((row, col)) = TOOL_ROWS
+        .iter()
+        .enumerate()
+        .find_map(|(r, pair)| pair.iter().position(|&t| t == tool).map(|c| (r, c)))
+    else {
+        return;
+    };
+    let bx = toolbox_x + col as i32 * geom::PITCH + 1;
+    let by = geom::TOOLS_Y + row as i32 * geom::PITCH + 1;
+    let bmp = icon(tool, IconState::Selected { filled: false });
+    for iy in 0..ICON {
+        for ix in 0..ICON {
+            let pen = if bmp.get(ix, iy) {
+                pens.face
+            } else {
+                pens.dark
+            };
+            img.fill_rect((bx + ix as i32) * ux, (by + iy as i32) * uy, ux, uy, pen);
+        }
+    }
+}
+
 /// The ten built-in brushes in the block at the top of the toolbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuiltinBrush {
@@ -453,6 +487,30 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_toggle_is_drawn_like_a_selected_button() {
+        use crate::screen::{Screen, UiState};
+        use dpx_core::Palette;
+        let palette = Palette::dpaint_default_32();
+        let pens = crate::Pens::from_palette(&palette);
+        let screen = Screen::new(320, 256);
+        let page = dpx_core::IndexedImage::new(320, 256, 0);
+        let selected = UiState {
+            tool: Tool::Grid,
+            ..UiState::default()
+        };
+        let want = screen.render(&page, &palette, &selected);
+        let mut got = screen.render(&page, &palette, &UiState::default());
+        draw_toggle_on(&mut got, screen.toolbox_x(), Tool::Grid, &pens, 1, 1);
+        // Same Grid button; the default tool stays selected too.
+        let (bx, by) = (screen.toolbox_x(), crate::screen::geom::TOOLS_Y + 6 * 12);
+        for y in by..by + 11 {
+            for x in bx..bx + 11 {
+                assert_eq!(got.get(x, y), want.get(x, y), "({x},{y})");
+            }
+        }
     }
 
     #[test]

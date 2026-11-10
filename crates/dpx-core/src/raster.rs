@@ -72,6 +72,199 @@ pub fn stroke_bounds(brush: &[(i32, i32)], points: &[(i32, i32)]) -> Option<Rect
     ))
 }
 
+/// Rounds `num / den` to the nearest integer (halves up); `den` must be positive.
+fn div_round(num: i64, den: i64) -> i64 {
+    (2 * num + den).div_euclid(2 * den)
+}
+
+/// Removes consecutive duplicates.
+fn push_point(out: &mut Vec<(i32, i32)>, p: (i32, i32)) {
+    if out.last() != Some(&p) {
+        out.push(p);
+    }
+}
+
+/// The outline of an ellipse around `c` with radii `rx`, `ry` (midpoint algorithm), as a
+/// closed ring of 8-connected points in drawing order. Equal radii give a circle; a zero
+/// radius gives the straight line between the two ends.
+pub fn ellipse_points(c: (i32, i32), rx: i32, ry: i32) -> Vec<(i32, i32)> {
+    let (rx, ry) = (rx.abs(), ry.abs());
+    if rx == 0 || ry == 0 {
+        return vec![(c.0 - rx, c.1 - ry), (c.0 + rx, c.1 + ry)];
+    }
+    // First quadrant from (0, ry) to (rx, 0); all terms are scaled by 4 to stay integral.
+    let (a2, b2) = (i64::from(rx) * i64::from(rx), i64::from(ry) * i64::from(ry));
+    let (mut x, mut y) = (0i64, i64::from(ry));
+    let mut quad = Vec::new();
+    let mut d = 4 * b2 - 4 * a2 * y + a2;
+    while b2 * x < a2 * y {
+        quad.push((x as i32, y as i32));
+        if d >= 0 {
+            y -= 1;
+            d -= 8 * a2 * y;
+        }
+        x += 1;
+        d += 4 * b2 * (2 * x + 1);
+    }
+    let mut d = b2 * (2 * x + 1) * (2 * x + 1) + 4 * a2 * (y - 1) * (y - 1) - 4 * a2 * b2;
+    while y >= 0 {
+        quad.push((x as i32, y as i32));
+        if d <= 0 {
+            x += 1;
+            d += 8 * b2 * x;
+        }
+        y -= 1;
+        d += 4 * a2 * (1 - 2 * y);
+    }
+    let mut ring = Vec::with_capacity(quad.len() * 4);
+    for &(x, y) in &quad {
+        push_point(&mut ring, (c.0 + x, c.1 + y));
+    }
+    for &(x, y) in quad.iter().rev() {
+        push_point(&mut ring, (c.0 + x, c.1 - y));
+    }
+    for &(x, y) in &quad {
+        push_point(&mut ring, (c.0 - x, c.1 - y));
+    }
+    for &(x, y) in quad.iter().rev() {
+        push_point(&mut ring, (c.0 - x, c.1 + y));
+    }
+    if ring.len() > 1 && ring.first() == ring.last() {
+        ring.pop();
+    }
+    ring
+}
+
+/// Points along the quadratic curve from `a` to `b` that passes through `through` halfway
+/// (the Curve tool's bend point), sampled densely enough that joining consecutive points with
+/// lines gives a smooth curve. The ends are exact.
+pub fn curve_points(a: (i32, i32), through: (i32, i32), b: (i32, i32)) -> Vec<(i32, i32)> {
+    let cheb = |p: (i32, i32), q: (i32, i32)| (p.0 - q.0).abs().max((p.1 - q.1).abs());
+    let n = i64::from((cheb(a, through) + cheb(through, b)).max(1)) * 2;
+    // B(t) = (1-t)² a + 2t(1-t) c + t² b with the control point c = 2·through − (a+b)/2,
+    // so with t = i/n: n²·B = (n-i)² a + i(n-i)(4·through − a − b) + i² b.
+    let axis = |a: i32, t: i32, b: i32, i: i64| -> i32 {
+        let (a, t, b) = (i64::from(a), i64::from(t), i64::from(b));
+        let num = (n - i) * (n - i) * a + i * (n - i) * (4 * t - a - b) + i * i * b;
+        div_round(num, n * n) as i32
+    };
+    let mut out: Vec<(i32, i32)> = Vec::new();
+    for i in 0..=n {
+        let p = (axis(a.0, through.0, b.0, i), axis(a.1, through.1, b.1, i));
+        // Drop staircase corners: a point whose neighbours already touch is redundant.
+        // The bend point itself always stays.
+        while out.len() >= 2 && out[out.len() - 1] != through && cheb(out[out.len() - 2], p) <= 1 {
+            out.pop();
+        }
+        push_point(&mut out, p);
+    }
+    out
+}
+
+/// Fills the polygon through `points` (closed; even-odd rule, sampled at pixel centres) and
+/// also sets every pixel on its edges, so the outline drawn with a 1-pixel brush always lies
+/// inside the filled shape. Clipped to the image.
+pub fn fill_polygon(img: &mut IndexedImage, points: &[(i32, i32)], color: u8) {
+    let Some(bounds) = Rect::from_points(points) else {
+        return;
+    };
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let (y0, y1) = (bounds.y.max(0), (bounds.y + bounds.h - 1).min(h - 1));
+    if y0 <= y1 {
+        let mut rows: Vec<Vec<f64>> = vec![Vec::new(); (y1 - y0 + 1) as usize];
+        for (i, &a) in points.iter().enumerate() {
+            let b = points[(i + 1) % points.len()];
+            if a.1 == b.1 {
+                continue;
+            }
+            let (top, bot) = if a.1 < b.1 { (a, b) } else { (b, a) };
+            let (dx, dy) = (f64::from(bot.0 - top.0), f64::from(bot.1 - top.1));
+            // Half-open in y, so a vertex shared by two edges is counted once.
+            for y in top.1.max(y0)..bot.1.min(y1 + 1) {
+                let x = f64::from(top.0) + f64::from(y - top.1) * dx / dy;
+                rows[(y - y0) as usize].push(x);
+            }
+        }
+        for (r, xs) in rows.iter_mut().enumerate() {
+            xs.sort_by(f64::total_cmp);
+            let y = y0 + r as i32;
+            for &[a, b] in xs.as_chunks::<2>().0 {
+                let xa = (a.ceil() as i32).max(0);
+                let xb = (b.floor() as i32).min(w - 1);
+                if xa <= xb {
+                    img.hline(xa, xb, y, color);
+                }
+            }
+        }
+    }
+    for (i, &a) in points.iter().enumerate() {
+        let b = points[(i + 1) % points.len()];
+        for (x, y) in line_points(a, b) {
+            img.set(x, y, color);
+        }
+    }
+}
+
+/// 4-connected flood fill (the Fill tool): the region of the colour at (`x`, `y`) becomes
+/// `color`. Returns the bounding rect of the changed pixels, `None` if nothing changed
+/// (outside the image, or the region already has the colour).
+pub fn flood_fill(img: &mut IndexedImage, x: i32, y: i32, color: u8) -> Option<Rect> {
+    let target = img.get(x, y)?;
+    if target == color {
+        return None;
+    }
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let mut changed = Rect::default();
+    let mut stack = vec![(x, y)];
+    while let Some((x, y)) = stack.pop() {
+        if img.get(x, y) != Some(target) {
+            continue;
+        }
+        let (mut l, mut r) = (x, x);
+        while l > 0 && img.get(l - 1, y) == Some(target) {
+            l -= 1;
+        }
+        while r < w - 1 && img.get(r + 1, y) == Some(target) {
+            r += 1;
+        }
+        img.hline(l, r, y, color);
+        changed = changed.union(Rect::new(l, y, r - l + 1, 1));
+        for ny in [y - 1, y + 1] {
+            if !(0..h).contains(&ny) {
+                continue;
+            }
+            let mut i = l;
+            while i <= r {
+                if img.get(i, ny) == Some(target) {
+                    stack.push((i, ny));
+                    while i <= r && img.get(i, ny) == Some(target) {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    Some(changed)
+}
+
+/// The part `src` of `img` enlarged `factor` times (nearest neighbour), for the Magnify view.
+/// Pixels of `src` outside the image become `outside`.
+pub fn magnified(img: &IndexedImage, src: Rect, factor: i32, outside: u8) -> IndexedImage {
+    let f = factor.max(1);
+    let (w, h) = (src.w.max(0) * f, src.h.max(0) * f);
+    let mut out = IndexedImage::new(w as u32, h as u32, outside);
+    for y in 0..src.h.max(0) {
+        for x in 0..src.w.max(0) {
+            if let Some(p) = img.get(src.x + x, src.y + y) {
+                out.fill_rect(x * f, y * f, f, f, p);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

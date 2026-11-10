@@ -17,7 +17,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Keyboard navigation in requesters (AGA addition) | |
 | P0 | Undo / redo (multi-level) | DPaint had one level; we keep the button, add history |
 | P1 | Requesters (modal, keyboard: Enter/Esc/Tab): Screen Format, Page Size, Palette, Fill Type, Spacing, Grid, Symmetry, Font, File | Square corners, 1-px bevels |
-| P1 | Magnify window (split view: normal + zoomed) | DPaint's signature zoom |
+| P1 | Magnify window (split view: normal + zoomed) | DPaint's signature zoom; done (ADR-14), 2×–20× |
 | P1 | Spare page (swap, copy, merge front/back) | |
 | P1 | Hide/show toolbox and menu bar for full-screen painting | |
 | P0 | Window: snaps to the picture's screen in whole and half pixel-size steps (Prefs ▸ Pixel Size Largest/1x–8x, Cmd/Ctrl +/−/0), full screen centred with Ctrl+Cmd+F / F11 | done (ADR-13); layout C (screen larger than the picture's screen), grey work area, movable requesters and status line dropped |
@@ -38,19 +38,19 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 
 | P | Tool | Options |
 |---|---|---|
-| P0 | Freehand (dotted / continuous), single pixel | built-in brush sizes/shapes |
-| P0 | Straight line | |
-| P1 | Curve | |
-| P0 | Rectangle, circle, ellipse — outline / filled | Shift constrains |
-| P1 | Polygon — outline / filled | |
-| P0 | Flood fill (solid) | |
+| P0 | Freehand (dotted / continuous / filled), single pixel | built-in brush sizes/shapes; done (ADR-14) |
+| P0 | Straight line | done (ADR-14); Shift = horizontal/vertical |
+| P1 | Curve | done (ADR-14): drag, release, bend, click |
+| P0 | Rectangle, circle, ellipse — outline / filled | done (ADR-14); Shift = square, Be Square for circles; ellipse rotation open |
+| P1 | Polygon — outline / filled | done (ADR-14) |
+| P0 | Flood fill (solid) | done (ADR-14), 4-connected |
 | P1 | Fill types: solid, brush, wrap, pattern, perspective(P3), 8 gradient types (linear, shape, circle, contour, highlight …) with dither, random + range | Fill Type requester; also used by filled shapes |
-| P1 | Airbrush, spacing (N total / every Nth / airbrush / continuous) | Spacing requester |
+| P1 | Airbrush, spacing (N total / every Nth / airbrush / continuous) | Spacing requester; airbrush done (ADR-14), spacing open |
 | P0 | Pipette (pick colour) | |
 | P1 | Brush pick-up (rectangle, lasso), last brush, custom brush stamping | |
 | P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | |
-| P1 | Text tool with bitmap fonts | original fonts only |
-| P1 | Grid snap, symmetry (point/mirror, N-fold) | |
+| P1 | Text tool with bitmap fonts | original fonts only; UI font done (ADR-14), Choose Font open |
+| P1 | Grid snap, symmetry (point/mirror, N-fold) | 16×16 grid and 6-fold cyclic symmetry done (ADR-14); requesters, mirror, tile open |
 | P1 | Stencil (protect colours) | |
 | P1 | Paint modes (F1–F8 + menu): Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite | |
 | P2 | Effects: Translucency, Process, AntiAlias (off/low/high, off by default), fixed Background | Effect menu |

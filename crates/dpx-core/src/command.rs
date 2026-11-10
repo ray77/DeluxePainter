@@ -12,6 +12,7 @@ use crate::image::{IndexedImage, Rect};
 use crate::mode::DisplayMode;
 use crate::palette::{Palette, Rgb8};
 use crate::raster;
+use crate::shapes::{Shape, Symmetry};
 
 /// Most points one stroke may carry.
 pub const MAX_STROKE_POINTS: usize = 100_000;
@@ -45,6 +46,20 @@ pub enum Command {
         points: Vec<(i32, i32)>,
         continuous: bool,
     },
+    /// A drawing-tool shape (ADR-14): the brush stamped along the outline, or with `filled` a
+    /// solid shape in `color` (the brush is not used). With `symmetry`, rotated copies too.
+    Shape {
+        shape: Shape,
+        #[serde(default)]
+        brush: Vec<(i32, i32)>,
+        color: u8,
+        #[serde(default)]
+        filled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symmetry: Option<Symmetry>,
+    },
+    /// Fill tool: the 4-connected region of the colour at (`x`, `y`) becomes `color`.
+    FloodFill { x: i32, y: i32, color: u8 },
     /// Fills the whole page with one colour (CLR).
     Clear { color: u8 },
     /// Mirrors the page (Picture ▸ Flip).
@@ -151,6 +166,25 @@ impl Command {
                 {
                     return Err(CommandError::invalid(format!(
                         "stroke points must lie within ±{MAX_COORD}"
+                    )));
+                }
+                Ok(())
+            }
+            Command::Shape {
+                shape,
+                brush,
+                color: c,
+                filled,
+                symmetry,
+            } => {
+                color(*c)?;
+                shape.validate(brush, *filled, symmetry.as_ref())
+            }
+            Command::FloodFill { x, y, color: c } => {
+                color(*c)?;
+                if x.abs() > MAX_COORD || y.abs() > MAX_COORD {
+                    return Err(CommandError::invalid(format!(
+                        "fill point must lie within ±{MAX_COORD}"
                     )));
                 }
                 Ok(())
@@ -283,6 +317,9 @@ impl Command {
             Command::Stroke { brush, points, .. } => Footprint::Pixels(
                 raster::stroke_bounds(brush, points).map_or(Rect::default(), |r| r.intersect(page)),
             ),
+            Command::Shape { .. } | Command::FloodFill { .. } => {
+                Footprint::Pixels(self.paint_bounds(&doc.page).unwrap_or_default())
+            }
             Command::Clear { .. }
             | Command::Flip { .. }
             | Command::ReplaceColor { .. }
@@ -312,6 +349,9 @@ impl Command {
                 points,
                 continuous,
             } => raster::stroke(page, brush, *color, points, *continuous),
+            Command::Shape { .. } | Command::FloodFill { .. } => {
+                self.paint(page);
+            }
             Command::Clear { color } => {
                 let (w, h) = (page.width() as i32, page.height() as i32);
                 page.fill_rect(0, 0, w, h, *color);
@@ -466,7 +506,7 @@ impl CommandError {
         }
     }
 
-    fn invalid(message: String) -> Self {
+    pub(crate) fn invalid(message: String) -> Self {
         Self::new(ErrorCode::InvalidArgument, message)
     }
 }

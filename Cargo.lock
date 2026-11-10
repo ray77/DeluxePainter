@@ -717,6 +717,7 @@ dependencies = [
  "dpx-ui",
  "eframe",
  "png",
+ "serde_json",
 ]
 
 [[package]]

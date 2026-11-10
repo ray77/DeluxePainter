@@ -595,4 +595,241 @@ mod tests {
         let cmd: Command = serde_json::from_str(json).unwrap();
         assert!(matches!(cmd, Command::SetFormat { screen: None, .. }));
     }
+
+    fn shape(shape: crate::Shape, filled: bool, symmetry: Option<crate::Symmetry>) -> Command {
+        Command::Shape {
+            shape,
+            brush: vec![(0, 0), (1, 0)],
+            color: 4,
+            filled,
+            symmetry,
+        }
+    }
+
+    #[test]
+    fn shapes_match_their_preview_and_undo_in_one_step() {
+        use crate::{Shape, Symmetry};
+        let sym = Some(Symmetry {
+            center: (8, 4),
+            order: 6,
+            aspect: (1, 1),
+        });
+        let cases = [
+            shape(
+                Shape::Line {
+                    from: (-3, 1),
+                    to: (12, 6),
+                },
+                false,
+                None,
+            ),
+            shape(
+                Shape::Curve {
+                    from: (0, 7),
+                    to: (15, 7),
+                    through: (7, 0),
+                },
+                false,
+                sym,
+            ),
+            shape(
+                Shape::Rect {
+                    from: (2, 1),
+                    to: (9, 6),
+                },
+                true,
+                sym,
+            ),
+            shape(
+                Shape::Ellipse {
+                    center: (8, 4),
+                    radius: (6, 3),
+                },
+                false,
+                None,
+            ),
+            shape(
+                Shape::Polygon {
+                    points: vec![(1, 1), (14, 2), (6, 7)],
+                    closed: false,
+                },
+                true,
+                None,
+            ),
+            shape(
+                Shape::Dots {
+                    points: vec![(3, 3), (20, 20), (9, 2)],
+                },
+                false,
+                sym,
+            ),
+            Command::FloodFill {
+                x: 0,
+                y: 0,
+                color: 6,
+            },
+        ];
+        for cmd in cases {
+            let mut e = engine();
+            e.execute(stroke(2, &[(0, 3), (15, 3)])).unwrap();
+            let before = e.document().page().clone();
+            let mut preview = before.clone();
+            assert!(cmd.paint(&mut preview));
+            let out = e.execute(cmd.clone()).unwrap();
+            assert_eq!(e.document().page(), &preview, "{cmd:?}");
+            assert_ne!(&preview, &before, "{cmd:?} changes something");
+            let r = out.affected.unwrap();
+            for y in 0..8 {
+                for x in 0..16 {
+                    if preview.get(x, y) != before.get(x, y) {
+                        assert!(r.contains(x, y), "{cmd:?}: ({x},{y}) outside {r:?}");
+                    }
+                }
+            }
+            e.undo().unwrap();
+            assert_eq!(e.document().page(), &before, "{cmd:?} undone");
+            e.redo().unwrap();
+            assert_eq!(e.document().page(), &preview, "{cmd:?} redone");
+        }
+    }
+
+    #[test]
+    fn flood_fill_only_snapshots_the_filled_region() {
+        let mut e = engine();
+        e.execute(stroke(2, &[(5, 0), (5, 7)])).unwrap();
+        let out = e
+            .execute(Command::FloodFill {
+                x: 0,
+                y: 0,
+                color: 3,
+            })
+            .unwrap();
+        assert_eq!(out.affected, Some(Rect::new(0, 0, 5, 8)));
+        assert_eq!(e.document().page().get(7, 0), Some(0), "wall stops it");
+        // Filling with the colour already there changes nothing but is a harmless step.
+        let out = e
+            .execute(Command::FloodFill {
+                x: 0,
+                y: 0,
+                color: 3,
+            })
+            .unwrap();
+        assert_eq!(out.affected, None);
+    }
+
+    #[test]
+    fn invalid_shapes_change_nothing() {
+        use crate::shapes::{MAX_SHAPE_COORD, MAX_SYMMETRY_ORDER};
+        use crate::{Shape, Symmetry};
+        let mut e = engine();
+        let before = e.document().clone();
+        let line = Shape::Line {
+            from: (0, 0),
+            to: (3, 3),
+        };
+        let cases = [
+            (
+                Command::Shape {
+                    shape: line.clone(),
+                    brush: vec![],
+                    color: 1,
+                    filled: false,
+                    symmetry: None,
+                },
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                Command::Shape {
+                    shape: line.clone(),
+                    brush: vec![(0, 0)],
+                    color: 99,
+                    filled: false,
+                    symmetry: None,
+                },
+                ErrorCode::PaletteRangeInvalid,
+            ),
+            (
+                shape(
+                    Shape::Line {
+                        from: (0, 0),
+                        to: (MAX_SHAPE_COORD + 1, 0),
+                    },
+                    false,
+                    None,
+                ),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                shape(
+                    Shape::Ellipse {
+                        center: (0, 0),
+                        radius: (-1, 2),
+                    },
+                    true,
+                    None,
+                ),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                shape(
+                    Shape::Polygon {
+                        points: vec![],
+                        closed: true,
+                    },
+                    true,
+                    None,
+                ),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                shape(
+                    line.clone(),
+                    false,
+                    Some(Symmetry {
+                        center: (0, 0),
+                        order: MAX_SYMMETRY_ORDER + 1,
+                        aspect: (1, 1),
+                    }),
+                ),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                shape(
+                    line,
+                    false,
+                    Some(Symmetry {
+                        center: (0, 0),
+                        order: 6,
+                        aspect: (0, 1),
+                    }),
+                ),
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                Command::FloodFill {
+                    x: 0,
+                    y: 0,
+                    color: 32,
+                },
+                ErrorCode::PaletteRangeInvalid,
+            ),
+        ];
+        for (cmd, code) in cases {
+            assert_eq!(e.execute(cmd.clone()).unwrap_err().code, code, "{cmd:?}");
+        }
+        // A filled shape needs no brush.
+        e.execute(Command::Shape {
+            shape: Shape::Rect {
+                from: (0, 0),
+                to: (2, 2),
+            },
+            brush: vec![],
+            color: 1,
+            filled: true,
+            symmetry: None,
+        })
+        .unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.document().page(), before.page());
+    }
 }
