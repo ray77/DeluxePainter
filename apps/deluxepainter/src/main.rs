@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dpx_core::{
-    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, raster,
+    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, Target, raster,
 };
 use dpx_ui::menu::{self, MENUS};
 use dpx_ui::requester::{self, ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
@@ -104,7 +104,7 @@ fn main() -> eframe::Result {
     }
     let opened = arg_value(&args, "--open").map(|p| match files::load(Path::new(&p)) {
         Ok(loaded) => {
-            let (doc, extras, notes) = files::open_picture(loaded.picture);
+            let (doc, extras, notes) = files::open_picture(loaded.picture, Target::default());
             loaded
                 .notes
                 .iter()
@@ -501,7 +501,8 @@ impl PainterApp {
     fn load_picture(&mut self, path: PathBuf) {
         match files::load(&path) {
             Ok(loaded) => {
-                let (doc, extras, notes) = files::open_picture(loaded.picture);
+                let current = self.engine.document().target();
+                let (doc, extras, notes) = files::open_picture(loaded.picture, current);
                 for n in loaded.notes.iter().chain(&notes) {
                     eprintln!("note: {}: {n}", path.display());
                 }
@@ -1214,7 +1215,7 @@ mod tests {
         app.file_requester_event(ReqEvent::Key(ReqKey::Char('y')), 0);
         assert!(app.ui.file_requester.is_none());
         let back = files::load(&dir.join("Castle.iff")).unwrap().picture;
-        assert_eq!(back.image(), &img);
+        assert_eq!(back.indexed().unwrap().0, &img);
         assert_eq!(back.camg(), Some(0x0002_9000), "AGA PAL HiRes mode id");
 
         // A new name with .png writes PNG; JPEG is refused with a message.
@@ -1235,7 +1236,9 @@ mod tests {
             files::load(&dir.join("Castle.png"))
                 .unwrap()
                 .picture
-                .image(),
+                .indexed()
+                .unwrap()
+                .0,
             &img
         );
         assert!(!dir.join("Castle.jpg").exists());
@@ -1244,6 +1247,48 @@ mod tests {
         app.run_action(Action::Command("picture.load"), &ctx);
         app.file_requester_event(ReqEvent::Key(ReqKey::Escape), 0);
         assert!(app.ui.file_requester.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_big_true_colour_png_loads_scaled_to_the_current_screen() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("dpx-app-tc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 700x600 fits no screen format (at most 512 lines): two colour halves.
+        let (w, h) = (700u32, 600u32);
+        let data: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                if i % w < w / 2 {
+                    [200, 40, 40]
+                } else {
+                    [40, 40, 200]
+                }
+            })
+            .collect();
+        let mut png_bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, w, h);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&data).unwrap();
+        }
+        std::fs::write(dir.join("Photo.png"), png_bytes).unwrap();
+
+        let mut app = PainterApp::new();
+        let before = app.engine.document().target();
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        app.run_action(Action::Command("picture.load"), &ctx);
+        type_into(&mut app, "Photo.png");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none(), "loaded and closed");
+        assert_eq!(app.engine.document().target(), before, "kept the screen");
+        // 320x256 LoRes: 7:6 shown on square pixels → 299x256.
+        assert_eq!((app.page().width(), app.page().height()), (299, 256));
+        let at = |x: i32| app.palette().get(app.page().get(x, 100).unwrap()).unwrap();
+        assert_eq!(at(10), dpx_core::Rgb8::new(200, 40, 40));
+        assert_eq!(at(290), dpx_core::Rgb8::new(40, 40, 200));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

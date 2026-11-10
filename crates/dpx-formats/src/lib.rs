@@ -1,6 +1,9 @@
-//! Non-Amiga picture formats for DeluxePainter. Phase 2: PNG import/export of indexed
-//! pictures. True-colour import (PNG, JPEG) needs colour reduction and follows later.
+//! Non-Amiga picture formats for DeluxePainter: indexed PNG import/export, true-colour PNG
+//! and JPEG import (decoded to RGBA, JPEG with its EXIF orientation applied). Colour
+//! reduction of true-colour pictures lives in `dpx_core::quantize` (ADR-9).
 
+pub mod jpeg_io;
 pub mod png_io;
 
-pub use png_io::{PngError, PngPicture, read_png, write_png};
+pub use jpeg_io::{JpegError, read_jpeg};
+pub use png_io::{PngError, PngImage, PngPicture, read_png, write_png};

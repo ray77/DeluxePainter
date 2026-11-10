@@ -17,7 +17,7 @@ Method: `cargo search`, the crates.io API (`https://crates.io/api/v1/crates/<nam
 | image | **0.25.10** | 0.25.10 | 1.88 | MIT OR Apache-2.0 | Decode/encode PNG/JPEG etc. (use `default-features = false`, pick formats) | https://crates.io/crates/image | 2026-11-09 |
 | png | **0.18.1** | 0.18.1 | 1.73 | MIT OR Apache-2.0 | Direct PNG control (indexed, chunks, metadata) | https://crates.io/crates/png | 2026-11-09 |
 | jpeg-decoder | avoid | 0.3.2 | 1.61 | MIT OR Apache-2.0 | Older JPEG decoder; superseded by zune-jpeg (which `image` uses) | https://crates.io/crates/jpeg-decoder | 2026-11-09 |
-| zune-jpeg | 0.5.15 (only if used directly) | 0.5.16-rc3 (pre-release) | 1.75 | MIT OR Apache-2.0 OR Zlib | JPEG decode; normally reached through `image` | https://crates.io/crates/zune-jpeg | 2026-11-09 |
+| zune-jpeg | **0.5.15 (used directly since ADR-9)** | 0.5.16-rc3 (pre-release) | 1.75 | MIT OR Apache-2.0 OR Zlib | JPEG decode in `dpx-formats` (default features: std + x86/NEON SIMD); `image` is not used | https://crates.io/crates/zune-jpeg | 2026-11-10 |
 | zip | **9.5.0** | 9.5.0 | 1.88 | MIT | Project container (.zip) | https://crates.io/crates/zip | 2026-11-09 |
 | zstd | **0.14.3** | 0.14.3 (0.13.4 also published) | 1.64 | BSD-3-Clause (wrapper; bundles Zstandard C lib, BSD-3/GPLv2 dual - used under BSD) | Compression of layer data | https://crates.io/crates/zstd | 2026-11-09 |
 | serde | **1.0.229** | 1.0.229 | 1.56 | MIT OR Apache-2.0 | Serialization framework | https://crates.io/crates/serde | 2026-11-09 |

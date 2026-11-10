@@ -27,12 +27,14 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 - CLI: `deluxepainter info <file>`, `deluxepainter convert <in> <out>` (reports whatever the target format cannot store), `--open <file>` for the GUI and snapshots.
 - Display modes (ADR-7): PAL/NTSC × LoRes/HiRes/SuperHiRes × laced, chipset limits, `SetFormat` command with whole-document undo; Picture ▸ Screen Format requester on its own HiRes screen (menu only, owner decision); screens shown with the right pixel shape; `--open` picks the picture's mode.
 - Picture ▸ Load/Save (ADR-8): DeluxePaint-style file requester on the paint screen (list, scroll bar, Drawer/Pattern/File, Disks/Assigns/Parent, AmigaDOS patterns, double-click, overwrite confirmation); ILBM saves write the document's CAMG, aspect and page size and keep CRNG/GRAB/transparent colour from the loaded file; `.png` names save PNG. Covered by unit tests and headless snapshots; not yet clicked through by hand in the window.
+- True-colour import (ADR-9): RGB/RGBA/greyscale PNG and JPEG (EXIF orientation) load through Picture ▸ Load, `--open` and the CLI. Pictures that fit a screen format keep their size; bigger ones are scaled to the current screen. New palette with the mode's colour count (exact when the picture has that few, 12-bit on OCS), median cut + k-means, Floyd–Steinberg; transparent pixels become pink colour 0, saved as the ILBM transparent colour. Verified by tests, real ILBMs round-tripped through RGB PNG, and release timings (see ADR-9).
 
 Next in Phase 2:
-1. True-colour PNG and JPEG import with colour reduction.
-2. Page larger than the screen (scrolling), overscan and custom screen sizes.
-3. Error diagnostics for broken files; more golden fixtures.
-4. Visible notes (e.g. "DPPS chunk not kept") instead of stderr only.
+1. Page larger than the screen (scrolling), overscan and custom screen sizes; pages at least screen size.
+2. Error diagnostics for broken files; more golden fixtures.
+3. Visible notes (e.g. "DPPS chunk not kept", "reduced to 256 colours") instead of stderr only.
+
+Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 
 ## Phase 1 status
 

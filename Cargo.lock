@@ -790,6 +790,7 @@ version = "0.1.0"
 dependencies = [
  "dpx-core",
  "png",
+ "zune-jpeg",
 ]
 
 [[package]]

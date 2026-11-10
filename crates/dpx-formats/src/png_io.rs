@@ -1,17 +1,18 @@
-//! PNG import/export of indexed pictures. The palette travels in PLTE, so a PNG round trip
-//! keeps pixels and colours exactly. ILBM-only metadata (CAMG, CRNG, masking, aspect) has no
-//! place in PNG; callers report what they drop.
+//! PNG import/export. Indexed pictures keep their palette in PLTE, so a PNG round trip keeps
+//! pixels and colours exactly. True-colour and greyscale PNGs (any bit depth, with or without
+//! alpha) are read as RGBA for colour reduction (ADR-9). ILBM-only metadata (CAMG, CRNG,
+//! masking, aspect) has no place in PNG; callers report what they drop.
 
 use std::fmt;
 use std::io::Cursor;
 
-use dpx_core::{IndexedImage, Palette, Rgb8};
+use dpx_core::{IndexedImage, Palette, Rgb8, Rgba8, RgbaImage};
 
 #[derive(Debug)]
 pub enum PngError {
     Decode(png::DecodingError),
     Encode(png::EncodingError),
-    /// Valid PNG that cannot be loaded yet (e.g. true-colour without colour reduction).
+    /// Valid PNG that cannot be loaded (e.g. too large).
     Unsupported(String),
     /// The picture cannot be written as described.
     Invalid(String),
@@ -40,17 +41,38 @@ pub struct PngPicture {
     pub transparent_entries: Vec<u8>,
 }
 
-/// Reads an indexed (palette) PNG with 1, 2, 4 or 8 bits per pixel.
-pub fn read_png(bytes: &[u8]) -> Result<PngPicture, PngError> {
-    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+/// Largest accepted picture (64 megapixels, as for JPEG).
+const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// A PNG as read: indexed with its palette, or true colour for colour reduction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PngImage {
+    Indexed(PngPicture),
+    TrueColor(RgbaImage),
+}
+
+fn decoder(bytes: &[u8]) -> png::Decoder<Cursor<&[u8]>> {
+    // RGBA output of the largest accepted picture, plus room for the raw rows.
+    let limits = png::Limits {
+        bytes: (MAX_PIXELS * 8) as usize,
+    };
+    png::Decoder::new_with_limits(Cursor::new(bytes), limits)
+}
+
+/// Reads a PNG: indexed (1, 2, 4 or 8 bits per pixel) as it is, everything else as RGBA.
+pub fn read_png(bytes: &[u8]) -> Result<PngImage, PngError> {
+    let mut decoder = decoder(bytes);
     decoder.set_transformations(png::Transformations::IDENTITY);
     let mut reader = decoder.read_info().map_err(PngError::Decode)?;
     let info = reader.info();
-    if info.color_type != png::ColorType::Indexed {
+    if u64::from(info.width) * u64::from(info.height) > MAX_PIXELS {
         return Err(PngError::Unsupported(format!(
-            "{:?} PNG (true-colour import needs colour reduction, planned)",
-            info.color_type
+            "{}x{} exceeds the 64 megapixel limit",
+            info.width, info.height
         )));
+    }
+    if info.color_type != png::ColorType::Indexed {
+        return read_true_color(bytes).map(PngImage::TrueColor);
     }
     let depth = info.bit_depth as u32;
     let plte = info
@@ -98,11 +120,55 @@ pub fn read_png(bytes: &[u8]) -> Result<PngPicture, PngError> {
         .filter(|&(_, &a)| a < 255)
         .map(|(i, _)| i as u8)
         .collect();
-    Ok(PngPicture {
+    Ok(PngImage::Indexed(PngPicture {
         image: IndexedImage::from_pixels(frame.width, frame.height, pixels).expect("w*h pixels"),
         palette,
         transparent_entries,
-    })
+    }))
+}
+
+/// Greyscale or RGB PNG (with alpha or a tRNS colour key) → 8-bit RGBA.
+fn read_true_color(bytes: &[u8]) -> Result<RgbaImage, PngError> {
+    let mut decoder = decoder(bytes);
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(PngError::Decode)?;
+    let mut buf = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .ok_or_else(|| PngError::Unsupported("picture too large".into()))?
+    ];
+    let frame = reader.next_frame(&mut buf).map_err(PngError::Decode)?;
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let channels = match frame.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => {
+            return Err(PngError::Unsupported("unexpected indexed output".into()));
+        }
+    };
+    if frame.bit_depth != png::BitDepth::Eight {
+        return Err(PngError::Unsupported(format!(
+            "unexpected {:?} output",
+            frame.bit_depth
+        )));
+    }
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in buf.chunks(frame.line_size).take(h) {
+        for px in row[..w * channels].chunks_exact(channels) {
+            pixels.push(match *px {
+                [v] => Rgba8::opaque(v, v, v),
+                [v, a] => Rgba8::new(v, v, v, a),
+                [r, g, b] => Rgba8::opaque(r, g, b),
+                [r, g, b, a] => Rgba8::new(r, g, b, a),
+                _ => unreachable!("chunks of 1 to 4 channels"),
+            });
+        }
+    }
+    RgbaImage::from_pixels(frame.width, frame.height, pixels)
+        .ok_or_else(|| PngError::Unsupported("truncated picture data".into()))
 }
 
 /// Writes an 8-bit indexed PNG with the full palette in PLTE.
@@ -161,7 +227,9 @@ mod tests {
     fn indexed_round_trip() {
         for (w, h, colors) in [(1, 1, 1), (7, 3, 2), (320, 200, 32), (33, 5, 256)] {
             let (img, pal) = sample(w, h, colors);
-            let back = read_png(&write_png(&img, &pal).unwrap()).unwrap();
+            let PngImage::Indexed(back) = read_png(&write_png(&img, &pal).unwrap()).unwrap() else {
+                panic!("expected an indexed PNG");
+            };
             assert_eq!(back.image, img);
             assert_eq!(back.palette, pal);
             assert!(back.transparent_entries.is_empty());
@@ -207,24 +275,95 @@ mod tests {
             Some(plte),
             Some(vec![0, 255]),
         );
-        let pic = read_png(&png).unwrap();
+        let PngImage::Indexed(pic) = read_png(&png).unwrap() else {
+            panic!("expected an indexed PNG");
+        };
         assert_eq!(pic.image.pixels(), &[0, 1, 2, 3, 1, 3, 2, 1, 0, 2]);
         assert_eq!(pic.palette.len(), 4);
         assert_eq!(pic.transparent_entries, vec![0]);
     }
 
+    fn true_color(png: &[u8]) -> RgbaImage {
+        match read_png(png).unwrap() {
+            PngImage::TrueColor(img) => img,
+            PngImage::Indexed(_) => panic!("expected true colour"),
+        }
+    }
+
     #[test]
-    fn true_colour_is_refused_clearly() {
-        let png = encode(
-            png::ColorType::Rgb,
-            png::BitDepth::Eight,
+    fn true_colour_and_greyscale_read_as_rgba() {
+        use png::{BitDepth, ColorType};
+        let rgb = encode(
+            ColorType::Rgb,
+            BitDepth::Eight,
+            2,
             1,
-            1,
-            &[1, 2, 3],
+            &[1, 2, 3, 4, 5, 6],
             None,
             None,
         );
-        assert!(matches!(read_png(&png), Err(PngError::Unsupported(_))));
+        let img = true_color(&rgb);
+        assert_eq!(
+            img.pixels(),
+            &[Rgba8::opaque(1, 2, 3), Rgba8::opaque(4, 5, 6)]
+        );
+        let rgba = encode(
+            ColorType::Rgba,
+            BitDepth::Eight,
+            1,
+            1,
+            &[9, 8, 7, 6],
+            None,
+            None,
+        );
+        assert_eq!(true_color(&rgba).pixels(), &[Rgba8::new(9, 8, 7, 6)]);
+        // 16-bit samples keep their high byte.
+        let rgb16 = encode(
+            ColorType::Rgb,
+            BitDepth::Sixteen,
+            1,
+            1,
+            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC],
+            None,
+            None,
+        );
+        assert_eq!(
+            true_color(&rgb16).pixels(),
+            &[Rgba8::opaque(0x12, 0x56, 0x9A)]
+        );
+        // 1-bit greyscale with a tRNS key: black is transparent.
+        let grey = encode(
+            ColorType::Grayscale,
+            BitDepth::One,
+            3,
+            1,
+            &[0b0100_0000],
+            None,
+            Some(vec![0, 0]),
+        );
+        assert_eq!(
+            true_color(&grey).pixels(),
+            &[
+                Rgba8::new(0, 0, 0, 0),
+                Rgba8::opaque(255, 255, 255),
+                Rgba8::new(0, 0, 0, 0)
+            ]
+        );
+        let ga = encode(
+            ColorType::GrayscaleAlpha,
+            BitDepth::Eight,
+            1,
+            1,
+            &[77, 128],
+            None,
+            None,
+        );
+        assert_eq!(true_color(&ga).pixels(), &[Rgba8::new(77, 77, 77, 128)]);
+    }
+
+    #[test]
+    fn garbage_is_a_decode_error() {
+        assert!(matches!(read_png(b"not a png"), Err(PngError::Decode(_))));
     }
 
     #[test]

@@ -278,6 +278,7 @@ Crate `dpx-iff` (`iff`, `byterun1`, `ilbm`), used by `deluxepainter info|convert
 | Writer | canonical order BMHD, CMAP, GRAB, CAMG, CRNG*, other chunks, BODY; CMAP written in replicated 8-bit form; refuses pixels outside the palette, a palette larger than the plane count, and inconsistent masks |
 | Refused with a clear message | HAM, EHB, 6 planes without CAMG, lasso masking, >8 planes / DEEP, other FORM types (PBM, ANIM) |
 | GUI Picture ▸ Save (ADR-8) | writes CAMG from the document target (AGA full mode id, OCS 16-bit), BMHD aspect and page size from the display mode, CRNG/GRAB/transparent colour kept from the loaded file; private chunks (DPPS, DPPV, TINY) and mask planes are not carried over after editing, with a note |
+| True-colour PNG/JPEG → ILBM (ADR-9) | reduced to the mode's colour count, saved with that mode's CAMG; transparent pixels → masking 2 with transparent colour 0 (pink); `convert photo.jpg out.iff` uses the default screen (AGA PAL LoRes) |
 | Not done | EHB/HAM/AGA mode interpretation (Phase 5), CMAP low-nibble variant, chunks after BODY, ANIM |
 
 Verification on six real DeluxePaint-era pictures (320×200, 5 and 8 planes, ByteRun1, masking 0/2, 4-bit CMAPs, DPPS/DPPV/TINY, up to 16 CRNG): pixels and palettes of our PNG export, our ILBM rewrite and a PNG → ILBM round trip all match an independent Python ILBM decoder read with Pillow. Rewritten files are not byte-identical to the originals: the CMAP is written in replicated form (0xNN instead of 0xN0) and chunks are written in canonical order.

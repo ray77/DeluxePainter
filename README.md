@@ -59,7 +59,7 @@ cargo run -p deluxepainter -- --snapshot screen.png --scale 2
 
 Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` or UNDO undo, `Shift+U` or right-click on UNDO redo (64 steps); `F10` hide/show toolbox and title bar, `F9` title bar only.
 
-Pictures (IFF ILBM and indexed PNG; HAM/EHB and true-colour import come later):
+Pictures: IFF ILBM and indexed PNG in and out; true-colour PNG and JPEG in (HAM/EHB come later). True-colour pictures get a new palette with the mode's colour count and Floyd–Steinberg dithering; pictures bigger than any screen are scaled to the current screen; transparent pixels become pink colour 0 (ADR-9). `info` shows how a picture will open:
 
 ```bash
 cargo run -p deluxepainter --release -- info picture.iff
@@ -77,7 +77,7 @@ Picture ▸ Load.. and Save.. open a DeluxePaint-style file requester (click a `
 
 Display modes: Picture ▸ Screen Format.. chooses PAL/NTSC LoRes, HiRes and SuperHiRes (laced or not), palette size, page size and whether to keep the picture.
 
-Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff`, `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--font-preview out.png`.
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--font-preview out.png`.
 
 ## License
 

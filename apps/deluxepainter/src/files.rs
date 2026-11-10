@@ -1,11 +1,15 @@
 //! Loading and saving pictures by file type, plus the headless `info` and `convert` commands.
 //!
-//! Formats: IFF ILBM and PNG in and out (JPEG import follows). Whatever a target format cannot
+//! Formats: IFF ILBM and PNG in and out, JPEG in only. True-colour PNG and JPEG pictures are
+//! reduced to an indexed page when they are opened (ADR-9). Whatever a target format cannot
 //! store is reported, never dropped silently.
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use dpx_core::{DisplayMode, Document, IndexedImage, Palette, Target};
+use dpx_core::quantize::{self, Dither, PaletteDepth, ReduceOptions, Reduction};
+use dpx_core::resample;
+use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Palette, Rgb8, RgbaImage, Target};
 use dpx_iff::{ColorRange, Compression, Ilbm, Masking, ilbm};
 
 /// A loaded picture plus notes about anything that did not survive the import.
@@ -21,20 +25,20 @@ pub enum Picture {
         image: IndexedImage,
         palette: Palette,
     },
+    /// True-colour PNG or JPEG; becomes indexed only when it is opened ([`reduce_true_color`]).
+    TrueColor {
+        image: RgbaImage,
+        format: &'static str,
+    },
 }
 
 impl Picture {
-    pub fn image(&self) -> &IndexedImage {
+    /// Pixels and palette of an indexed picture; `None` for true colour.
+    pub fn indexed(&self) -> Option<(&IndexedImage, &Palette)> {
         match self {
-            Picture::Ilbm(i) => &i.image,
-            Picture::Png { image, .. } => image,
-        }
-    }
-
-    pub fn palette(&self) -> &Palette {
-        match self {
-            Picture::Ilbm(i) => &i.palette,
-            Picture::Png { palette, .. } => palette,
+            Picture::Ilbm(i) => Some((&i.image, &i.palette)),
+            Picture::Png { image, palette } => Some((image, palette)),
+            Picture::TrueColor { .. } => None,
         }
     }
 
@@ -42,7 +46,7 @@ impl Picture {
     pub fn camg(&self) -> Option<u32> {
         match self {
             Picture::Ilbm(i) => i.camg,
-            Picture::Png { .. } => None,
+            Picture::Png { .. } | Picture::TrueColor { .. } => None,
         }
     }
 }
@@ -51,6 +55,7 @@ impl Picture {
 enum Kind {
     Ilbm,
     Png,
+    Jpeg,
 }
 
 fn kind_of_bytes(bytes: &[u8]) -> Option<Kind> {
@@ -58,17 +63,30 @@ fn kind_of_bytes(bytes: &[u8]) -> Option<Kind> {
         Some(Kind::Ilbm)
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(Kind::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(Kind::Jpeg)
     } else {
         None
     }
 }
 
-fn kind_of_path(path: &Path) -> Option<Kind> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "iff" | "ilbm" | "lbm" => Some(Kind::Ilbm),
-        "png" => Some(Kind::Png),
-        _ => None,
+/// Output type for `convert`, by extension.
+fn kind_of_path(path: &Path) -> Result<Kind, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("iff" | "ilbm" | "lbm") => Ok(Kind::Ilbm),
+        Some("png") => Ok(Kind::Png),
+        Some("jpg" | "jpeg") => Err(format!(
+            "{}: JPEG is import-only (DeluxePainter writes .iff/.ilbm/.lbm and .png)",
+            path.display()
+        )),
+        _ => Err(format!(
+            "{}: unsupported output type (DeluxePainter writes .iff/.ilbm/.lbm and .png)",
+            path.display()
+        )),
     }
 }
 
@@ -83,8 +101,19 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
             })
         }
         Some(Kind::Png) => {
-            let pic =
-                dpx_formats::read_png(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            let pic = match dpx_formats::read_png(&bytes) {
+                Ok(dpx_formats::PngImage::Indexed(pic)) => pic,
+                Ok(dpx_formats::PngImage::TrueColor(image)) => {
+                    return Ok(Loaded {
+                        picture: Picture::TrueColor {
+                            image,
+                            format: "PNG",
+                        },
+                        notes: Vec::new(),
+                    });
+                }
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            };
             let mut notes = Vec::new();
             if !pic.transparent_entries.is_empty() {
                 notes.push(format!(
@@ -100,8 +129,19 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                 notes,
             })
         }
+        Some(Kind::Jpeg) => {
+            let image =
+                dpx_formats::read_jpeg(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok(Loaded {
+                picture: Picture::TrueColor {
+                    image,
+                    format: "JPEG",
+                },
+                notes: Vec::new(),
+            })
+        }
         None => Err(format!(
-            "{}: unknown file type (DeluxePainter reads IFF ILBM and PNG)",
+            "{}: unknown file type (DeluxePainter reads IFF ILBM, PNG and JPEG)",
             path.display()
         )),
     }
@@ -109,21 +149,18 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
 
 /// Writes `picture` in the format given by the file extension; returns notes about metadata
 /// the target format cannot hold.
+/// True-colour pictures must be opened (reduced) first; see [`convert`].
 pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
-    let kind = kind_of_path(path).ok_or_else(|| {
-        format!(
-            "{}: unsupported output type (DeluxePainter writes .iff/.ilbm/.lbm and .png)",
-            path.display()
-        )
-    })?;
+    let kind = kind_of_path(path)?;
+    let (image, palette) = picture
+        .indexed()
+        .ok_or_else(|| "true-colour picture must be reduced before saving".to_string())?;
     let mut notes = Vec::new();
     let bytes = match kind {
-        Kind::Ilbm => {
+        Kind::Ilbm | Kind::Jpeg => {
             let ilbm = match picture {
                 Picture::Ilbm(i) => (**i).clone(),
-                Picture::Png { image, palette } => {
-                    Ilbm::from_indexed(image.clone(), palette.clone())
-                }
+                _ => Ilbm::from_indexed(image.clone(), palette.clone()),
             };
             ilbm::write(&ilbm, Compression::ByteRun1).map_err(|e| e.to_string())?
         }
@@ -131,7 +168,7 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
             if let Picture::Ilbm(i) = picture {
                 notes.extend(png_drops(i));
             }
-            dpx_formats::write_png(picture.image(), picture.palette()).map_err(|e| e.to_string())?
+            dpx_formats::write_png(image, palette).map_err(|e| e.to_string())?
         }
     };
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -148,16 +185,99 @@ pub struct PictureExtras {
     pub transparent_color: Option<u16>,
 }
 
-/// Turns a loaded picture into a document; the display mode is guessed from CAMG and size.
-/// Returns notes about everything that is not kept.
-pub fn open_picture(picture: Picture) -> (Document, PictureExtras, Vec<String>) {
-    let mode = DisplayMode::guess(
-        picture.camg(),
-        picture.image().width(),
-        picture.image().height(),
-    );
+/// Colour 0 of a reduced true-colour picture with transparent pixels (owner decision: the
+/// old "magic pink", so transparent areas stay visible). Saved as the ILBM transparent colour.
+pub const TRANSPARENT_PINK: Rgb8 = Rgb8::new(255, 0, 255);
+
+/// A true-colour picture turned into an indexed page (ADR-9).
+pub struct ReducedPicture {
+    pub image: IndexedImage,
+    pub palette: Palette,
+    pub target: Target,
+    pub transparent_color: Option<u16>,
+    pub notes: Vec<String>,
+}
+
+/// Owner decisions (ADR-9): a picture that fits a screen format keeps its size and gets the
+/// mode guessed from it, like an ILBM without CAMG; a bigger one is scaled down to the
+/// `current` screen, keeping its proportions on that screen's pixel shape. The palette is
+/// new, with as many colours as the mode allows (exact when the picture has that few), and
+/// the reduction uses Floyd–Steinberg dithering. Transparent pixels become colour 0 (pink).
+pub fn reduce_true_color(img: &RgbaImage, format: &str, current: Target) -> ReducedPicture {
+    let (w, h) = (img.width(), img.height());
+    let default = Target::default();
+    let fits = DisplayMode::all().iter().any(|m| {
+        let (sw, sh) = m.size();
+        m.max_colors(default.chipset).is_some() && w <= sw && h <= sh
+    });
+    let mut notes = Vec::new();
+    let (target, scaled) = if fits {
+        let mode = DisplayMode::guess(None, w, h);
+        (Target { mode, ..default }, None)
+    } else {
+        let mode = current.mode;
+        let (sw, sh) = mode.size();
+        let (nw, nh) = resample::fit_size(w, h, sw, sh, mode.pixel_shape());
+        notes.push(format!(
+            "{format} picture {w}x{h} is larger than any screen: scaled to {nw}x{nh} for {}",
+            mode.name()
+        ));
+        (current, Some(resample::scale_area(img, nw, nh)))
+    };
+    let source = scaled.as_ref().unwrap_or(img);
+    let opts = ReduceOptions {
+        max_colors: target.mode.max_colors(target.chipset).unwrap_or(16),
+        depth: match target.chipset {
+            Chipset::Ocs => PaletteDepth::Rgb4,
+            Chipset::Aga => PaletteDepth::Rgb8,
+        },
+        dither: Dither::FloydSteinberg,
+        transparent: TRANSPARENT_PINK,
+    };
+    let r = quantize::reduce(source, &opts);
+    match r.reduction {
+        Reduction::Exact => {}
+        Reduction::Rounded => {
+            notes.push(format!("{} colours rounded to 12-bit OCS values", r.colors))
+        }
+        Reduction::Quantized => notes.push(format!(
+            "{format} true colour reduced to {} colours (Floyd-Steinberg dithering)",
+            r.colors
+        )),
+    }
+    if r.transparent_index.is_some() {
+        notes.push("transparent pixels became colour 0 (pink), the transparent colour".into());
+    }
+    ReducedPicture {
+        image: r.image,
+        palette: r.palette,
+        target,
+        transparent_color: r.transparent_index.map(u16::from),
+        notes,
+    }
+}
+
+/// Turns a loaded picture into a document. Indexed pictures get the display mode guessed from
+/// CAMG and size; true-colour ones are reduced ([`reduce_true_color`], which scales pictures
+/// too big for any screen to `current`). Returns notes about everything that is not kept.
+pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtras, Vec<String>) {
+    if let Picture::TrueColor { image, format } = &picture {
+        let r = reduce_true_color(image, format, current);
+        let extras = PictureExtras {
+            transparent_color: r.transparent_color,
+            ..PictureExtras::default()
+        };
+        return (
+            Document::from_picture(r.image, r.palette, r.target),
+            extras,
+            r.notes,
+        );
+    }
+    let (w, h) = picture
+        .indexed()
+        .map_or((0, 0), |(i, _)| (i.width(), i.height()));
     let target = Target {
-        mode,
+        mode: DisplayMode::guess(picture.camg(), w, h),
         ..Target::default()
     };
     let mut extras = PictureExtras::default();
@@ -184,6 +304,7 @@ pub fn open_picture(picture: Picture) -> (Document, PictureExtras, Vec<String>) 
             (i.image, i.palette)
         }
         Picture::Png { image, palette } => (image, palette),
+        Picture::TrueColor { .. } => unreachable!("handled above"),
     };
     (
         Document::from_picture(image, palette, target),
@@ -319,8 +440,11 @@ fn png_drops(i: &Ilbm) -> Vec<String> {
 pub fn info(path: &Path) -> Result<String, String> {
     let loaded = load(path)?;
     let mut out = String::new();
-    let img = loaded.picture.image();
     let name = path.display();
+    if let Picture::TrueColor { image, format } = &loaded.picture {
+        return Ok(true_color_info(&name.to_string(), image, format));
+    }
+    let (img, _) = loaded.picture.indexed().expect("indexed picture");
     match &loaded.picture {
         Picture::Ilbm(i) => {
             out += &format!(
@@ -381,6 +505,7 @@ pub fn info(path: &Path) -> Result<String, String> {
                 palette.len()
             );
         }
+        Picture::TrueColor { .. } => unreachable!("handled above"),
     }
     let used = {
         let mut seen = [false; 256];
@@ -396,11 +521,57 @@ pub fn info(path: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-/// `deluxepainter convert <in> <out>`.
+/// `info` for a true-colour picture: what it is and how it would open (on the default screen).
+fn true_color_info(name: &str, img: &RgbaImage, format: &str) -> String {
+    let opaque: HashSet<(u8, u8, u8)> = img
+        .pixels()
+        .iter()
+        .filter(|p| p.a >= quantize::ALPHA_THRESHOLD)
+        .map(|p| (p.r, p.g, p.b))
+        .collect();
+    let transparent = img
+        .pixels()
+        .iter()
+        .filter(|p| p.a < quantize::ALPHA_THRESHOLD)
+        .count();
+    let mut out = format!(
+        "{name}: {format} true colour {}x{}, {} colours",
+        img.width(),
+        img.height(),
+        opaque.len()
+    );
+    if transparent > 0 {
+        out += &format!(", {transparent} transparent pixels");
+    }
+    let r = reduce_true_color(img, format, Target::default());
+    out += &format!(
+        "\n  opens as: {}x{} {} with {} palette entries\n",
+        r.image.width(),
+        r.image.height(),
+        r.target.mode.name(),
+        r.palette.len()
+    );
+    for n in &r.notes {
+        out += &format!("  note: {n}\n");
+    }
+    out
+}
+
+/// `deluxepainter convert <in> <out>`. True-colour input is reduced as on opening, for the
+/// default screen (PAL LoRes, AGA), and written with its display mode.
 pub fn convert(input: &Path, output: &Path) -> Result<Vec<String>, String> {
+    kind_of_path(output)?;
     let loaded = load(input)?;
     let mut notes = loaded.notes;
-    notes.extend(save(&loaded.picture, output)?);
+    if let Picture::TrueColor { .. } = loaded.picture {
+        let (doc, extras, opened) = open_picture(loaded.picture, Target::default());
+        notes.extend(opened);
+        let (bytes, saved) = encode_document(&doc, &extras, output)?;
+        std::fs::write(output, bytes).map_err(|e| format!("{}: {e}", output.display()))?;
+        notes.extend(saved);
+    } else {
+        notes.extend(save(&loaded.picture, output)?);
+    }
     Ok(notes)
 }
 
@@ -443,15 +614,14 @@ mod tests {
         let c = tmp("c.lbm");
         assert!(convert(&b, &c).unwrap().is_empty());
         let back = load(&c).unwrap().picture;
-        assert_eq!(back.image(), &img);
-        assert_eq!(back.palette(), &pal);
+        assert_eq!(back.indexed(), Some((&img, &pal)));
 
         // ILBM → ILBM keeps the colour cycling.
         let d = tmp("d.ilbm");
         convert(&a, &d).unwrap();
         match load(&d).unwrap().picture {
             Picture::Ilbm(i) => assert_eq!(i.ranges, src.ranges),
-            Picture::Png { .. } => panic!("expected ILBM"),
+            _ => panic!("expected ILBM"),
         }
         assert!(
             info(&a)
@@ -502,7 +672,7 @@ mod tests {
             id: *b"DPPS",
             data: vec![0; 10],
         });
-        let (doc, extras, notes) = open_picture(Picture::Ilbm(Box::new(src)));
+        let (doc, extras, notes) = open_picture(Picture::Ilbm(Box::new(src)), Target::default());
         assert_eq!(doc.target().mode, pal_hi_lace);
         assert_eq!(notes, ["DPPS chunk (10 bytes) not kept"]);
 
@@ -540,6 +710,164 @@ mod tests {
         );
         assert!(notes.iter().any(|n| n.contains("CRNG")));
         assert!(notes.iter().any(|n| n.contains("transparent colour 3")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn rgba_image(w: u32, h: u32, f: impl Fn(u32, u32) -> dpx_core::Rgba8) -> RgbaImage {
+        let mut img = RgbaImage::new(w, h, dpx_core::Rgba8::default());
+        for y in 0..h {
+            for x in 0..w {
+                img.set(x, y, f(x, y));
+            }
+        }
+        img
+    }
+
+    fn photo(w: u32, h: u32) -> RgbaImage {
+        rgba_image(w, h, |x, y| {
+            dpx_core::Rgba8::opaque(
+                (x * 255 / (w - 1)) as u8,
+                (y * 255 / (h - 1)) as u8,
+                ((x * 7 + y * 3) % 256) as u8,
+            )
+        })
+    }
+
+    fn write_rgba_png(path: &Path, img: &RgbaImage) {
+        let data: Vec<u8> = img
+            .pixels()
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, p.a])
+            .collect();
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, img.width(), img.height());
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&data).unwrap();
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn true_colour_pixel_art_opens_exactly_at_its_size() {
+        use dpx_core::{Resolution, Video};
+        let cols = [(0, 0, 0), (255, 255, 255), (12, 34, 56)];
+        let img = rgba_image(640, 200, |x, y| {
+            let (r, g, b) = cols[((x / 8 + y / 8) % 3) as usize];
+            dpx_core::Rgba8::opaque(r, g, b)
+        });
+        let r = reduce_true_color(&img, "PNG", Target::default());
+        assert_eq!(
+            r.target.mode,
+            DisplayMode::new(Video::Ntsc, Resolution::Hi, false)
+        );
+        assert_eq!((r.image.width(), r.image.height()), (640, 200));
+        assert_eq!(r.palette.len(), 4);
+        assert!(r.notes.is_empty(), "nothing lost: {:?}", r.notes);
+        for (x, y) in [(0, 0), (9, 0), (17, 3), (639, 199)] {
+            let p = img.get(x, y).unwrap();
+            let shown = r
+                .palette
+                .get(r.image.get(x as i32, y as i32).unwrap())
+                .unwrap();
+            assert_eq!(shown, Rgb8::new(p.r, p.g, p.b));
+        }
+    }
+
+    #[test]
+    fn big_photo_is_scaled_to_the_current_screen() {
+        use dpx_core::{Resolution, Video};
+        let img = photo(2000, 1500);
+        // An OCS HiRes screen: 16 colours, 12-bit palette, tall pixels (1:2).
+        let current = Target {
+            chipset: Chipset::Ocs,
+            mode: DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        };
+        let r = reduce_true_color(&img, "JPEG", current);
+        assert_eq!(r.target, current);
+        // 640 wide; 4:3 shown with 1:2 pixels → 480 display units = 240 lines.
+        assert_eq!((r.image.width(), r.image.height()), (640, 240));
+        assert_eq!(r.palette.len(), 16);
+        for &c in r.palette.colors() {
+            assert_eq!(Rgb8::from_rgb4(c.to_rgb4()), c, "OCS 12-bit entry");
+        }
+        assert!(r.notes[0].contains("2000x1500") && r.notes[0].contains("640x240"));
+        assert!(
+            r.notes[1].contains("reduced to 16 colours"),
+            "{:?}",
+            r.notes
+        );
+        assert_eq!(r.transparent_color, None);
+    }
+
+    #[test]
+    fn transparent_png_opens_with_pink_colour_zero_and_saves_it_as_ilbm_transparency() {
+        let dir = std::env::temp_dir().join(format!("dpx-files-tc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = rgba_image(48, 40, |x, y| {
+            if x < 8 {
+                dpx_core::Rgba8::new(0, 0, 0, 0)
+            } else {
+                dpx_core::Rgba8::opaque((x / 4 * 20) as u8, (y / 4 * 25) as u8, 99)
+            }
+        });
+        let png_path = dir.join("sprite.png");
+        write_rgba_png(&png_path, &img);
+        let loaded = load(&png_path).unwrap();
+        assert!(matches!(
+            loaded.picture,
+            Picture::TrueColor { format: "PNG", .. }
+        ));
+        let (doc, extras, notes) = open_picture(loaded.picture, Target::default());
+        assert_eq!(extras.transparent_color, Some(0));
+        assert_eq!(doc.palette().get(0), Some(TRANSPARENT_PINK));
+        assert_eq!(doc.page().get(3, 3), Some(0));
+        assert_ne!(doc.page().get(20, 3), Some(0));
+        assert!(notes.iter().any(|n| n.contains("pink")), "{notes:?}");
+        // 10 x 10 opaque colours fit into 255: kept exactly, no reduction note.
+        assert!(!notes.iter().any(|n| n.contains("reduced")), "{notes:?}");
+
+        let iff = dir.join("sprite.iff");
+        let (bytes, _) = encode_document(&doc, &extras, &iff).unwrap();
+        let back = ilbm::read(&bytes).unwrap();
+        assert_eq!(
+            (back.masking, back.transparent_color),
+            (Masking::TransparentColor, 0)
+        );
+        assert!(info(&png_path).unwrap().contains("320 transparent pixels"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn jpeg_converts_to_ilbm_and_info_explains_it() {
+        let dir = std::env::temp_dir().join(format!("dpx-files-jpg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpg = dir.join("red-blue.jpg");
+        std::fs::write(
+            &jpg,
+            include_bytes!("../../../crates/dpx-formats/tests/data/red-blue-16x8.jpg"),
+        )
+        .unwrap();
+        let text = info(&jpg).unwrap();
+        assert!(text.contains("JPEG true colour 16x8"), "{text}");
+        assert!(text.contains("opens as: 16x8 NTSC:Low Res"), "{text}");
+        let out = dir.join("red-blue.iff");
+        convert(&jpg, &out).unwrap();
+        let Picture::Ilbm(i) = load(&out).unwrap().picture else {
+            panic!("expected ILBM");
+        };
+        assert_eq!((i.image.width(), i.image.height()), (16, 8));
+        assert!(i.camg.is_some(), "written with its display mode");
+        let left = i.palette.get(i.image.get(2, 2).unwrap()).unwrap();
+        let right = i.palette.get(i.image.get(13, 5).unwrap()).unwrap();
+        assert!(left.r > 200 && left.b < 60, "{left}");
+        assert!(right.b > 200 && right.r < 60, "{right}");
+        assert!(
+            convert(&jpg, &dir.join("x.jpg"))
+                .unwrap_err()
+                .contains("import-only")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

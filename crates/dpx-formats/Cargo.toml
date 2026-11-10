@@ -1,6 +1,6 @@
 [package]
 name = "dpx-formats"
-description = "DeluxePainter non-Amiga formats: PNG import/export (JPEG import planned)"
+description = "DeluxePainter non-Amiga formats: PNG import/export, JPEG import"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 dpx-core.workspace = true
 png.workspace = true
+zune-jpeg.workspace = true

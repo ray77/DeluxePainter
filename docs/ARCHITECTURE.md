@@ -18,9 +18,11 @@ crates/
                 Command enum, Engine (execute/undo/redo/transactions), errors
   dpx-raster    Pure pixel algorithms on index buffers: line, ellipse, polygon,
                 flood fill, brush stamping, spacing, symmetry, gradients, dither
+                (until it is split out: `dpx_core::raster`; colour reduction and
+                resampling of true-colour pictures: `dpx_core::quantize`/`resample`)
   dpx-iff       IFF container, ILBM (BMHD/CMAP/CAMG/BODY/CRNG/CCRT/GRAB…),
                 ByteRun1, EHB/HAM6/HAM8 codecs, later ANIM
-  dpx-formats   PNG import/export, JPEG import, colour quantisation, ExportAnalyzer
+  dpx-formats   PNG import/export, JPEG import (decoders only), ExportAnalyzer
   dpx-project   .dpxproj read/write/migrate (ZIP + JSON manifest + zstd blobs)
   dpx-render    Compositing layers → indexed/RGBA frame, colour-cycling preview
   dpx-ui        RetroUi: framebuffer, bitmap font, widgets, toolbox, menus,
@@ -109,8 +111,8 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
 | `.dpxproj` | dpx-project | ZIP: `project.json` (schema_version, canvas, target, layer tree, frames), `palette.json`, `cels/<layer>/<frame>.bin` (zstd, tiled), `preview.png`, `source/` (preserved import chunks). Atomic save: temp file in same dir → fsync → rename. Zip-bomb/traversal/duplicate-entry checks. |
 | IFF ILBM | dpx-iff | Import all documented variants incl. EHB/HAM6/HAM8, CRNG/CCRT; export via `ExportAnalyzer` report → explicit confirmation if lossy. |
 | IFF ANIM | dpx-iff | Phase 6: op 5 first (most common, DPaint), verified against foreign files. |
-| PNG | dpx-formats | Import (to RGBA layer or quantised indexed), export composited native resolution. |
-| JPEG | dpx-formats | Import only. |
+| PNG | dpx-formats | Import (indexed as is; true colour reduced by `dpx_core::quantize`, ADR-9; later also as RGBA layer), export composited native resolution. |
+| JPEG | dpx-formats | Import only (zune-jpeg, EXIF orientation), reduced like true-colour PNG (ADR-9). |
 
 ## 7. MCP (ADR-5)
 

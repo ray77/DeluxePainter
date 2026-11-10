@@ -80,8 +80,8 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P | Format | Import | Export |
 |---|---|---|---|
 | P0 | IFF ILBM (ByteRun1, mask, CMAP, CAMG) | ✓ | ✓ with ExportAnalyzer report |
-| P0 | PNG | ✓ (as layer or quantised) | ✓ native resolution |
-| P0 | JPEG | ✓ | ✗ (never) |
+| P0 | PNG | ✓ (indexed as is; true colour quantised ✓ ADR-9; as layer later) | ✓ native resolution |
+| P0 | JPEG | ✓ (quantised, EXIF orientation; ADR-9) | ✗ (never) |
 | P2 | ILBM EHB / HAM6 / HAM8, CRNG/CCRT | ✓ | ✓ |
 | P2 | IFF ANIM (op 5 first) | ✓ | ✓ |
 | P2 | IFF brushes / AnimBrushes | ✓ | ✓ |
