@@ -1,0 +1,29 @@
+# ADR-16: Color Mixer (palette requester)
+
+- Status: accepted (Phase 3, 2026-11-10)
+- Context: Color ▸ Palette ▸ Mixer On/Off (key `p`) is DeluxePaint IV's colour editor. The AGA manual (p.244–248, notes in `docs/research/manual-ui-notes.md` §3.4) describes a strip that replaces the palette at the bottom of the screen: a 256-slot Color Set grid (32 per row, scroll arrows), a sample-colour box, an RGB/HSV toggle with three sliders (RGB 0–15, hue 0–360°, saturation/value 0–100 %), a mixing area, and the buttons COPY, EX, SPREAD (each takes a second click, "TO" on the pointer), PICK, DELETE, UNDO (last change), REVERT and OK. The owner asked for speed and visible results, so this slice keeps the editing core and leaves the rest for later.
+- Decision:
+  - **Requester (`dpx_ui::palette_requester`):** a modal requester on the UI layer like Page Size and the notes, centred, square corners, 288×122 LoRes UI pixels (fits 320×200), palette-derived pens, the bitmap font, `widgets.rs` buttons. Title "Color Mixer".
+    - Palette grid 256×32: one row for up to 16 colours, 16 columns up to 64, 32 columns above (8×4-pixel cells at 256 colours). Cells show their own palette index; the selected cell has a shine/dark ring.
+    - Sample box with the selected colour, the RGB/HSV toggle under it, three sliders with their value, and an info line ("Color 6", or "Copy 6 to?" while an operation waits for its second colour).
+    - Buttons: Spread, Copy, Ex, Undo, Cancel, Ok. A waiting operation shows its button pressed; clicking it again or Esc withdraws it.
+  - **Behaviour:**
+    - Clicking a cell selects the colour. Sliders: drag the knob, or click beside it for one step (like an Amiga proportional gadget); the colour changes at once.
+    - OCS documents have 4-bit sliders (0–15, stored as level × 17); AGA documents 8-bit sliders (0–255). HSV results are quantised to the same depth. The HSV values are kept while dragging so the hue survives grey and black.
+    - Spread: an even gradient between the selected entry and the next clicked one (both ends kept), computed per RGB channel in slider levels. Copy: selected → clicked. Ex: exchanges the two palette entries only; pixels are not remapped (DeluxePaint needs Color ▸ Remap for that, too).
+    - Undo reverts the last edit inside the requester; we keep up to 64 steps (DeluxePaint: last change only). A whole slider drag is one step. `u` = Undo.
+    - The requester edits a copy of the palette. While it is open the app uploads the screen in that copy, so the whole screen (picture, toolbox palette, interface pens) shows the edit live; the document is untouched.
+    - Ok, Return or `p` (Mixer Off) close it and commit the copy as **one** undoable `Command::SetPalette` (none if nothing changed); the selected colour becomes the FG colour. Cancel or Esc drop the copy, which restores the shown palette.
+    - `p` opens it only on the paint screen (no other requester, Show Page or menu open); the menu item does the same.
+  - Snapshot option `--palette-requester` (selected colour = `--fg`); `docs/design/screenshots/phase3-palette.png`.
+- Deviations from DeluxePaint IV AGA (documented, to revisit):
+  - A centred modal requester with Cancel/Ok instead of the non-modal bottom strip in which painting stays possible.
+  - Only the palette's own colours: no 256-slot Color Set beyond the palette, no row scrolling, no mixing area, no PICK, DELETE, REVERT (Cancel covers it) and no AGA "Scale" button; the range controls are left out as well.
+  - Spread interpolates in RGB; DeluxePaint spreads in HSV.
+  - "TO" is shown on the info line, not attached to the pointer (the pointer is the host's).
+  - EHB halfbrite rows are not special yet (EHB arrives with the hardware profiles).
+- Verified:
+  - Unit tests in `dpx-ui` (12): cell selection and cell↔entry mapping for 2–256 colours, AGA slider drag/step values, OCS 16 levels stored ×17, HSV conversion and sliders (hue kept through black, OCS quantising), spread maths forwards/backwards and OCS rounding, copy, exchange, withdrawing a waiting operation, multi-step undo and no-op drags, Ok/Cancel/keys, render size, layout inside the box without overlaps, labels fitting their buttons, cells drawn with their own index.
+  - App test: `p` opens the mixer on the FG colour (the opening key press is not fed to it), a slider change shows in the requester's palette but not the document, a cell click plus Return commits one SetPalette and sets FG, one undo restores the palette; the menu opens it, Esc leaves the document and the undo list unchanged; Ok without changes adds no step; `p` is ignored while the Page Size requester is open.
+  - Headless snapshot looked at (PAL LoRes, default 32-colour palette, colour 6 selected).
+  - Not tried by hand in the window: the live upload path (`palette_upload`) and pointer handling in the real GUI are exercised only through the shared modal-requester code.
