@@ -693,8 +693,12 @@ impl Stroke {
     }
 
     /// Paints part of the gesture on top of the preview (freehand, airbrush). `page` is the
-    /// document page (the page before the gesture).
+    /// document page (the page before the gesture). A part the engine would refuse is not
+    /// shown, so nothing appears that vanishes on release.
     fn paint_more(&mut self, cmd: &Command, page: &IndexedImage, palette: &Palette) {
+        if cmd.check_paint(page, palette).is_err() {
+            return;
+        }
         if let Some(r) = cmd.paint_bounds(&self.preview) {
             self.drawn = self.drawn.union(r);
         }
@@ -724,7 +728,9 @@ impl Stroke {
             self.drawn = r.intersect(page.bounds());
             return;
         }
-        if let Some(cmd) = self.candidate(false) {
+        if let Some(cmd) = self.candidate(false)
+            && cmd.check_paint(page, palette).is_ok()
+        {
             self.drawn = cmd.paint_bounds(page).unwrap_or_default();
             cmd.paint(&mut self.preview, page, palette);
         }
@@ -1994,6 +2000,31 @@ mod tests {
         app.redo();
         assert_eq!(app.page(), &painted, "redo repeats exactly");
         painted
+    }
+
+    #[test]
+    fn a_command_the_engine_refuses_is_not_previewed() {
+        // A brush wider than any brush may be (e.g. loaded from a file): the engine refuses
+        // every stroke with it.
+        let mut app = app(Tool::Line, false);
+        let width = dpx_core::command::MAX_BRUSH_SIDE + 1;
+        app.custom_brush = Some(BrushImage {
+            width,
+            height: 1,
+            pixels: vec![3; width as usize],
+            handle: (0, 0),
+            transparent: None,
+        });
+        press(&mut app, 10, 10);
+        app.handle_drag(40, 30);
+        assert_eq!(app.page(), &IndexedImage::new(320, 256, 0), "no preview");
+        app.release();
+        assert_eq!(app.engine.document().revision(), 0, "nothing committed");
+        // The same gesture with a valid brush is previewed.
+        let mut app = self::app(Tool::Line, false);
+        press(&mut app, 10, 10);
+        app.handle_drag(40, 30);
+        assert_ne!(app.page(), &IndexedImage::new(320, 256, 0));
     }
 
     #[test]

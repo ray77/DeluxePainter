@@ -65,3 +65,4 @@
 - Consequences:
   - Fill types, spacing and brush pick-up can extend the same `shape` command (e.g. a fill-type field) without changing the preview mechanism.
   - Symmetry and grid settings move into requesters later; the commands already carry the order, centre and aspect.
+- Review fix (2026-11-11): lines are clipped to the page grown by the brush extent before stamping (`raster::clip_steps`, exact Bresenham points via `raster::line_point`), filled polygons keep only the active edges' crossings per row, and shape validation refuses work above `MAX_PAINT_WORK` (every symmetric copy counted; see ADR-6). Pixels are unchanged (tested against the old algorithms).

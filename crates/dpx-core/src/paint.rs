@@ -95,7 +95,8 @@ pub enum DrawMode {
     Smooth,
     /// Like Blend, AGA: the RGB mix of brush and page colour.
     Mix,
-    /// Extra-HalfBrite: the colour under the brush becomes its half-bright twin (index + 32).
+    /// Extra-HalfBrite: the colour under the brush becomes its half-bright twin (index + 32);
+    /// the right button restores it (index - 32).
     HBrite,
 }
 
@@ -165,7 +166,7 @@ pub struct PaintContext<'a> {
     pub before: &'a IndexedImage,
     /// Brush movement since the previous stamp (Smear).
     pub motion: (i32, i32),
-    /// The right mouse button is painting (Shade goes down, Color uses BG).
+    /// The right mouse button is painting (Shade goes down, Color uses BG, HBrite restores).
     pub right: bool,
 }
 
@@ -176,6 +177,10 @@ pub struct PaintContext<'a> {
 /// the brush's own colour). The other modes (ADR-19) ignore `color` unless noted and read the
 /// colour under the brush from `ctx.before`, so a gesture changes a pixel at most one step
 /// however often the brush passes over it. A mode that has nothing to do leaves the pixel.
+///
+/// Smear reads `page` itself, `ctx.motion` behind the pixel. A whole stamp must read the page
+/// as it was before that stamp, or the result depends on the order of the brush pixels:
+/// [`crate::raster::Pen::stamp`] takes that snapshot and paints with [`smear_pixel`].
 pub fn plot(
     page: &mut IndexedImage,
     x: i32,
@@ -203,15 +208,9 @@ pub fn plot_fx(
     fx: &PaintFx,
     cover: u8,
 ) {
-    let Some(under) = page.get(x, y) else {
+    let Some(under) = unprotected(page, x, y, ctx) else {
         return;
     };
-    if ctx
-        .stencil
-        .is_some_and(|s| s.get(usize::from(under)).copied().unwrap_or(false))
-    {
-        return;
-    }
     let before = ctx.before.get(x, y).unwrap_or(under);
     let new = match mode {
         DrawMode::Matte | DrawMode::Color | DrawMode::Replace => {
@@ -227,11 +226,65 @@ pub fn plot_fx(
         DrawMode::Blend => mix(ctx, before, color, 1, 2),
         DrawMode::Mix => mix(ctx, before, color, 1, 4),
         DrawMode::Smooth => smooth(ctx, x, y),
-        DrawMode::HBrite => (before < 32 && ctx.palette.len() == 64).then_some(before + 32),
+        DrawMode::HBrite => half_brite(before, ctx),
     };
     if let Some(c) = new {
         page.set(x, y, c);
     }
+}
+
+/// The page colour at (`x`, `y`) when the pixel may be painted: on the page and not protected
+/// by the stencil.
+fn unprotected(page: &IndexedImage, x: i32, y: i32, ctx: &PaintContext) -> Option<u8> {
+    let under = page.get(x, y)?;
+    let protected = ctx
+        .stencil
+        .is_some_and(|s| s.get(usize::from(under)).copied().unwrap_or(false));
+    (!protected).then_some(under)
+}
+
+/// Smear for one brush pixel: (`x`, `y`) takes `source`, the colour `ctx.motion` behind it as
+/// the page was before the current stamp (`None` when that lies off the page: the pixel stays).
+/// The stencil applies as in [`plot`].
+pub(crate) fn smear_pixel(
+    page: &mut IndexedImage,
+    x: i32,
+    y: i32,
+    source: Option<u8>,
+    ctx: &PaintContext,
+) {
+    if let (Some(_), Some(c)) = (unprotected(page, x, y, ctx), source) {
+        page.set(x, y, c);
+    }
+}
+
+/// HBrite on a 64-colour (Extra-HalfBrite) palette: the left button darkens one of the first
+/// 32 colours to its half-bright twin (index + 32), the right button restores a half-bright
+/// pixel (index - 32), as DeluxePaint IV does (manual notes section 5). Other palettes: no
+/// change.
+fn half_brite(c: u8, ctx: &PaintContext) -> Option<u8> {
+    if ctx.palette.len() != 64 {
+        return None;
+    }
+    if ctx.right {
+        (32..64).contains(&c).then(|| c - 32)
+    } else {
+        (c < 32).then_some(c + 32)
+    }
+}
+
+/// Work units (see [`crate::command::MAX_PAINT_WORK`]) of one pixel [`plot_fx`] paints in
+/// `mode` with `fx` on a palette of `colors` entries: 1, or more where every pixel looks up
+/// the nearest palette colour (Blend, Mix, Smooth, and the set modes with an effect on), as
+/// that search walks the whole palette (measured: Blend on 32 colours costs about 9 times
+/// Matte).
+pub fn pixel_work(mode: DrawMode, fx: &PaintFx, colors: usize) -> u64 {
+    let searches = match mode {
+        DrawMode::Blend | DrawMode::Mix | DrawMode::Smooth => true,
+        DrawMode::Matte | DrawMode::Color | DrawMode::Replace => !fx.is_off(),
+        DrawMode::Smear | DrawMode::Shade | DrawMode::Cycle | DrawMode::HBrite => false,
+    };
+    if searches { 1 + colors as u64 / 4 } else { 1 }
 }
 
 /// The colour a set-mode pixel gets: `color` after Process, mixed with `under`.
@@ -564,6 +617,31 @@ mod tests {
         let pal32 = Palette::dpaint_default_32();
         let c = ctx(&pal32, &img);
         assert_eq!(one(DrawMode::HBrite, &img, &c, 1), Some(5));
+    }
+
+    #[test]
+    fn hbrite_right_button_restores() {
+        // DeluxePaint IV: the left button darkens the first 32 colours to their half-bright
+        // twins, the right button restores half-bright pixels (manual-ui-notes.md section 5).
+        let pal64 = Palette::new(vec![Rgb8::new(200, 100, 50); 64]).unwrap();
+        let before = IndexedImage::from_pixels(2, 1, vec![5, 37]).unwrap();
+        let mut c = ctx(&pal64, &before);
+        c.right = true;
+        let mut page = before.clone();
+        plot(&mut page, 0, 0, 1, DrawMode::HBrite, &c);
+        plot(&mut page, 1, 0, 1, DrawMode::HBrite, &c);
+        assert_eq!(page.pixels(), &[5, 5]);
+        c.right = false;
+        let mut page = before.clone();
+        plot(&mut page, 0, 0, 1, DrawMode::HBrite, &c);
+        plot(&mut page, 1, 0, 1, DrawMode::HBrite, &c);
+        assert_eq!(page.pixels(), &[37, 37]);
+        // Without 64 colours the right button changes nothing either.
+        let pal32 = Palette::dpaint_default_32();
+        let low = IndexedImage::new(3, 3, 5);
+        let mut c = ctx(&pal32, &low);
+        c.right = true;
+        assert_eq!(one(DrawMode::HBrite, &low, &c, 1), Some(5));
     }
 
     #[test]

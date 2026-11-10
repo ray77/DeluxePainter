@@ -2,8 +2,17 @@
 //!
 //! Every function returns a new brush; the handle follows the pixels it points at. Size and
 //! shape operations keep the transparent colour. No function touches the page.
+//!
+//! No operation makes a brush wider or taller than [`MAX_SIDE`], the limit strokes and shapes
+//! accept, so every result can be painted: Stretch, Shear and Bend clamp their amount; Double,
+//! Outline and Any Angle return the brush unchanged when the result would not fit.
 
 use crate::paint::BrushImage;
+
+/// Whether a `width`×`height` brush is within [`MAX_SIDE`].
+fn fits(width: u32, height: u32) -> bool {
+    width <= MAX_SIDE && height <= MAX_SIDE
+}
 
 fn new_brush(
     width: u32,
@@ -88,9 +97,12 @@ pub fn rotate_90(b: &BrushImage) -> BrushImage {
 }
 
 /// Brush ▸ Size ▸ Double / Double Horiz / Double Vert: every pixel becomes 2 pixels wide
-/// and/or high.
+/// and/or high. Unchanged when the result would exceed [`MAX_SIDE`].
 pub fn double(b: &BrushImage, horizontal: bool, vertical: bool) -> BrushImage {
     let (fx, fy) = (1 + u32::from(horizontal), 1 + u32::from(vertical));
+    if !fits(b.width.saturating_mul(fx), b.height.saturating_mul(fy)) {
+        return b.clone();
+    }
     let handle = (b.handle.0 * fx as i32, b.handle.1 * fy as i32);
     let mut out = new_brush(b.width * fx, b.height * fy, 0, b, handle);
     for y in 0..b.height * fy {
@@ -137,8 +149,11 @@ pub fn halve(b: &BrushImage) -> BrushImage {
 
 /// Brush ▸ Edge ▸ Outline: grows the brush by one pixel on every side and paints `color` on
 /// the new pixels next to opaque ones (8 neighbours). Without a transparent colour the whole
-/// new ring is painted.
+/// new ring is painted. Unchanged when the result would exceed [`MAX_SIDE`].
 pub fn outline(b: &BrushImage, color: u8) -> BrushImage {
+    if !fits(b.width.saturating_add(2), b.height.saturating_add(2)) {
+        return b.clone();
+    }
     let handle = (b.handle.0 + 1, b.handle.1 + 1);
     let mut out = new_brush(b.width + 2, b.height + 2, color, b, handle);
     for y in 0..out.height as i32 {
@@ -267,8 +282,9 @@ pub fn handle_next_corner(b: &BrushImage) -> BrushImage {
 
 // ---- Interactive transforms (ADR-30) -------------------------------------------------------
 
-/// Largest side a stretch may produce (keeps a wild drag from allocating without bound).
-pub const MAX_SIDE: u32 = 1024;
+/// Largest side any brush operation produces: [`crate::command::MAX_BRUSH_SIDE`], the limit
+/// strokes and shapes accept (it also keeps a wild drag from allocating without bound).
+pub const MAX_SIDE: u32 = crate::command::MAX_BRUSH_SIDE;
 
 /// The colour that stands for "nothing" in a transformed brush: its transparent colour, else
 /// the lowest colour below `colors` that no pixel uses, else 0 (then colour 0 pixels turn
@@ -336,7 +352,8 @@ pub fn rotated_point(b: &BrushImage, degrees: f64, (x, y): (f64, f64)) -> (f64, 
 fn rotated_size(b: &BrushImage, degrees: f64) -> (u32, u32) {
     let (s, c) = sin_cos(degrees);
     let (w, h) = (f64::from(b.width), f64::from(b.height));
-    let fit = |v: f64| ((v - 1e-6).ceil() as u32).clamp(1, MAX_SIDE);
+    // Not clamped: `rotate_any` refuses a result beyond MAX_SIDE instead of cropping it.
+    let fit = |v: f64| (v - 1e-6).ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
     (
         fit(w * c.abs() + h * s.abs()),
         fit(w * s.abs() + h * c.abs()),
@@ -346,11 +363,15 @@ fn rotated_size(b: &BrushImage, degrees: f64) -> (u32, u32) {
 /// Brush ▸ Rotate ▸ Any Angle: rotated clockwise by `degrees` (nearest neighbour). The new
 /// area is transparent: the brush's transparent colour, or one picked by [`fill_colour`]
 /// from the `colors` of the palette. The handle turns with the pixels. Multiples of 90
-/// degrees give the same pixels as [`rotate_90`] and the flips.
+/// degrees give the same pixels as [`rotate_90`] and the flips. Unchanged when the rotated
+/// brush would exceed [`MAX_SIDE`] (it is never cropped).
 pub fn rotate_any(b: &BrushImage, degrees: f64, colors: usize) -> BrushImage {
+    let (dw, dh) = rotated_size(b, degrees);
+    if !fits(dw, dh) {
+        return b.clone();
+    }
     let fill = fill_colour(b, colors);
     let (s, c) = sin_cos(degrees);
-    let (dw, dh) = rotated_size(b, degrees);
     let (hx, hy) = rotated_point(
         b,
         degrees,
@@ -425,9 +446,11 @@ fn displace(b: &BrushImage, offsets: &[i32], rows: bool, colors: usize) -> Brush
 }
 
 /// Brush ▸ Rotate ▸ Shear: the top row stays, the bottom row moves `dx` pixels sideways
-/// (negative = left), rows in between in proportion. The brush grows to hold the result.
+/// (negative = left), rows in between in proportion. The brush grows to hold the result;
+/// `dx` is clamped so it stays within [`MAX_SIDE`].
 pub fn shear(b: &BrushImage, dx: i32, colors: usize) -> BrushImage {
-    let dx = dx.clamp(-(MAX_SIDE as i32), MAX_SIDE as i32);
+    let room = MAX_SIDE.saturating_sub(b.width) as i32;
+    let dx = dx.clamp(-room, room);
     let span = (b.height as i32 - 1).max(1);
     let offsets: Vec<i32> = (0..b.height as i32)
         .map(|y| (f64::from(dx) * f64::from(y) / f64::from(span)).round() as i32)
@@ -437,15 +460,22 @@ pub fn shear(b: &BrushImage, dx: i32, colors: usize) -> BrushImage {
 
 /// Brush ▸ Bend ▸ Horiz (`horizontal`) or Vert: a quadratic bend. The two edges stay; the
 /// row (column) at `line` moves `amount` pixels sideways (up or down), the others along
-/// the parabola through those three points. `line` is clamped to the inside of the brush.
+/// the parabola through those three points. `line` is clamped to the inside of the brush,
+/// `amount` so the brush stays within [`MAX_SIDE`].
 pub fn bend(b: &BrushImage, horizontal: bool, amount: i32, line: i32, colors: usize) -> BrushImage {
-    let amount = amount.clamp(-(MAX_SIDE as i32), MAX_SIDE as i32);
     let n = if horizontal { b.height } else { b.width } as i32;
     if n < 3 {
         return b.clone();
     }
     let line = line.clamp(1, n - 2);
     let denom = f64::from(line) * f64::from(n - 1 - line);
+    // The middle row (column) moves `peak` times `amount`: more than the bend line itself when
+    // that lies near an edge. The brush grows by the largest move.
+    let middle = (n - 1) / 2;
+    let peak = f64::from(middle) * f64::from(n - 1 - middle) / denom;
+    let room = MAX_SIDE.saturating_sub(if horizontal { b.width } else { b.height });
+    let limit = (f64::from(room) / peak).floor() as i32;
+    let amount = amount.clamp(-limit, limit);
     let offsets: Vec<i32> = (0..n)
         .map(|i| (f64::from(amount) * f64::from(i) * f64::from(n - 1 - i) / denom).round() as i32)
         .collect();
@@ -802,6 +832,59 @@ mod tests {
         // Too small to bend.
         let tiny = stretch(&b, 1, 2);
         assert_eq!(bend(&tiny, true, 3, 1, 32), tiny);
+    }
+
+    /// A solid brush of colour 5 (0 transparent), handle top-left.
+    fn solid(width: u32, height: u32) -> BrushImage {
+        BrushImage {
+            width,
+            height,
+            pixels: vec![5; width as usize * height as usize],
+            handle: (0, 0),
+            transparent: Some(0),
+        }
+    }
+
+    #[test]
+    fn growing_operations_stay_within_the_shared_limit() {
+        assert_eq!(MAX_SIDE, crate::command::MAX_BRUSH_SIDE);
+        // Double and Outline refuse (the brush stays) instead of cropping.
+        let half = solid(MAX_SIDE / 2 + 1, 3);
+        assert_eq!(double(&half, true, false), half);
+        assert_eq!(
+            double(&half, false, true).height,
+            6,
+            "the other side may double"
+        );
+        let full = solid(MAX_SIDE - 1, 2);
+        assert_eq!(outline(&full, 9), full);
+        assert_eq!(outline(&solid(MAX_SIDE - 2, 2), 9).width, MAX_SIDE);
+        // Shear clamps the move to the room left.
+        let s = shear(&solid(MAX_SIDE - 10, 4), 1_000, 32);
+        assert_eq!(s.width, MAX_SIDE);
+        assert_eq!(
+            s.pixels.iter().filter(|&&p| p == 5).count(),
+            4 * (MAX_SIDE - 10) as usize
+        );
+        // Bend near an edge moves the middle much more than the bend line; clamped to fit.
+        let b = bend(&solid(600, 4), false, 100_000, 1, 32);
+        assert!(b.height <= MAX_SIDE, "{}", b.height);
+        assert_eq!(b.pixels.iter().filter(|&&p| p == 5).count(), 2400);
+        let small = bend(&solid(600, 4), false, 2, 1, 32);
+        assert!(
+            small.height > 4 + 2,
+            "the middle moves more than the bend line"
+        );
+        // Any Angle refuses a result beyond the limit (3000 px turned 45 degrees is 4243 px)
+        // and never crops.
+        let big = solid(3000, 3000);
+        assert!(rotate_any(&big, 45.0, 32) == big, "refused, not cropped");
+        let long = solid(MAX_SIDE, 8);
+        let turned = rotate_any(&long, 90.0, 32);
+        assert_eq!((turned.width, turned.height), (8, MAX_SIDE));
+        let diagonal = rotate_any(&long, 45.0, 32);
+        assert_eq!((diagonal.width, diagonal.height), (2902, 2902));
+        assert_eq!(rotated_size(&big, 45.0), (4243, 4243));
     }
 
     #[test]
