@@ -6,23 +6,30 @@
 //!     [--palette gold16]                use the 16-colour demo palette
 //!     [--fg N] [--tool NAME[:filled]]   foreground colour and selected tool
 //!     [--menu M[:I[:S]]]                open menu M (0 = Picture), highlight item I / sub item S
-//! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //!     [--requester]                     show the Screen Format requester instead
+//!     [--file-requester load|save]      show the Load/Save Picture requester
+//!     [--drawer DIR] [--file NAME]      … listing DIR, with NAME in the File field
+//!     [--drawer-as TEXT]                … showing TEXT in the Drawer field (doc screenshots)
+//! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter info <file>`           describe an IFF ILBM or PNG picture
 //! `deluxepainter convert <in> <out>`    convert between IFF ILBM and PNG
 
+mod browse;
 mod files;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dpx_core::{
-    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, Target, raster,
+    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, raster,
 };
 use dpx_ui::menu::{self, MENUS};
 use dpx_ui::requester::{self, ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
-use dpx_ui::{Action, Hit, PaintMode, Screen, Tool, UiState, to_rgba};
+use dpx_ui::{
+    Action, Browse, FileKind, FileRequester, FileResponse, Hit, PaintMode, Screen, Tool, UiState,
+    to_rgba,
+};
 use eframe::egui;
 
 /// Initial window size in points: PAL LoRes at 3×.
@@ -72,20 +79,6 @@ impl View {
     }
 }
 
-/// The document for a loaded picture: its display mode is guessed from CAMG and size.
-fn document_for(p: &files::Picture) -> Document {
-    let img = p.image();
-    let mode = DisplayMode::guess(p.camg(), img.width(), img.height());
-    Document::from_picture(
-        img.clone(),
-        p.palette().clone(),
-        Target {
-            mode,
-            ..Target::default()
-        },
-    )
-}
-
 /// A small 16-colour palette (blacks, blues, golds) to demonstrate palette-derived UI pens.
 fn gold16() -> Palette {
     Palette::from_rgb4(&[
@@ -111,8 +104,13 @@ fn main() -> eframe::Result {
     }
     let opened = arg_value(&args, "--open").map(|p| match files::load(Path::new(&p)) {
         Ok(loaded) => {
-            loaded.notes.iter().for_each(|n| eprintln!("note: {n}"));
-            loaded.picture
+            let (doc, extras, notes) = files::open_picture(loaded.picture);
+            loaded
+                .notes
+                .iter()
+                .chain(&notes)
+                .for_each(|n| eprintln!("note: {n}"));
+            (PathBuf::from(p), doc, extras)
         }
         Err(e) => {
             eprintln!("{e}");
@@ -135,7 +133,7 @@ fn main() -> eframe::Result {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2);
         let doc = match &opened {
-            Some(p) => document_for(p),
+            Some((_, doc, _)) => doc.clone(),
             None => {
                 let (w, h) = DisplayMode::PAL_LORES.size();
                 Document::new(
@@ -185,6 +183,32 @@ fn main() -> eframe::Result {
                 }
             }
         }
+        if let Some(kind) = arg_value(&args, "--file-requester") {
+            let kind = match kind.as_str() {
+                "load" => FileKind::LoadPicture,
+                "save" => FileKind::SavePicture,
+                _ => {
+                    eprintln!("--file-requester expects load or save");
+                    std::process::exit(2);
+                }
+            };
+            let mut req = FileRequester::new(kind);
+            let drawer = arg_value(&args, "--drawer").unwrap_or_else(|| ".".into());
+            match browse::list_drawer(&drawer) {
+                Ok((listed, entries)) => {
+                    let shown = arg_value(&args, "--drawer-as").unwrap_or(listed);
+                    req.set_listing(&shown, entries);
+                }
+                Err(e) => {
+                    eprintln!("{drawer}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            if let Some(name) = arg_value(&args, "--file") {
+                req.set_file(&name);
+            }
+            ui.file_requester = Some(req);
+        }
         if args.iter().any(|a| a == "--requester") {
             let page = (doc.page().width(), doc.page().height());
             let req = ScreenFormatRequester::new(doc.target(), page, doc.palette().len());
@@ -223,8 +247,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             let mut app = PainterApp::new();
-            if let Some(p) = opened {
-                app.engine = Engine::new(document_for(&p));
+            if let Some((path, doc, extras)) = opened {
+                app.set_picture(doc, extras, path);
             }
             Ok(Box::new(app))
         }),
@@ -351,6 +375,14 @@ struct PainterApp {
     requester: Option<ScreenFormatRequester>,
     /// Requester-screen pointer position while the left button is held.
     req_pointer: Option<(i32, i32)>,
+    /// The file the picture was loaded from or last saved to.
+    picture_path: Option<PathBuf>,
+    /// File details kept from Load to Save (colour ranges, …).
+    extras: files::PictureExtras,
+    /// Drawer of the last Load/Save, where the file requester opens next time.
+    last_drawer: Option<String>,
+    /// Mouse-wheel movement not yet turned into whole list rows.
+    wheel: f32,
 }
 
 /// A freehand stroke in progress: drawn into a preview copy of the page with the same raster
@@ -375,6 +407,140 @@ impl PainterApp {
             stroke: None,
             requester: None,
             req_pointer: None,
+            picture_path: None,
+            extras: files::PictureExtras::default(),
+            last_drawer: None,
+            wheel: 0.0,
+        }
+    }
+
+    /// Replaces the document with a loaded picture (not undoable, like DeluxePaint's Load).
+    fn set_picture(&mut self, doc: Document, extras: files::PictureExtras, path: PathBuf) {
+        self.stroke = None;
+        self.engine = Engine::new(doc);
+        self.extras = extras;
+        self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
+        self.picture_path = Some(path);
+        self.clamp_colors();
+        self.dirty = true;
+    }
+
+    /// Keeps the FG/BG colours inside the palette.
+    fn clamp_colors(&mut self) {
+        let max = (self.palette().len() - 1) as u8;
+        self.ui.fg = self.ui.fg.min(max);
+        self.ui.bg = self.ui.bg.min(max);
+    }
+
+    fn open_file_requester(&mut self, kind: FileKind) {
+        self.finish_stroke();
+        let mut req = FileRequester::new(kind);
+        if kind == FileKind::SavePicture
+            && let Some(name) = self.picture_path.as_ref().and_then(|p| p.file_name())
+        {
+            req.set_file(&name.to_string_lossy());
+        }
+        let start = self.last_drawer.clone().unwrap_or_else(|| ".".into());
+        Self::browse(&mut req, Browse::Drawer(start));
+        if req.drawer().is_empty() {
+            // The last drawer is gone: fall back to the start folder.
+            Self::browse(&mut req, Browse::Drawer(".".into()));
+        }
+        self.ui.file_requester = Some(req);
+        self.dirty = true;
+    }
+
+    /// Lists what the file requester asked for.
+    fn browse(req: &mut FileRequester, what: Browse) {
+        let listing = match what {
+            Browse::Drawer(d) => browse::list_drawer(&d),
+            Browse::Parent => match browse::parent(req.drawer()) {
+                Some(p) => browse::list_drawer(&p),
+                None => return,
+            },
+            Browse::Disks => Ok((String::new(), browse::disks())),
+            Browse::Assigns => Ok((String::new(), browse::assigns())),
+        };
+        match listing {
+            Ok((drawer, entries)) => req.set_listing(&drawer, entries),
+            Err(e) => req.set_message(e),
+        }
+    }
+
+    /// Feeds one event to the open file requester and acts on its answer.
+    fn file_requester_event(&mut self, event: ReqEvent, now_ms: u64) {
+        let Some(req) = &mut self.ui.file_requester else {
+            return;
+        };
+        let kind = req.kind();
+        match req.handle(event, now_ms) {
+            FileResponse::Continue => {}
+            FileResponse::Cancel => self.ui.file_requester = None,
+            FileResponse::Browse(what) => Self::browse(req, what),
+            FileResponse::Accept {
+                drawer,
+                file,
+                overwrite,
+            } => {
+                let path = browse::expand_home(&drawer).join(file);
+                match kind {
+                    FileKind::LoadPicture => self.load_picture(path),
+                    FileKind::SavePicture => self.save_picture(path, overwrite),
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn requester_message(&mut self, text: String) {
+        if let Some(req) = &mut self.ui.file_requester {
+            req.set_message(text);
+        }
+    }
+
+    fn load_picture(&mut self, path: PathBuf) {
+        match files::load(&path) {
+            Ok(loaded) => {
+                let (doc, extras, notes) = files::open_picture(loaded.picture);
+                for n in loaded.notes.iter().chain(&notes) {
+                    eprintln!("note: {}: {n}", path.display());
+                }
+                self.set_picture(doc, extras, path);
+                self.ui.file_requester = None;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                let prefix = format!("{}: ", path.display());
+                self.requester_message(e.strip_prefix(&prefix).unwrap_or(&e).to_string());
+            }
+        }
+    }
+
+    fn save_picture(&mut self, path: PathBuf, overwrite: bool) {
+        if path.is_dir() {
+            return self.requester_message("That is a drawer".into());
+        }
+        if path.exists() && !overwrite {
+            if let Some(req) = &mut self.ui.file_requester {
+                req.ask_overwrite();
+            }
+            return;
+        }
+        let result = files::encode_document(self.engine.document(), &self.extras, &path)
+            .and_then(|(bytes, notes)| files::write_atomic(&path, &bytes).map(|()| notes));
+        match result {
+            Ok(notes) => {
+                for n in notes {
+                    eprintln!("note: {}: {n}", path.display());
+                }
+                self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
+                self.picture_path = Some(path);
+                self.ui.file_requester = None;
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                self.requester_message(e);
+            }
         }
     }
 
@@ -415,9 +581,7 @@ impl PainterApp {
                 Ok(_) => {
                     self.requester = None;
                     // Colours beyond the new palette would be invalid.
-                    let max = (self.palette().len() - 1) as u8;
-                    self.ui.fg = self.ui.fg.min(max);
-                    self.ui.bg = self.ui.bg.min(max);
+                    self.clamp_colors();
                 }
                 Err(e) => req.set_message(e.message),
             },
@@ -562,6 +726,8 @@ impl PainterApp {
                     colors: Palette::dpaint_default_32().colors().to_vec(),
                 }),
                 "picture.screen_format" => self.open_screen_format(),
+                "picture.load" => self.open_file_requester(FileKind::LoadPicture),
+                "picture.save" => self.open_file_requester(FileKind::SavePicture),
                 "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 _ => {}
             },
@@ -612,6 +778,11 @@ impl eframe::App for PainterApp {
 
         if self.requester.is_some() {
             self.requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.ui.file_requester.is_some() {
+            self.file_requester_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -789,6 +960,95 @@ impl PainterApp {
         }
     }
 
+    /// Pointer, wheel and keys while the file requester is open (it is modal).
+    fn file_requester_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: i32,
+        view: View,
+    ) {
+        let ui_screen = view.ui_screen();
+        let (rx, ry) = FileRequester::origin(ui_screen.width, ui_screen.height);
+        let (hover, press, down, time, events) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.time,
+                i.events.clone(),
+            )
+        });
+        let now_ms = (time * 1000.0) as u64;
+        // Requester coordinates: UI (LoRes) pixels relative to its top-left corner.
+        let pos = hover.map(|p| {
+            let v = (p - origin) * ppp;
+            let screen = (
+                (v.x / (scale * view.fx) as f32).floor() as i32,
+                (v.y / (scale * view.fy) as f32).floor() as i32,
+            );
+            let (ux, uy) = view.ui_pos(screen);
+            (ux - rx, uy - ry)
+        });
+        if press && let Some(p) = pos {
+            self.req_pointer = Some(p);
+            self.file_requester_event(ReqEvent::Press(p.0, p.1), now_ms);
+        } else if down && let Some(p) = pos {
+            if self.req_pointer != Some(p) {
+                self.req_pointer = Some(p);
+                self.file_requester_event(ReqEvent::Drag(p.0, p.1), now_ms);
+            }
+        } else if !down && self.req_pointer.take().is_some() {
+            self.file_requester_event(ReqEvent::Release, now_ms);
+        }
+        for event in events {
+            if self.ui.file_requester.is_none() {
+                break;
+            }
+            match event {
+                egui::Event::Text(text) => {
+                    for c in text.chars() {
+                        self.file_requester_event(ReqEvent::Key(ReqKey::Char(c)), now_ms);
+                    }
+                }
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => {
+                    let k = match key {
+                        egui::Key::ArrowUp => ReqKey::Up,
+                        egui::Key::ArrowDown => ReqKey::Down,
+                        egui::Key::ArrowLeft => ReqKey::Left,
+                        egui::Key::ArrowRight => ReqKey::Right,
+                        egui::Key::Home => ReqKey::Home,
+                        egui::Key::End => ReqKey::End,
+                        egui::Key::Backspace => ReqKey::Backspace,
+                        egui::Key::Delete => ReqKey::Delete,
+                        egui::Key::Tab => ReqKey::Tab,
+                        egui::Key::Enter => ReqKey::Enter,
+                        egui::Key::Escape => ReqKey::Escape,
+                        _ => continue,
+                    };
+                    self.file_requester_event(ReqEvent::Key(k), now_ms);
+                }
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    // Positive y moves the content down, i.e. scrolls the list up.
+                    self.wheel -= match unit {
+                        egui::MouseWheelUnit::Point => delta.y / 20.0,
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Page => delta.y * 8.0,
+                    };
+                    let rows = self.wheel.trunc();
+                    if rows != 0.0 {
+                        self.wheel -= rows;
+                        self.file_requester_event(ReqEvent::Scroll(rows as i32), now_ms);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn upload_and_paint(
         &mut self,
         ui: &mut egui::Ui,
@@ -902,6 +1162,89 @@ mod tests {
         // Escape cancels.
         app.requester_event(ReqEvent::Key(ReqKey::Escape));
         assert!(app.requester.is_none());
+    }
+
+    fn type_into(app: &mut PainterApp, text: &str) {
+        for c in text.chars() {
+            app.file_requester_event(ReqEvent::Key(ReqKey::Char(c)), 0);
+        }
+    }
+
+    #[test]
+    fn load_and_save_through_the_file_requester() {
+        use dpx_core::{Resolution, Video};
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("dpx-app-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        // A PAL HiRes picture with one painted pixel.
+        let hi = DisplayMode::new(Video::Pal, Resolution::Hi, false);
+        let mut img = IndexedImage::new(640, 256, 0);
+        img.set(600, 200, 9);
+        let mut src = dpx_iff::Ilbm::from_indexed(img.clone(), Palette::dpaint_default_32());
+        src.camg = Some(hi.mode_id());
+        let bytes = dpx_iff::ilbm::write(&src, dpx_iff::Compression::ByteRun1).unwrap();
+        std::fs::write(dir.join("Castle.iff"), bytes).unwrap();
+
+        let mut app = PainterApp::new();
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        app.run_action(Action::Command("picture.load"), &ctx);
+        let req = app.ui.file_requester.as_ref().expect("requester open");
+        assert_eq!(req.drawer(), dir.to_string_lossy());
+        // A missing file keeps the requester open with a message.
+        type_into(&mut app, "Missing.iff");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_some());
+        for _ in 0.."Missing.iff".len() {
+            app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
+        }
+        type_into(&mut app, "Castle.iff");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none(), "loaded and closed");
+        assert_eq!(app.engine.document().target().mode, hi);
+        assert_eq!(app.page(), &img);
+        assert_eq!(app.view().screen_w, 640);
+
+        // Save offers the current name; replacing it needs a "yes".
+        app.run_action(Action::Command("picture.save"), &ctx);
+        assert_eq!(app.ui.file_requester.as_ref().unwrap().file(), "Castle.iff");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_some(), "asks before replacing");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Char('y')), 0);
+        assert!(app.ui.file_requester.is_none());
+        let back = files::load(&dir.join("Castle.iff")).unwrap().picture;
+        assert_eq!(back.image(), &img);
+        assert_eq!(back.camg(), Some(0x0002_9000), "AGA PAL HiRes mode id");
+
+        // A new name with .png writes PNG; JPEG is refused with a message.
+        app.run_action(Action::Command("picture.save"), &ctx);
+        for _ in 0.."Castle.iff".len() {
+            app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
+        }
+        type_into(&mut app, "Castle.jpg");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_some());
+        for _ in 0..3 {
+            app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
+        }
+        type_into(&mut app, "png");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none());
+        assert_eq!(
+            files::load(&dir.join("Castle.png"))
+                .unwrap()
+                .picture
+                .image(),
+            &img
+        );
+        assert!(!dir.join("Castle.jpg").exists());
+
+        // Cancel closes without changes.
+        app.run_action(Action::Command("picture.load"), &ctx);
+        app.file_requester_event(ReqEvent::Key(ReqKey::Escape), 0);
+        assert!(app.ui.file_requester.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

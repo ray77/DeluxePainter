@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use dpx_core::{IndexedImage, Palette};
-use dpx_iff::{Compression, Ilbm, Masking, ilbm};
+use dpx_core::{DisplayMode, Document, IndexedImage, Palette, Target};
+use dpx_iff::{ColorRange, Compression, Ilbm, Masking, ilbm};
 
 /// A loaded picture plus notes about anything that did not survive the import.
 pub struct Loaded {
@@ -136,6 +136,156 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
     };
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(notes)
+}
+
+/// Picture-file details the document model does not hold yet (colour cycling arrives with
+/// Phase 3). They are kept from Load to Save so a DeluxePaint picture round-trips.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PictureExtras {
+    pub ranges: Vec<ColorRange>,
+    pub grab: Option<(i16, i16)>,
+    /// Palette entry DeluxePaint marks transparent (ILBM masking "transparent colour").
+    pub transparent_color: Option<u16>,
+}
+
+/// Turns a loaded picture into a document; the display mode is guessed from CAMG and size.
+/// Returns notes about everything that is not kept.
+pub fn open_picture(picture: Picture) -> (Document, PictureExtras, Vec<String>) {
+    let mode = DisplayMode::guess(
+        picture.camg(),
+        picture.image().width(),
+        picture.image().height(),
+    );
+    let target = Target {
+        mode,
+        ..Target::default()
+    };
+    let mut extras = PictureExtras::default();
+    let mut notes = Vec::new();
+    let (image, palette) = match picture {
+        Picture::Ilbm(i) => {
+            let i = *i;
+            extras.ranges = i.ranges;
+            extras.grab = i.grab;
+            match i.masking {
+                Masking::TransparentColor => extras.transparent_color = Some(i.transparent_color),
+                Masking::HasMask => {
+                    notes.push("mask plane not kept (pages are opaque)".to_string());
+                }
+                Masking::None | Masking::Lasso => {}
+            }
+            for c in &i.other_chunks {
+                notes.push(format!(
+                    "{} chunk ({} bytes) not kept",
+                    dpx_iff::iff::id_str(c.id),
+                    c.data.len()
+                ));
+            }
+            (i.image, i.palette)
+        }
+        Picture::Png { image, palette } => (image, palette),
+    };
+    (
+        Document::from_picture(image, palette, target),
+        extras,
+        notes,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveFormat {
+    Ilbm,
+    Png,
+}
+
+/// Picture ▸ Save picks the format by name: `.png` writes PNG; everything else writes IFF
+/// ILBM, because Amiga names often have no extension or tags like `.LoRes`.
+pub fn save_format(path: &Path) -> Result<SaveFormat, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => Ok(SaveFormat::Png),
+        Some("jpg" | "jpeg") => Err("JPEG is import-only: use .iff or .png".into()),
+        Some("gif" | "bmp" | "tif" | "tiff" | "webp" | "dpxproj") => {
+            Err("DeluxePainter saves pictures as IFF or PNG".into())
+        }
+        _ => Ok(SaveFormat::Ilbm),
+    }
+}
+
+/// Encodes the document for `path`: ILBM with the display mode's CAMG, pixel aspect and page
+/// size plus the kept extras, or indexed PNG. Notes name what the chosen format cannot hold.
+pub fn encode_document(
+    doc: &Document,
+    extras: &PictureExtras,
+    path: &Path,
+) -> Result<(Vec<u8>, Vec<String>), String> {
+    let colors = doc.palette().len();
+    let (ranges, dropped): (Vec<ColorRange>, Vec<ColorRange>) = extras
+        .ranges
+        .iter()
+        .partition(|r| usize::from(r.low) < colors && usize::from(r.high) < colors);
+    let mut notes: Vec<String> = dropped
+        .iter()
+        .map(|r| {
+            format!(
+                "colour range {}-{} lies outside the palette, not saved",
+                r.low, r.high
+            )
+        })
+        .collect();
+    let transparent = extras
+        .transparent_color
+        .filter(|&c| usize::from(c) < colors);
+    match save_format(path)? {
+        SaveFormat::Ilbm => {
+            let mode = doc.target().mode;
+            let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
+            out.camg = Some(doc.target().camg());
+            (out.x_aspect, out.y_aspect) = mode.aspect();
+            let (sw, sh) = mode.size();
+            out.page_width = sw as i16;
+            out.page_height = sh as i16;
+            out.ranges = ranges;
+            out.grab = extras.grab;
+            if let Some(c) = transparent {
+                out.masking = Masking::TransparentColor;
+                out.transparent_color = c;
+            }
+            let bytes = ilbm::write(&out, Compression::ByteRun1).map_err(|e| e.to_string())?;
+            Ok((bytes, notes))
+        }
+        SaveFormat::Png => {
+            let mut drops = vec![format!("display mode {}", doc.target().mode.name())];
+            if !ranges.is_empty() {
+                drops.push(format!("{} colour-cycling ranges (CRNG)", ranges.len()));
+            }
+            if let Some(c) = transparent {
+                drops.push(format!("transparent colour {c}"));
+            }
+            notes.extend(drops.into_iter().map(|d| format!("PNG cannot store: {d}")));
+            let bytes =
+                dpx_formats::write_png(doc.page(), doc.palette()).map_err(|e| e.to_string())?;
+            Ok((bytes, notes))
+        }
+    }
+}
+
+/// Writes through a temporary file in the same drawer and renames it, so a failed save never
+/// leaves a half-written picture behind.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| "no file name".to_string())?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.dpx-tmp"));
+    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| e.to_string())
 }
 
 /// ILBM details that PNG has no place for.
@@ -310,5 +460,86 @@ mod tests {
         );
         assert!(save(&back, &tmp("x.jpg")).is_err(), "no JPEG export");
         let _ = std::fs::remove_dir_all(a.parent().unwrap());
+    }
+
+    #[test]
+    fn save_format_by_name() {
+        let f = |n: &str| save_format(Path::new(n));
+        assert_eq!(f("a.PNG"), Ok(SaveFormat::Png));
+        assert_eq!(f("a.iff"), Ok(SaveFormat::Ilbm));
+        assert_eq!(f("Venus.LoRes"), Ok(SaveFormat::Ilbm));
+        assert_eq!(f("noext"), Ok(SaveFormat::Ilbm));
+        assert!(f("a.jpg").unwrap_err().contains("import-only"));
+        assert!(f("a.gif").is_err());
+    }
+
+    #[test]
+    fn open_then_save_keeps_mode_ranges_and_transparency() {
+        use dpx_core::{Resolution, Video};
+        let mut img = IndexedImage::new(640, 512, 0);
+        img.set(3, 4, 7);
+        let mut src = Ilbm::from_indexed(img.clone(), Palette::dpaint_default_32());
+        let pal_hi_lace = DisplayMode::new(Video::Pal, Resolution::Hi, true);
+        src.camg = Some(pal_hi_lace.mode_id());
+        src.ranges = vec![
+            ColorRange {
+                rate: 2560,
+                flags: 1,
+                low: 20,
+                high: 31,
+            },
+            ColorRange {
+                rate: 0,
+                flags: 0,
+                low: 40,
+                high: 50,
+            },
+        ];
+        src.grab = Some((5, 6));
+        src.masking = Masking::TransparentColor;
+        src.transparent_color = 3;
+        src.other_chunks.push(ilbm::RawChunk {
+            id: *b"DPPS",
+            data: vec![0; 10],
+        });
+        let (doc, extras, notes) = open_picture(Picture::Ilbm(Box::new(src)));
+        assert_eq!(doc.target().mode, pal_hi_lace);
+        assert_eq!(notes, ["DPPS chunk (10 bytes) not kept"]);
+
+        // Own drawer: the other test removes the shared one when it ends.
+        let dir = std::env::temp_dir().join(format!("dpx-files-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.LoRes");
+        let (bytes, notes) = encode_document(&doc, &extras, &path).unwrap();
+        assert_eq!(
+            notes.len(),
+            1,
+            "range 40-50 is outside 32 colours: {notes:?}"
+        );
+        write_atomic(&path, &bytes).unwrap();
+        let Picture::Ilbm(back) = load(&path).unwrap().picture else {
+            panic!("expected ILBM");
+        };
+        assert_eq!(back.image, img);
+        assert_eq!(back.camg, Some(0x0002_9004));
+        assert_eq!((back.x_aspect, back.y_aspect), pal_hi_lace.aspect());
+        assert_eq!((back.page_width, back.page_height), (640, 512));
+        assert_eq!(back.ranges, extras.ranges[..1]);
+        assert_eq!(back.grab, Some((5, 6)));
+        assert_eq!(
+            (back.masking, back.transparent_color),
+            (Masking::TransparentColor, 3)
+        );
+        assert!(back.other_chunks.is_empty());
+
+        // PNG says what it cannot hold.
+        let (_, notes) = encode_document(&doc, &extras, &dir.join("x.png")).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("PAL:High Res Laced")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.contains("CRNG")));
+        assert!(notes.iter().any(|n| n.contains("transparent colour 3")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

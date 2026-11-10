@@ -117,6 +117,17 @@ impl Font {
         (total - GAP).max(0)
     }
 
+    /// Advance of one character, including the trailing gap. Characters the font lacks are
+    /// drawn (and measured) as `?`.
+    pub fn char_advance(&self, c: char) -> i32 {
+        self.advance(Self::code_for(c))
+    }
+
+    /// Draws one character; returns the x position after it (including the gap).
+    pub fn draw_char(&self, img: &mut IndexedImage, x: i32, y: i32, c: char, pen: u8) -> i32 {
+        self.draw_code(img, x, y, Self::code_for(c), pen)
+    }
+
     /// Draws a single glyph code; returns the x position after it (including the gap).
     pub fn draw_code(&self, img: &mut IndexedImage, x: i32, y: i32, code: u8, pen: u8) -> i32 {
         if let Some(g) = self.glyphs[usize::from(code)] {

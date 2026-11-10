@@ -5,8 +5,10 @@
 //! converts that buffer to RGBA and shows it with nearest-neighbour scaling.
 
 pub mod bitmap;
+pub mod file_requester;
 pub mod font;
 pub mod menu;
+pub mod pattern;
 pub mod pens;
 pub mod requester;
 pub mod screen;
@@ -14,6 +16,7 @@ pub mod toolbox;
 
 use dpx_core::{IndexedImage, Palette};
 
+pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
 pub use menu::{Action, MenuState, Pref, Prefs};
 pub use pens::Pens;
 pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};

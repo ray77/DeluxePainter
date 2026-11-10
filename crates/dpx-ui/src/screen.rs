@@ -4,6 +4,7 @@
 
 use dpx_core::{IndexedImage, Palette};
 
+use crate::file_requester::FileRequester;
 use crate::font::Font;
 use crate::menu::{self, MenuContext, MenuState, Pref, Prefs};
 use crate::pens::Pens;
@@ -82,6 +83,8 @@ pub struct UiState {
     pub coords: Option<(i32, i32)>,
     pub prefs: Prefs,
     pub menu: MenuState,
+    /// Picture ▸ Load/Save while it is open (drawn over everything else).
+    pub file_requester: Option<FileRequester>,
 }
 
 impl UiState {
@@ -111,6 +114,7 @@ impl Default for UiState {
             coords: None,
             prefs: Prefs::default(),
             menu: MenuState::default(),
+            file_requester: None,
         }
     }
 }
@@ -210,6 +214,9 @@ impl Screen {
             } else {
                 self.draw_title_bar(img, ui, pens);
             }
+        }
+        if let Some(req) = &ui.file_requester {
+            req.draw(img, pens);
         }
     }
 

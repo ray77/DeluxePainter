@@ -1,0 +1,22 @@
+# DeluxePainter file requester glyphs, LoRes ('#' = drawn pen, '.' = transparent).
+# Copyright © 2026 Dominik Schmidt, part of DeluxePainter, PolyForm Noncommercial 1.0.0.
+# Original artwork drawn for DeluxePainter in the style of the classic Amiga gadgets.
+
+# Scroll arrows, 7x7.
+= arrow_up
+...#...
+..###..
+.#####.
+#######
+..###..
+..###..
+..###..
+
+= arrow_down
+..###..
+..###..
+..###..
+#######
+.#####.
+..###..
+...#...

@@ -227,6 +227,19 @@ pub struct Target {
     pub mode: DisplayMode,
 }
 
+impl Target {
+    /// The ILBM CAMG value to write. AGA documents get the full 32-bit mode id with its
+    /// monitor (PAL/NTSC) bits; OCS documents get the classic 16-bit view modes, which old
+    /// readers understand, so PAL/NTSC is then only implied by the page height.
+    pub fn camg(self) -> u32 {
+        let id = self.mode.mode_id();
+        match self.chipset {
+            Chipset::Aga => id,
+            Chipset::Ocs => id & !mode_id::MONITOR_MASK,
+        }
+    }
+}
+
 impl Default for Target {
     /// DeluxePaint IV AGA on a PAL machine.
     fn default() -> Self {
@@ -240,6 +253,32 @@ impl Default for Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camg_round_trips_through_guess() {
+        for mode in DisplayMode::all() {
+            let (w, h) = mode.size();
+            for chipset in [Chipset::Aga, Chipset::Ocs] {
+                let camg = Target { chipset, mode }.camg();
+                assert_eq!(
+                    DisplayMode::guess(Some(camg), w, h),
+                    mode,
+                    "{chipset:?} {camg:#x}"
+                );
+            }
+        }
+        let pal_hi_lace = DisplayMode::new(Video::Pal, Resolution::Hi, true);
+        let ocs = Target {
+            chipset: Chipset::Ocs,
+            mode: pal_hi_lace,
+        };
+        assert_eq!(ocs.camg(), 0x8004);
+        let aga = Target {
+            chipset: Chipset::Aga,
+            mode: pal_hi_lace,
+        };
+        assert_eq!(aga.camg(), 0x0002_9004);
+    }
 
     #[test]
     fn list_order_and_names() {

@@ -79,8 +79,16 @@ pub enum PageChoice {
 pub enum ReqKey {
     Up,
     Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Backspace,
+    Delete,
+    Tab,
     Enter,
     Escape,
+    /// A typed character (text input).
     Char(char),
 }
 
@@ -92,6 +100,8 @@ pub enum ReqEvent {
     Drag(i32, i32),
     Release,
     Key(ReqKey),
+    /// Mouse wheel: rows to scroll (positive = down).
+    Scroll(i32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,7 +268,13 @@ impl ScreenFormatRequester {
                     }
                     _ => ReqResponse::Continue,
                 },
+                _ => ReqResponse::Continue,
             },
+            ReqEvent::Scroll(rows) => {
+                let max = self.modes.len().saturating_sub(geom::ROWS as usize) as i32;
+                self.scroll = (self.scroll as i32 + rows).clamp(0, max) as usize;
+                ReqResponse::Continue
+            }
         }
     }
 
