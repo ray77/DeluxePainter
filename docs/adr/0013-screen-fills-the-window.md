@@ -1,40 +1,39 @@
-# ADR-13: The screen fills the window (layout C), pixel size, full screen
+# ADR-13: The window snaps to the screen in whole and half pixel-size steps
 
 - Status: accepted (Phase 2, 2026-11-10)
 - Context:
-  - The owner chose layout C on 2026-11-09 (design/README.md): the virtual screen grows with the window. AMIGA_GUI_FIDELITY.md §1 narrowed it: everything drawn on the screen stays identical to DeluxePaint; the screen may only be larger than a stock Amiga mode.
-  - Until now the app showed the document's Amiga screen (e.g. 320×256) at the largest integer scale and filled the rest of the window with black. The owner found that this looks like an emulator window (2026-11-10).
-  - Owner decisions (2026-11-10): the screen grows with the window; where the screen is larger than the page, a dark pattern with a clear page edge; a selectable pixel size; full screen without borders.
-  - After trying the first version on a 2560×1440 display without Retina scaling, the owner found whole steps too coarse (3× → 4× is a big jump, and the rest of the window showed extra screen). Decision (2026-11-10): scale in whole steps and, in between, half steps. The rest of the window, less than half a step, is still filled by a slightly larger screen.
+  - The app showed the document's Amiga screen (e.g. 320×256) at the largest integer scale and filled the rest of the window with black. The owner found this looks like an emulator window (2026-11-10).
+  - **First attempt (layout C):** the screen grew with the window and a dark dotted pattern filled the area beyond the page. The owner then asked for scaling in whole and, in between, half steps.
+  - **Second attempt:** half steps, with the rest of the window still shown as a slightly larger screen. Tried on a 2560×1440 display without Retina scaling, the rest was up to half a picture width of dotted pattern. Owner verdict: "sieht übel aus".
+  - **Owner decision (2026-11-10):** the window snaps to the steps, so the picture fills it exactly.
 - Decision:
-  - **Screen size (`View::fill_window`):**
-    - A UI pixel size is chosen in **half points** (1x, 1.5x, 2x, 2.5x …). On a display without Retina scaling a half step means uneven pixels: at 3.5× they are alternately 3 and 4 device pixels wide (nearest-neighbour, no blur). On Retina every half step is a whole number of device pixels, so all steps stay sharp.
-    - The screen is the window divided by that size, rounded down to whole UI pixels. It is drawn from the window's top-left corner. With uneven steps the UI pixel count is kept even, so the screen's edge falls on a device pixel.
-    - Less than one UI pixel is left at the right and bottom; it is filled with the interface's dark pen. There are no letterbox bars.
-    - The screen is at least 320×200 UI pixels (the toolbox and title bar need it). A smaller window cuts it off, as before.
-    - The document's screen (`Target.screen`) is unchanged: it is still the hardware screen for export, page limits and ILBM page fields. The window only shows more or less around it.
-    - The title bar spans the whole window and the toolbox sits at the right edge, as on wider screens before (ADR-11). Requesters are centred on the window.
-  - **Pixel size (Prefs ▸ Pixel Size, a DeluxePainter addition):**
-    - **Auto** (default): the largest whole or half step at which the picture's whole screen fits the window. Example for 320×256 on a 1× display: 960×768 → 3x, 1120×896 → 3.5x, 1280×1024 → 4x; sizes in between show a slightly larger screen.
-    - **1x, 1.5x … 8x**: one UI pixel is that many points (`PixelSize::Fixed(h)` in half points). The interface has the same size in every display mode: a HiRes UI pixel is two screen pixels wide, so HiRes screen pixels can get quarter steps.
-    - Fixed sizes are limited so the screen keeps 320×200 UI pixels.
-    - Cmd/Ctrl + `+` (or `=`) and `−` go half a step up or down from the size shown now; Cmd/Ctrl + `0` returns to Auto. egui's own keyboard zoom is switched off for this.
+  - **Screen:**
+    - The window shows exactly the document's screen (`Target.screen`) at a pixel size. Layout C (a screen larger than the picture's screen) is dropped.
+    - The pixel size is one UI (LoRes) pixel in **half points**: 1x, 1.5x, 2x … 8x (`PixelSize(h)`, h = 2…16).
+    - UI pixels are square in every mode, so a HiRes screen pixel is half of that wide.
+    - Rendering stays nearest-neighbour. On a display without Retina scaling, half steps give uneven pixels: at 3.5× they are alternately 3 and 4 device pixels wide. On Retina every half step is a whole number of device pixels.
+  - **Snapping (`snap_window`):**
+    - The window's drawing area is set to screen × pixel size, e.g. 320×256 at 3.5x = 1120×896 points.
+    - When the user resizes the window and stops for 0.25 s, the pixel size becomes the nearest step (the smaller axis decides), and the window snaps to it.
+    - A pixel size chosen in the menu or with the keys resizes the window. So does a new screen (Load, Screen Format), which keeps the pixel size.
+    - The pixel size is limited so the window fits on the monitor, keeping 100 points free for the menu bar, window title and Dock.
+    - While the window is not at its snapped size (during a drag, or if the system refuses the size), the screen is drawn centred at the largest step that fits, with the interface's dark pen around it.
+  - **Full screen and maximized windows** cannot snap. The screen is centred at the largest step that fits, with a dark border like a monitor's. Ctrl+Cmd+F on macOS and F11 everywhere toggle full screen; the green window button works too.
+  - **Prefs ▸ Pixel Size (a DeluxePainter addition):**
+    - "Largest" (Amiga-key 0) picks the largest step that fits on the monitor.
+    - 1x to 8x in half steps; the current step is checked.
+    - Cmd/Ctrl + `+` (or `=`) and `−` go half a step up or down; Cmd/Ctrl + `0` = Largest. egui's own keyboard zoom is switched off.
+    - The start window, 960×768 points, is 3x for the default 320×256 screen.
     - The choice is not saved yet (no settings file exists).
-  - **Outside the page:**
-    - The screen can now be larger than the page. Pixels beyond the page's right or bottom edge show a dark pattern: the interface's dark pen with face-coloured dots in a staggered 4×4 lattice (1 in 8 UI pixels). It is anchored to the screen and drawn in UI pixels.
-    - Pressing there does nothing and Coords shows nothing. Strokes that leave the page are clipped as before.
-    - Scrolling only happens along an axis where the page is larger than the screen.
-  - **Full screen:** Ctrl+Cmd+F on macOS and F11 everywhere toggle full screen; the screen then fills the monitor. The macOS green window button also works, because the layout follows any window size.
-  - **Unchanged:** the Screen Format requester keeps its own fixed HiRes screen, centred on the dark pen like a separate Amiga screen. Show Page uses the window's screen.
-  - **Snapshot option:** `--view WxH` renders a screen of that size in screen pixels, as a window of that size would show it.
+  - **The Screen Format requester** keeps its own screen. It is shown at the same pixel size (or the largest that fits) and centred; the window does not snap while it is open.
+  - **Left from the earlier attempts:**
+    - `dpx_ui::Screen::render` draws a dark dotted pattern where the page image does not cover the screen. With the screen equal to `Target.screen` and pages never smaller than it (ADR-10), this is not visible in normal use.
+    - Pressing outside the page is ignored.
 - Verified:
-  - Unit tests for steps and screen sizes: Auto with whole and half steps on 1× and Retina scales, wider windows, even sizes at half steps, fixed sizes, HiRes (including 1.75 device pixels per HiRes pixel), the 320×200 limit, and the inverse used by the keys.
-  - App test: the pixel size menu action changes the view, the page shows on the pattern, nothing scrolls when the page is smaller, the step keys' logic works, and Auto returns.
-  - dpx-ui tests: the pattern right of and below the page in LoRes and HiRes, no pattern when the page covers the screen, and the Pixel Size submenu (order, check marks, selection on a 320-wide screen).
-  - Headless snapshots `phase2-window-wide.png`, `phase2-window-small-page.png` and `phase2-window-big-page.png` (480×270 screens) and `phase2-menu-pixel-size.png`.
+  - Unit tests: steps that fit, the nearest step after a resize, window sizes (including half points for odd screen sizes), and the snapping sequence. That sequence covers the start size, a drag that settles to 3.5x, our own resize not counting as a user resize, the centred layout before the window follows, the keys and Largest limited by the monitor, a new HiRes overscan screen keeping 3x, and full screen centring at the largest step.
+  - dpx-ui tests for the menu (labels, checks, selection on a 320×256 screen).
   - The GUI starts.
-  - Not tried by hand: resizing the window, the pixel size keys, full screen, the menu in the window, Windows/Linux scale factors. How uneven half-step pixels look on the GPU was not checked against a screenshot of the window.
+  - Not tried by hand: dragging the window and the snap, the keys, full screen, how the system reacts to sizes in half points, and Windows/Linux. Windows has no live-resize snapping guarantee from winit; untested.
 - Consequences:
-  - Layout A (a fixed classic screen, letterboxed) is no longer the behaviour. It remains possible as a later "Classic screen" preference (FEATURES.md P1).
+  - The picture always fills a windowed DeluxePainter without bars. Pictures bigger than the screen scroll as before (ADR-10).
   - Saving the pixel size waits for a settings file.
-  - Magnify and the brush/text tools must treat off-page pointer positions like the freehand tool does now.

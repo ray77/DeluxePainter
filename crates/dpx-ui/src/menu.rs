@@ -113,21 +113,23 @@ impl Prefs {
     }
 }
 
-/// Size of one interface (LoRes) pixel, a DeluxePainter preference (ADR-13). `Fixed(h)` is
-/// h half points (logical pixels) per interface pixel, i.e. whole and half steps from 1x
-/// (`Fixed(2)`) to 8x (`Fixed(16)`). `Auto` is the largest step at which the picture's whole
-/// screen fits the window.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PixelSize {
-    #[default]
-    Auto,
-    Fixed(u8),
-}
+/// Size of one interface (LoRes) pixel in half points, a DeluxePainter preference (ADR-13):
+/// whole and half steps from 1x (`PixelSize(2)`) to 8x (`PixelSize(16)`). The window snaps to
+/// the picture's screen at this size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelSize(pub u8);
 
 impl PixelSize {
-    /// Smallest and largest fixed size, in half points (1x and 8x).
+    /// Smallest and largest size, in half points (1x and 8x).
     pub const MIN: u8 = 2;
     pub const MAX: u8 = 16;
+}
+
+impl Default for PixelSize {
+    /// 3x: the start window shows a 320×256 screen at 960×768 points.
+    fn default() -> Self {
+        PixelSize(6)
+    }
 }
 
 /// What a menu item does.
@@ -514,22 +516,22 @@ pub static MENUS: [Menu; 7] = [
             sub(
                 "Pixel Size",
                 &[
-                    pixel_size("Auto", Key::Amiga('0'), PixelSize::Auto),
-                    pixel_size("1x", Key::None, PixelSize::Fixed(2)),
-                    pixel_size("1.5x", Key::None, PixelSize::Fixed(3)),
-                    pixel_size("2x", Key::None, PixelSize::Fixed(4)),
-                    pixel_size("2.5x", Key::None, PixelSize::Fixed(5)),
-                    pixel_size("3x", Key::None, PixelSize::Fixed(6)),
-                    pixel_size("3.5x", Key::None, PixelSize::Fixed(7)),
-                    pixel_size("4x", Key::None, PixelSize::Fixed(8)),
-                    pixel_size("4.5x", Key::None, PixelSize::Fixed(9)),
-                    pixel_size("5x", Key::None, PixelSize::Fixed(10)),
-                    pixel_size("5.5x", Key::None, PixelSize::Fixed(11)),
-                    pixel_size("6x", Key::None, PixelSize::Fixed(12)),
-                    pixel_size("6.5x", Key::None, PixelSize::Fixed(13)),
-                    pixel_size("7x", Key::None, PixelSize::Fixed(14)),
-                    pixel_size("7.5x", Key::None, PixelSize::Fixed(15)),
-                    pixel_size("8x", Key::None, PixelSize::Fixed(16)),
+                    cmd_key("Largest", Key::Amiga('0'), "view.largest_pixel_size"),
+                    pixel_size("1x", Key::None, PixelSize(2)),
+                    pixel_size("1.5x", Key::None, PixelSize(3)),
+                    pixel_size("2x", Key::None, PixelSize(4)),
+                    pixel_size("2.5x", Key::None, PixelSize(5)),
+                    pixel_size("3x", Key::None, PixelSize(6)),
+                    pixel_size("3.5x", Key::None, PixelSize(7)),
+                    pixel_size("4x", Key::None, PixelSize(8)),
+                    pixel_size("4.5x", Key::None, PixelSize(9)),
+                    pixel_size("5x", Key::None, PixelSize(10)),
+                    pixel_size("5.5x", Key::None, PixelSize(11)),
+                    pixel_size("6x", Key::None, PixelSize(12)),
+                    pixel_size("6.5x", Key::None, PixelSize(13)),
+                    pixel_size("7x", Key::None, PixelSize(14)),
+                    pixel_size("7.5x", Key::None, PixelSize(15)),
+                    pixel_size("8x", Key::None, PixelSize(16)),
                 ],
             ),
         ],
@@ -951,7 +953,7 @@ mod tests {
             prefs: Prefs::default(),
             ehb: false,
             ham: false,
-            pixel_size: PixelSize::Auto,
+            pixel_size: PixelSize::default(),
         }
     }
 
@@ -1040,17 +1042,20 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Auto", "1x", "1.5x", "2x", "2.5x", "3x", "3.5x", "4x", "4.5x", "5x", "5.5x", "6x",
-                "6.5x", "7x", "7.5x", "8x"
+                "Largest", "1x", "1.5x", "2x", "2.5x", "3x", "3.5x", "4x", "4.5x", "5x", "5.5x",
+                "6x", "6.5x", "7x", "7.5x", "8x"
             ]
         );
         assert_eq!(items[0].key, Key::Amiga('0'));
-        assert_eq!(items[0].action(), Some(Action::PixelSize(PixelSize::Auto)));
+        assert_eq!(
+            items[0].action(),
+            Some(Action::Command("view.largest_pixel_size"))
+        );
         // Whole and half steps: item i is i+1 half points.
         for h in PixelSize::MIN..=PixelSize::MAX {
             assert_eq!(
                 items[usize::from(h) - 1].action(),
-                Some(Action::PixelSize(PixelSize::Fixed(h)))
+                Some(Action::PixelSize(PixelSize(h)))
             );
         }
     }
@@ -1058,19 +1063,13 @@ mod tests {
     #[test]
     fn pixel_size_checked() {
         let c = MenuContext {
-            pixel_size: PixelSize::Fixed(2),
+            pixel_size: PixelSize(2),
             ..ctx()
         };
-        assert_eq!(
-            Action::PixelSize(PixelSize::Fixed(2)).checked(&c),
-            Some(true)
-        );
-        assert_eq!(Action::PixelSize(PixelSize::Auto).checked(&c), Some(false));
-        assert_eq!(
-            Action::PixelSize(PixelSize::Auto).checked(&ctx()),
-            Some(true)
-        );
-        assert!(Action::PixelSize(PixelSize::Fixed(8)).enabled(&c));
+        assert_eq!(Action::PixelSize(PixelSize(2)).checked(&c), Some(true));
+        assert_eq!(Action::PixelSize(PixelSize(6)).checked(&c), Some(false));
+        assert_eq!(Action::PixelSize(PixelSize(6)).checked(&ctx()), Some(true));
+        assert!(Action::PixelSize(PixelSize(8)).enabled(&c));
     }
 
     #[test]
@@ -1093,7 +1092,7 @@ mod tests {
         st.pointer(320, 256, sb.x + sb.w / 2, sb.item_top(5) + 2);
         assert_eq!(
             st.hovered_action(&ctx()),
-            Some(Action::PixelSize(PixelSize::Fixed(6)))
+            Some(Action::PixelSize(PixelSize(6)))
         );
         // Drawing with the submenu open must not panic.
         let pens = Pens::from_palette(&Palette::dpaint_default_32());

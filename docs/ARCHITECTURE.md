@@ -93,13 +93,13 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
             │     menu bar, toolbox, palette, requesters, canvas viewport  │
             │  upload changed rows → egui texture (TextureOptions::NEAREST) │
             │  draw one textured rect at integer scale, snapped to device  │
-            │  pixels, screen sized to the window (ADR-13)                 │
+            │  pixels; the window snaps to screen × pixel size (ADR-13)    │
             └──────────────────────────────────────────────────────────────┘
 ```
 
 - The **whole visible UI**, including the zoomed canvas viewport, is software-rendered into one RGBA framebuffer at "Amiga screen" resolution. egui only provides the window, input, clipboard and the GPU blit.
-- Scale in whole and half points per UI pixel, computed in **physical** pixels (Retina: every step sharp; 1× displays: half steps give uneven nearest-neighbour pixels, never blur): Prefs ▸ Pixel Size `Auto` = the largest step at which the document's whole screen fits, or `1x`–`8x` (ADR-13).
-- Screen size: the window divided by the scale, in whole UI pixels (layout C, ADR-13). Beyond the page a dark pattern is shown. A fixed classic screen (layout A) is a possible later preference.
+- Pixel size in whole and half points per UI pixel (Prefs ▸ Pixel Size 1x–8x), drawn in **physical** pixels (Retina: every step sharp; 1× displays: half steps give uneven nearest-neighbour pixels, never blur).
+- Screen size: exactly the document's screen; the window snaps to screen × pixel size after a resize. Full screen centres it at the largest step that fits (ADR-13).
 - Because rendering is pure CPU code, **UI screenshots are deterministic** and testable headless (golden PNGs) and available to MCP (`get_ui_screenshot`).
 - Colour cycling is a display-time palette rotation; document pixels never change while cycling.
 - Font: an **original** 8×8 / 8×9 bitmap font drawn for this project (Topaz and other Amiga ROM fonts are not redistributable). Icons are original pixel art drawn in the spirit of DPaint IV, not copied.

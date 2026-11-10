@@ -14,8 +14,6 @@
 //!     [--show-page]                     show the Show Page view
 //!     [--page-size-requester]           show the Page Size requester
 //!     [--notes]                         show the notes of `--open` in the note requester
-//!     [--view WxH]                      screen size in screen pixels, as in a window of that
-//!                                       size (default: the picture's screen)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG or JPEG picture
@@ -48,8 +46,12 @@ const SCROLL_STEP: i32 = 16;
 const START_W: f32 = 960.0;
 const START_H: f32 = 768.0;
 
-/// Smallest interface screen in UI (LoRes) pixels: the toolbox and title bar need it.
-const MIN_UI: (i32, i32) = (320, 200);
+/// After the user stops resizing the window for this long, it snaps to the nearest pixel size
+/// (seconds).
+const SNAP_SETTLE: f64 = 0.25;
+
+/// Room kept free on the monitor for the menu bar, the window title and the Dock (points).
+const MONITOR_MARGIN: egui::Vec2 = egui::vec2(0.0, 100.0);
 
 /// The window's drawing area in physical pixels and the OS scale (physical pixels per point),
 /// as of the last frame.
@@ -61,25 +63,43 @@ struct Window {
 }
 
 impl Window {
-    /// The largest UI pixel size, in half points (at least 1x), at which `ui` UI pixels fit.
-    fn fit(&self, ui: (i32, i32)) -> i32 {
-        let half = self.ppp / 2.0;
-        let steps = |len: i32, n: i32| (len as f32 / (n as f32 * half) + 1e-4).floor() as i32;
-        steps(self.w, ui.0)
-            .min(steps(self.h, ui.1))
-            .max(i32::from(PixelSize::MIN))
+    /// The drawing area in points.
+    fn points(&self) -> egui::Vec2 {
+        egui::vec2(self.w as f32, self.h as f32) / self.ppp
     }
 }
 
-/// How many UI pixels of `p` physical pixels fit into `len`, preferring a count that covers a
-/// whole number of physical pixels (with half steps on a 1× display: an even count), so the
-/// screen's edge falls on a device pixel.
-fn whole_ui_pixels(len: i32, p: f32) -> i32 {
-    let n = (len as f32 / p + 1e-4).floor() as i32;
-    (0..8)
-        .map(|d| n - d)
-        .find(|&m| m > 0 && ((m as f32 * p).fract()).min(1.0 - (m as f32 * p).fract()) < 1e-3)
-        .unwrap_or(n)
+/// The largest pixel size (half points per UI pixel, 1x–8x) at which a screen of `ui` UI
+/// pixels fits into `avail` points.
+fn fit_step(avail: egui::Vec2, ui: (i32, i32)) -> u8 {
+    let steps = |len: f32, n: i32| (len * 2.0 / n as f32 + 1e-3).floor() as i32;
+    steps(avail.x, ui.0)
+        .min(steps(avail.y, ui.1))
+        .clamp(i32::from(PixelSize::MIN), i32::from(PixelSize::MAX)) as u8
+}
+
+/// The pixel size nearest to a window the user sized to `size` points (the smaller of the
+/// two axes decides).
+fn nearest_step(size: egui::Vec2, ui: (i32, i32)) -> u8 {
+    let x = size.x * 2.0 / ui.0 as f32;
+    let y = size.y * 2.0 / ui.1 as f32;
+    (x.min(y).round() as i32).clamp(i32::from(PixelSize::MIN), i32::from(PixelSize::MAX)) as u8
+}
+
+/// The window's drawing area (points) that shows a screen of `ui` UI pixels at `step`.
+fn window_size(ui: (i32, i32), step: u8) -> egui::Vec2 {
+    egui::vec2(ui.0 as f32, ui.1 as f32) * f32::from(step) / 2.0
+}
+
+/// Snapping state of the window (ADR-13).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Snap {
+    /// Drawing area (points) in the last frame.
+    last: Option<egui::Vec2>,
+    /// When the user last changed the window size; cleared when it snapped.
+    resized_at: Option<f64>,
+    /// The size we asked for and have not seen yet.
+    requested: Option<egui::Vec2>,
 }
 
 /// How a display mode maps to the window: its screen size, the size of a UI (LoRes) pixel in
@@ -118,32 +138,9 @@ impl View {
         }
     }
 
-    /// Layout C (ADR-13): the screen fills the window. Returns the view and the scale
-    /// (physical pixels per screen pixel, before the pixel shape; may be fractional).
-    ///
-    /// The UI pixel size goes in whole and half steps (half points): `Auto` takes the largest
-    /// step at which the picture's whole screen fits; `Fixed(h)` is h half points. Either is
-    /// limited so the interface keeps at least [`MIN_UI`]. The screen is the window divided by
-    /// that size, in whole UI pixels; the rest (less than one UI pixel) stays dark.
-    fn fill_window(target: Target, size: PixelSize, win: Window) -> (View, f32) {
-        let doc = View::of_target(target);
-        let largest = win.fit(MIN_UI);
-        let steps = match size {
-            PixelSize::Auto => win.fit((doc.screen_w / doc.ux, doc.screen_h / doc.uy)),
-            PixelSize::Fixed(h) => i32::from(h),
-        }
-        .clamp(i32::from(PixelSize::MIN), largest);
-        // Physical pixels per UI pixel; UI pixels are square in every mode (fx·ux = fy·uy).
-        let p = steps as f32 * win.ppp / 2.0;
-        let w = whole_ui_pixels(win.w, p).max(MIN_UI.0) * doc.ux;
-        let h = whole_ui_pixels(win.h, p).max(MIN_UI.1) * doc.uy;
-        let scale = p / (doc.fx * doc.ux) as f32;
-        (View::screen(target.mode, (w as u32, h as u32)), scale)
-    }
-
-    /// The UI pixel size at `scale`, in half points (the unit of `PixelSize::Fixed`).
-    fn half_points(&self, scale: f32, ppp: f32) -> i32 {
-        (scale * (self.fx * self.ux) as f32 * 2.0 / ppp).round() as i32
+    /// The screen's size in UI (LoRes) pixels.
+    fn ui_size(&self) -> (i32, i32) {
+        (self.screen_w / self.ux, self.screen_h / self.uy)
     }
 
     /// The UI layout screen (always LoRes geometry: 320 wide).
@@ -263,19 +260,7 @@ fn main() -> eframe::Result {
             }
         }
         let doc = engine.document().clone();
-        let view = match arg_value(&args, "--view") {
-            Some(spec) => {
-                let size = spec
-                    .split_once('x')
-                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
-                let Some((w, h)) = size else {
-                    eprintln!("bad --view '{spec}' (expected WxH)");
-                    std::process::exit(2);
-                };
-                View::screen(doc.target().mode, (w, h))
-            }
-            None => View::of_target(doc.target()),
-        };
+        let view = View::of_target(doc.target());
         let scroll = arg_value(&args, "--scroll")
             .and_then(|s| {
                 let (x, y) = s.split_once(',')?;
@@ -405,7 +390,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeluxePainter")
             .with_inner_size([START_W, START_H])
-            .with_min_inner_size([320.0, 256.0])
+            .with_min_inner_size([320.0, 200.0])
             .with_icon(Arc::new(app_icon())),
         ..Default::default()
     };
@@ -594,9 +579,14 @@ struct PainterApp {
     pointer_page: Option<(i32, i32)>,
     /// Picture ▸ Show Page while it is shown.
     show_page: Option<ShowPage>,
-    /// The window as of the last frame; `None` before the first one (and in tests), when the
-    /// view is the picture's screen.
+    /// The window as of the last frame; `None` before the first one (and in tests).
     window: Option<Window>,
+    /// The window is full screen or maximized: it cannot snap, so the screen is centred at
+    /// the largest pixel size that fits.
+    free: bool,
+    /// The monitor's size in points, if known.
+    monitor: Option<egui::Vec2>,
+    snap: Snap,
 }
 
 /// A freehand stroke in progress: drawn into a preview copy of the page with the same raster
@@ -630,6 +620,9 @@ impl PainterApp {
             pointer_page: None,
             show_page: None,
             window: None,
+            free: false,
+            monitor: None,
+            snap: Snap::default(),
         }
     }
 
@@ -873,27 +866,39 @@ impl PainterApp {
         self.layout().0
     }
 
-    /// The screen currently shown and its scale (physical pixels per screen pixel). The
-    /// Screen Format requester has its own fixed screen, centred like a separate Amiga
-    /// screen; the paint screen fills the window (ADR-13).
+    /// The screen currently shown and its scale (physical pixels per screen pixel, may be
+    /// fractional). The screen is the picture's screen (or the Screen Format requester's own
+    /// screen) at the chosen pixel size, or smaller while it does not fit the window (during a
+    /// resize, full screen); it is centred in the window (ADR-13).
     fn layout(&self) -> (View, f32) {
-        let target = self.engine.document().target();
-        match self.window {
-            _ if self.requester.is_some() => {
-                let v = View::of(requester::SCREEN);
-                let scale = self.window.map_or(1.0, |w| {
-                    let steps = w.fit((v.screen_w / v.ux, v.screen_h / v.uy));
-                    steps as f32 * w.ppp / 2.0 / (v.fx * v.ux) as f32
-                });
-                (v, scale)
-            }
-            Some(win) => View::fill_window(target, self.ui.pixel_size, win),
-            None => (View::of_target(target), 1.0),
-        }
+        let view = if self.requester.is_some() {
+            View::of(requester::SCREEN)
+        } else {
+            View::of_target(self.engine.document().target())
+        };
+        let Some(win) = self.window else {
+            return (view, 1.0);
+        };
+        let fit = fit_step(win.points(), view.ui_size());
+        let step = if self.free {
+            fit
+        } else {
+            self.ui.pixel_size.0.min(fit)
+        };
+        let scale = f32::from(step) * win.ppp / 2.0 / (view.fx * view.ux) as f32;
+        (view, scale)
     }
 
-    /// Prefs ▸ Pixel Size and Cmd/Ctrl + `+`, `−`, `0`: changes the interface pixel size.
+    /// The largest pixel size at which the picture's screen fits on the monitor.
+    fn largest_step(&self) -> u8 {
+        let ui = View::of_target(self.engine.document().target()).ui_size();
+        self.monitor
+            .map_or(PixelSize::MAX, |m| fit_step(m - MONITOR_MARGIN, ui))
+    }
+
+    /// Prefs ▸ Pixel Size and Cmd/Ctrl + `+`, `−`, `0`: the window snaps to the new size.
     fn set_pixel_size(&mut self, size: PixelSize) {
+        let size = PixelSize(size.0.clamp(PixelSize::MIN, self.largest_step()));
         if self.ui.pixel_size != size {
             self.ui.pixel_size = size;
             self.clamp_scroll();
@@ -901,15 +906,52 @@ impl PainterApp {
         }
     }
 
-    /// One half step bigger (`+1`) or smaller (`-1`) than the size shown now.
+    /// Half a step bigger (`+1`) or smaller (`-1`).
     fn step_pixel_size(&mut self, step: i32) {
-        let Some(win) = self.window else {
-            return;
-        };
-        let (view, scale) = self.layout();
-        let now = view.half_points(scale, win.ppp);
-        let h = (now + step).clamp(i32::from(PixelSize::MIN), i32::from(PixelSize::MAX));
-        self.set_pixel_size(PixelSize::Fixed(h as u8));
+        let h = (i32::from(self.ui.pixel_size.0) + step).clamp(0, 255) as u8;
+        self.set_pixel_size(PixelSize(h));
+    }
+
+    /// The window snaps to the picture's screen at the pixel size (ADR-13). `size` is the
+    /// drawing area in points now; after the user resized it and stopped for
+    /// [`SNAP_SETTLE`] seconds, the pixel size becomes the nearest step. Returns the size to
+    /// ask the window for, if it differs. Full screen, maximized windows and the Screen Format
+    /// requester do not snap.
+    fn snap_window(&mut self, size: egui::Vec2, now: f64) -> Option<egui::Vec2> {
+        let near = |a: egui::Vec2, b: egui::Vec2| (a - b).abs().max_elem() < 1.0;
+        let changed = self.snap.last.is_some_and(|l| !near(l, size));
+        self.snap.last = Some(size);
+        if self.free || self.requester.is_some() {
+            self.snap = Snap {
+                last: Some(size),
+                ..Snap::default()
+            };
+            return None;
+        }
+        if changed {
+            if !self.snap.requested.is_some_and(|r| near(r, size)) {
+                self.snap.resized_at = Some(now);
+            }
+            self.snap.requested = None;
+        }
+        let ui = View::of_target(self.engine.document().target()).ui_size();
+        if let Some(t) = self.snap.resized_at {
+            if now - t < SNAP_SETTLE {
+                return None;
+            }
+            self.snap.resized_at = None;
+            self.set_pixel_size(PixelSize(nearest_step(size, ui)));
+        }
+        let largest = self.largest_step();
+        if self.ui.pixel_size.0 > largest {
+            self.set_pixel_size(PixelSize(largest));
+        }
+        let target = window_size(ui, self.ui.pixel_size.0);
+        if near(target, size) || self.snap.requested.is_some_and(|r| near(r, target)) {
+            return None;
+        }
+        self.snap.requested = Some(target);
+        Some(target)
     }
 
     fn open_screen_format(&mut self) {
@@ -1087,6 +1129,7 @@ impl PainterApp {
                     colors: Palette::dpaint_default_32().colors().to_vec(),
                 }),
                 "picture.screen_format" => self.open_screen_format(),
+                "view.largest_pixel_size" => self.set_pixel_size(PixelSize(self.largest_step())),
                 "picture.page_size" => self.open_page_size(),
                 "picture.show_page" => self.open_show_page(),
                 "picture.load" => self.open_file_requester(FileKind::LoadPicture),
@@ -1134,23 +1177,34 @@ impl eframe::App for PainterApp {
             self.window = Some(window);
             self.dirty = true;
         }
+        let (free, monitor, now) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false),
+                v.monitor_size,
+                i.time,
+            )
+        });
+        self.free = free;
+        self.monitor = monitor;
+        if let Some(size) = self.snap_window(window.points(), now) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        if self.snap.resized_at.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         self.clamp_scroll();
 
-        // The screen fills the window in whole and half pixel-size steps (ADR-13); each screen
-        // pixel is shown fx×fy times `scale` physical pixels (its shape in this mode). The
-        // paint screen starts at the top-left corner; the rest (less than one UI pixel) stays
-        // dark. The Screen Format requester screen is centred.
+        // The screen at its pixel size (whole and half steps, ADR-13), centred; each screen
+        // pixel is shown fx×fy times `scale` physical pixels (its shape in this mode). When
+        // the window has snapped, the screen fills it exactly; otherwise the rest is dark.
         let (view, scale) = self.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
-        let origin_px = if self.requester.is_some() {
-            egui::vec2(
-                ((window.w - img_w) / 2) as f32,
-                ((window.h - img_h) / 2) as f32,
-            )
-        } else {
-            egui::Vec2::ZERO
-        };
+        let origin_px = egui::vec2(
+            ((window.w - img_w) / 2) as f32,
+            ((window.h - img_h) / 2) as f32,
+        );
         let origin = area.min + origin_px / ppp;
         let rect = egui::Rect::from_min_size(origin, egui::vec2(img_w as f32, img_h as f32) / ppp);
 
@@ -1312,8 +1366,9 @@ impl eframe::App for PainterApp {
 }
 
 impl PainterApp {
-    /// DeluxePainter window keys (ADR-13): Cmd/Ctrl + `+` / `−` / `0` change the pixel size
-    /// (bigger, smaller, Auto); Ctrl+Cmd+F (macOS) or F11 switch full screen.
+    /// DeluxePainter window keys (ADR-13): Cmd/Ctrl + `+` / `−` change the pixel size by half a
+    /// step, Cmd/Ctrl + `0` picks the largest that fits on the monitor; Ctrl+Cmd+F (macOS) or
+    /// F11 switch full screen.
     fn window_keys(&mut self, ctx: &egui::Context) {
         let (bigger, smaller, auto, full) = ctx.input(|i| {
             let cmd = i.modifiers.command && !i.modifiers.alt;
@@ -1332,7 +1387,7 @@ impl PainterApp {
             self.step_pixel_size(-1);
         }
         if auto {
-            self.set_pixel_size(PixelSize::Auto);
+            self.set_pixel_size(PixelSize(self.largest_step()));
         }
         if full {
             let now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -1914,141 +1969,102 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_fills_the_window_in_whole_and_half_steps() {
-        use dpx_core::{Resolution, Video};
-        let pal = Target::default();
-        let retina = |w, h| Window { w, h, ppp: 2.0 };
-        let plain = |w, h| Window { w, h, ppp: 1.0 };
-        let fill = |t: Target, size, win| {
-            let (v, scale) = View::fill_window(t, size, win);
-            ((v.screen_w, v.screen_h), scale)
-        };
-        // Auto: the largest step that shows the whole 320x256 screen; the rest of the window
-        // (less than a step) shows more screen at the same step.
+    fn pixel_size_steps_fit_and_window_sizes() {
+        let v = egui::vec2;
+        let lores = (320, 256);
+        // The largest whole or half step that fits: 960x768 is 3x, 1120x896 3.5x.
+        assert_eq!(fit_step(v(960.0, 768.0), lores), 6);
+        assert_eq!(fit_step(v(1119.0, 900.0), lores), 6);
+        assert_eq!(fit_step(v(1120.0, 896.0), lores), 7);
         assert_eq!(
-            fill(pal, PixelSize::Auto, retina(1920, 1536)),
-            ((320, 256), 6.0)
+            fit_step(v(2560.0, 1340.0), lores),
+            10,
+            "5x on a 1440-line monitor"
         );
-        assert_eq!(
-            fill(pal, PixelSize::Auto, retina(2800, 1536)),
-            ((466, 256), 6.0)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Auto, retina(1925, 1540)),
-            ((320, 256), 6.0)
-        );
-        // On a 1x display the steps are 3x, 3.5x, 4x …; a half step makes uneven pixels, and
-        // the screen then has an even width/height so its edge falls on a device pixel.
-        assert_eq!(
-            fill(pal, PixelSize::Auto, plain(960, 768)),
-            ((320, 256), 3.0)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Auto, plain(1120, 896)),
-            ((320, 256), 3.5)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Auto, plain(1121, 900)),
-            ((320, 256), 3.5)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Auto, plain(1100, 896)),
-            ((366, 298), 3.0)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Auto, plain(1280, 1024)),
-            ((320, 256), 4.0)
-        );
-        // Fixed(h): one UI pixel is h half points (Fixed(4) = 2x = 4 physical pixels on Retina).
-        assert_eq!(
-            fill(pal, PixelSize::Fixed(4), retina(1920, 1536)),
-            ((480, 384), 4.0)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Fixed(5), plain(1000, 800)),
-            ((400, 320), 2.5)
-        );
-        // HiRes keeps LoRes-sized UI pixels: 2 screen pixels wide, 1 line tall shown twice.
-        let hi = Target::new(
-            dpx_core::Chipset::Aga,
-            DisplayMode::new(Video::Pal, Resolution::Hi, false),
-        );
-        assert_eq!(
-            fill(hi, PixelSize::Auto, retina(1920, 1536)),
-            ((640, 256), 3.0)
-        );
-        assert_eq!(
-            fill(hi, PixelSize::Fixed(6), retina(1920, 1536)),
-            ((640, 256), 3.0)
-        );
-        assert_eq!(
-            fill(hi, PixelSize::Fixed(4), retina(1921, 1537)),
-            ((960, 384), 2.0)
-        );
-        assert_eq!(
-            fill(hi, PixelSize::Auto, plain(1120, 896)),
-            ((640, 256), 1.75)
-        );
-        // Too big for the window: limited so the interface keeps 320x200 UI pixels; a window
-        // smaller than that still gets 320x200 at 1x (it is cut off, as before).
-        assert_eq!(
-            fill(pal, PixelSize::Fixed(16), retina(1920, 1536)),
-            ((320, 256), 6.0)
-        );
-        assert_eq!(
-            fill(pal, PixelSize::Fixed(2), retina(300, 150)),
-            ((320, 200), 2.0)
-        );
-        // The inverse gives the size in half points.
-        let (v, scale) = View::fill_window(pal, PixelSize::Auto, retina(1920, 1536));
-        assert_eq!(v.half_points(scale, 2.0), 6);
-        let (v, scale) = View::fill_window(hi, PixelSize::Auto, plain(1120, 896));
-        assert_eq!(v.half_points(scale, 1.0), 7);
+        assert_eq!(fit_step(v(100.0, 100.0), lores), 2, "never below 1x");
+        assert_eq!(fit_step(v(9999.0, 9999.0), lores), 16, "never above 8x");
+        // After a resize the nearest step wins; the smaller axis decides.
+        assert_eq!(nearest_step(v(1100.0, 850.0), lores), 7);
+        assert_eq!(nearest_step(v(1000.0, 790.0), lores), 6);
+        assert_eq!(nearest_step(v(2000.0, 790.0), lores), 6);
+        // The window for a step; overscan screens get half-point sizes at half steps.
+        assert_eq!(window_size(lores, 7), v(1120.0, 896.0));
+        assert_eq!(window_size((368, 283), 5), v(920.0, 707.5));
+        assert_eq!(View::of(DisplayMode::PAL_LORES).ui_size(), lores);
     }
 
     #[test]
-    fn pixel_size_changes_the_view_and_the_page_shows_on_a_pattern() {
-        let ctx = egui::Context::default();
+    fn the_window_snaps_to_the_screen_at_the_pixel_size() {
+        use dpx_core::{Resolution, Video};
+        let v = egui::vec2;
         let mut app = PainterApp::new();
+        let plain = |w: f32, h: f32| Window {
+            w: w as i32,
+            h: h as i32,
+            ppp: 1.0,
+        };
+        // The start window is 3x: nothing to do.
+        app.monitor = Some(v(2560.0, 1440.0));
+        assert_eq!(app.ui.pixel_size, PixelSize(6));
+        assert_eq!(app.snap_window(v(960.0, 768.0), 0.0), None);
+        // The user drags to 1100x850: wait until the size settles, then snap to 3.5x.
+        assert_eq!(app.snap_window(v(1100.0, 850.0), 1.0), None);
+        assert_eq!(app.snap_window(v(1100.0, 850.0), 1.1), None);
         assert_eq!(
-            app.view().screen_w,
-            320,
-            "no window yet: the picture's screen"
+            app.snap_window(v(1100.0, 850.0), 1.3),
+            Some(v(1120.0, 896.0))
         );
-        app.window = Some(Window {
-            w: 1920,
-            h: 1536,
-            ppp: 2.0,
-        });
-        assert_eq!(app.layout(), (View::of(DisplayMode::PAL_LORES), 6.0));
-        // Smaller pixels show more screen; the 320x256 page stays top-left on the pattern.
-        app.run_action(Action::PixelSize(PixelSize::Fixed(4)), &ctx);
-        assert_eq!(app.ui.pixel_size, PixelSize::Fixed(4));
-        let (view, scale) = app.layout();
-        assert_eq!(((view.screen_w, view.screen_h), scale), ((480, 384), 4.0));
-        let screen = view.compose(app.page(), app.scroll, app.palette(), &app.ui);
-        let pens = Pens::from_palette(app.palette());
-        assert_eq!(
-            screen.get(12, 300),
-            Some(pens.face),
-            "pattern dot below the page"
-        );
-        assert_eq!(screen.get(13, 300), Some(pens.dark));
-        assert_eq!(screen.get(10, 100), Some(app.page().get(10, 100).unwrap()));
-        // Nothing to scroll: the page is smaller than the screen.
-        app.scroll_to(50, 50);
-        assert_eq!(app.scroll, (0, 0));
-        // Half steps from the size shown now; Auto again.
+        assert_eq!(app.ui.pixel_size, PixelSize(7));
+        // While the window has not followed yet, the screen is centred at the step that fits.
+        app.window = Some(plain(1100.0, 850.0));
+        assert_eq!(app.layout(), (View::of(DisplayMode::PAL_LORES), 3.0));
+        assert_eq!(app.snap_window(v(1100.0, 850.0), 1.4), None, "asked once");
+        // Our own size arrives: no new resize; the screen fills the window at 3.5x.
+        assert_eq!(app.snap_window(v(1120.0, 896.0), 1.5), None);
+        assert_eq!(app.snap.resized_at, None);
+        app.window = Some(plain(1120.0, 896.0));
+        assert_eq!(app.layout().1, 3.5);
+        // Keys: half a step; Cmd+0 = the largest that fits on the monitor (5x on 2560x1440).
         app.step_pixel_size(1);
-        assert_eq!(app.ui.pixel_size, PixelSize::Fixed(5));
-        app.step_pixel_size(-1);
-        app.step_pixel_size(-1);
-        assert_eq!(app.ui.pixel_size, PixelSize::Fixed(3));
-        app.step_pixel_size(-1);
-        app.step_pixel_size(-1);
-        assert_eq!(app.ui.pixel_size, PixelSize::Fixed(2), "1x is the smallest");
-        app.set_pixel_size(PixelSize::Auto);
-        assert_eq!(app.layout().1, 6.0);
+        assert_eq!(app.ui.pixel_size, PixelSize(8));
+        assert_eq!(
+            app.snap_window(v(1120.0, 896.0), 2.0),
+            Some(v(1280.0, 1024.0))
+        );
+        app.run_action(
+            Action::Command("view.largest_pixel_size"),
+            &egui::Context::default(),
+        );
+        assert_eq!(app.ui.pixel_size, PixelSize(10));
+        app.run_action(Action::PixelSize(PixelSize(16)), &egui::Context::default());
+        assert_eq!(app.ui.pixel_size, PixelSize(10), "limited by the monitor");
+        app.step_pixel_size(-9);
+        assert_eq!(app.ui.pixel_size, PixelSize(2), "1x is the smallest");
+        // A new screen (HiRes overscan) keeps the pixel size and resizes the window.
+        app.set_pixel_size(PixelSize(6));
+        let hi = Target::new(
+            dpx_core::Chipset::Aga,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        )
+        .with_screen(736, 283);
+        app.run(Command::SetFormat {
+            mode: hi.mode,
+            colors: 32,
+            width: 736,
+            height: 283,
+            retain: false,
+            screen: Some(hi.screen),
+        });
+        assert_eq!(app.engine.document().target().screen, (736, 283));
+        let got = app.snap_window(v(1280.0, 1024.0), 3.0);
+        assert_eq!(got, Some(v(1104.0, 849.0)), "368x283 UI pixels at 3x");
+        // Full screen: no snapping; the screen is centred at the largest step that fits.
+        app.free = true;
+        app.window = Some(plain(2560.0, 1440.0));
+        assert_eq!(app.snap_window(v(2560.0, 1440.0), 4.0), None);
+        let (view, scale) = app.layout();
+        assert_eq!(view.ui_size(), (368, 283));
+        assert_eq!(scale, 2.5, "5x for UI pixels of two HiRes pixels");
     }
 
     #[test]

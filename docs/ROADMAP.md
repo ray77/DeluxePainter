@@ -16,7 +16,7 @@ Vertical slices: every phase ends with a runnable build, automated tests and rea
 
 ## Open owner decisions
 
-1. ~~**UI layout**~~ — decided: C (extended work area) by default, A (classic fixed screen) as preference. See [design/README.md](design/README.md).
+1. ~~**UI layout**~~ — decided: C (extended work area) by default, A (classic fixed screen) as preference. See [design/README.md](design/README.md). Revised 2026-11-10 after trying C: the window snaps to the picture's screen in whole and half pixel-size steps (ADR-13).
 2. ~~**Rust toolchain**~~ — decided: rustup, Rust 1.99.1 pinned in `rust-toolchain.toml`; eframe/egui 0.37.
 
 ## Phase 2 status (started 2026-11-10, before Phase 1 was finished, on owner request)
@@ -35,7 +35,7 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 
 - Notes after Load/Save (ADR-12): whatever was not kept, reduced, scaled or cannot be stored is listed in a "Picture loaded" / "Picture saved" requester with Ok (also after `--open`), not only on stderr. Verified by tests and a snapshot.
 
-- The screen fills the window (layout C, ADR-13, owner request): no black bars; whole and half pixel-size steps (Prefs ▸ Pixel Size Auto or 1x–8x in half steps, Cmd/Ctrl +/−/0); a dark pattern beyond the page; full screen with Ctrl+Cmd+F / F11. Verified by tests and snapshots; resizing, keys and full screen not tried by hand.
+- Window scaling (ADR-13, owner request): the window snaps to the picture's screen in whole and half pixel-size steps (1x–8x), so the picture fills it without bars; Prefs ▸ Pixel Size and Cmd/Ctrl +/−/0; full screen (Ctrl+Cmd+F / F11) centres the screen at the largest step. Verified by tests; dragging, keys and full screen not tried by hand.
 
 Next in Phase 2:
 1. Error diagnostics for broken files; more golden fixtures.

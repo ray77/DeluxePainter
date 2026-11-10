@@ -122,7 +122,7 @@ impl Default for UiState {
             title_visible: true,
             coords: None,
             prefs: Prefs::default(),
-            pixel_size: PixelSize::Auto,
+            pixel_size: PixelSize::default(),
             menu: MenuState::default(),
             file_requester: None,
             page_size_requester: None,
@@ -518,8 +518,8 @@ mod tests {
     }
 
     #[test]
-    fn pixel_size_defaults_to_auto() {
-        assert_eq!(UiState::default().pixel_size, PixelSize::Auto);
+    fn pixel_size_defaults_to_3x() {
+        assert_eq!(UiState::default().pixel_size, PixelSize(6), "3x");
     }
 
     #[test]
