@@ -21,6 +21,7 @@ Implementation:
 | `dark` | black | text, icons, outlines, bevel shadow |
 | `shine` | white | bevel highlight |
 | `select` | Amiga blue (≈ #0055AA) | highlighted menu item / selected toggle |
+| `ghost` (optional) | grey 60 % from `dark` to `face` (≈ #666666) | text of disabled items; only if the palette has a close grey, else checkerboard fallback |
 
 - Each pen = palette entry nearest to its ideal colour (perceptual distance, deterministic tie-break by lowest index). Recomputed on every palette change.
 - If two pens collapse onto the same entry, fall back so that text stays readable (`dark` must differ from `face`; then `shine` may equal `face`).
@@ -31,7 +32,7 @@ Implementation:
 | Element | Reference | Notes |
 |---|---|---|
 | Title bar | Wikipedia LoRes shot, `inapp_gfx_03`, `Inapp_gfx_02` | `face` background, text **"DeluxePainter"** + two spaces + paint mode name, depth gadget at the right, `dark` line beneath. Becomes the menu strip while the right mouse button is held. The original shows its own product name here; DeluxePainter always shows its own name (owner directive 2026-11-09: never "DeluxePaint" in the GUI — trademark). |
-| Menus | `inapp_gfx_03` | Intuition style: `face` box with `dark` border, highlighted item filled in `select` with `shine` text, Right-Amiga shortcuts as key glyph + letter, plain-key shortcuts in `select`, `▸` for submenus, check marks in Mode/Prefs, ghosted items for unavailable entries. Geometry in §4. |
+| Menus | `inapp_gfx_03` | Intuition style: `face` box with `dark` border, highlighted item filled in `select` with `shine` text, Right-Amiga shortcuts as key glyph + letter, plain-key shortcuts in `select`, `▸` for submenus, check marks in Mode/Prefs, ghosted items for unavailable entries (solid `ghost` pen, see §4). Geometry in §4. |
 | Toolbox | all screenshots, manual §1.4 | Right edge, 2 columns, built-in brush block on top, 10 tool rows, then colour indicator bar, then palette. Buttons: `face` fill, `shine` top/left edge, `dark` gaps/shadow, `dark` icons; selected tool inverted. LoRes width 24 px (to calibrate). |
 | Palette | screenshots | Columns of colour cells below the indicator; column count depends on number of colours; AGA page selector `◂ a ▸` for >64 colours. |
 | Requesters | `Inapp_gfx_04/05`, `Choose_Setup` | `face` panel, 2-px `shine`/`dark` bevels, centred title, bevelled rectangular buttons, numeric fields, selected toggles in `select`. Square corners only. |
@@ -72,9 +73,10 @@ Measured on `inapp_gfx_03` (Picture menu open, "Load.." highlighted).
 | Shortcut column | letter at `box_x + box_w − 12`; Right-Amiga glyph 14×8 at letter − 17; plain keys (e.g. `S`, `Q`) in `select`; submenu triangle 4×7 at letter + 3 |
 | Box width | widest item: text + 8 + shortcut column, or text + 10 without shortcut (reference: "Screen Format.." + 10) |
 
-Not visible in the references, therefore chosen and **to calibrate**: check-mark indent (13 px, Intuition LOWCHECKWIDTH), ghost pattern for disabled items (Intuition 0x2222/0x8888 in `face`), submenu position (right of the parent with 4 px overlap, first sub item level with its parent item; flipped to the left at the screen edge), which shortcuts are displayed inside submenus.
+Not visible in the references, therefore chosen and **to calibrate**: check-mark indent (13 px, Intuition LOWCHECKWIDTH), submenu position (right of the parent with 4 px overlap, first sub item level with its parent item; flipped to the left at the screen edge), which shortcuts are displayed inside submenus.
 
 Known deviations:
+- Disabled items are drawn in a solid `ghost` pen instead of Intuition's 1-in-4 dot pattern (0x2222/0x8888), which tore the 2-px strokes of our font (owner decision 2026-11-10). The ghost pen is the palette entry closest to a grey 60 % of the way from `dark` to `face`; if the palette has no such grey, the item is thinned with a 50 % `face` checkerboard instead. No reference shows how DeluxePaint itself ghosts items.
 - Our font is about 1 px per glyph wider than the original screen font, so menus are wider than in the reference (Picture box 123 instead of 112 px) and title slots use text + 6 instead of text + 8 so that all seven titles fit into 320 px. Owner decision (2026-11-10): keep the current font; the wider menus are accepted.
 - The Right-Amiga key glyph is an original drawing (an "A" cut out of a key cap), not a copy of the system imagery.
 - Color ▸ BG -> FG and BG <-> FG are undoable in DeluxePainter (not in DeluxePaint).

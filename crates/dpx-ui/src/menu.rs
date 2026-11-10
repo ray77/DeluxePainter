@@ -841,7 +841,11 @@ fn draw_box(
                 pens.select,
             );
         }
-        let ink = if lit { pens.shine } else { pens.dark };
+        let ink = match (enabled, lit) {
+            (false, _) => pens.ghost.unwrap_or(pens.dark),
+            (true, true) => pens.shine,
+            (true, false) => pens.dark,
+        };
         if item.action().and_then(|a| a.checked(ctx)) == Some(true) {
             font.draw_code(img, b.x + geom::TEXT_DX, ty, glyph::CHECK, ink);
         }
@@ -856,23 +860,28 @@ fn draw_box(
             }
             (_, Key::Plain(k)) => {
                 let x = key_x.min(b.x + b.w - 4 - font.text_width(k));
-                font.draw(img, x, ty, k, if lit { pens.shine } else { pens.select });
+                let key_ink = match (enabled, lit) {
+                    (false, _) => ink,
+                    (true, true) => pens.shine,
+                    (true, false) => pens.select,
+                };
+                font.draw(img, x, ty, k, key_ink);
             }
             (_, Key::None) => {}
         }
-        if !enabled {
-            ghost(img, b, top, pens.face);
+        if !enabled && pens.ghost.is_none() {
+            checker_ghost(img, b, top, pens.face);
         }
     }
 }
 
-/// Intuition-style ghosting of a disabled item: a sparse `face` pattern laid over it
-/// (pattern 0x2222 / 0x8888; to calibrate).
-fn ghost(img: &mut IndexedImage, b: &BoxLayout, top: i32, face: u8) {
+/// Fallback ghosting when the palette has no usable grey: a 50 % `face` checkerboard laid
+/// over the disabled item (owner decision 2026-11-10; replaces the Intuition 1-in-4 dots,
+/// which tore the 2-px strokes of our font).
+fn checker_ghost(img: &mut IndexedImage, b: &BoxLayout, top: i32, face: u8) {
     for y in top..top + geom::ITEM_H {
-        let phase = if y % 2 == 0 { 2 } else { 0 };
         for x in b.x + geom::BORDER_X..b.x + b.w - geom::BORDER_X {
-            if x.rem_euclid(4) == phase {
+            if (x + y).rem_euclid(2) == 0 {
                 img.set(x, y, face);
             }
         }
@@ -973,6 +982,39 @@ mod tests {
         assert_eq!(Action::Mode(PaintMode::Color).checked(&ctx()), Some(true));
         assert_eq!(Action::Pref(Pref::Coords).checked(&ctx()), Some(false));
         assert_eq!(Action::Pref(Pref::BeSquare).checked(&ctx()), Some(true));
+    }
+
+    #[test]
+    fn ghosted_item_uses_ghost_pen_or_checkerboard() {
+        let mode = MENUS.iter().position(|m| m.title == "Mode").unwrap();
+        let items = MENUS[mode].items;
+        let hbrite = items.iter().position(|i| i.label == "HBrite").unwrap();
+        let no_grey = Palette::from_rgb4(&[0x000, 0xAAA, 0x05A, 0xFFF]).unwrap();
+        for (pal, has_grey) in [(Palette::dpaint_default_32(), true), (no_grey, false)] {
+            let pens = Pens::from_palette(&pal);
+            assert_eq!(pens.ghost.is_some(), has_grey);
+            let mut img = IndexedImage::new(320, 256, pens.dark);
+            let b = menu_box(mode, 320, 256);
+            draw_box(&mut img, &pens, &ctx(), &b, items, None);
+            let top = b.item_top(hbrite);
+            let ink: Vec<(i32, i32, u8)> = (top..top + geom::ITEM_H)
+                .flat_map(|y| {
+                    (b.x + geom::BORDER_X..b.x + b.w - geom::BORDER_X).map(move |x| (x, y))
+                })
+                .map(|(x, y)| (x, y, img.get(x, y).unwrap()))
+                .filter(|&(_, _, c)| c != pens.face)
+                .collect();
+            assert!(!ink.is_empty(), "label is drawn");
+            match pens.ghost {
+                // Solid label in the ghost pen.
+                Some(g) => assert!(ink.iter().all(|&(_, _, c)| c == g)),
+                // Dark label thinned by the checkerboard.
+                None => assert!(
+                    ink.iter()
+                        .all(|&(x, y, c)| c == pens.dark && (x + y).rem_euclid(2) == 1)
+                ),
+            }
+        }
     }
 
     #[test]
