@@ -568,6 +568,9 @@ fn app_icon() -> egui::IconData {
     }
 }
 
+// Wave 2 foundation: custom brush and stencil fields are wired up by the tools, Brush menu and
+// Stencil requester work (ADR-18).
+#[allow(dead_code)]
 struct PainterApp {
     /// The document; every change goes through its command engine.
     engine: Engine,
@@ -608,6 +611,12 @@ struct PainterApp {
     /// The monitor's size in points, if known.
     monitor: Option<egui::Vec2>,
     snap: Snap,
+    /// The custom brush (Brush Selector); `None` paints with the toolbox's built-in brush.
+    custom_brush: Option<dpx_core::BrushImage>,
+    /// The brush as picked up, for Brush ▸ Restore after transforms.
+    picked_brush: Option<dpx_core::BrushImage>,
+    /// Effect ▸ Stencil: `stencil[c]` protects colour `c` from painting; `None` = off.
+    stencil: Option<Vec<bool>>,
 }
 
 impl PainterApp {
@@ -636,6 +645,9 @@ impl PainterApp {
             free: false,
             monitor: None,
             snap: Snap::default(),
+            custom_brush: None,
+            picked_brush: None,
+            stencil: None,
         }
     }
 
