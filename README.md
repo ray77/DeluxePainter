@@ -108,6 +108,10 @@ Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu 
 }
 ```
 
+## Project files (.dpxproj)
+
+The lossless project format is a ZIP with a JSON manifest and one indexed PNG per layer; see [`docs/PROJECT_FORMAT.md`](docs/PROJECT_FORMAT.md). On the command line, `deluxepainter info x.dpxproj` describes a project and `deluxepainter convert a.iff b.dpxproj` (and back) converts. Wiring it into the Save and Export menus is still to do.
+
 ## License
 
 Copyright © 2026 Dominik Schmidt. DeluxePainter is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You may use, modify and share it for any **noncommercial** purpose. Commercial use requires a separate license from the author.
