@@ -1,7 +1,8 @@
 //! The command engine: validates and applies [`Command`]s, keeps the revision counter and a
 //! multi-level undo/redo history (ADR-2, Phase 1 implementation: see ADR-6).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::command::{Command, CommandError, ErrorCode, Footprint};
 use crate::document::Document;
@@ -46,9 +47,71 @@ pub struct Outcome {
 /// What an undo step restores.
 #[derive(Clone, Debug)]
 enum Before {
-    Pixels { rect: Rect, pixels: IndexedImage },
+    Pixels {
+        rect: Rect,
+        pixels: IndexedImage,
+    },
     Palette(Palette),
     Document(Box<Document>),
+    /// Arrange Palette: the order that arranges the palette and every frame back. Exact, and
+    /// no copy of the frames is kept.
+    Arranged(Vec<u8>),
+}
+
+impl Before {
+    /// Bytes this snapshot keeps alive besides `doc`, the document after the command: pixel
+    /// copies, and the frames of a document snapshot that `doc` no longer shares (each frame
+    /// buffer counted once).
+    fn bytes(&self, doc: &Document) -> u64 {
+        match self {
+            Before::Pixels { pixels, .. } => pixels.pixels().len() as u64,
+            Before::Palette(p) => 3 * p.len() as u64,
+            Before::Arranged(order) => order.len() as u64,
+            Before::Document(snapshot) => {
+                let mut seen: HashSet<*const IndexedImage> =
+                    doc.others.iter().map(Arc::as_ptr).collect();
+                let frames: u64 = snapshot
+                    .others
+                    .iter()
+                    .filter(|f| seen.insert(Arc::as_ptr(f)))
+                    .map(|f| f.pixels().len() as u64)
+                    .sum();
+                snapshot.page.pixels().len() as u64 + frames
+            }
+        }
+    }
+}
+
+/// Bytes of a command's own data (pixels, points, brushes) that its undo step keeps.
+fn command_bytes(command: &Command) -> u64 {
+    let custom = |b: &Option<crate::BrushImage>| b.as_ref().map_or(0, |b| b.pixels.len() as u64);
+    let points = |n: usize| 8 * n as u64;
+    match command {
+        Command::Stroke {
+            brush,
+            points: p,
+            custom: c,
+            ..
+        } => points(brush.len() + p.len()) + custom(c),
+        Command::Shape {
+            shape,
+            brush,
+            custom: c,
+            ..
+        } => {
+            let n = match shape {
+                crate::Shape::Polygon { points, .. } | crate::Shape::Dots { points } => {
+                    points.len()
+                }
+                _ => 0,
+            };
+            points(brush.len() + n) + custom(c)
+        }
+        Command::SetPage { pixels, .. } | Command::MergePage { pixels, .. } => pixels.len() as u64,
+        Command::SetPalette { colors } => 3 * colors.len() as u64,
+        Command::ArrangePalette { order } => order.len() as u64,
+        _ => 0,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +120,8 @@ struct Step {
     before: Before,
     /// The current frame when the command ran (ADR-28): undo and redo go back to it.
     frame: usize,
+    /// Memory this step keeps (its snapshot and its command's data), for the byte budget.
+    bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -67,22 +132,40 @@ pub struct Engine {
     /// deterministic).
     redo: Vec<(Command, usize)>,
     undo_limit: usize,
+    /// Most bytes the undo steps may keep together; beyond it the oldest steps are dropped.
+    undo_byte_limit: u64,
+    /// Bytes the undo steps keep now (the sum of their `bytes`).
+    undo_bytes: u64,
 }
 
 impl Engine {
     pub const DEFAULT_UNDO_LIMIT: usize = 64;
+    /// Most memory the undo history keeps by default: twice the frame limit of ADR-28
+    /// ([`crate::anim::MAX_FRAME_BYTES`]). Undo steps that copy whole animations (Page Size,
+    /// Screen Format) would otherwise multiply that limit by the 64 steps.
+    pub const DEFAULT_UNDO_BYTES: u64 = 2 * crate::anim::MAX_FRAME_BYTES;
 
     pub fn new(doc: Document) -> Self {
         Self::with_undo_limit(doc, Self::DEFAULT_UNDO_LIMIT)
     }
 
-    /// `limit` = number of undo steps kept (at least 1); the oldest steps are dropped.
+    /// `limit` = number of undo steps kept (at least 1); the oldest steps are dropped. The
+    /// byte budget is [`Self::DEFAULT_UNDO_BYTES`].
     pub fn with_undo_limit(doc: Document, limit: usize) -> Self {
+        Self::with_undo_budget(doc, limit, Self::DEFAULT_UNDO_BYTES)
+    }
+
+    /// `steps` = number of undo steps kept (at least 1), `bytes` = most memory they may keep
+    /// together (snapshots and command data). The oldest steps are dropped first; the most
+    /// recent step always stays, so the last command can be undone.
+    pub fn with_undo_budget(doc: Document, steps: usize, bytes: u64) -> Self {
         Self {
             doc,
             undo: VecDeque::new(),
             redo: Vec::new(),
-            undo_limit: limit.max(1),
+            undo_limit: steps.max(1),
+            undo_byte_limit: bytes,
+            undo_bytes: 0,
         }
     }
 
@@ -125,16 +208,19 @@ impl Engine {
             return Ok(self.outcome(footprint));
         }
         self.redo.clear();
-        Ok(self.commit(request.command, footprint))
+        self.commit(request.command, footprint);
+        Ok(self.outcome(footprint))
     }
 
     /// Reverts the most recent step. A pixel step of another frame makes that frame current
-    /// first, so the change shows (ADR-28).
+    /// first, so the change shows (ADR-28); the outcome then names the whole page.
     pub fn undo(&mut self) -> Result<Outcome, CommandError> {
         let step = self
             .undo
             .pop_back()
             .ok_or_else(|| CommandError::new(ErrorCode::NothingToUndo, "nothing to undo"))?;
+        self.undo_bytes -= step.bytes;
+        let switched = step.frame != self.doc.current;
         let footprint = match step.before {
             Before::Pixels { rect, pixels } => {
                 self.doc.go_to(step.frame);
@@ -153,13 +239,20 @@ impl Engine {
                 self.doc.fps = fps;
                 Footprint::Document
             }
+            Before::Arranged(order) => {
+                // Back on its frame, as a document snapshot would be.
+                self.doc.go_to(step.frame);
+                Command::ArrangePalette { order }.apply(&mut self.doc);
+                Footprint::Document
+            }
         };
         self.redo.push((step.command, step.frame));
         self.doc.revision += 1;
-        Ok(self.outcome(footprint))
+        Ok(self.outcome_on(footprint, switched))
     }
 
-    /// Re-applies the most recently undone command, on the frame it first ran on.
+    /// Re-applies the most recently undone command, on the frame it first ran on (the
+    /// outcome names the whole page when that frame was not current).
     pub fn redo(&mut self) -> Result<Outcome, CommandError> {
         let (command, frame) = self
             .redo
@@ -167,36 +260,59 @@ impl Engine {
             .ok_or_else(|| CommandError::new(ErrorCode::NothingToRedo, "nothing to redo"))?;
         // The document is back in the state the command was first validated against (only
         // the current frame may differ: settings keep the redo list).
+        let switched = frame != self.doc.current;
         self.doc.go_to(frame);
         command.validate(&self.doc)?;
         let footprint = command.footprint(&self.doc);
-        Ok(self.commit(command, footprint))
+        self.commit(command, footprint);
+        Ok(self.outcome_on(footprint, switched))
     }
 
-    fn commit(&mut self, command: Command, footprint: Footprint) -> Outcome {
-        let before = match footprint {
-            Footprint::Pixels(rect) => Before::Pixels {
+    /// Applies a validated command as a new undo step.
+    fn commit(&mut self, command: Command, footprint: Footprint) {
+        let before = match (&command, footprint) {
+            (Command::ArrangePalette { order }, _) => {
+                Before::Arranged(crate::remap::inverse(order)[..order.len()].to_vec())
+            }
+            (_, Footprint::Pixels(rect)) => Before::Pixels {
                 rect,
                 pixels: self.doc.page.crop(rect),
             },
-            Footprint::Palette => Before::Palette(self.doc.palette.clone()),
+            (_, Footprint::Palette) => Before::Palette(self.doc.palette.clone()),
             // Other frames are shared, not copied (Arc).
-            Footprint::Document | Footprint::Frames | Footprint::Setting => {
+            (_, Footprint::Document | Footprint::Frames | Footprint::Setting) => {
                 Before::Document(Box::new(self.doc.clone()))
             }
         };
         let frame = self.doc.current;
         command.apply(&mut self.doc);
-        if self.undo.len() == self.undo_limit {
-            self.undo.pop_front();
-        }
+        let bytes = before.bytes(&self.doc) + command_bytes(&command);
         self.undo.push_back(Step {
             command,
             before,
             frame,
+            bytes,
         });
+        self.undo_bytes += bytes;
+        // The oldest steps go beyond the step limit or the byte budget; the newest stays.
+        while self.undo.len() > self.undo_limit
+            || (self.undo_bytes > self.undo_byte_limit && self.undo.len() > 1)
+        {
+            if let Some(old) = self.undo.pop_front() {
+                self.undo_bytes -= old.bytes;
+            }
+        }
         self.doc.revision += 1;
-        self.outcome(footprint)
+    }
+
+    /// [`Self::outcome`] after undo or redo; `switched`: another frame became current, so the
+    /// whole page shows something else.
+    fn outcome_on(&self, footprint: Footprint, switched: bool) -> Outcome {
+        let mut out = self.outcome(footprint);
+        if switched {
+            out.affected = Some(self.doc.page.bounds());
+        }
+        out
     }
 
     fn outcome(&self, footprint: Footprint) -> Outcome {
@@ -1127,8 +1243,9 @@ mod tests {
             ),
             (
                 with(&|b| {
-                    b.width = 2000;
-                    b.pixels = vec![1; 2000 * 2];
+                    // One limit for every brush (shared with brush_ops).
+                    b.width = crate::command::MAX_BRUSH_SIDE + 1;
+                    b.pixels = vec![1; b.width as usize * 2];
                 }),
                 ErrorCode::InvalidArgument,
             ),
@@ -1141,5 +1258,386 @@ mod tests {
             assert_eq!(e.execute(cmd.clone()).unwrap_err().code, code, "{cmd:?}");
         }
         assert_eq!(e.document().revision(), 1, "nothing else ran");
+    }
+
+    /// A one-row document of `pixels` (PAL LoRes target, default palette).
+    fn row_engine(pixels: Vec<u8>) -> Engine {
+        let w = pixels.len() as u32;
+        Engine::new(Document::from_picture(
+            IndexedImage::from_pixels(w, 1, pixels).unwrap(),
+            Palette::dpaint_default_32(),
+            crate::Target::default(),
+        ))
+    }
+
+    #[test]
+    fn smear_is_mirror_symmetric() {
+        // Colours 2, 3, ..., 22 in one row; a 5x1 opaque brush with the handle in the middle.
+        let row: Vec<u8> = (2..=22).collect();
+        let brush = BrushImage {
+            width: 5,
+            height: 1,
+            pixels: vec![1; 5],
+            handle: (2, 0),
+            transparent: None,
+        };
+        let smear = |pixels: Vec<u8>, from, to| {
+            let mut e = row_engine(pixels);
+            e.execute(custom_stroke(brush.clone(), DrawMode::Smear, &[from, to]))
+                .unwrap();
+            e.document().page().pixels().to_vec()
+        };
+        // One step to the right moves the colours under the brush one pixel to the right.
+        let right = smear(row.clone(), (10, 0), (11, 0));
+        let mut expect: Vec<u8> = (2..=10).collect();
+        expect.extend([10, 11, 12, 13, 14]);
+        expect.extend(16..=22);
+        assert_eq!(right, expect);
+        // The mirrored picture smeared to the left, mirrored back, is the same.
+        let mut left = smear(row.iter().rev().copied().collect(), (10, 0), (9, 0));
+        left.reverse();
+        assert_eq!(left, right, "the result depends on the direction");
+        // A built-in brush gives the same, whatever the order of its offsets.
+        let offsets: Vec<(i32, i32)> = (-2..=2).map(|x| (x, 0)).collect();
+        for order in [offsets.clone(), offsets.iter().rev().copied().collect()] {
+            let mut e = row_engine(row.clone());
+            let mut cmd = stroke(3, &[(10, 0), (11, 0)]);
+            if let Command::Stroke { brush, mode, .. } = &mut cmd {
+                *brush = order.clone();
+                *mode = DrawMode::Smear;
+            }
+            e.execute(cmd).unwrap();
+            assert_eq!(e.document().page().pixels(), &right[..], "{order:?}");
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_on_another_frame_report_the_whole_page() {
+        let mut e = Engine::new(Document::new(8, 8, Palette::dpaint_default_32()));
+        e.execute(Command::SetFrameCount { count: 2 }).unwrap();
+        e.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        let painted = e.execute(stroke(5, &[(0, 0)])).unwrap();
+        assert_eq!(painted.affected, Some(Rect::new(0, 0, 2, 2)));
+        e.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        let whole = Some(Rect::new(0, 0, 8, 8));
+        let out = e.undo().unwrap();
+        assert_eq!(e.document().current_frame(), 1);
+        assert_eq!(out.affected, whole, "undo switched frames");
+        e.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        let out = e.redo().unwrap();
+        assert_eq!(e.document().current_frame(), 1);
+        assert_eq!(out.affected, whole, "redo switched frames");
+        // On the step's own frame only its rectangle changes.
+        assert_eq!(e.undo().unwrap().affected, painted.affected);
+        assert_eq!(e.redo().unwrap().affected, painted.affected);
+    }
+
+    #[test]
+    fn brush_transforms_always_give_a_paintable_brush() {
+        use crate::brush_ops;
+        // A 600x4 brush, as picked from a 640-wide HiRes screen.
+        let wide = BrushImage {
+            width: 600,
+            height: 4,
+            pixels: vec![5; 2400],
+            handle: (300, 2),
+            transparent: Some(0),
+        };
+        let doubled = |b: &BrushImage| brush_ops::double(b, true, false);
+        let results = [
+            brush_ops::stretch(&wide, 100_000, 4),
+            brush_ops::stretch(&wide, 4, 100_000),
+            doubled(&wide),
+            doubled(&doubled(&doubled(&doubled(&wide)))),
+            brush_ops::shear(&wide, i32::MAX / 2, 32),
+            brush_ops::shear(&rotate_quarter(&wide), -100_000, 32),
+            brush_ops::bend(&wide, false, 100_000, 1, 32),
+            brush_ops::bend(&rotate_quarter(&wide), true, -100_000, 1, 32),
+            brush_ops::rotate_any(&wide, 45.0, 32),
+            brush_ops::outline(&brush_ops::stretch(&wide, 100_000, 3), 7),
+        ];
+        let mut e = engine();
+        for b in results {
+            let size = (b.width, b.height);
+            e.execute(custom_stroke(b, DrawMode::Matte, &[(3, 3)]))
+                .unwrap_or_else(|err| panic!("{size:?}: {err}"));
+        }
+        // Rotating keeps every pixel (no silent crop).
+        let long = brush_ops::stretch(&wide, 3000, 4);
+        let turned = brush_ops::rotate_any(&long, 90.0, 32);
+        assert_eq!((turned.width, turned.height), (4, 3000));
+    }
+
+    /// Pixel bytes the undo history keeps alive beyond the document itself: snapshot pages,
+    /// rectangles and every frame buffer not shared with the document (counted once).
+    fn held_bytes(e: &Engine) -> u64 {
+        let live: Vec<*const IndexedImage> = e.doc.others.iter().map(Arc::as_ptr).collect();
+        let mut seen = Vec::new();
+        let mut bytes = 0u64;
+        for step in &e.undo {
+            match &step.before {
+                Before::Pixels { pixels, .. } => bytes += pixels.pixels().len() as u64,
+                Before::Document(d) => {
+                    bytes += d.page.pixels().len() as u64;
+                    for f in &d.others {
+                        let p = Arc::as_ptr(f);
+                        if !live.contains(&p) && !seen.contains(&p) {
+                            seen.push(p);
+                            bytes += f.pixels().len() as u64;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn arrange_palette_undo_keeps_no_frame_copies() {
+        let mut e = Engine::new(Document::new(64, 64, Palette::dpaint_default_32()));
+        e.execute(Command::SetFrameCount { count: 200 }).unwrap();
+        let animation = 200 * 64 * 64;
+        let shared = held_bytes(&e);
+        assert!(shared < animation / 10, "frames are shared: {shared}");
+        let mut order: Vec<u8> = (0..32).collect();
+        order.swap(0, 1);
+        for _ in 0..10 {
+            e.execute(Command::ArrangePalette {
+                order: order.clone(),
+            })
+            .unwrap();
+        }
+        let held = held_bytes(&e);
+        assert!(
+            held < animation,
+            "10 arranges keep {held} bytes of an animation of {animation}"
+        );
+        // Every arrange still undoes exactly.
+        for _ in 0..10 {
+            e.undo().unwrap();
+        }
+        assert!(e.document().frames().all(|f| f.get(0, 0) == Some(0)));
+        assert_eq!(e.document().palette(), &Palette::dpaint_default_32());
+    }
+
+    #[test]
+    fn the_undo_history_keeps_a_byte_budget() {
+        assert_eq!(
+            Engine::DEFAULT_UNDO_BYTES,
+            2 * crate::anim::MAX_FRAME_BYTES,
+            "twice the frame limit (ADR-28)"
+        );
+        let page = || IndexedImage::new(320, 256, 0);
+        let doc = Document::from_picture(page(), Palette::dpaint_default_32(), Default::default());
+        // Room for about three whole-animation copies of 10 frames.
+        let animation = 10 * 320 * 256;
+        let mut e = Engine::with_undo_budget(doc, 64, 3 * animation + animation / 2);
+        e.execute(Command::SetFrameCount { count: 10 }).unwrap();
+        let shared = e.undo_bytes;
+        assert!(shared <= 320 * 256, "new frames are shared: {shared}");
+        // Each Page Size gives every frame a new buffer; its step keeps the old ones.
+        for i in 0..10u32 {
+            e.execute(Command::SetPageSize {
+                width: 320,
+                height: 256 + i % 2,
+                fill: 0,
+            })
+            .unwrap();
+            assert_eq!(e.undo_bytes, e.undo.iter().map(|s| s.bytes).sum::<u64>());
+            assert!(e.undo_bytes <= e.undo_byte_limit, "{}", e.undo_bytes);
+            assert!(
+                held_bytes(&e) <= e.undo_bytes,
+                "the count covers what is held"
+            );
+        }
+        assert_eq!(e.undo.len(), 3, "only the newest steps stay");
+        for _ in 0..3 {
+            e.undo().unwrap();
+        }
+        assert_eq!(e.undo().unwrap_err().code, ErrorCode::NothingToUndo);
+        assert_eq!(e.undo_bytes, 0);
+        // The newest step stays even when it alone exceeds the budget.
+        let mut tiny =
+            Engine::with_undo_budget(Document::new(8, 8, Palette::dpaint_default_32()), 64, 1);
+        tiny.execute(Command::Clear { color: 1 }).unwrap();
+        tiny.execute(Command::Clear { color: 2 }).unwrap();
+        assert_eq!(tiny.undo.len(), 1);
+        tiny.undo().unwrap();
+        assert_eq!(tiny.document().page().get(0, 0), Some(1));
+    }
+
+    #[test]
+    fn check_paint_is_the_engine_check_for_page_pixel_commands() {
+        let e = engine();
+        let (page, pal) = (e.document().page(), e.document().palette());
+        assert!(stroke(3, &[(1, 1)]).check_paint(page, pal).is_ok());
+        assert_eq!(
+            stroke(40, &[(1, 1)])
+                .check_paint(page, pal)
+                .unwrap_err()
+                .code,
+            ErrorCode::PaletteRangeInvalid
+        );
+        assert_eq!(
+            Command::Clear { color: 1 }
+                .check_paint(page, pal)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    fn rotate_quarter(b: &BrushImage) -> BrushImage {
+        crate::brush_ops::rotate_90(b)
+    }
+
+    #[test]
+    fn work_far_off_the_page_is_free_and_huge_work_is_refused() {
+        let dry = |e: &mut Engine, command: Command| {
+            e.execute(Request {
+                command,
+                expected_revision: None,
+                dry_run: true,
+            })
+        };
+        // 100 000 points zigzagging far beyond the page (the review's case): every segment
+        // is clipped to the few pixels near the page, so it is cheap and allowed.
+        let far: Vec<(i32, i32)> = (0..100_000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (-1_000_000, -1_000_000)
+                } else {
+                    (1_000_000, 1_000_000)
+                }
+            })
+            .collect();
+        let zigzag = stroke(1, &far);
+        let work = zigzag.paint_work(16, 8, 32);
+        assert!(work < 5_000_000, "{work}");
+        let mut e = engine();
+        e.execute(zigzag).unwrap();
+        assert_eq!(
+            e.document().page().get(5, 5),
+            Some(1),
+            "the diagonal is painted"
+        );
+        // Never near the page: only the points count.
+        let mut beside = far.clone();
+        for p in beside.iter_mut().skip(1).step_by(2) {
+            p.1 = -999_000;
+        }
+        assert_eq!(stroke(1, &beside).paint_work(16, 8, 32), 100_000);
+        // A page-sized custom brush stamped 100 000 times on a big page: refused.
+        let mut e = Engine::new(Document::new(1008, 1024, Palette::dpaint_default_32()));
+        let big = BrushImage {
+            width: 1008,
+            height: 1024,
+            pixels: vec![1; 1008 * 1024],
+            handle: (0, 0),
+            transparent: None,
+        };
+        let mut cmd = custom_stroke(big, DrawMode::Matte, &[(0, 0); 100_000]);
+        if let Command::Stroke { continuous, .. } = &mut cmd {
+            *continuous = false;
+        }
+        assert_eq!(
+            dry(&mut e, cmd).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        // A filled polygon whose 100 000 edges each cross every row of a tall page: refused.
+        let mut e = Engine::new(Document::new(320, 4096, Palette::dpaint_default_32()));
+        let zigzag: Vec<(i32, i32)> = (0..100_000)
+            .map(|i| (i % 320, if i % 2 == 0 { -16_384 } else { 16_384 }))
+            .collect();
+        let poly = shape(
+            crate::Shape::Polygon {
+                points: zigzag,
+                closed: true,
+            },
+            true,
+            None,
+        );
+        assert_eq!(
+            dry(&mut e, poly).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    /// Commands just inside [`crate::command::MAX_PAINT_WORK`] and how long they take. Run in
+    /// a release build: `cargo test --release -p dpx-core -- --ignored --nocapture timing`.
+    #[test]
+    #[ignore = "timing, release build only"]
+    fn timing_of_commands_at_the_work_budget() {
+        use crate::command::MAX_PAINT_WORK;
+        use std::time::Instant;
+        let page = || Engine::new(Document::new(1008, 1024, Palette::dpaint_default_32()));
+        let square: Vec<(i32, i32)> = (0..100 * 100)
+            .map(|i| (i % 100 - 50, i / 100 - 50))
+            .collect();
+        // Back and forth across the page diagonal until the budget is nearly used.
+        let zigzag = |per_stamp: u64| -> Vec<(i32, i32)> {
+            let segments = (MAX_PAINT_WORK / per_stamp / 1025).max(1) as usize;
+            (0..=segments)
+                .map(|i| if i % 2 == 0 { (0, 0) } else { (1007, 1023) })
+                .collect()
+        };
+        let run = |name: &str, cmd: Command| {
+            let mut e = page();
+            let work = cmd.paint_work(1008, 1024, 32);
+            let t = Instant::now();
+            let r = e.execute(cmd);
+            println!(
+                "{name}: work {work} ({:.2} of budget), {:?}, ok={}",
+                work as f64 / MAX_PAINT_WORK as f64,
+                t.elapsed(),
+                r.is_ok()
+            );
+        };
+        for mode in [DrawMode::Matte, DrawMode::Smear, DrawMode::Blend] {
+            let weight = crate::paint::pixel_work(mode, &Default::default(), 32);
+            let mut cmd = stroke(1, &zigzag(weight * square.len() as u64));
+            if let Command::Stroke { brush, mode: m, .. } = &mut cmd {
+                *brush = square.clone();
+                *m = mode;
+            }
+            run(&format!("built-in 100x100 {mode:?}"), cmd);
+            let custom = BrushImage {
+                width: 100,
+                height: 100,
+                pixels: vec![1; 100 * 100],
+                handle: (50, 50),
+                transparent: None,
+            };
+            run(
+                &format!("custom 100x100 {mode:?}"),
+                custom_stroke(custom, mode, &zigzag(weight * 10_000)),
+            );
+        }
+        let edges: Vec<(i32, i32)> = (0..100_000)
+            .map(|i| (i % 1008, if i % 2 == 0 { -16_384 } else { 16_384 }))
+            .collect();
+        let n = (MAX_PAINT_WORK / crate::command::POLYGON_CROSSING_WORK / 1024 * 9 / 10) as usize;
+        run(
+            "filled polygon",
+            shape(
+                crate::Shape::Polygon {
+                    points: edges[..n.min(edges.len())].to_vec(),
+                    closed: true,
+                },
+                true,
+                None,
+            ),
+        );
+        let far: Vec<(i32, i32)> = (0..100_000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (-1_000_000, -1_000_000)
+                } else {
+                    (1_000_000, 1_000_000)
+                }
+            })
+            .collect();
+        run("100 000 points far off the page", stroke(1, &far));
     }
 }

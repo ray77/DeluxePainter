@@ -25,6 +25,21 @@ pub const MAX_BRUSH_OFFSET: i32 = 1_000;
 pub const MAX_COORD: i32 = 1_000_000;
 /// Largest page width or height.
 pub const MAX_PAGE_SIDE: u32 = 4096;
+/// Largest custom brush width or height. One limit for every brush: strokes and shapes
+/// accept it, and the brush operations ([`crate::brush_ops`]) clamp or refuse at it, so a
+/// transformed brush can always be painted. It is the largest page, so every pick-up fits.
+pub const MAX_BRUSH_SIDE: u32 = MAX_PAGE_SIDE;
+/// Most work one Stroke or Shape may cost (validation refuses more), in work units: per
+/// pixel a brush stamp may plot on the page and per pixel of a filled shape's bounding box on
+/// the page [`crate::paint::pixel_work`] units (1 for Matte, about 9 for Blend on 32
+/// colours), plus one unit per path point and per mask pixel, and [`POLYGON_CROSSING_WORK`]
+/// per row crossing of a filled shape's edge. Stamps and rows off the page cost nothing (they
+/// are clipped away). The whole budget takes about 2 to 5 seconds in a release build on the
+/// development machine (`timing_of_commands_at_the_work_budget`); realistic gestures stay
+/// far below it (a 100×100 brush dragged across a 1008×1024 page 50 times is about 2^29).
+pub const MAX_PAINT_WORK: u64 = 1 << 30;
+/// Work units of one edge crossing of a filled shape's row (computed, then sorted).
+pub const POLYGON_CROSSING_WORK: u64 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -216,23 +231,14 @@ pub(crate) enum Footprint {
 }
 
 impl Command {
-    /// Checks the command against the document without changing anything.
-    pub(crate) fn validate(&self, doc: &Document) -> Result<(), CommandError> {
-        if self.is_frame_command() {
-            return crate::frame_ops::validate(self, doc);
-        }
-        let colors = doc.palette.len();
-        let color = |c: u8| {
-            if usize::from(c) < colors {
-                Ok(())
-            } else {
-                Err(CommandError::new(
-                    ErrorCode::PaletteRangeInvalid,
-                    format!("colour {c} is outside the palette (0..{colors})"),
-                ))
-            }
-        };
-        match self {
+    /// Checks a page-pixel command (Stroke, Shape, FloodFill) exactly as
+    /// [`crate::Engine::execute`] does on a document with this page and palette, without
+    /// painting anything; other commands are refused. Front-ends use it before previewing a
+    /// candidate command, so nothing is shown that the engine would refuse on release.
+    pub fn check_paint(&self, page: &IndexedImage, palette: &Palette) -> Result<(), CommandError> {
+        let colors = palette.len();
+        let color = |c: u8| check_color(c, colors);
+        let result = match self {
             Command::Stroke {
                 brush,
                 color: c,
@@ -243,7 +249,7 @@ impl Command {
                 ..
             } => {
                 color(*c)?;
-                validate_paint(doc, custom.as_ref(), *range, stencil.as_deref())?;
+                validate_paint(colors, custom.as_ref(), *range, stencil.as_deref())?;
                 if (brush.is_empty() && custom.is_none()) || brush.len() > MAX_BRUSH_PIXELS {
                     return Err(CommandError::invalid(format!(
                         "brush must have 1..={MAX_BRUSH_PIXELS} pixels, got {}",
@@ -286,7 +292,7 @@ impl Command {
                 ..
             } => {
                 color(*c)?;
-                validate_paint(doc, custom.as_ref(), *range, stencil.as_deref())?;
+                validate_paint(colors, custom.as_ref(), *range, stencil.as_deref())?;
                 shape.validate(brush, custom.is_some(), *filled, symmetry.as_ref())
             }
             Command::FloodFill {
@@ -305,7 +311,39 @@ impl Command {
                         "fill point must lie within ±{MAX_COORD}"
                     )));
                 }
-                Ok(())
+                return Ok(());
+            }
+            _ => {
+                return Err(CommandError::invalid(
+                    "only strokes, shapes and fills paint page pixels".into(),
+                ));
+            }
+        };
+        result?;
+        let (w, h) = (page.width(), page.height());
+        let work = self.paint_work(w, h, colors);
+        if work > MAX_PAINT_WORK {
+            return Err(CommandError::invalid(format!(
+                "too much work for one command: at least {} million units on this {w}x{h} \
+                 page, at most {} million (use fewer points, a smaller brush or fewer \
+                 symmetry copies)",
+                work / 1_000_000,
+                MAX_PAINT_WORK / 1_000_000
+            )));
+        }
+        Ok(())
+    }
+
+    /// Checks the command against the document without changing anything.
+    pub(crate) fn validate(&self, doc: &Document) -> Result<(), CommandError> {
+        if self.is_frame_command() {
+            return crate::frame_ops::validate(self, doc);
+        }
+        let colors = doc.palette.len();
+        let color = |c: u8| check_color(c, colors);
+        match self {
+            Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
+                self.check_paint(&doc.page, &doc.palette)
             }
             Command::Clear { color: c } => color(*c),
             Command::Flip { .. } => Ok(()),
@@ -612,16 +650,28 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
 /// Largest absolute brush handle coordinate (the handle may lie outside the brush).
 pub const MAX_HANDLE: i32 = 2 * MAX_PAGE_SIDE as i32;
 
+/// `c` must be a colour of a palette of `colors` entries.
+fn check_color(c: u8, colors: usize) -> Result<(), CommandError> {
+    if usize::from(c) < colors {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            ErrorCode::PaletteRangeInvalid,
+            format!("colour {c} is outside the palette (0..{colors})"),
+        ))
+    }
+}
+
 /// Checks the paint fields of a Stroke or Shape (ADR-18): a custom brush whose pixel count
-/// matches its size, at most the target's largest page, colours inside the palette; a colour
-/// range inside the palette; a stencil with one entry per possible colour (256).
+/// matches its size, each side at most [`MAX_BRUSH_SIDE`], colours inside the palette of
+/// `colors` entries; a colour range inside the palette; a stencil with one entry per possible
+/// colour (256).
 fn validate_paint(
-    doc: &Document,
+    colors: usize,
     custom: Option<&BrushImage>,
     range: Option<(u8, u8)>,
     stencil: Option<&[bool]>,
 ) -> Result<(), CommandError> {
-    let colors = doc.palette.len();
     let outside = |c: u8, what: &str| {
         CommandError::new(
             ErrorCode::PaletteRangeInvalid,
@@ -629,11 +679,10 @@ fn validate_paint(
         )
     };
     if let Some(b) = custom {
-        let (_, (max_w, max_h)) = doc.target.page_limits();
-        let (max_w, max_h) = (max_w.min(MAX_PAGE_SIDE), max_h.min(MAX_PAGE_SIDE));
-        if !(1..=max_w).contains(&b.width) || !(1..=max_h).contains(&b.height) {
+        let max = MAX_BRUSH_SIDE;
+        if !(1..=max).contains(&b.width) || !(1..=max).contains(&b.height) {
             return Err(CommandError::invalid(format!(
-                "brush {}x{} must be 1x1 to {max_w}x{max_h}",
+                "brush {}x{} must be 1x1 to {max}x{max}",
                 b.width, b.height
             )));
         }

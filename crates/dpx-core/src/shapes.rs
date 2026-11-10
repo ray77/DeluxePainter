@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::command::{Command, CommandError, MAX_BRUSH_OFFSET, MAX_BRUSH_PIXELS};
+use crate::command::{
+    Command, CommandError, MAX_BRUSH_OFFSET, MAX_BRUSH_PIXELS, MAX_PAINT_WORK,
+    POLYGON_CROSSING_WORK,
+};
 use crate::gradient;
 use crate::image::{IndexedImage, Rect};
 use crate::paint::PaintContext;
@@ -278,6 +281,43 @@ impl Shape {
         }
     }
 
+    /// What [`Self::draw`] costs on a `size` page at most, in work units (see
+    /// [`MAX_PAINT_WORK`]); `per_pixel` = the work of one plotted pixel, `per_stamp` = that of
+    /// one brush stamp, `reach` = where a stamp can touch the page. Copies are visited one at
+    /// a time; the count stops early once it passes [`MAX_PAINT_WORK`].
+    fn work(
+        &self,
+        filled: bool,
+        symmetry: Option<&Symmetry>,
+        (per_pixel, per_stamp): (u64, u64),
+        reach: Rect,
+        size: (u32, u32),
+    ) -> u64 {
+        let path = self.path(filled);
+        let n = path.points.len() as u64;
+        let mut copy = Vec::with_capacity(path.points.len());
+        let mut total = 0u64;
+        for k in 0..Symmetry::copies(symmetry) {
+            copy.clear();
+            match symmetry {
+                Some(s) if k > 0 => copy.extend(path.points.iter().map(|&p| s.copy(k, p))),
+                _ => copy.extend_from_slice(&path.points),
+            }
+            let work = if filled && !path.dots {
+                raster::polygon_work(&copy, size, POLYGON_CROSSING_WORK, per_pixel)
+            } else {
+                raster::path_stamps(&copy, !path.dots, path.closed, reach)
+                    .saturating_mul(per_stamp)
+                    .saturating_add(n)
+            };
+            total = total.saturating_add(work);
+            if total > MAX_PAINT_WORK {
+                break;
+            }
+        }
+        total
+    }
+
     /// Unclipped bounding rect of every pixel [`Self::draw`] can touch; `extent` = the
     /// brush's pixels relative to its hotspot.
     fn bounds(&self, extent: Option<Rect>, filled: bool, symmetry: Option<&Symmetry>) -> Rect {
@@ -352,6 +392,55 @@ impl Command {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// What painting this Stroke or Shape on a `width`×`height` page with a palette of
+    /// `colors` entries costs at most, in work units (about one per brush pixel plotted; see
+    /// [`MAX_PAINT_WORK`]). Stamps that cannot touch the page cost nothing. 0 for other
+    /// commands.
+    pub(crate) fn paint_work(&self, width: u32, height: u32, colors: usize) -> u64 {
+        let (brush, custom, mode, fx) = match self {
+            Command::Stroke {
+                brush,
+                custom,
+                mode,
+                fx,
+                ..
+            }
+            | Command::Shape {
+                brush,
+                custom,
+                mode,
+                fx,
+                ..
+            } => (brush, custom.as_ref(), *mode, fx),
+            _ => return 0,
+        };
+        let per_pixel = crate::paint::pixel_work(mode, fx, colors);
+        let per_stamp = raster::stamp_cost(brush, custom, width, height).saturating_mul(per_pixel);
+        let reach = self
+            .brush_extent()
+            .map_or_else(Rect::default, |e| raster::reach(e, width, height));
+        match self {
+            Command::Stroke {
+                points, continuous, ..
+            } => raster::path_stamps(points, *continuous, false, reach)
+                .saturating_mul(per_stamp)
+                .saturating_add(points.len() as u64),
+            Command::Shape {
+                shape,
+                filled,
+                symmetry,
+                ..
+            } => shape.work(
+                *filled,
+                symmetry.as_ref(),
+                (per_pixel, per_stamp),
+                reach,
+                (width, height),
+            ),
+            _ => unreachable!("only strokes and shapes have a brush"),
         }
     }
 

@@ -33,6 +33,85 @@ pub fn line_points(a: (i32, i32), b: (i32, i32)) -> Vec<(i32, i32)> {
     }
 }
 
+/// Steps of the Bresenham line from `a` to `b` along its major axis: it has this many points
+/// plus one.
+pub fn line_steps(a: (i32, i32), b: (i32, i32)) -> u32 {
+    let dx = (i64::from(b.0) - i64::from(a.0)).unsigned_abs();
+    let dy = (i64::from(b.1) - i64::from(a.1)).unsigned_abs();
+    u32::try_from(dx.max(dy)).unwrap_or(u32::MAX)
+}
+
+/// Point `i` (`0..=line_steps(a, b)`) of [`line_points`]`(a, b)`, computed directly, so a
+/// clipped line can start anywhere along it.
+pub fn line_point(a: (i32, i32), b: (i32, i32), i: u32) -> (i32, i32) {
+    let dx = (i64::from(b.0) - i64::from(a.0)).abs();
+    let dy = (i64::from(b.1) - i64::from(a.1)).abs();
+    let sx = if a.0 < b.0 { 1 } else { -1 };
+    let sy = if a.1 < b.1 { 1 } else { -1 };
+    let i = i64::from(i);
+    // The major axis moves every step; the minor axis steps where the line passes the middle
+    // between two pixels (rounding half down), exactly as the error term of `line_points`
+    // decides (checked against it for every slope in the tests).
+    let (ox, oy) = if dx >= dy {
+        if dx == 0 {
+            return a;
+        }
+        (i, (2 * i * dy + dx) / (2 * dx))
+    } else {
+        ((2 * i * dx + dy) / (2 * dy), i)
+    };
+    (
+        (i64::from(a.0) + sx * ox) as i32,
+        (i64::from(a.1) + sy * oy) as i32,
+    )
+}
+
+/// The steps `i0..=i1` of the line from `a` to `b` whose points may lie inside `r`, `None`
+/// if none can. Conservative: a point just outside `r` may be included, a point inside never
+/// left out. Lines far off the page cost nothing this way.
+pub fn clip_steps(a: (i32, i32), b: (i32, i32), r: Rect) -> Option<(u32, u32)> {
+    if r.is_empty() {
+        return None;
+    }
+    let n = line_steps(a, b);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (s, e, lo, hi) in [
+        (a.0, b.0, r.x, r.x + r.w - 1),
+        (a.1, b.1, r.y, r.y + r.h - 1),
+    ] {
+        // Line points lie within half a pixel of the exact line; one pixel of margin.
+        let (lo, hi) = (f64::from(lo) - 1.0, f64::from(hi) + 1.0);
+        let (s, d) = (f64::from(s), f64::from(e) - f64::from(s));
+        if d == 0.0 {
+            if s < lo || s > hi {
+                return None;
+            }
+            continue;
+        }
+        let (u0, u1) = ((lo - s) / d, (hi - s) / d);
+        t0 = t0.max(u0.min(u1));
+        t1 = t1.min(u0.max(u1));
+    }
+    if t0 > t1 {
+        return None;
+    }
+    let n = f64::from(n);
+    let i0 = (t0 * n).floor().clamp(0.0, n) as u32;
+    let i1 = (t1 * n).ceil().clamp(0.0, n) as u32;
+    (i0 <= i1).then_some((i0, i1))
+}
+
+/// Hotspot positions at which a brush covering `extent` (its pixels relative to the hotspot)
+/// touches a `width`×`height` image: the image grown by the brush extent.
+pub fn reach(extent: Rect, width: u32, height: u32) -> Rect {
+    Rect::new(
+        -(extent.x + extent.w - 1),
+        -(extent.y + extent.h - 1),
+        width as i32 + extent.w - 1,
+        height as i32 + extent.h - 1,
+    )
+}
+
 /// Stamps `brush` (pixel offsets relative to the hotspot) at (`x`, `y`) in `color`, clipped.
 pub fn stamp(img: &mut IndexedImage, brush: &[(i32, i32)], x: i32, y: i32, color: u8) {
     for &(dx, dy) in brush {
@@ -146,10 +225,25 @@ impl Pen<'_> {
         }
     }
 
+    /// Where custom brush `b` lands on `img` with its handle at (`x`, `y`): the page position
+    /// of the brush's top-left pixel, and the rectangle of brush pixels (in brush
+    /// coordinates) that fall on the image.
+    fn span(b: &BrushImage, img: &IndexedImage, x: i32, y: i32) -> ((i32, i32), Rect) {
+        let (ox, oy) = (x - b.handle.0, y - b.handle.1);
+        let (w, h) = (b.width as i32, b.height as i32);
+        let (x0, x1) = ((-ox).max(0), (img.width() as i32 - ox).min(w));
+        let (y0, y1) = ((-oy).max(0), (img.height() as i32 - oy).min(h));
+        ((ox, oy), Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
     /// Stamps the brush with its hotspot at (`x`, `y`); `motion` is the movement since the
     /// previous stamp of the same path.
     pub fn stamp(&self, img: &mut IndexedImage, x: i32, y: i32, motion: (i32, i32)) {
         let ctx = PaintContext { motion, ..self.ctx };
+        if self.mode == DrawMode::Smear {
+            self.smear(img, x, y, &ctx);
+            return;
+        }
         let Some(b) = self.custom else {
             for &(dx, dy) in self.offsets {
                 paint::plot_fx(
@@ -166,15 +260,50 @@ impl Pen<'_> {
             return;
         };
         // Only the brush rows and columns that land on the image.
-        let (ox, oy) = (x - b.handle.0, y - b.handle.1);
-        let (w, h) = (b.width as i32, b.height as i32);
-        let (x0, x1) = ((-ox).max(0), (img.width() as i32 - ox).min(w));
-        let (y0, y1) = ((-oy).max(0), (img.height() as i32 - oy).min(h));
-        for by in y0..y1 {
-            for bx in x0..x1 {
+        let ((ox, oy), s) = Self::span(b, img, x, y);
+        for by in s.y..s.y + s.h {
+            for bx in s.x..s.x + s.w {
                 if let Some(c) = custom_color(b, bx, by, self.mode, self.color, ctx.right) {
                     let cover = paint::edge_cover(b, bx, by, self.fx.antialias);
                     paint::plot_fx(img, ox + bx, oy + by, c, self.mode, &ctx, &self.fx, cover);
+                }
+            }
+        }
+    }
+
+    /// Smear (ADR-19): every brush pixel takes the colour `motion` behind it on the page as it
+    /// was before this stamp, so each stamp moves the colours by exactly `motion`, whatever
+    /// the direction and the order of the brush pixels.
+    fn smear(&self, img: &mut IndexedImage, x: i32, y: i32, ctx: &PaintContext) {
+        let (mx, my) = ctx.motion;
+        if (mx, my) == (0, 0) {
+            // Every pixel would take its own colour.
+            return;
+        }
+        let Some(b) = self.custom else {
+            let source: Vec<Option<u8>> = self
+                .offsets
+                .iter()
+                .map(|&(dx, dy)| img.get(x + dx - mx, y + dy - my))
+                .collect();
+            for (&(dx, dy), s) in self.offsets.iter().zip(source) {
+                paint::smear_pixel(img, x + dx, y + dy, s, ctx);
+            }
+            return;
+        };
+        let ((ox, oy), s) = Self::span(b, img, x, y);
+        if s.is_empty() {
+            return;
+        }
+        // The stamped rectangle `motion` back, as it is before the stamp.
+        let from = Rect::new(ox + s.x - mx, oy + s.y - my, s.w, s.h).intersect(img.bounds());
+        let source = img.crop(from);
+        for by in s.y..s.y + s.h {
+            for bx in s.x..s.x + s.w {
+                if custom_color(b, bx, by, self.mode, self.color, ctx.right).is_some() {
+                    let (px, py) = (ox + bx, oy + by);
+                    let c = source.get(px - mx - from.x, py - my - from.y);
+                    paint::smear_pixel(img, px, py, c, ctx);
                 }
             }
         }
@@ -191,29 +320,91 @@ impl Pen<'_> {
 }
 
 /// Stamps a [`Pen`] along a path and remembers the previous stamp, for each stamp's motion.
+/// Stamps whose brush cannot touch the image are skipped (they would change nothing), and
+/// lines are clipped to the image grown by the brush extent first, so painting far off the
+/// page costs nothing.
 pub struct Stamper<'a> {
     pen: Pen<'a>,
     last: Option<(i32, i32)>,
+    /// The pen's extent; `None` for an empty brush, which paints nothing.
+    extent: Option<Rect>,
 }
 
 impl<'a> Stamper<'a> {
     pub fn new(pen: Pen<'a>) -> Self {
-        Self { pen, last: None }
+        Self {
+            pen,
+            last: None,
+            extent: pen.extent(),
+        }
+    }
+
+    /// Hotspot positions whose stamp can touch `img`.
+    fn reach(&self, img: &IndexedImage) -> Rect {
+        self.extent
+            .map_or_else(Rect::default, |e| reach(e, img.width(), img.height()))
     }
 
     /// One stamp at `p`.
     pub fn at(&mut self, img: &mut IndexedImage, p: (i32, i32)) {
         let motion = self.last.map_or((0, 0), |l| (p.0 - l.0, p.1 - l.1));
         self.last = Some(p);
-        self.pen.stamp(img, p.0, p.1, motion);
-    }
-
-    /// A stamp on every pixel of the Bresenham line from `a` to `b`, both ends included.
-    pub fn line(&mut self, img: &mut IndexedImage, a: (i32, i32), b: (i32, i32)) {
-        for p in line_points(a, b) {
-            self.at(img, p);
+        if self.reach(img).contains(p.0, p.1) {
+            self.pen.stamp(img, p.0, p.1, motion);
         }
     }
+
+    /// A stamp on every pixel of the Bresenham line from `a` to `b`, both ends included. Only
+    /// the part of the line near the image is walked; the stamps keep the motion they have on
+    /// the whole line.
+    pub fn line(&mut self, img: &mut IndexedImage, a: (i32, i32), b: (i32, i32)) {
+        if let Some((i0, i1)) = clip_steps(a, b, self.reach(img)) {
+            if i0 > 0 {
+                self.last = Some(line_point(a, b, i0 - 1));
+            }
+            for i in i0..=i1 {
+                self.at(img, line_point(a, b, i));
+            }
+        }
+        self.last = Some(b);
+    }
+}
+
+/// Pixels one stamp of a brush (built-in `offsets`, or `custom`) may plot on a
+/// `width`×`height` image at most (work estimate).
+pub fn stamp_cost(
+    offsets: &[(i32, i32)],
+    custom: Option<&BrushImage>,
+    width: u32,
+    height: u32,
+) -> u64 {
+    match custom {
+        Some(b) => u64::from(b.width.min(width)) * u64::from(b.height.min(height)),
+        None => offsets.len() as u64,
+    }
+}
+
+/// Stamps a [`Stamper`] makes in `reach` (see [`reach`]) for the line from `a` to `b`, at
+/// most (work estimate).
+pub fn line_stamps(a: (i32, i32), b: (i32, i32), reach: Rect) -> u64 {
+    clip_steps(a, b, reach).map_or(0, |(i0, i1)| u64::from(i1 - i0) + 1)
+}
+
+/// Stamps a [`Stamper`] makes in `reach` for a path through `points`, at most: one per point
+/// (`lines` false) or along the lines between consecutive points, and back to the first
+/// point when `closed` (work estimate).
+pub fn path_stamps(points: &[(i32, i32)], lines: bool, closed: bool, reach: Rect) -> u64 {
+    if !lines || points.len() < 2 {
+        return points.iter().filter(|p| reach.contains(p.0, p.1)).count() as u64;
+    }
+    let n = points.len();
+    let close = (closed && n > 2).then(|| (points[n - 1], points[0]));
+    points
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .chain(close)
+        .map(|(a, b)| line_stamps(a, b, reach))
+        .sum()
 }
 
 /// [`stroke`] with a [`Pen`]: the brush stamped at every point, or with `continuous` on every
@@ -353,23 +544,23 @@ fn polygon_pixels(points: &[(i32, i32)], width: u32, height: u32, mut f: impl Fn
         }
     };
     let (y0, y1) = (clip.y, clip.y + clip.h - 1);
-    let mut rows: Vec<Vec<f64>> = vec![Vec::new(); (y1 - y0 + 1) as usize];
-    for (i, &a) in points.iter().enumerate() {
-        let b = points[(i + 1) % points.len()];
-        if a.1 == b.1 {
-            continue;
+    // The edges that cross rows of the clip, by their first such row. Rows are half-open in
+    // y, so a vertex shared by two edges is counted once. Only the active edges' crossings
+    // of one row are held at a time (memory stays proportional to the number of edges).
+    let mut edges = polygon_edges(points, y0, y1);
+    edges.sort_by_key(|e| e.rows.0);
+    let mut active: Vec<Edge> = Vec::new();
+    let mut xs: Vec<f64> = Vec::new();
+    let mut next = 0;
+    for y in y0..=y1 {
+        while next < edges.len() && edges[next].rows.0 <= y {
+            active.push(edges[next]);
+            next += 1;
         }
-        let (top, bot) = if a.1 < b.1 { (a, b) } else { (b, a) };
-        let (dx, dy) = (f64::from(bot.0 - top.0), f64::from(bot.1 - top.1));
-        // Half-open in y, so a vertex shared by two edges is counted once.
-        for y in top.1.max(y0)..bot.1.min(y1 + 1) {
-            let x = f64::from(top.0) + f64::from(y - top.1) * dx / dy;
-            rows[(y - y0) as usize].push(x);
-        }
-    }
-    for (r, xs) in rows.iter_mut().enumerate() {
+        active.retain(|e| e.rows.1 > y);
+        xs.clear();
+        xs.extend(active.iter().map(|e| e.x_at(y)));
         xs.sort_by(f64::total_cmp);
-        let y = y0 + r as i32;
         for &[a, b] in xs.as_chunks::<2>().0 {
             let xa = (a.ceil() as i32).max(clip.x);
             let xb = (b.floor() as i32).min(clip.x + clip.w - 1);
@@ -380,14 +571,84 @@ fn polygon_pixels(points: &[(i32, i32)], width: u32, height: u32, mut f: impl Fn
     }
     for (i, &a) in points.iter().enumerate() {
         let b = points[(i + 1) % points.len()];
-        for (x, y) in line_points(a, b) {
-            mark(x, y);
+        if let Some((i0, i1)) = clip_steps(a, b, clip) {
+            for i in i0..=i1 {
+                let (x, y) = line_point(a, b, i);
+                mark(x, y);
+            }
         }
     }
     let w = clip.w as usize;
     for (i, _) in mask.iter().enumerate().filter(|(_, on)| **on) {
         f(clip.x + (i % w) as i32, clip.y + (i / w) as i32);
     }
+}
+
+/// A polygon edge that crosses the rows `rows.0..rows.1` of the fill.
+#[derive(Clone, Copy, Debug)]
+struct Edge {
+    rows: (i32, i32),
+    top: (i32, i32),
+    dx: f64,
+    dy: f64,
+}
+
+impl Edge {
+    /// Where the edge crosses the centre line of row `y`.
+    fn x_at(&self, y: i32) -> f64 {
+        f64::from(self.top.0) + f64::from(y - self.top.1) * self.dx / self.dy
+    }
+}
+
+/// The edges of the closed polygon through `points` that cross a row of `y0..=y1`.
+fn polygon_edges(points: &[(i32, i32)], y0: i32, y1: i32) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for (i, &a) in points.iter().enumerate() {
+        let b = points[(i + 1) % points.len()];
+        if a.1 == b.1 {
+            continue;
+        }
+        let (top, bot) = if a.1 < b.1 { (a, b) } else { (b, a) };
+        let rows = (top.1.max(y0), bot.1.min(y1 + 1));
+        if rows.0 < rows.1 {
+            edges.push(Edge {
+                rows,
+                top,
+                dx: f64::from(bot.0 - top.0),
+                dy: f64::from(bot.1 - top.1),
+            });
+        }
+    }
+    edges
+}
+
+/// What [`fill_polygon_pen`] costs on a `width`×`height` image, at most (work estimate): the
+/// edge crossings of every row (each `crossing_cost`, for the sort), the edge pixels, the
+/// clipped bounding box once for the mask and once more for plotting (each pixel
+/// `plot_cost`).
+pub fn polygon_work(
+    points: &[(i32, i32)],
+    (width, height): (u32, u32),
+    crossing_cost: u64,
+    plot_cost: u64,
+) -> u64 {
+    let Some(bounds) = Rect::from_points(points) else {
+        return 0;
+    };
+    let clip = bounds.intersect(Rect::new(0, 0, width as i32, height as i32));
+    if clip.is_empty() {
+        return 0;
+    }
+    let crossings: u64 = polygon_edges(points, clip.y, clip.y + clip.h - 1)
+        .iter()
+        .map(|e| (e.rows.1 - e.rows.0) as u64)
+        .sum();
+    let n = points.len();
+    let outline: u64 = (0..n)
+        .map(|i| line_stamps(points[i], points[(i + 1) % n], clip))
+        .sum();
+    let area = clip.w as u64 * clip.h as u64;
+    crossings * crossing_cost + outline + area * (1 + plot_cost) + n as u64
 }
 
 /// 4-connected flood fill (the Fill tool): the region of the colour at (`x`, `y`) becomes
@@ -549,5 +810,239 @@ mod tests {
         }
         assert_eq!(stroke_bounds(&[], &[(0, 0)]), None);
         assert_eq!(stroke_bounds(&[(0, 0)], &[]), None);
+    }
+
+    #[test]
+    fn line_point_is_line_points_for_every_slope() {
+        for dx in -40..=40 {
+            for dy in -40..=40 {
+                let (a, b) = ((3, -7), (3 + dx, -7 + dy));
+                let pts = line_points(a, b);
+                assert_eq!(pts.len() as u32, line_steps(a, b) + 1);
+                for (i, &p) in pts.iter().enumerate() {
+                    assert_eq!(line_point(a, b, i as u32), p, "{a:?}->{b:?} step {i}");
+                }
+            }
+        }
+        // Long lines with awkward slopes, and the coordinate limits.
+        for (a, b) in [
+            ((-1_000_000, -1_000_000), (1_000_000, 999_999)),
+            ((5, 9), (-7_771, 2_903)),
+            ((0, 0), (12_345, -54_321)),
+        ] {
+            let pts = line_points(a, b);
+            for i in (0..pts.len()).step_by(997).chain([pts.len() - 1]) {
+                assert_eq!(line_point(a, b, i as u32), pts[i], "{a:?}->{b:?} step {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn clip_steps_keeps_every_point_inside() {
+        let r = Rect::new(-3, 2, 9, 5);
+        let ends = [-20, -4, -3, 0, 2, 5, 6, 7, 30];
+        for &ax in &ends {
+            for &ay in &ends {
+                for &bx in &ends {
+                    for &by in &ends {
+                        let (a, b) = ((ax, ay), (bx, by));
+                        let inside: Vec<u32> = (0..=line_steps(a, b))
+                            .filter(|&i| {
+                                let p = line_point(a, b, i);
+                                r.contains(p.0, p.1)
+                            })
+                            .collect();
+                        match clip_steps(a, b, r) {
+                            None => assert!(inside.is_empty(), "{a:?}->{b:?}"),
+                            Some((i0, i1)) => {
+                                assert!(inside.iter().all(|i| (i0..=i1).contains(i)));
+                                // Only the margin's extra steps at either end: one pixel
+                                // on the minor axis is n / minor steps of the line.
+                                let n = line_steps(a, b);
+                                let minor = (bx - ax).abs().min((by - ay).abs()) as u32;
+                                let slack = if minor == 0 {
+                                    2
+                                } else {
+                                    2 + (2 * n).div_ceil(minor)
+                                };
+                                if let (Some(&f), Some(&l)) = (inside.first(), inside.last()) {
+                                    assert!(f - i0 <= slack && i1 - l <= slack, "{a:?}->{b:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(clip_steps((-1_000_000, 0), (-500, 0), r), None);
+        assert_eq!(clip_steps((0, 0), (5, 5), Rect::default()), None);
+    }
+
+    /// `stroke_pen` as it was before clipping: every line pixel stamped, motion from the
+    /// previous stamp.
+    fn naive_stroke(img: &mut IndexedImage, pen: &Pen, points: &[(i32, i32)]) {
+        let mut last: Option<(i32, i32)> = None;
+        for pair in points.windows(2) {
+            for p in line_points(pair[0], pair[1]) {
+                let motion = last.map_or((0, 0), |l| (p.0 - l.0, p.1 - l.1));
+                last = Some(p);
+                pen.stamp(img, p.0, p.1, motion);
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_strokes_paint_exactly_what_unclipped_ones_did() {
+        use crate::palette::Palette;
+        let pal = Palette::dpaint_default_32();
+        let mut page = IndexedImage::new(24, 16, 0);
+        for y in 0..16 {
+            for x in 0..24 {
+                page.set(x, y, ((x * 3 + y * 5) % 31) as u8 + 1);
+            }
+        }
+        let custom = BrushImage {
+            width: 4,
+            height: 3,
+            pixels: vec![1, 0, 2, 3, 4, 5, 0, 6, 7, 8, 9, 0],
+            handle: (5, -2),
+            transparent: Some(0),
+        };
+        let paths: [&[(i32, i32)]; 4] = [
+            &[(-500, -300), (600, 400), (-40, 20), (12, 8)],
+            &[(-30, 7), (60, 9), (60, -50), (2, 30), (-9, -9)],
+            &[(5, 5), (5, 5), (300, -2), (-300, 15)],
+            &[(-100, -100), (100, 100), (-100, 100), (100, -100)],
+        ];
+        for mode in [DrawMode::Matte, DrawMode::Smear] {
+            for custom in [None, Some(&custom)] {
+                for points in paths {
+                    let pen = Pen {
+                        offsets: BIG,
+                        custom,
+                        color: 9,
+                        mode,
+                        ctx: PaintContext {
+                            palette: &pal,
+                            range: None,
+                            stencil: None,
+                            before: &page,
+                            motion: (0, 0),
+                            right: false,
+                        },
+                        fx: Default::default(),
+                    };
+                    let mut clipped = page.clone();
+                    stroke_pen(&mut clipped, &pen, points, true);
+                    let mut naive = page.clone();
+                    naive_stroke(&mut naive, &pen, points);
+                    assert_eq!(
+                        clipped,
+                        naive,
+                        "{mode:?} custom={} {points:?}",
+                        custom.is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `fill_polygon` as it was before the active edge list (one crossing list per row).
+    fn naive_fill(img: &mut IndexedImage, points: &[(i32, i32)], color: u8) {
+        let bounds = Rect::from_points(points).unwrap();
+        let clip = bounds.intersect(img.bounds());
+        if clip.is_empty() {
+            return;
+        }
+        let (y0, y1) = (clip.y, clip.y + clip.h - 1);
+        let mut rows: Vec<Vec<f64>> = vec![Vec::new(); (y1 - y0 + 1) as usize];
+        for (i, &a) in points.iter().enumerate() {
+            let b = points[(i + 1) % points.len()];
+            if a.1 == b.1 {
+                continue;
+            }
+            let (top, bot) = if a.1 < b.1 { (a, b) } else { (b, a) };
+            let (dx, dy) = (f64::from(bot.0 - top.0), f64::from(bot.1 - top.1));
+            for y in top.1.max(y0)..bot.1.min(y1 + 1) {
+                rows[(y - y0) as usize].push(f64::from(top.0) + f64::from(y - top.1) * dx / dy);
+            }
+        }
+        let mut out = img.clone();
+        for (r, xs) in rows.iter_mut().enumerate() {
+            xs.sort_by(f64::total_cmp);
+            for &[a, b] in xs.as_chunks::<2>().0 {
+                let xa = (a.ceil() as i32).max(clip.x);
+                let xb = (b.floor() as i32).min(clip.x + clip.w - 1);
+                for x in xa..=xb {
+                    out.set(x, y0 + r as i32, color);
+                }
+            }
+        }
+        for (i, &a) in points.iter().enumerate() {
+            for (x, y) in line_points(a, points[(i + 1) % points.len()]) {
+                if clip.contains(x, y) {
+                    out.set(x, y, color);
+                }
+            }
+        }
+        *img = out;
+    }
+
+    #[test]
+    fn polygon_fill_is_unchanged_by_the_active_edge_list() {
+        let polys: [&[(i32, i32)]; 5] = [
+            &[(0, 0), (4, 0), (0, 4)],
+            &[(-50, -40), (70, 3), (10, 90), (-5, 8), (30, -100)],
+            &[(3, 3)],
+            &[
+                (0, 0),
+                (20, 0),
+                (20, 15),
+                (0, 15),
+                (0, 0),
+                (5, 5),
+                (5, 10),
+                (15, 10),
+                (15, 5),
+                (5, 5),
+            ],
+            &[(-1000, 7), (1000, 8), (2, -1000), (3, 1000), (-7, -7)],
+        ];
+        for points in polys {
+            let mut a = IndexedImage::new(24, 18, 0);
+            fill_polygon(&mut a, points, 1);
+            let mut b = IndexedImage::new(24, 18, 0);
+            naive_fill(&mut b, points, 1);
+            assert_eq!(a, b, "{points:?}");
+        }
+    }
+
+    #[test]
+    fn work_estimates_count_only_what_reaches_the_page() {
+        let reach_16x8 = reach(Rect::from_points(BIG).unwrap(), 16, 8);
+        // Far off the page: no stamps, however long the lines are.
+        let far = [(-1_000_000, -1_000_000), (1_000_000, -999_000)];
+        assert_eq!(path_stamps(&far, true, false, reach_16x8), 0);
+        // A line across the page costs about its length on the page.
+        let across = [(-1_000_000, 4), (1_000_000, 4)];
+        let n = path_stamps(&across, true, false, reach_16x8);
+        assert!((16..30).contains(&n), "{n}");
+        // Dots count where they are.
+        assert_eq!(
+            path_stamps(&[(0, 0), (500, 0), (3, 3)], false, false, reach_16x8),
+            2
+        );
+        // A polygon far above the page costs nothing; one over it costs its clipped area.
+        assert_eq!(
+            polygon_work(&[(0, -900), (9, -800), (3, -700)], (16, 8), 16, 1),
+            0
+        );
+        let w = polygon_work(
+            &[(-100, -100), (100, -100), (100, 100), (-100, 100)],
+            (16, 8),
+            16,
+            1,
+        );
+        assert!(w < 16 * 8 * 2 + 2 * 8 * 16 + 100, "{w}");
     }
 }
