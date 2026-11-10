@@ -15,6 +15,7 @@
 //!     [--show-page]                     show the Show Page view
 //!     [--page-size-requester]           show the Page Size requester
 //!     [--palette-requester]             show the Color Mixer (selected colour = `--fg`)
+//!     [--range-requester]               show the Range requester (ranges of `--open`, else the defaults)
 //!     [--notes]                         show the notes of `--open` in the note requester
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
@@ -350,6 +351,13 @@ fn main() -> eframe::Result {
                 doc.target().chipset,
             ));
         }
+        if args.iter().any(|a| a == "--range-requester") {
+            let ranges = match &opened {
+                Some((_, _, extras, _)) => extras.ranges.clone(),
+                None => files::default_ranges(doc.palette()),
+            };
+            ui.range_requester = Some(menu_actions::range_requester(doc.palette(), &ranges));
+        }
         if args.iter().any(|a| a == "--page-size-requester") {
             ui.page_size_requester = Some(page_size_requester(&doc));
         }
@@ -624,6 +632,7 @@ impl PainterApp {
     fn new() -> Self {
         let (w, h) = DisplayMode::PAL_LORES.size();
         let doc = Document::new(w, h, Palette::dpaint_default_32());
+        let extras = files::PictureExtras::for_new_picture(doc.palette());
         Self {
             engine: Engine::new(doc),
             ui: UiState::default(),
@@ -634,7 +643,7 @@ impl PainterApp {
             requester: None,
             req_pointer: None,
             picture_path: None,
-            extras: files::PictureExtras::default(),
+            extras,
             last_drawer: None,
             wheel: 0.0,
             scroll: (0, 0),
@@ -1101,6 +1110,7 @@ impl PainterApp {
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::PixelSize(p) => self.set_pixel_size(p),
             Action::Command(id) => match id {
+                "color.ranges" => self.open_ranges(),
                 "palette.mixer" => {
                     self.finish_stroke();
                     let doc = self.engine.document();
@@ -1208,6 +1218,11 @@ impl eframe::App for PainterApp {
         }
         if self.palette_input(&ctx, origin, ppp, scale, view) {
             self.palette_upload(&ctx);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.ui.range_requester.is_some() {
+            self.range_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }

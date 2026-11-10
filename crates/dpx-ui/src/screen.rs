@@ -95,6 +95,8 @@ pub struct UiState {
     pub note_requester: Option<NoteRequester>,
     /// Color ▸ Palette ▸ Mixer (the Color Mixer) while it is open.
     pub palette_requester: Option<crate::palette_requester::PaletteRequester>,
+    /// Color ▸ Ranges.. (the Range requester) while it is open.
+    pub range_requester: Option<crate::range_requester::RangeRequester>,
 }
 
 impl UiState {
@@ -130,6 +132,7 @@ impl Default for UiState {
             page_size_requester: None,
             note_requester: None,
             palette_requester: None,
+            range_requester: None,
         }
     }
 }
@@ -277,6 +280,9 @@ impl Screen {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.palette_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.range_requester {
             req.draw(img, pens);
         }
     }

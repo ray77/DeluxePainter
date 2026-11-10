@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use dpx_core::{Command, Document, Engine, IndexedImage, Palette, Rgb8, Target};
 use dpx_iff::{ColorRange, iff};
-use dpx_ui::{FileKind, NoteRequester};
+use dpx_ui::{FileKind, NoteRequester, RangeData, RangeRequester, RangeResponse, ReqEvent};
 use eframe::egui;
 
 use crate::{PainterApp, files, note_requester};
@@ -506,6 +506,82 @@ impl PainterApp {
     }
 }
 
+/// The Range requester over `palette` for the CRNG `ranges` (file order = range numbers).
+pub fn range_requester(palette: &Palette, ranges: &[ColorRange]) -> RangeRequester {
+    let data: Vec<RangeData> = ranges
+        .iter()
+        .map(|r| RangeData {
+            rate: r.rate,
+            flags: r.flags,
+            low: r.low,
+            high: r.high,
+        })
+        .collect();
+    RangeRequester::new(palette, &data, usize::MAX)
+}
+
+impl PainterApp {
+    /// Color ▸ Ranges..: opens the Range requester on a copy of the picture's ranges.
+    pub(crate) fn open_ranges(&mut self) {
+        self.finish_stroke();
+        let req = range_requester(self.engine.document().palette(), &self.extras.ranges);
+        self.ui.range_requester = Some(req);
+        self.dirty = true;
+    }
+
+    /// Pointer and keys while the Range requester is open (it is modal).
+    pub(crate) fn range_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: f32,
+        view: crate::View,
+    ) {
+        let ui_screen = view.ui_screen();
+        let at = RangeRequester::origin(ui_screen.width, ui_screen.height);
+        let (events, _) = self.modal_events(ctx, origin, ppp, scale, view, at);
+        for event in events {
+            if self.ui.range_requester.is_none() {
+                break;
+            }
+            self.range_event(event);
+        }
+    }
+
+    /// Feeds one event to the Range requester. Ok stores the edited ranges as the picture's
+    /// colour ranges (saved as CRNG chunks; they are file data, not part of the undo list);
+    /// Cancel drops the edits.
+    pub(crate) fn range_event(&mut self, event: ReqEvent) {
+        let Some(req) = &mut self.ui.range_requester else {
+            return;
+        };
+        let response = req.handle(event);
+        self.dirty = true;
+        match response {
+            RangeResponse::Continue => {}
+            RangeResponse::Cancel => self.ui.range_requester = None,
+            RangeResponse::Ok => {
+                let Some(req) = self.ui.range_requester.take() else {
+                    return;
+                };
+                self.extras.ranges = req
+                    .ranges()
+                    .iter()
+                    .map(|r| ColorRange {
+                        rate: r.rate,
+                        flags: r.flags,
+                        low: r.low,
+                        high: r.high,
+                    })
+                    .collect();
+                // The cycling clock restarts from the new ranges.
+                self.menu_data.cycled = None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,5 +971,82 @@ mod tests {
         let (colors, _) = decode_palette(&form.finish()).unwrap();
         assert_eq!(colors, [Rgb8::new(0xFF, 0x88, 0)]);
         assert!(decode_palette(b"FORM\0\0\0\x04ILBM").is_err(), "no CMAP");
+    }
+
+    fn press_release(app: &mut PainterApp, r: dpx_core::Rect) {
+        app.range_event(ReqEvent::Press(r.x + r.w / 2, r.y + r.h / 2));
+        app.range_event(ReqEvent::Release);
+    }
+
+    #[test]
+    fn new_picture_has_inactive_default_ranges() {
+        let app = PainterApp::new();
+        let r = &app.extras.ranges;
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].low, r[0].high), (20, 27));
+        assert_eq!((r[1].low, r[1].high), (8, 15));
+        assert!(r.iter().all(|r| !r.active() && r.rate == 4096));
+        // Tab cycling with only inactive ranges leaves the palette alone.
+        let doc = app.engine.document().palette();
+        assert_eq!(&cycled_palette(doc, r, 3.0), doc);
+        // Palettes below 32 colours get none.
+        let small = Palette::new(vec![Rgb8::BLACK; 16]).unwrap();
+        assert!(files::default_ranges(&small).is_empty());
+    }
+
+    #[test]
+    fn ranges_requester_edits_cycles_and_saves_as_crng() {
+        let mut app = PainterApp::new();
+        act(&mut app, "color.ranges");
+        let req = app.ui.range_requester.as_ref().expect("requester open");
+        // Opens on the first defined default range.
+        assert_eq!(req.selected(), 0);
+        // Switch range 1 on, make it reverse, set range 3 to colours 2..=6.
+        press_release(&mut app, RangeRequester::active_rect());
+        press_release(&mut app, RangeRequester::direction_rect());
+        press_release(&mut app, RangeRequester::select_rect(2));
+        let cell = |app: &PainterApp, i| app.ui.range_requester.as_ref().unwrap().cell_rect(i);
+        let (a, b) = (cell(&app, 2), cell(&app, 6));
+        press_release(&mut app, a);
+        press_release(&mut app, b);
+        // Cancel first: nothing changes.
+        let before = app.extras.ranges.clone();
+        app.range_event(ReqEvent::Key(ReqKey::Escape));
+        assert!(app.ui.range_requester.is_none());
+        assert_eq!(app.extras.ranges, before);
+
+        // Again, this time Ok.
+        act(&mut app, "color.ranges");
+        press_release(&mut app, RangeRequester::active_rect());
+        press_release(&mut app, RangeRequester::direction_rect());
+        press_release(&mut app, RangeRequester::select_rect(2));
+        let (a, b) = (cell(&app, 2), cell(&app, 6));
+        press_release(&mut app, a);
+        press_release(&mut app, b);
+        app.range_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.ui.range_requester.is_none());
+        let r = app.extras.ranges.clone();
+        assert_eq!(r.len(), 3);
+        assert!(r[0].active() && r[0].reverse() && (r[0].low, r[0].high) == (20, 27));
+        assert_eq!(r[1], before[1]);
+        assert!(r[2].active() && !r[2].reverse() && (r[2].low, r[2].high) == (2, 6));
+
+        // Cycling reads the new ranges: range 1 now moves.
+        let doc = app.engine.document().palette().clone();
+        assert_ne!(cycled_palette(&doc, &r, 1.0), doc);
+
+        // Save as ILBM and load again: the ranges come back as CRNG chunks.
+        let dir = std::env::temp_dir().join(format!("dpx-ranges-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ranges.iff");
+        let (bytes, _) = files::encode_document(app.engine.document(), &app.extras, &path).unwrap();
+        files::write_atomic(&path, &bytes).unwrap();
+        let files::Picture::Ilbm(back) = files::load(&path).unwrap().picture else {
+            panic!("expected ILBM");
+        };
+        assert_eq!(back.ranges, r);
+        let (_, extras, _) = files::open_picture(files::Picture::Ilbm(back), Target::default());
+        assert_eq!(extras.ranges, r);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -608,6 +608,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "background.free",
     // Prefs
     "view.largest_pixel_size",
+    // Range requester (ADR-22)
+    "color.ranges",
 ];
 
 impl Item {

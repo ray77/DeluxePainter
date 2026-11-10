@@ -252,6 +252,35 @@ pub struct PictureExtras {
     pub transparent_color: Option<u16>,
 }
 
+impl PictureExtras {
+    /// Extras of a new picture: DeluxePaint-like default ranges for its palette.
+    pub fn for_new_picture(palette: &Palette) -> Self {
+        Self {
+            ranges: default_ranges(palette),
+            ..Self::default()
+        }
+    }
+}
+
+/// Default colour ranges of a new picture (ADR-22). The manual only says that Palette ▸
+/// Default Palette restores "the startup palette and default ranges" without listing them,
+/// so these are our choice for the 32-colour default palette: range 1 the grey ramp
+/// (entries 20–27), range 2 the colour sweep (entries 8–15), both inactive at 15 steps per
+/// second, so Tab changes nothing until a range is switched on. Palettes of fewer than
+/// 32 colours get none.
+pub fn default_ranges(palette: &Palette) -> Vec<ColorRange> {
+    if palette.len() < 32 {
+        return Vec::new();
+    }
+    let range = |low, high| ColorRange {
+        rate: 4096,
+        flags: 0,
+        low,
+        high,
+    };
+    vec![range(20, 27), range(8, 15)]
+}
+
 /// Colour 0 of a reduced true-colour picture with transparent pixels (owner decision: the
 /// old "magic pink", so transparent areas stay visible). Saved as the ILBM transparent colour.
 pub const TRANSPARENT_PINK: Rgb8 = Rgb8::new(255, 0, 255);
