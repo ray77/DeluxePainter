@@ -159,9 +159,9 @@ Encoder guidance from [S2]: emit a 2-byte repeat as a run only when it is not be
 | masking 1 (mask plane) | to alpha | from alpha | early | verified |
 | masking 2 (transparent colour) | to alpha | when brush marks a colour | early | verified |
 | masking 3 (lasso) | flood-fill from edge on import | not written | mid | verified; low value |
-| EHB (6 planes, CAMG 0x80) | expand with half-brightness lookup | export keep 6 planes + 32-entry CMAP | mid | see HARDWARE_MODES.md section 6 |
-| HAM6 | decode with rules from section 7 there | encoder later | mid | decoder to RGB; saving as HAM needs an encoder (later) |
-| HAM8 / AGA 8 planes | same, 8-bit CMAP | same | mid | control-bit layout needs validation against a real file |
+| EHB (6 planes, CAMG 0x80) | expand with half-brightness lookup | export keep 6 planes + 32-entry CMAP | mid | see HARDWARE_MODES.md section 6; codec `dpx_formats::ehb` exists (ADR-25), not yet wired into the app |
+| HAM6 | decode with rules from section 7 there | encoder later | mid | decoder and greedy encoder exist in `dpx_formats::ham` (ADR-25), not yet wired into the app |
+| HAM8 / AGA 8 planes | same, 8-bit CMAP | same | mid | codec exists (ADR-25), not yet wired; control-bit layout needs validation against a real file |
 | 7-8 plane indexed | full | full | mid | |
 | CMAP depth conversion | 4 -> 8 bit heuristic | 8-bit replicated | early | |
 | PBM / DEEP | detect + message | none | later | |

@@ -2,6 +2,8 @@
 //! and JPEG import (decoded to RGBA, JPEG with its EXIF orientation applied). Colour
 //! reduction of true-colour pictures lives in `dpx_core::quantize` (ADR-9).
 
+pub mod ehb;
+pub mod ham;
 pub mod jpeg_io;
 pub mod png_io;
 pub mod project;

@@ -189,8 +189,8 @@ Recommendation: implement the decoder as `prev = palette[0]` at x=0 of every row
 
 ## 10. Open points
 
-1. **HAM scanline start** not confirmed in the Hardware Reference Manual. Obtain the HRM HAM section (Commodore PDF is linked in [S12]'s search results; not read). Until then: palette[0] per line (likely).
-2. **HAM8 control-bit location** conflict ([S4] top planes vs [S11] low planes). Validate with a real HAM8 ILBM file from the `Pics` folder or a reference decoder source.
+1. **HAM scanline start** (implemented as palette[0] per line, ADR-25) not confirmed in the Hardware Reference Manual. Obtain the HRM HAM section (Commodore PDF is linked in [S12]'s search results; not read). Until then: palette[0] per line (likely).
+2. **HAM8 control-bit location** (codec in `dpx-formats` follows [S4], ADR-25; still unverified against a real file) conflict ([S4] top planes vs [S11] low planes). Validate with a real HAM8 ILBM file from the `Pics` folder or a reference decoder source.
 3. **HAM control-code mapping** differs between the summary of the ILBM wiki page [S2] and three other sources [S13][S14][S13][S14]. Re-read [S2] directly or test with a real HAM6 file.
 4. **ECS SuperHiRes colours**: [S5] says 4 colours (palette 64?), [S9] says 4 bit / 16. Out of scope but affects AGA SHRES plane limit on OCS-compatible fallback. Check the Hardware Reference Manual.
 5. **AGA HiRes plane limit** (8 planes needs fetch mode 2/4 and bandwidth): no read table; [S11] covers only SuperHiRes.
