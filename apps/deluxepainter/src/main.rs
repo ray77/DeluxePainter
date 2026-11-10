@@ -13,6 +13,7 @@
 //!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
 //!     [--show-page]                     show the Show Page view
 //!     [--page-size-requester]           show the Page Size requester
+//!     [--notes]                         show the notes of `--open` in the note requester
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG or JPEG picture
@@ -31,9 +32,9 @@ use dpx_core::{
 use dpx_ui::menu::{self, MENUS};
 use dpx_ui::requester::{self, ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 use dpx_ui::{
-    Action, Browse, FileKind, FileRequester, FileResponse, Hit, PageSizeRequester,
-    PageSizeResponse, PaintMode, Preset, Screen, ShowPage, ShowPageResponse, Tool, UiState,
-    to_rgba,
+    Action, Browse, FileKind, FileRequester, FileResponse, Hit, NoteRequester, NoteResponse,
+    PageSizeRequester, PageSizeResponse, PaintMode, Preset, Screen, ShowPage, ShowPageResponse,
+    Tool, UiState, to_rgba,
 };
 use eframe::egui;
 
@@ -141,13 +142,9 @@ fn main() -> eframe::Result {
         Ok(loaded) => {
             let (doc, extras, notes) = files::open_picture(loaded.picture, Target::default());
             let (doc, grown) = files::page_at_least_screen(doc);
-            loaded
-                .notes
-                .iter()
-                .chain(&notes)
-                .chain(&grown)
-                .for_each(|n| eprintln!("note: {n}"));
-            (PathBuf::from(p), doc, extras)
+            let notes: Vec<String> = loaded.notes.into_iter().chain(notes).chain(grown).collect();
+            notes.iter().for_each(|n| eprintln!("note: {n}"));
+            (PathBuf::from(p), doc, extras, notes)
         }
         Err(e) => {
             eprintln!("{e}");
@@ -170,7 +167,7 @@ fn main() -> eframe::Result {
             .and_then(|s| s.parse().ok())
             .unwrap_or(2);
         let doc = match &opened {
-            Some((_, doc, _)) => doc.clone(),
+            Some((_, doc, _, _)) => doc.clone(),
             None => {
                 let (w, h) = DisplayMode::PAL_LORES.size();
                 Document::new(
@@ -278,6 +275,11 @@ fn main() -> eframe::Result {
         if args.iter().any(|a| a == "--page-size-requester") {
             ui.page_size_requester = Some(page_size_requester(&doc));
         }
+        if args.iter().any(|a| a == "--notes")
+            && let Some((_, _, _, notes)) = &opened
+        {
+            ui.note_requester = note_requester(LOADED, notes);
+        }
         if args.iter().any(|a| a == "--show-page") {
             let sp = ShowPage::new(
                 (doc.page().width(), doc.page().height()),
@@ -336,12 +338,22 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             let mut app = PainterApp::new();
-            if let Some((path, doc, extras)) = opened {
+            if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
+                app.ui.note_requester = note_requester(LOADED, &notes);
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+/// Title of the note requester after Picture ▸ Load (and `--open`) and after Save.
+const LOADED: &str = "Picture loaded";
+const SAVED: &str = "Picture saved";
+
+/// The note requester for `notes`, or `None` when there is nothing to tell (ADR-12).
+fn note_requester(title: &str, notes: &[String]) -> Option<NoteRequester> {
+    (!notes.is_empty()).then(|| NoteRequester::new(title, notes))
 }
 
 /// Picture ▸ Page Size for `doc`: its page size in the fields and the mode's presets.
@@ -724,11 +736,14 @@ impl PainterApp {
                 let current = self.engine.document().target();
                 let (doc, extras, notes) = files::open_picture(loaded.picture, current);
                 let (doc, grown) = files::page_at_least_screen(doc);
-                for n in loaded.notes.iter().chain(&notes).chain(&grown) {
+                let notes: Vec<String> =
+                    loaded.notes.into_iter().chain(notes).chain(grown).collect();
+                for n in &notes {
                     eprintln!("note: {}: {n}", path.display());
                 }
                 self.set_picture(doc, extras, path);
                 self.ui.file_requester = None;
+                self.ui.note_requester = note_requester(LOADED, &notes);
             }
             Err(e) => {
                 eprintln!("{e}");
@@ -752,12 +767,13 @@ impl PainterApp {
             .and_then(|(bytes, notes)| files::write_atomic(&path, &bytes).map(|()| notes));
         match result {
             Ok(notes) => {
-                for n in notes {
+                for n in &notes {
                     eprintln!("note: {}: {n}", path.display());
                 }
                 self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
                 self.picture_path = Some(path);
                 self.ui.file_requester = None;
+                self.ui.note_requester = note_requester(SAVED, &notes);
             }
             Err(e) => {
                 eprintln!("{}: {e}", path.display());
@@ -1008,6 +1024,11 @@ impl eframe::App for PainterApp {
 
         if self.requester.is_some() {
             self.requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.ui.note_requester.is_some() {
+            self.note_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -1460,6 +1481,36 @@ impl PainterApp {
         }
     }
 
+    /// Pointer and keys while the note requester is shown (it is modal).
+    fn note_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: i32,
+        view: View,
+    ) {
+        let Some(req) = &self.ui.note_requester else {
+            return;
+        };
+        let ui_screen = view.ui_screen();
+        let at = req.origin(ui_screen.width, ui_screen.height);
+        let (events, _) = self.modal_events(ctx, origin, ppp, scale, view, at);
+        for event in events {
+            self.note_event(event);
+        }
+    }
+
+    /// Feeds one event to the note requester; Ok, Return, Esc or Space close it.
+    fn note_event(&mut self, event: ReqEvent) {
+        if let Some(req) = &mut self.ui.note_requester {
+            if req.handle(event) == NoteResponse::Close {
+                self.ui.note_requester = None;
+            }
+            self.dirty = true;
+        }
+    }
+
     /// Pointer and keys while the Page Size requester is open (it is modal).
     fn page_size_input(
         &mut self,
@@ -1684,6 +1735,71 @@ mod tests {
         app.run_action(Action::Command("picture.load"), &ctx);
         app.file_requester_event(ReqEvent::Key(ReqKey::Escape), 0);
         assert!(app.ui.file_requester.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_and_save_notes_show_in_a_requester_that_ok_closes() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("dpx-app-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        // An ILBM with a chunk DeluxePainter does not keep, and a plain one.
+        let img = IndexedImage::new(320, 256, 0);
+        let mut src = dpx_iff::Ilbm::from_indexed(img.clone(), Palette::dpaint_default_32());
+        src.other_chunks.push(dpx_iff::ilbm::RawChunk {
+            id: *b"DPPS",
+            data: vec![0; 10],
+        });
+        let write = |name: &str, i: &dpx_iff::Ilbm| {
+            let bytes = dpx_iff::ilbm::write(i, dpx_iff::Compression::ByteRun1).unwrap();
+            std::fs::write(dir.join(name), bytes).unwrap();
+        };
+        write("Notes.iff", &src);
+        src.other_chunks.clear();
+        write("Plain.iff", &src);
+
+        let mut app = PainterApp::new();
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        app.run_action(Action::Command("picture.load"), &ctx);
+        type_into(&mut app, "Notes.iff");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none(), "loaded and closed");
+        let req = app.ui.note_requester.as_ref().expect("notes shown");
+        // Drawn on top of the screen; the Ok button closes it.
+        let ui_screen = app.view().ui_screen();
+        let (ox, oy) = req.origin(ui_screen.width, ui_screen.height);
+        let with = app
+            .view()
+            .compose(app.page(), app.scroll, app.palette(), &app.ui);
+        let ok = (ox + 128, oy + req.height() - 10);
+        app.note_event(ReqEvent::Press(ok.0 - ox, ok.1 - oy));
+        app.note_event(ReqEvent::Release);
+        assert!(app.ui.note_requester.is_none(), "Ok closes");
+        let without = app
+            .view()
+            .compose(app.page(), app.scroll, app.palette(), &app.ui);
+        assert_ne!(with, without);
+
+        // A picture without notes opens none.
+        app.run_action(Action::Command("picture.load"), &ctx);
+        type_into(&mut app, "Plain.iff");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.note_requester.is_none());
+
+        // Saving PNG tells what PNG cannot store (the display mode); Return closes.
+        app.run_action(Action::Command("picture.save"), &ctx);
+        for _ in 0.."Plain.iff".len() {
+            app.file_requester_event(ReqEvent::Key(ReqKey::Backspace), 0);
+        }
+        type_into(&mut app, "Plain.png");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none());
+        assert!(dir.join("Plain.png").exists());
+        assert!(app.ui.note_requester.is_some(), "PNG notes shown");
+        app.note_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.ui.note_requester.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

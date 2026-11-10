@@ -33,9 +33,10 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 
 - Overscan and custom screens (ADR-11): Screen Format ▸ Screen Size cycles Standard / Overscan / Custom (editable width/height, up to 368/736/1472 × 241/283, laced 482/566); the information panel shows Size and Max Size; pictures open on the screen from their ILBM page fields or their own size; ILBM saves write the screen size. Verified by tests and snapshots.
 
+- Notes after Load/Save (ADR-12): whatever was not kept, reduced, scaled or cannot be stored is listed in a "Picture loaded" / "Picture saved" requester with Ok (also after `--open`), not only on stderr. Verified by tests and a snapshot.
+
 Next in Phase 2:
 1. Error diagnostics for broken files; more golden fixtures.
-2. Visible notes (e.g. "DPPS chunk not kept", "reduced to 256 colours") instead of stderr only.
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 

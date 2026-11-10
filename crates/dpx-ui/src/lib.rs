@@ -8,6 +8,7 @@ pub mod bitmap;
 pub mod file_requester;
 pub mod font;
 pub mod menu;
+pub mod note_requester;
 pub mod page_size_requester;
 pub mod pattern;
 pub mod pens;
@@ -21,6 +22,7 @@ use dpx_core::{IndexedImage, Palette};
 
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
 pub use menu::{Action, MenuState, Pref, Prefs};
+pub use note_requester::{NoteRequester, NoteResponse};
 pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};
 pub use pens::Pens;
 pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};

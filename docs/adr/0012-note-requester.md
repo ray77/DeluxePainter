@@ -1,0 +1,25 @@
+# ADR-12: Notes after Load and Save in a requester
+
+- Status: accepted (Phase 2, 2026-11-10)
+- Context: Loading and saving often change or drop something: unknown chunks (DPPS, TINY …) are not kept, the mask plane is dropped, true colour is reduced and dithered, big pictures are scaled, small pages grow to the screen, PNG cannot store CAMG, colour ranges or masking. Until now these notes went to stderr only, which a user who starts the app from the Finder never sees. DeluxePaint IV shows its own messages ("Can't Load …", "change the screen format to that of the file?") in small requesters with buttons (AGA manual p.12, p.81–82, p.170). Its title bar only shows status (paint mode, fill box, flags, coordinates; p.266–267) and has room for about 40 characters. The visible behaviour was decided by the owner (2026-11-10): a requester with Ok.
+- Decision:
+  - **Note requester (`dpx_ui::note_requester`):**
+    - A box on the UI layer like the other requesters, centred on the screen, square corners. Its layout is ours: 256 LoRes pixels wide, title centred with a line under it, one bullet per note, text word-wrapped to the proportional font with a hanging indent, one Ok button centred at the bottom. The height follows the number of lines.
+    - The first letter of each note is capitalised for display; the notes themselves stay lower-case for the CLI.
+    - At most 14 lines are shown. With more, the last line reads "...and N more", where N counts the notes not shown completely.
+    - It is modal. Ok (pressed and released over it), Return, Esc and Space close it; nothing else happens while it is shown.
+  - **When it appears:**
+    - After Picture ▸ Load with the title "Picture loaded": notes from reading the file, from opening it on a screen, and from enlarging a small page.
+    - After Picture ▸ Save with the title "Picture saved": what the chosen format cannot store, and colour ranges outside the palette.
+    - At start-up after `--open` with the same notes as Load.
+    - Only when there is at least one note. Errors still appear in the file requester's message line and keep it open.
+  - The notes are still printed to stderr as `note: <path>: <text>`, and the CLI (`info`, `convert`) is unchanged.
+  - Snapshot option for documentation: `--notes` shows the notes of `--open`.
+- Verified:
+  - Unit tests in `dpx-ui`: size and height, wrapping (words kept, width respected, long words broken), capitalisation, the overflow line and its count, Ok press/release, keys, centring and clamping, title pixels.
+  - App test: loading an ILBM with a DPPS chunk through the file requester shows the requester and Ok closes it; a picture without notes shows none; saving PNG shows what PNG cannot store and Return closes it.
+  - Headless snapshot `docs/design/screenshots/phase2-notes.png` of a self-made 1600×1200 JPEG opened with `--open`.
+  - Not tried by hand in the window.
+- Consequences:
+  - Error diagnostics for broken files (next Phase 2 item) can reuse the requester for warnings that do not stop loading.
+  - Other messages (e.g. future "change the screen format?" questions) need Yes/No buttons; that is a later extension of the same widget.
