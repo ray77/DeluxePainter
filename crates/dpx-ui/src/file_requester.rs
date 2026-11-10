@@ -80,6 +80,9 @@ pub enum FileKind {
     SavePicture,
     /// Picture ▸ Export..: IFF ILBM or PNG (ADR-27).
     ExportPicture,
+    /// Anim ▸ Load.. / Save..: IFF ANIM (ADR-32).
+    LoadAnim,
+    SaveAnim,
     /// Picture ▸ Delete..: the action button asks Yes/No before it answers (ADR-15).
     DeleteFile,
     LoadPalette,
@@ -98,6 +101,8 @@ impl FileKind {
             FileKind::LoadPicture => "Load Picture",
             FileKind::SavePicture => "Save Project",
             FileKind::ExportPicture => "Export Picture",
+            FileKind::LoadAnim => "Load Animation",
+            FileKind::SaveAnim => "Save Animation",
             FileKind::DeleteFile => "Delete File",
             FileKind::LoadPalette => "Load Palette",
             FileKind::SavePalette => "Save Palette",
@@ -111,10 +116,12 @@ impl FileKind {
     fn action(self) -> &'static str {
         match self {
             FileKind::LoadPicture
+            | FileKind::LoadAnim
             | FileKind::LoadPalette
             | FileKind::LoadBrush
             | FileKind::LoadStencil => "Load",
             FileKind::SavePicture
+            | FileKind::SaveAnim
             | FileKind::SavePalette
             | FileKind::SaveBrush
             | FileKind::SaveStencil => "Save",

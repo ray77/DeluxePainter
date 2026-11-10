@@ -590,8 +590,8 @@ fn refused() -> Vec<(&'static str, Vec<u8>, ErrorKind, String)> {
         "anim",
         form(b"ANIM", &[form(b"ILBM", &[bmhd(16, 2, 2, 0, 0, 0)])]),
         ErrorKind::NotIlbm,
-        "ANIM files arrive in Phase 6\nThis is an IFF ANIM animation. DeluxePainter loads \
-         animations from Phase 6 on; until then it reads single FORM ILBM pictures.",
+        "An animation, not a picture\nThis is an IFF ANIM animation. The ILBM reader reads \
+         single pictures; animations are read by dpx_iff::anim (the app does that on Load).",
     );
     add(
         "8svx",

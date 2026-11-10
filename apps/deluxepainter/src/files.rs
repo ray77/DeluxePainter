@@ -1,6 +1,6 @@
 //! Loading and saving pictures by file type, plus the headless `info` and `convert` commands.
 //!
-//! Formats: IFF ILBM and PNG in and out, JPEG in only. True-colour PNG and JPEG pictures are
+//! Formats: IFF ILBM and PNG in and out, IFF ANIM in and out (ADR-32), JPEG in only. True-colour PNG and JPEG pictures are
 //! reduced to an indexed page when they are opened (ADR-9). EHB pictures open as 64 free
 //! colours and HAM pictures are decoded and reduced like true colour (ADR-26). Whatever a target format cannot
 //! store is reported, never dropped silently.
@@ -13,6 +13,7 @@ use dpx_core::resample;
 use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Palette, Rgb8, RgbaImage, Target};
 use dpx_formats::ham::{HamKind, decode_ham};
 use dpx_formats::project::{self, Project, ProjectExtras, ProjectRange};
+use dpx_iff::anim_doc::{self, AnimContent};
 use dpx_iff::ilbm::CAMG_EHB;
 use dpx_iff::{ColorRange, Compression, Ilbm, Masking, SpecialMode, ilbm};
 
@@ -36,6 +37,8 @@ pub enum Picture {
     },
     /// A `.dpxproj` project: document, extras and spare page, all lossless (ADR-23).
     Project(Box<Project>),
+    /// An IFF ANIM; becomes a multi-frame document when it is opened (ADR-32).
+    Anim(Box<AnimContent>),
 }
 
 impl Picture {
@@ -45,6 +48,7 @@ impl Picture {
             Picture::Ilbm(i) => Some((&i.image, &i.palette)),
             Picture::Png { image, palette } => Some((image, palette)),
             Picture::Project(p) => Some((p.document.page(), p.document.palette())),
+            Picture::Anim(a) => Some((&a.frames[0], &a.palette)),
             Picture::TrueColor { .. } => None,
         }
     }
@@ -53,6 +57,7 @@ impl Picture {
     pub fn camg(&self) -> Option<u32> {
         match self {
             Picture::Ilbm(i) => i.camg,
+            Picture::Anim(a) => a.camg,
             Picture::Png { .. } | Picture::TrueColor { .. } | Picture::Project(_) => None,
         }
     }
@@ -64,6 +69,7 @@ enum Kind {
     Png,
     Jpeg,
     Project,
+    Anim,
 }
 
 impl From<&PictureExtras> for ProjectExtras {
@@ -106,7 +112,11 @@ impl From<&ProjectExtras> for PictureExtras {
 
 fn kind_of_bytes(bytes: &[u8]) -> Option<Kind> {
     if bytes.starts_with(b"FORM") {
-        Some(Kind::Ilbm)
+        if bytes.get(8..12) == Some(b"ANIM") {
+            Some(Kind::Anim)
+        } else {
+            Some(Kind::Ilbm)
+        }
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(Kind::Png)
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -128,12 +138,13 @@ fn kind_of_path(path: &Path) -> Result<Kind, String> {
         Some("iff" | "ilbm" | "lbm") => Ok(Kind::Ilbm),
         Some("png") => Ok(Kind::Png),
         Some("dpxproj") => Ok(Kind::Project),
+        Some("anim") => Ok(Kind::Anim),
         Some("jpg" | "jpeg") => Err(format!(
-            "{}: JPEG is import-only (DeluxePainter writes .iff/.ilbm/.lbm, .png and .dpxproj)",
+            "{}: JPEG is import-only (DeluxePainter writes .iff/.ilbm/.lbm, .png, .anim and .dpxproj)",
             path.display()
         )),
         _ => Err(format!(
-            "{}: unsupported output type (DeluxePainter writes .iff/.ilbm/.lbm, .png and .dpxproj)",
+            "{}: unsupported output type (DeluxePainter writes .iff/.ilbm/.lbm, .png, .anim and .dpxproj)",
             path.display()
         )),
     }
@@ -145,6 +156,19 @@ fn kind_of_path(path: &Path) -> Result<Kind, String> {
 pub fn load(path: &Path) -> Result<Loaded, String> {
     let bytes = std::fs::read(path).map_err(|e| with_path(path, read_error(&e)))?;
     match kind_of_bytes(&bytes) {
+        Some(Kind::Anim) => {
+            let (anim, mut notes) =
+                dpx_iff::anim::read_with_notes(&bytes).map_err(|e| with_path(path, e))?;
+            let content = anim_doc::content_of(&anim);
+            notes.extend(content.notes.iter().cloned());
+            Ok(Loaded {
+                picture: Picture::Anim(Box::new(AnimContent {
+                    notes: Vec::new(),
+                    ..content
+                })),
+                notes,
+            })
+        }
         Some(Kind::Ilbm) => {
             let (mut pic, mut notes) =
                 ilbm::read_with_notes(&bytes).map_err(|e| with_path(path, e))?;
@@ -322,7 +346,7 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
     let (image, palette) = picture
         .indexed()
         .ok_or_else(|| "true-colour picture must be reduced before saving".to_string())?;
-    if matches!(picture, Picture::Project(_)) && kind != Kind::Project {
+    if matches!(picture, Picture::Project(_) | Picture::Anim(_)) && kind != Kind::Project {
         return Err("a project is exported through the document: use convert".into());
     }
     let mut notes = Vec::new();
@@ -331,6 +355,9 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
             Picture::Project(p) => project::write_project(p).map_err(|e| e.to_string())?,
             _ => return Err("only a project is saved as is: use convert".into()),
         },
+        Kind::Anim => {
+            return Err("an animation is written through the document: use convert".into());
+        }
         Kind::Ilbm | Kind::Jpeg => {
             let ilbm = match picture {
                 Picture::Ilbm(i) => (**i).clone(),
@@ -486,6 +513,9 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
         }
         return (p.document.clone(), PictureExtras::from(&p.extras), notes);
     }
+    if let Picture::Anim(a) = picture {
+        return open_anim(*a);
+    }
     if let Picture::TrueColor { image, format } = &picture {
         let r = reduce_true_color(image, format, current);
         let extras = PictureExtras {
@@ -536,13 +566,41 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
             (i.image, i.palette)
         }
         Picture::Png { image, palette } => (image, palette),
-        Picture::TrueColor { .. } | Picture::Project(_) => unreachable!("handled above"),
+        Picture::TrueColor { .. } | Picture::Project(_) | Picture::Anim(_) => {
+            unreachable!("handled above")
+        }
     };
     (
         Document::from_picture(image, palette, target),
         extras,
         notes,
     )
+}
+
+/// An ANIM as a multi-frame document: display mode from CAMG and size like an ILBM picture,
+/// the screen from the picture size (the file has no page fields), current frame 1 (ADR-32).
+fn open_anim(a: AnimContent) -> (Document, PictureExtras, Vec<String>) {
+    let (w, h) = (a.frames[0].width(), a.frames[0].height());
+    let mode = DisplayMode::guess(a.camg, w, h);
+    let (sw, sh) = mode.screen_for_picture(w, h);
+    let target = Target::new(Target::default().chipset, mode).with_screen(sw, sh);
+    let extras = PictureExtras {
+        ranges: a.ranges,
+        ..PictureExtras::default()
+    };
+    let first = a.frames[0].clone();
+    match Document::from_frames(a.frames, 0, a.fps, a.palette.clone(), target) {
+        Ok(doc) => (doc, extras, Vec::new()),
+        // More frames than a document holds (ADR-28 limits): open the first frame only.
+        Err(e) => (
+            Document::from_picture(first, a.palette, target),
+            extras,
+            vec![format!(
+                "only the first frame is opened: {}",
+                e.message.trim_end_matches('.')
+            )],
+        ),
+    }
 }
 
 /// DeluxePaint pages are never smaller than the screen (ADR-10): a smaller picture is placed
@@ -589,10 +647,12 @@ pub enum SaveFormat {
     Png,
     /// The lossless project (`.dpxproj`, ADR-23).
     Project,
+    /// IFF ANIM (`.anim`, ADR-32).
+    Anim,
 }
 
 /// Picture ▸ Save picks the format by name: `.png` writes PNG, `.dpxproj` the lossless
-/// project; everything else writes IFF ILBM, because Amiga names often have no extension or tags like `.LoRes`.
+/// project, `.anim` an IFF ANIM; everything else writes IFF ILBM, because Amiga names often have no extension or tags like `.LoRes`.
 pub fn save_format(path: &Path) -> Result<SaveFormat, String> {
     let ext = path
         .extension()
@@ -601,6 +661,7 @@ pub fn save_format(path: &Path) -> Result<SaveFormat, String> {
     match ext.as_deref() {
         Some("png") => Ok(SaveFormat::Png),
         Some("dpxproj") => Ok(SaveFormat::Project),
+        Some("anim") => Ok(SaveFormat::Anim),
         Some("jpg" | "jpeg") => Err("JPEG is import-only: use .iff or .png".into()),
         Some("gif" | "bmp" | "tif" | "tiff" | "webp") => {
             Err("DeluxePainter saves pictures as IFF or PNG".into())
@@ -634,10 +695,10 @@ pub fn encode_document(
         .transparent_color
         .filter(|&c| usize::from(c) < colors);
     let frames = doc.frame_count();
-    if frames > 1 && save_format(path)? != SaveFormat::Project {
-        // ADR-28: one picture per export until IFF ANIM export exists.
+    if frames > 1 && !matches!(save_format(path)?, SaveFormat::Project | SaveFormat::Anim) {
+        // ADR-28: a picture format holds one frame; .anim writes all of them (ADR-32).
         notes.push(format!(
-            "frame {} of {frames} exported as a picture (IFF ANIM export comes later)",
+            "frame {} of {frames} exported as a picture (save as .anim for all frames)",
             doc.current_frame() + 1
         ));
     }
@@ -657,6 +718,33 @@ pub fn encode_document(
                 out.transparent_color = c;
             }
             let bytes = ilbm::write(&out, Compression::ByteRun1).map_err(|e| e.to_string())?;
+            Ok((bytes, notes))
+        }
+        SaveFormat::Anim => {
+            let mode = doc.target().mode;
+            let (xa, ya) = mode.aspect();
+            let (w, h) = (doc.page().width(), doc.page().height());
+            let images: Vec<IndexedImage> = doc.frames().cloned().collect();
+            let fps = doc.fps();
+            let opts = dpx_iff::anim::EncodeOptions {
+                hold: dpx_iff::anim::Hold::PerFrame(anim_doc::holds_for_fps(fps, images.len())),
+                ranges,
+                camg: Some(doc.target().camg()),
+                x_aspect: xa,
+                y_aspect: ya,
+                ..Default::default()
+            };
+            if doc.target().screen != mode.screen_for_picture(w, h) {
+                notes.push("ANIM cannot store the screen size, it opens as the picture's".into());
+            }
+            if let Some(c) = transparent {
+                notes.push(format!("ANIM output cannot store: transparent colour {c}"));
+            }
+            if extras.grab.is_some() {
+                notes.push("ANIM output cannot store: grab point".into());
+            }
+            let bytes =
+                dpx_iff::anim::encode(&images, doc.palette(), &opts).map_err(|e| e.to_string())?;
             Ok((bytes, notes))
         }
         SaveFormat::Project => {
@@ -737,6 +825,31 @@ pub fn info(path: &Path) -> Result<String, String> {
     }
     let (img, _) = loaded.picture.indexed().expect("indexed picture");
     match &loaded.picture {
+        Picture::Anim(a) => {
+            let (_, _, opened) = open_picture(Picture::Anim(a.clone()), Target::default());
+            let n = a.frames.len();
+            out += &format!(
+                "{name}: IFF ANIM {}x{}, {} colours, {n} frame{}, {} per second\n",
+                img.width(),
+                img.height(),
+                a.palette.len(),
+                if n == 1 { "" } else { "s" },
+                a.fps
+            );
+            for (i, r) in a.ranges.iter().enumerate() {
+                out += &format!(
+                    "  CRNG {i}: colours {}-{}, {:.1} steps/s{}{}\n",
+                    r.low,
+                    r.high,
+                    r.steps_per_second(),
+                    if r.active() { ", active" } else { "" },
+                    if r.reverse() { ", reverse" } else { "" }
+                );
+            }
+            for o in opened {
+                out += &format!("  note: {o}\n");
+            }
+        }
         Picture::Ilbm(i) => {
             out += &format!(
                 "{name}: IFF ILBM {}x{}, {} planes ({} colours), {:?}, masking {:?}",
@@ -852,7 +965,12 @@ pub fn info(path: &Path) -> Result<String, String> {
     }
     let used = {
         let mut seen = [false; 256];
-        for &p in img.pixels() {
+        let frames: Vec<&IndexedImage> = match &loaded.picture {
+            Picture::Anim(a) => a.frames.iter().collect(),
+            Picture::Project(p) => p.document.frames().collect(),
+            _ => vec![img],
+        };
+        for &p in frames.iter().flat_map(|f| f.pixels()) {
             seen[usize::from(p)] = true;
         }
         seen.iter().filter(|&&s| s).count()
@@ -915,7 +1033,9 @@ pub fn convert(input: &Path, output: &Path) -> Result<Vec<String>, String> {
     // PNG pictures otherwise convert directly so ILBM → ILBM keeps every chunk.
     let via_document = matches!(
         (&loaded.picture, out_kind),
-        (Picture::TrueColor { .. }, _) | (Picture::Project(_), _) | (_, Kind::Project)
+        (Picture::TrueColor { .. }, _)
+            | (Picture::Project(_) | Picture::Anim(_), _)
+            | (_, Kind::Project | Kind::Anim)
     );
     if via_document {
         let (doc, extras, opened) = open_picture(loaded.picture, Target::default());
@@ -1210,6 +1330,158 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A 3-frame 320x256 document at `fps` with different pixels in every frame.
+    fn three_frames(fps: u8) -> Document {
+        let frames: Vec<IndexedImage> = (0..3)
+            .map(|i| {
+                let mut f = IndexedImage::new(320, 256, 2 + i);
+                f.set(10 + i32::from(i), 20, 31);
+                f.set(319, 255, 7);
+                f
+            })
+            .collect();
+        Document::from_frames(
+            frames,
+            0,
+            fps,
+            Palette::dpaint_default_32(),
+            Target::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn anim_files_convert_both_ways_and_describe_themselves() {
+        let doc = three_frames(20);
+        let extras = PictureExtras {
+            ranges: vec![ColorRange {
+                rate: 8192,
+                flags: 1,
+                low: 4,
+                high: 9,
+            }],
+            ..PictureExtras::default()
+        };
+        let a = tmp("walk-a.anim");
+        let (bytes, notes) = encode_document(&doc, &extras, &a).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        std::fs::write(&a, &bytes).unwrap();
+        assert_eq!(&bytes[8..12], b"ANIM");
+
+        // info describes frames, size, colours, rate and the range.
+        let info = info(&a).unwrap();
+        assert!(
+            info.contains("IFF ANIM 320x256, 32 colours, 3 frames, 20 per second"),
+            "{info}"
+        );
+        assert!(info.contains("CRNG 0: colours 4-9"), "{info}");
+        assert!(info.contains("colours used: 5"), "{info}");
+        assert!(!info.contains("note:"), "{info}");
+
+        // anim -> dpxproj -> anim: frames, palette, rate and ranges survive; bytes are equal.
+        let proj = tmp("walk-b.dpxproj");
+        let notes = convert(&a, &proj).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let (back, back_extras, _) = open_picture(load(&proj).unwrap().picture, Target::default());
+        assert!(back.frames().eq(doc.frames()));
+        assert_eq!(back.palette(), doc.palette());
+        assert_eq!((back.fps(), back.frame_count()), (20, 3));
+        assert_eq!(back_extras.ranges, extras.ranges);
+        let c = tmp("walk-c.anim");
+        assert!(convert(&proj, &c).unwrap().is_empty());
+        assert_eq!(std::fs::read(&c).unwrap(), bytes, "deterministic");
+
+        // anim -> iff keeps the first frame and says so; anim -> png too.
+        let iff = tmp("walk-d.iff");
+        let notes = convert(&a, &iff).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("frame 1 of 3 exported")),
+            "{notes:?}"
+        );
+        let first = load(&iff).unwrap().picture;
+        assert_eq!(first.indexed().unwrap().0, doc.page());
+        // iff -> anim gives a one-frame animation.
+        let one = tmp("walk-e.anim");
+        convert(&iff, &one).unwrap();
+        let text = info_of(&one);
+        assert!(text.contains("1 frame, "), "{text}");
+        for f in [&a, &proj, &c, &iff, &one] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    fn info_of(path: &Path) -> String {
+        info(path).unwrap()
+    }
+
+    #[test]
+    fn anim_timing_and_palette_changes_are_noted() {
+        use dpx_iff::anim::{self, EncodeOptions, Hold};
+        let doc = three_frames(30);
+        let frames: Vec<IndexedImage> = doc.frames().cloned().collect();
+        let encode = |hold: Hold| {
+            let opts = EncodeOptions {
+                hold,
+                ..EncodeOptions::default()
+            };
+            let path = tmp(&format!("timing-{}.anim", std::process::id()));
+            std::fs::write(&path, anim::encode(&frames, doc.palette(), &opts).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            let (d, _, _) = open_picture(loaded.picture, Target::default());
+            (d, loaded.notes)
+        };
+        // 30 per second is 2 jiffies per frame: no note.
+        let (d, notes) = encode(Hold::Uniform(2));
+        assert_eq!((d.fps(), notes.len()), (30, 0), "{notes:?}");
+        // Whole-jiffy rounding by one is no difference worth a note.
+        let (d, notes) = encode(Hold::PerFrame(vec![2, 3, 2]));
+        assert_eq!(d.fps(), 26, "{notes:?}");
+        assert!(notes.iter().all(|n| !n.contains("differs")), "{notes:?}");
+        // Different holds: the average rate and a note.
+        let (d, notes) = encode(Hold::PerFrame(vec![6, 6, 30]));
+        assert_eq!(d.fps(), 4);
+        assert!(
+            notes.iter().any(|n| n.contains("frame timing differs")),
+            "{notes:?}"
+        );
+        // Slower than 1 per second is clamped to the slowest Set Rate value.
+        let (d, _) = encode(Hold::Uniform(240));
+        assert_eq!(d.fps(), 1);
+    }
+
+    #[test]
+    fn a_broken_or_cut_anim_is_refused_with_a_short_line() {
+        let doc = three_frames(30);
+        let frames: Vec<IndexedImage> = doc.frames().cloned().collect();
+        let good = dpx_iff::anim::encode(
+            &frames,
+            doc.palette(),
+            &dpx_iff::anim::EncodeOptions::default(),
+        )
+        .unwrap();
+        // Nothing after the FORM header.
+        let e = load_error("empty.anim", b"FORM\0\0\0\x04ANIM");
+        assert!(e.starts_with("<file>: "), "{e}");
+        assert!(requester_line(&e).len() <= 34 + 8, "{e}");
+        // Cut inside the first picture: no frame to show.
+        let e = load_error("cut.anim", &good[..300]);
+        assert!(e.starts_with("<file>: "), "{e}");
+        assert!(requester_line(&e).chars().count() <= 34, "{e}");
+        // A damaged delta: the error names the frame.
+        let mut bad = good.clone();
+        let at = bad.windows(4).position(|w| w == b"DLTA").unwrap();
+        for b in &mut bad[at + 8..at + 8 + 64] {
+            *b = 0xFF;
+        }
+        let e = load_error("bad.anim", &bad);
+        assert!(!e.is_empty());
+        assert!(requester_line(&e).chars().count() <= 34, "{e}");
+        // The ILBM reader says what an ANIM is instead of "Phase 6".
+        let e = ilbm::read(&good).unwrap_err();
+        assert!(e.summary.contains("animation"), "{e}");
     }
 
     #[test]

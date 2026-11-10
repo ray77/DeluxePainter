@@ -16,6 +16,8 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub enum Format {
     Ilbm,
     Png,
+    /// IFF ANIM: all frames (ADR-32).
+    Anim,
 }
 
 /// Output format by extension: `.iff`, `.ilbm`, `.lbm` (IFF ILBM) or `.png`. Unlike the GUI,
@@ -28,13 +30,14 @@ pub fn format_for_save(path: &str) -> Result<Format, ToolError> {
     match ext.as_deref() {
         Some("iff" | "ilbm" | "lbm") => Ok(Format::Ilbm),
         Some("png") => Ok(Format::Png),
+        Some("anim") => Ok(Format::Anim),
         Some("jpg" | "jpeg") => Err(ToolError::new(
             "UNSUPPORTED_FILE_TYPE",
             "JPEG is import-only: save as .iff or .png",
         )),
         _ => Err(ToolError::new(
             "UNSUPPORTED_FILE_TYPE",
-            "save_picture writes .iff/.ilbm/.lbm (IFF ILBM) and .png (indexed PNG)",
+            "save_picture writes .iff/.ilbm/.lbm (IFF ILBM), .png (indexed PNG) and .anim (IFF ANIM)",
         )),
     }
 }
@@ -50,6 +53,9 @@ fn bad_file(path: &str, e: impl std::fmt::Display) -> ToolError {
 /// Decodes an indexed ILBM or PNG into a document at revision 0 plus notes about whatever
 /// the document model does not keep.
 pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>), ToolError> {
+    if bytes.starts_with(b"FORM") && bytes.get(8..12) == Some(b"ANIM") {
+        return decode_anim(name, bytes);
+    }
     let mut notes = Vec::new();
     let (image, palette, camg, page_fields) = if bytes.starts_with(b"FORM") {
         let (i, n) = ilbm::read_with_notes(bytes).map_err(|e| bad_file(name, e))?;
@@ -119,6 +125,26 @@ pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>
     Ok((Document::from_picture(image, palette, target), notes))
 }
 
+/// An IFF ANIM as a multi-frame document, like the app's Load (ADR-32).
+fn decode_anim(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>), ToolError> {
+    let (anim, mut notes) = dpx_iff::anim::read_with_notes(bytes).map_err(|e| bad_file(name, e))?;
+    let content = dpx_iff::anim_doc::content_of(&anim);
+    notes.extend(content.notes);
+    if !content.ranges.is_empty() {
+        notes.push(format!(
+            "{} colour-cycling ranges not kept (not in the document model yet)",
+            content.ranges.len()
+        ));
+    }
+    let (w, h) = (content.frames[0].width(), content.frames[0].height());
+    let mode = DisplayMode::guess(content.camg, w, h);
+    let (sw, sh) = mode.screen_for_picture(w, h);
+    let target = Target::new(Target::default().chipset, mode).with_screen(sw, sh);
+    let doc = Document::from_frames(content.frames, 0, content.fps, content.palette, target)
+        .map_err(|e| bad_file(name, e.message))?;
+    Ok((doc, notes))
+}
+
 fn hardware(msg: String) -> ToolError {
     ToolError::new("HARDWARE_LIMIT", msg)
 }
@@ -178,11 +204,11 @@ pub fn encode_document(
     format: Format,
 ) -> Result<(Vec<u8>, Vec<String>), ToolError> {
     validate_hardware(doc)?;
-    // ADR-28: an animation is written one frame at a time until IFF ANIM export exists.
+    // ADR-28: a picture format holds one frame; .anim writes all of them (ADR-32).
     let mut notes = Vec::new();
-    if doc.frame_count() > 1 {
+    if doc.frame_count() > 1 && format != Format::Anim {
         notes.push(format!(
-            "frame {} of {} saved as a picture (IFF ANIM export comes later)",
+            "frame {} of {} saved as a picture (save as .anim for all frames)",
             doc.current_frame() + 1,
             doc.frame_count()
         ));
@@ -196,6 +222,24 @@ pub fn encode_document(
             out.page_width = sw as i16;
             out.page_height = sh as i16;
             let bytes = ilbm::write(&out, ilbm::Compression::ByteRun1)
+                .map_err(|e| hardware(e.to_string()))?;
+            Ok((bytes, notes))
+        }
+        Format::Anim => {
+            let mode = doc.target().mode;
+            let (x_aspect, y_aspect) = mode.aspect();
+            let images: Vec<IndexedImage> = doc.frames().cloned().collect();
+            let opts = dpx_iff::anim::EncodeOptions {
+                hold: dpx_iff::anim::Hold::PerFrame(dpx_iff::anim_doc::holds_for_fps(
+                    doc.fps(),
+                    images.len(),
+                )),
+                camg: Some(doc.target().camg()),
+                x_aspect,
+                y_aspect,
+                ..Default::default()
+            };
+            let bytes = dpx_iff::anim::encode(&images, doc.palette(), &opts)
                 .map_err(|e| hardware(e.to_string()))?;
             Ok((bytes, notes))
         }
@@ -232,6 +276,36 @@ mod tests {
             assert_eq!(back.palette(), d.palette(), "{f:?}");
             assert_eq!(back.revision(), 0);
         }
+    }
+
+    #[test]
+    fn anim_round_trip_keeps_every_frame_and_the_rate() {
+        let frames: Vec<IndexedImage> = (0..3)
+            .map(|i| {
+                let mut f = IndexedImage::new(320, 256, i);
+                f.set(5, 6 + i32::from(i), 9);
+                f
+            })
+            .collect();
+        let d = Document::from_frames(
+            frames,
+            1,
+            10,
+            Palette::dpaint_default_32(),
+            Target::default(),
+        )
+        .unwrap();
+        assert_eq!(format_for_save("a.ANIM").unwrap(), Format::Anim);
+        let (bytes, notes) = encode_document(&d, Format::Anim).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let (back, notes) = decode_picture("x", &bytes).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(back.frames().eq(d.frames()));
+        assert_eq!((back.fps(), back.current_frame()), (10, 0));
+        assert_eq!(back.palette(), d.palette());
+        // Pictures still say which frame they hold.
+        let (_, notes) = encode_document(&d, Format::Ilbm).unwrap();
+        assert!(notes[0].contains("frame 2 of 3"), "{notes:?}");
     }
 
     #[test]

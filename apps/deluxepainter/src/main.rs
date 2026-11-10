@@ -381,6 +381,8 @@ fn main() -> eframe::Result {
                 "load" => FileKind::LoadPicture,
                 "save" => FileKind::SavePicture,
                 "export" => FileKind::ExportPicture,
+                "load-anim" => FileKind::LoadAnim,
+                "save-anim" => FileKind::SaveAnim,
                 _ => {
                     eprintln!("--file-requester expects load, save or export");
                     std::process::exit(2);
@@ -524,6 +526,7 @@ fn main() -> eframe::Result {
 const LOADED: &str = "Picture loaded";
 const SAVED: &str = "Picture saved";
 const EXPORTED: &str = "Picture exported";
+const ANIM_SAVED: &str = "Animation saved";
 
 /// Picture ▸ Save.. always writes the lossless project (ADR-27): a picture extension becomes
 /// `.dpxproj`, any other name gets `.dpxproj` appended (Amiga names often have no extension).
@@ -534,10 +537,32 @@ fn project_path(path: &Path) -> PathBuf {
         .map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("dpxproj") => path.to_path_buf(),
-        Some("iff" | "ilbm" | "lbm" | "png" | "jpg" | "jpeg") => path.with_extension("dpxproj"),
+        Some("iff" | "ilbm" | "lbm" | "png" | "jpg" | "jpeg" | "anim") => {
+            path.with_extension("dpxproj")
+        }
         _ => {
             let mut name = path.as_os_str().to_owned();
             name.push(".dpxproj");
+            PathBuf::from(name)
+        }
+    }
+}
+
+/// The name Anim ▸ Save.. writes: `.anim` is kept, a picture or project extension becomes
+/// `.anim`, any other name gets `.anim` appended (ADR-32).
+fn anim_path(path: &Path) -> PathBuf {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("anim") => path.to_path_buf(),
+        Some("iff" | "ilbm" | "lbm" | "png" | "jpg" | "jpeg" | "dpxproj") => {
+            path.with_extension("anim")
+        }
+        _ => {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".anim");
             PathBuf::from(name)
         }
     }
@@ -909,6 +934,9 @@ impl PainterApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned()),
             (FileKind::ExportPicture, Some(p)) => export_name(p),
+            (FileKind::SaveAnim, Some(p)) => anim_path(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
             _ => None,
         };
         if let Some(name) = suggested {
@@ -958,7 +986,8 @@ impl PainterApp {
             } => {
                 let path = browse::expand_home(&drawer).join(file);
                 match kind {
-                    FileKind::LoadPicture => self.load_picture(path),
+                    FileKind::LoadPicture | FileKind::LoadAnim => self.load_picture(path),
+                    FileKind::SaveAnim => self.save_picture(anim_path(&path), overwrite, true),
                     FileKind::SavePicture => {
                         self.save_picture(project_path(&path), overwrite, false)
                     }
@@ -1028,8 +1057,14 @@ impl PainterApp {
                 }
                 self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
                 self.ui.file_requester = None;
-                self.ui.note_requester =
-                    note_requester(if export { EXPORTED } else { SAVED }, &notes);
+                self.ui.note_requester = note_requester(
+                    match (export, files::save_format(&path)) {
+                        (_, Ok(files::SaveFormat::Anim)) => ANIM_SAVED,
+                        (true, _) => EXPORTED,
+                        _ => SAVED,
+                    },
+                    &notes,
+                );
                 if !export {
                     self.picture_path = Some(path);
                 }
@@ -2306,6 +2341,101 @@ mod tests {
         for c in text.chars() {
             app.file_requester_event(ReqEvent::Key(ReqKey::Char(c)), 0);
         }
+    }
+
+    #[test]
+    fn anim_save_and_load_through_the_requesters() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("dpx-app-anim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        let mut app = PainterApp::new();
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        app.engine
+            .execute(Command::SetFrameCount { count: 3 })
+            .unwrap();
+        for frame in 0..3u32 {
+            app.engine.execute(Command::GotoFrame { frame }).unwrap();
+            let mut page = IndexedImage::new(320, 256, 5 + frame as u8);
+            page.set(10 + frame as i32, 20, 31);
+            app.engine
+                .execute(Command::SetPage {
+                    width: 320,
+                    height: 256,
+                    pixels: page.pixels().to_vec(),
+                })
+                .unwrap();
+        }
+        app.engine.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        app.engine
+            .execute(Command::SetFrameRate { fps: 12 })
+            .unwrap();
+        let doc = app.engine.document().clone();
+
+        // Anim > Save.. is "Save Animation"; a name without extension gets .anim.
+        app.run_action(Action::Command("anim.save"), &ctx);
+        let req = app.ui.file_requester.as_ref().expect("requester open");
+        assert_eq!(req.kind(), FileKind::SaveAnim);
+        assert_eq!(req.kind().title(), "Save Animation");
+        type_into(&mut app, "walk");
+        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(app.ui.file_requester.is_none(), "saved");
+        let path = dir.join("walk.anim");
+        assert!(path.exists());
+        assert!(app.ui.note_requester.is_none(), "nothing to report");
+        assert_eq!(app.picture_path, None, "Anim > Save keeps the picture name");
+
+        // Anim > Load.. is "Load Animation" and gives the same frames, palette and rate.
+        let mut other = PainterApp::new();
+        other.last_drawer = Some(dir.to_string_lossy().into_owned());
+        other.run_action(Action::Command("anim.load"), &ctx);
+        let req = other.ui.file_requester.as_ref().unwrap();
+        assert_eq!(req.kind().title(), "Load Animation");
+        type_into(&mut other, "walk.anim");
+        other.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(other.ui.file_requester.is_none(), "loaded");
+        let back = other.engine.document();
+        assert_eq!(back.frame_count(), 3);
+        assert!(back.frames().eq(doc.frames()), "identical frames");
+        assert_eq!(back.palette(), doc.palette());
+        assert_eq!((back.fps(), back.current_frame()), (12, 0));
+        assert_eq!(other.picture_path.as_deref(), Some(path.as_path()));
+        // The suggested name for the next save is the picture's, as .anim.
+        other.run_action(Action::Command("anim.save"), &ctx);
+        assert_eq!(
+            other.ui.file_requester.as_ref().unwrap().file(),
+            "walk.anim"
+        );
+        other.file_requester_event(ReqEvent::Key(ReqKey::Escape), 0);
+
+        // Picture > Load.. opens an ANIM too; Export with a .anim name writes one, and a
+        // single frame gives a one-frame animation.
+        let mut third = PainterApp::new();
+        third.last_drawer = Some(dir.to_string_lossy().into_owned());
+        third.run_action(Action::Command("picture.load"), &ctx);
+        type_into(&mut third, "walk.anim");
+        third.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert_eq!(third.engine.document().frame_count(), 3);
+        let mut single = PainterApp::new();
+        single.last_drawer = Some(dir.to_string_lossy().into_owned());
+        single.run_action(Action::Command("picture.export"), &ctx);
+        type_into(&mut single, "one.anim");
+        single.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+        assert!(single.ui.file_requester.is_none());
+        let one = files::load(&dir.join("one.anim")).unwrap();
+        let (one, _, _) = files::open_picture(one.picture, Target::default());
+        assert_eq!(one.frame_count(), 1);
+        assert_eq!(one.page(), single.engine.document().page());
+
+        assert_eq!(anim_path(Path::new("Venus")), Path::new("Venus.anim"));
+        assert_eq!(anim_path(Path::new("a/V.iff")), Path::new("a/V.anim"));
+        assert_eq!(
+            project_path(Path::new("a/V.anim")),
+            Path::new("a/V.dpxproj")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

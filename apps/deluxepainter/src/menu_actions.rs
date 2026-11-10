@@ -437,7 +437,11 @@ impl PainterApp {
             FileKind::LoadStencil | FileKind::SaveStencil => {
                 self.stencil_file_accept(kind, path, overwrite)
             }
-            FileKind::LoadPicture | FileKind::SavePicture | FileKind::ExportPicture => {}
+            FileKind::LoadPicture
+            | FileKind::SavePicture
+            | FileKind::ExportPicture
+            | FileKind::LoadAnim
+            | FileKind::SaveAnim => {}
             FileKind::LoadBrush | FileKind::SaveBrush => {
                 self.brush_file_accept(kind, path, overwrite)
             }

@@ -650,8 +650,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "translucency.settings",
     // Prefs
     "view.largest_pixel_size",
-    // Anim > Frames and Control, Effect > LightTable (ADR-28); AnimBrush, Load, Save, Move,
-    // Panel, Set Range and Method stay ghosted.
+    // Anim > Frames and Control, Effect > LightTable (ADR-28); AnimBrush, Move, Panel, Set
+    // Range and Method stay ghosted.
     "anim.set_frame_count",
     "anim.add_frames",
     "anim.copy_frames",
@@ -670,6 +670,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "light_table.previous",
     "light_table.next",
     "light_table.spare",
+    // Anim > Load.. and Save.. (IFF ANIM, ADR-32).
+    "anim.load",
+    "anim.save",
     // Range requester (ADR-22)
     "color.ranges",
     // Brush menu (ADR-19).

@@ -770,9 +770,10 @@ fn foreign_form(t: FourCc) -> IlbmError {
                 .to_string(),
         ),
         b"ANIM" => (
-            "ANIM files arrive in Phase 6".to_string(),
-            "This is an IFF ANIM animation. DeluxePainter loads animations from Phase 6 on; \
-             until then it reads single FORM ILBM pictures."
+            "An animation, not a picture".to_string(),
+            "This is an IFF ANIM animation. The ILBM reader reads single pictures; animations \
+             are read by dpx_iff::anim (the app does that on Load)."
+                .to_string()
                 .to_string(),
         ),
         b"DEEP" | b"RGBN" | b"RGB8" | b"TVPP" => (
