@@ -10,6 +10,7 @@ use dpx_core::{BrushImage, IndexedImage, Palette, brush_ops};
 use dpx_iff::ilbm::{self, Compression, Ilbm, Masking};
 use dpx_ui::FileKind;
 
+use crate::tools::XformKind;
 use crate::{PainterApp, files, note_requester};
 
 /// Title of the note requester after Brush ▸ Load.
@@ -107,6 +108,26 @@ impl PainterApp {
                 }
                 return;
             }
+            // ADR-30: the drag gestures, the spare brush and Remap.
+            "brush.stretch" => return self.arm_xform(XformKind::Stretch),
+            "brush.rotate_any" => return self.arm_xform(XformKind::Rotate),
+            "brush.shear" => return self.arm_xform(XformKind::Shear),
+            "brush.bend_horizontal" => return self.arm_xform(XformKind::BendH),
+            "brush.bend_vertical" => return self.arm_xform(XformKind::BendV),
+            "brush.handle_place" => return self.arm_xform(XformKind::Place),
+            "brush.to_spare" => {
+                self.tools.spare_brush.clone_from(&self.custom_brush);
+                return;
+            }
+            "brush.swap_spare" => {
+                // Nothing to swap with: both stay as they were.
+                if self.tools.spare_brush.is_some() && self.custom_brush.is_some() {
+                    std::mem::swap(&mut self.tools.spare_brush, &mut self.custom_brush);
+                    self.dirty = true;
+                }
+                return;
+            }
+            "brush.remap" => return self.remap_brush(),
             _ => {}
         }
         let (fg, bg) = (self.ui.fg, self.ui.bg);
@@ -137,6 +158,20 @@ impl PainterApp {
         self.dirty = true;
     }
 
+    /// Color > Brush > Remap: the brush's colours (as the palette at pick-up or load had them)
+    /// become the nearest colours of the current palette. A brush has no palette of its own
+    /// here, so without that snapshot nothing happens (ADR-30).
+    fn remap_brush(&mut self) {
+        let (Some(b), Some(from)) = (&self.custom_brush, &self.tools.brush_palette) else {
+            return;
+        };
+        let now = self.engine.document().palette().clone();
+        let (new, _) = brush_ops::remap(b, from, &now);
+        self.custom_brush = Some(new);
+        self.tools.brush_palette = Some(now);
+        self.dirty = true;
+    }
+
     /// The file requester's answer for Brush ▸ Load.. and Save..
     pub(crate) fn brush_file_accept(&mut self, kind: FileKind, path: &Path, overwrite: bool) {
         match kind {
@@ -154,6 +189,7 @@ impl PainterApp {
             Ok((brush, changed)) => {
                 self.custom_brush = Some(brush.clone());
                 self.picked_brush = Some(brush);
+                self.tools.brush_palette = Some(self.engine.document().palette().clone());
                 self.ui.file_requester = None;
                 let mut notes = Vec::new();
                 if changed > 0 {
@@ -343,6 +379,54 @@ mod tests {
         assert!(!enabled(&app, "brush.flip_vertical"));
         app.custom_brush = Some(brush());
         assert!(enabled(&app, "brush.flip_vertical"));
+    }
+
+    #[test]
+    fn spare_brush_copies_and_swaps() {
+        let mut app = PainterApp::new();
+        app.custom_brush = Some(brush());
+        act(&mut app, "brush.swap_spare");
+        assert_eq!(app.custom_brush, Some(brush()), "no spare: nothing happens");
+        assert!(app.tools.spare_brush.is_none());
+        act(&mut app, "brush.to_spare");
+        act(&mut app, "brush.rotate_90");
+        let rotated = app.custom_brush.clone().unwrap();
+        act(&mut app, "brush.swap_spare");
+        assert_eq!(app.custom_brush, Some(brush()));
+        assert_eq!(app.tools.spare_brush, Some(rotated));
+    }
+
+    #[test]
+    fn remap_fits_the_brush_to_the_changed_palette() {
+        let mut app = PainterApp::new();
+        let old = app.engine.document().palette().clone();
+        app.custom_brush = Some(brush());
+        act(&mut app, "brush.remap");
+        assert_eq!(
+            app.custom_brush,
+            Some(brush()),
+            "no snapshot: nothing happens"
+        );
+        app.tools.brush_palette = Some(old.clone());
+        act(&mut app, "brush.remap");
+        assert_eq!(
+            app.custom_brush,
+            Some(brush()),
+            "same palette: nothing changes"
+        );
+        let mut colors = old.colors().to_vec();
+        colors[5] = Rgb8::new(1, 2, 3);
+        let new = Palette::new(colors).unwrap();
+        app.run(dpx_core::Command::SetPalette {
+            colors: new.colors().to_vec(),
+        });
+        assert_eq!(app.engine.document().palette(), &new);
+        act(&mut app, "brush.remap");
+        let want = new.nearest(old.get(5).unwrap());
+        let b = app.custom_brush.clone().unwrap();
+        assert_eq!(b.get(1, 0), Some(want));
+        assert_eq!(b.get(0, 0), Some(0), "transparent stays");
+        assert_eq!(app.tools.brush_palette.as_ref(), Some(&new));
     }
 
     /// The mode demo behind docs/design/screenshots/phase3-modes.png. Set `DPX_MODES_PNG` to a

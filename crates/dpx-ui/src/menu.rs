@@ -634,8 +634,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "view.largest_pixel_size",
     // Range requester (ADR-22)
     "color.ranges",
-    // Brush menu (ADR-19); the interactive items (Stretch, Any Angle, Shear, Bend, Place,
-    // Remap, Spare, Metamorph) stay ghosted.
+    // Brush menu (ADR-19).
     "brush.load",
     "brush.save",
     "brush.restore",
@@ -653,6 +652,16 @@ pub const IMPLEMENTED: &[&str] = &[
     "brush.bg_to_fg",
     "brush.swap_bg_fg",
     "brush.change_transparency",
+    // Brush menu, interactive items and spare brush (ADR-30); Metamorph stays ghosted.
+    "brush.stretch",
+    "brush.rotate_any",
+    "brush.shear",
+    "brush.bend_horizontal",
+    "brush.bend_vertical",
+    "brush.handle_place",
+    "brush.to_spare",
+    "brush.swap_spare",
+    "brush.remap",
 ];
 
 impl Item {
@@ -1334,9 +1343,10 @@ mod tests {
         };
         assert!(Action::Command("brush.flip_horizontal").enabled(&with));
         assert!(Action::Command("brush.restore").enabled(&with));
+        assert!(Action::Command("brush.stretch").enabled(&with));
         assert!(
-            !Action::Command("brush.stretch").enabled(&with),
-            "interactive: ghosted"
+            !Action::Command("brush.metamorph").enabled(&with),
+            "Metamorph: ghosted"
         );
         assert!(!menu_enabled(menu("Anim"), &c));
         assert!(menu_enabled(menu("Picture"), &c));

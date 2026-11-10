@@ -48,7 +48,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Airbrush, spacing (N total / every Nth / airbrush / continuous) | Spacing requester; airbrush done (ADR-14), Spacing requester and airbrush radius done (ADR-20) |
 | P0 | Pipette (pick colour) | |
 | P1 | Brush pick-up (rectangle, lasso), last brush, custom brush stamping | |
-| P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | flip, rotate 90, halve/double, outline/trim, handle centre/corner, BG/FG colour items, load/save brush files (ILBM) done (ADR-19); stretch, any angle, shear, bend, place handle open |
+| P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | flip, rotate 90, halve/double, outline/trim, handle centre/corner, BG/FG colour items, load/save brush files (ILBM) done (ADR-19); stretch, any angle, shear, bend, place handle (drag gestures), spare brush and Remap done (ADR-30); Metamorph open |
 | P1 | Text tool with bitmap fonts | original fonts only; UI font done (ADR-14), Choose Font open |
 | P1 | Grid snap, symmetry (point/mirror, N-fold) | Grid and cyclic symmetry done (ADR-14); Gridding and Symmetry requesters (X/Y spacing, cyclic or mirror, order 2–40) done (ADR-20); tile open |
 | P1 | Stencil (protect colours) | Effect ▸ Stencil Make.. / Remake / Reverse / On-Off / Free done (ADR-20); Show, Paint, Load, Save open; painting code honouring it is wired separately (ADR-18) |
