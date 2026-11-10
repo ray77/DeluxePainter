@@ -1195,19 +1195,21 @@ mod tests {
             low: 1,
             high: 4,
         });
-        let a = tmp("a.iff");
+        // Its own drawer: removing it at the end must not race other tests using tmp().
+        let own = own_dir("convert-all");
+        let a = own.join("a.iff");
         std::fs::write(&a, ilbm::write(&src, Compression::ByteRun1).unwrap()).unwrap();
 
-        let b = tmp("b.png");
+        let b = own.join("b.png");
         let notes = convert(&a, &b).unwrap();
         assert!(notes.iter().any(|n| n.contains("CRNG")), "{notes:?}");
-        let c = tmp("c.lbm");
+        let c = own.join("c.lbm");
         assert!(convert(&b, &c).unwrap().is_empty());
         let back = load(&c).unwrap().picture;
         assert_eq!(back.indexed(), Some((&img, &pal)));
 
         // ILBM → ILBM keeps the colour cycling.
-        let d = tmp("d.ilbm");
+        let d = own.join("d.ilbm");
         convert(&a, &d).unwrap();
         match load(&d).unwrap().picture {
             Picture::Ilbm(i) => assert_eq!(i.ranges, src.ranges),
@@ -1218,8 +1220,8 @@ mod tests {
                 .unwrap()
                 .contains("CRNG 0: colours 1-4, 30.0 steps/s, active")
         );
-        assert!(save(&back, &tmp("x.jpg")).is_err(), "no JPEG export");
-        let _ = std::fs::remove_dir_all(a.parent().unwrap());
+        assert!(save(&back, &own.join("x.jpg")).is_err(), "no JPEG export");
+        let _ = std::fs::remove_dir_all(&own);
     }
 
     #[test]
