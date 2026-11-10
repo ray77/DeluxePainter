@@ -8,19 +8,24 @@ pub mod bitmap;
 pub mod file_requester;
 pub mod font;
 pub mod menu;
+pub mod page_size_requester;
 pub mod pattern;
 pub mod pens;
 pub mod requester;
 pub mod screen;
+pub mod show_page;
 pub mod toolbox;
+pub(crate) mod widgets;
 
 use dpx_core::{IndexedImage, Palette};
 
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
 pub use menu::{Action, MenuState, Pref, Prefs};
+pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};
 pub use pens::Pens;
 pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 pub use screen::{Hit, PaintMode, Screen, UiState};
+pub use show_page::{ShowPage, ShowPageResponse};
 pub use toolbox::Tool;
 
 /// Converts an indexed screen to RGBA8, scaling each pixel by `sx`×`sy` (integer factors).

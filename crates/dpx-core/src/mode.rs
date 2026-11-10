@@ -1,7 +1,8 @@
 //! Amiga display modes and the document's hardware target (`docs/HARDWARE_MODES.md`).
 //!
 //! A mode is video standard × resolution × interlace. Sizes are the standard
-//! (non-overscan) screen sizes; overscan and custom sizes follow later.
+//! (non-overscan) screen sizes; overscan screens and custom sizes follow later. Pages may be
+//! larger than the screen within [`DisplayMode::page_limits`] (ADR-10).
 
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +106,54 @@ impl DisplayMode {
             Video::Ntsc => 200,
         };
         (w, if self.interlace { h * 2 } else { h })
+    }
+
+    /// Full video ("Overscan") size, used by the Page Size preset: 368/736/1472 pixels wide,
+    /// 241 (NTSC) or 283 (PAL) lines, laced 483/567 (HARDWARE_MODES.md §2; the NTSC LoRes
+    /// value 368×241 also appears in DeluxePaint's Set Page Size requester). SuperHiRes is
+    /// derived (four times LoRes), not verified.
+    pub fn overscan_size(self) -> (u32, u32) {
+        let w = match self.resolution {
+            Resolution::Lo => 368,
+            Resolution::Hi => 736,
+            Resolution::SuperHi => 1472,
+        };
+        let h = match (self.video, self.interlace) {
+            (Video::Ntsc, false) => 241,
+            (Video::Pal, false) => 283,
+            (Video::Ntsc, true) => 483,
+            (Video::Pal, true) => 567,
+        };
+        (w, h)
+    }
+
+    /// "Full Page" preset: the screen width and the height that shows the proportions of
+    /// DeluxePaint's NTSC LoRes Full Page (320×340 with 10:11 pixels, read from the manual
+    /// figure) with this mode's pixel aspect. Other modes are derived, not verified.
+    pub fn full_page_size(self) -> (u32, u32) {
+        let (w, _) = self.size();
+        let (ax, ay) = self.aspect();
+        // h = w · ax/ay · (340·11)/(320·10), rounded.
+        let num = u64::from(w) * u64::from(ax) * 340 * 11;
+        let den = u64::from(ay) * 320 * 10;
+        let h = ((num + den / 2) / den) as u32;
+        let ((min_w, min_h), (max_w, max_h)) = self.page_limits();
+        (w.clamp(min_w, max_w), h.clamp(min_h, max_h))
+    }
+
+    /// Smallest and largest page: never smaller than the screen; DeluxePaint IV recognises
+    /// pages up to 1008×1024 (AGA manual p.236). Wider overscan pages (SuperHiRes) are allowed
+    /// up to the overscan size — a DeluxePainter extension, as the manual names no AGA limit.
+    pub fn page_limits(self) -> ((u32, u32), (u32, u32)) {
+        let (sw, sh) = self.size();
+        let (ow, oh) = self.overscan_size();
+        ((sw, sh), (ow.max(1008), oh.max(1024)))
+    }
+
+    /// True if a `width`×`height` page is allowed in this mode.
+    pub fn page_fits(self, width: u32, height: u32) -> bool {
+        let ((min_w, min_h), (max_w, max_h)) = self.page_limits();
+        (min_w..=max_w).contains(&width) && (min_h..=max_h).contains(&height)
     }
 
     /// Shape of one pixel as integer display factors (width, height), reduced: LoRes 1×1,
@@ -360,5 +409,35 @@ mod tests {
         }
         assert!(DisplayMode::is_special(0x0002_1800));
         assert!(!DisplayMode::is_special(0x0002_9004));
+    }
+
+    #[test]
+    fn page_presets_and_limits() {
+        let ntsc_lo = DisplayMode::new(Video::Ntsc, Resolution::Lo, false);
+        // The values in DeluxePaint's Set Page Size figure (NTSC LoRes).
+        assert_eq!(ntsc_lo.size(), (320, 200));
+        assert_eq!(ntsc_lo.full_page_size(), (320, 340));
+        assert_eq!(ntsc_lo.overscan_size(), (368, 241));
+        assert_eq!(ntsc_lo.page_limits(), ((320, 200), (1008, 1024)));
+        // Derived for the other modes.
+        assert_eq!(DisplayMode::PAL_LORES.full_page_size(), (320, 316));
+        assert_eq!(DisplayMode::PAL_LORES.overscan_size(), (368, 283));
+        let ntsc_hi = DisplayMode::new(Video::Ntsc, Resolution::Hi, false);
+        assert_eq!(ntsc_hi.full_page_size(), (640, 340));
+        let ntsc_lo_lace = DisplayMode::new(Video::Ntsc, Resolution::Lo, true);
+        assert_eq!(ntsc_lo_lace.full_page_size(), (320, 680));
+        let pal_super_lace = DisplayMode::new(Video::Pal, Resolution::SuperHi, true);
+        assert_eq!(pal_super_lace.overscan_size(), (1472, 567));
+        assert_eq!(pal_super_lace.page_limits(), ((1280, 512), (1472, 1024)));
+        for m in DisplayMode::all() {
+            let (w, h) = m.size();
+            assert!(m.page_fits(w, h), "{}", m.name());
+            let (fw, fh) = m.full_page_size();
+            assert!(m.page_fits(fw, fh), "{}", m.name());
+            let (ow, oh) = m.overscan_size();
+            assert!(m.page_fits(ow, oh), "{}", m.name());
+            assert!(!m.page_fits(w - 1, h));
+            assert!(!m.page_fits(w, 1025));
+        }
     }
 }

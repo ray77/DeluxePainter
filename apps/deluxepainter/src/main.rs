@@ -10,10 +10,13 @@
 //!     [--file-requester load|save]      show the Load/Save Picture requester
 //!     [--drawer DIR] [--file NAME]      … listing DIR, with NAME in the File field
 //!     [--drawer-as TEXT]                … showing TEXT in the Drawer field (doc screenshots)
+//!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
+//!     [--show-page]                     show the Show Page view
+//!     [--page-size-requester]           show the Page Size requester
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
-//! `deluxepainter info <file>`           describe an IFF ILBM or PNG picture
-//! `deluxepainter convert <in> <out>`    convert between IFF ILBM and PNG
+//! `deluxepainter info <file>`           describe an IFF ILBM, PNG or JPEG picture
+//! `deluxepainter convert <in> <out>`    convert to IFF ILBM or PNG
 
 mod browse;
 mod files;
@@ -22,15 +25,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dpx_core::{
-    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, Target, raster,
+    Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, Rect, Target,
+    raster,
 };
 use dpx_ui::menu::{self, MENUS};
 use dpx_ui::requester::{self, ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 use dpx_ui::{
-    Action, Browse, FileKind, FileRequester, FileResponse, Hit, PaintMode, Screen, Tool, UiState,
+    Action, Browse, FileKind, FileRequester, FileResponse, Hit, PageSizeRequester,
+    PageSizeResponse, PaintMode, Preset, Screen, ShowPage, ShowPageResponse, Tool, UiState,
     to_rgba,
 };
 use eframe::egui;
+
+/// Arrow keys scroll the page by this many UI (LoRes) pixels; Alt+arrows by a screen. The
+/// manual gives no step for plain arrows (ADR-10).
+const SCROLL_STEP: i32 = 16;
 
 /// Initial window size in points: PAL LoRes at 3×.
 const START_W: f32 = 960.0;
@@ -68,9 +77,26 @@ impl View {
         Screen::new(self.screen_w / self.ux, self.screen_h / self.uy)
     }
 
-    fn compose(&self, page: &IndexedImage, palette: &Palette, ui: &UiState) -> IndexedImage {
+    /// The screen with the part of `page` that starts at `scroll` and the interface on top.
+    fn compose(
+        &self,
+        page: &IndexedImage,
+        scroll: (i32, i32),
+        palette: &Palette,
+        ui: &UiState,
+    ) -> IndexedImage {
+        let visible = page.crop(Rect::new(scroll.0, scroll.1, self.screen_w, self.screen_h));
         self.ui_screen()
-            .render_scaled(page, palette, ui, self.ux, self.uy)
+            .render_scaled(&visible, palette, ui, self.ux, self.uy)
+    }
+
+    /// Largest scroll position for a page of `page` pixels: the page's right/bottom edge at
+    /// the screen's right/bottom edge.
+    fn max_scroll(&self, page: &IndexedImage) -> (i32, i32) {
+        (
+            (page.width() as i32 - self.screen_w).max(0),
+            (page.height() as i32 - self.screen_h).max(0),
+        )
     }
 
     /// Screen pixel → UI pixel.
@@ -105,10 +131,12 @@ fn main() -> eframe::Result {
     let opened = arg_value(&args, "--open").map(|p| match files::load(Path::new(&p)) {
         Ok(loaded) => {
             let (doc, extras, notes) = files::open_picture(loaded.picture, Target::default());
+            let (doc, grown) = files::page_at_least_screen(doc);
             loaded
                 .notes
                 .iter()
                 .chain(&notes)
+                .chain(&grown)
                 .for_each(|n| eprintln!("note: {n}"));
             (PathBuf::from(p), doc, extras)
         }
@@ -146,6 +174,35 @@ fn main() -> eframe::Result {
                 )
             }
         };
+        let mut engine = Engine::new(doc);
+        if let Some(spec) = arg_value(&args, "--page") {
+            let size = spec
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+            let Some((width, height)) = size else {
+                eprintln!("bad --page '{spec}' (expected WxH)");
+                std::process::exit(2);
+            };
+            if let Err(e) = engine.execute(Command::SetPageSize {
+                width,
+                height,
+                fill: 0,
+            }) {
+                eprintln!("--page {spec}: {}", e.message);
+                std::process::exit(2);
+            }
+        }
+        let doc = engine.document().clone();
+        let view = View::of(doc.target().mode);
+        let scroll = arg_value(&args, "--scroll")
+            .and_then(|s| {
+                let (x, y) = s.split_once(',')?;
+                Some((x.parse().ok()?, y.parse().ok()?))
+            })
+            .map_or((0, 0), |(x, y): (i32, i32)| {
+                let (mx, my) = view.max_scroll(doc.page());
+                (x.clamp(0, mx), y.clamp(0, my))
+            });
         let mut ui = UiState::default();
         if let Some(fg) = arg_value(&args, "--fg").and_then(|s| s.parse().ok()) {
             ui.fg = fg;
@@ -209,6 +266,29 @@ fn main() -> eframe::Result {
             }
             ui.file_requester = Some(req);
         }
+        if args.iter().any(|a| a == "--page-size-requester") {
+            ui.page_size_requester = Some(page_size_requester(&doc));
+        }
+        if args.iter().any(|a| a == "--show-page") {
+            let sp = ShowPage::new(
+                (doc.page().width(), doc.page().height()),
+                (view.screen_w as u32, view.screen_h as u32),
+                scroll,
+            );
+            let screen = sp.render(doc.page(), doc.palette().len());
+            let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
+            let rgba = to_rgba(&screen, doc.palette(), sx, sy);
+            if let Err(e) = write_png(
+                path,
+                screen.width() * sx as u32,
+                screen.height() * sy as u32,
+                &rgba,
+            ) {
+                eprintln!("snapshot failed: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--requester") {
             let page = (doc.page().width(), doc.page().height());
             let req = ScreenFormatRequester::new(doc.target(), page, doc.palette().len());
@@ -227,7 +307,7 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        if let Err(e) = snapshot(path, scale, &doc, &ui) {
+        if let Err(e) = snapshot(path, scale, &doc, scroll, &ui) {
             eprintln!("snapshot failed: {e}");
             std::process::exit(1);
         }
@@ -252,6 +332,28 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(app))
         }),
+    )
+}
+
+/// Picture ▸ Page Size for `doc`: its page size in the fields and the mode's presets.
+fn page_size_requester(doc: &Document) -> PageSizeRequester {
+    let mode = doc.target().mode;
+    PageSizeRequester::new(
+        (doc.page().width(), doc.page().height()),
+        [
+            Preset {
+                label: "Standard",
+                size: mode.size(),
+            },
+            Preset {
+                label: "Full Page",
+                size: mode.full_page_size(),
+            },
+            Preset {
+                label: "Overscan",
+                size: mode.overscan_size(),
+            },
+        ],
     )
 }
 
@@ -302,10 +404,11 @@ fn snapshot(
     path: &str,
     scale: usize,
     doc: &Document,
+    scroll: (i32, i32),
     ui: &UiState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let view = View::of(doc.target().mode);
-    let screen = view.compose(doc.page(), doc.palette(), ui);
+    let screen = view.compose(doc.page(), scroll, doc.palette(), ui);
     let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
     let rgba = to_rgba(&screen, doc.palette(), sx, sy);
     write_png(
@@ -383,6 +486,14 @@ struct PainterApp {
     last_drawer: Option<String>,
     /// Mouse-wheel movement not yet turned into whole list rows.
     wheel: f32,
+    /// Top-left page pixel shown at the top-left of the screen (pages may be larger).
+    scroll: (i32, i32),
+    /// Wheel/trackpad movement not yet turned into whole page pixels.
+    page_wheel: egui::Vec2,
+    /// Page pixel under the pointer (also under the toolbox), for the `n` key.
+    pointer_page: Option<(i32, i32)>,
+    /// Picture ▸ Show Page while it is shown.
+    show_page: Option<ShowPage>,
 }
 
 /// A freehand stroke in progress: drawn into a preview copy of the page with the same raster
@@ -411,6 +522,10 @@ impl PainterApp {
             extras: files::PictureExtras::default(),
             last_drawer: None,
             wheel: 0.0,
+            scroll: (0, 0),
+            page_wheel: egui::Vec2::ZERO,
+            pointer_page: None,
+            show_page: None,
         }
     }
 
@@ -422,7 +537,102 @@ impl PainterApp {
         self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
         self.picture_path = Some(path);
         self.clamp_colors();
+        self.scroll = (0, 0);
         self.dirty = true;
+    }
+
+    /// Keeps the shown part inside the page (after loads, page and format changes, undo).
+    fn clamp_scroll(&mut self) {
+        let (mx, my) = self.view().max_scroll(self.engine.document().page());
+        let clamped = (self.scroll.0.clamp(0, mx), self.scroll.1.clamp(0, my));
+        if clamped != self.scroll {
+            self.scroll = clamped;
+            self.dirty = true;
+        }
+    }
+
+    fn scroll_to(&mut self, x: i32, y: i32) {
+        let before = self.scroll;
+        self.scroll = (x, y);
+        self.clamp_scroll();
+        self.dirty |= self.scroll != before;
+    }
+
+    /// The `n` key: centres the page pixel under the pointer as far as the page allows.
+    fn centre_on(&mut self, (x, y): (i32, i32)) {
+        let v = self.view();
+        self.scroll_to(x - v.screen_w / 2, y - v.screen_h / 2);
+    }
+
+    fn open_page_size(&mut self) {
+        self.finish_stroke();
+        self.ui.page_size_requester = Some(page_size_requester(self.engine.document()));
+        self.dirty = true;
+    }
+
+    /// Feeds one event to the Page Size requester; Ok sets the page size (undoable) with the
+    /// BG colour in the new area.
+    fn page_size_event(&mut self, event: ReqEvent) {
+        let Some(req) = &mut self.ui.page_size_requester else {
+            return;
+        };
+        let response = req.handle(event);
+        self.dirty = true;
+        match response {
+            PageSizeResponse::Continue => {}
+            PageSizeResponse::Cancel => self.ui.page_size_requester = None,
+            PageSizeResponse::Ok { width, height } => {
+                let doc = self.engine.document();
+                if (width, height) == (doc.page().width(), doc.page().height()) {
+                    self.ui.page_size_requester = None;
+                    return;
+                }
+                let ((min_w, min_h), (max_w, max_h)) = doc.target().mode.page_limits();
+                let command = Command::SetPageSize {
+                    width,
+                    height,
+                    fill: self.ui.bg,
+                };
+                match self.engine.execute(command) {
+                    Ok(_) => {
+                        self.ui.page_size_requester = None;
+                        self.clamp_scroll();
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        if let Some(req) = &mut self.ui.page_size_requester {
+                            req.set_message(format!("Size {min_w}x{min_h} to {max_w}x{max_h}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_show_page(&mut self) {
+        self.finish_stroke();
+        let view = self.view();
+        let page = self.engine.document().page();
+        self.show_page = Some(ShowPage::new(
+            (page.width(), page.height()),
+            (view.screen_w as u32, view.screen_h as u32),
+            self.scroll,
+        ));
+        self.dirty = true;
+    }
+
+    fn show_page_event(&mut self, event: ReqEvent, alt: bool) {
+        let Some(sp) = &mut self.show_page else {
+            return;
+        };
+        let response = sp.handle(event, alt);
+        self.dirty = true;
+        if let ShowPageResponse::Done(view) = response {
+            self.show_page = None;
+            if let Some((x, y)) = view {
+                self.scroll_to(x, y);
+            }
+        }
     }
 
     /// Keeps the FG/BG colours inside the palette.
@@ -503,7 +713,8 @@ impl PainterApp {
             Ok(loaded) => {
                 let current = self.engine.document().target();
                 let (doc, extras, notes) = files::open_picture(loaded.picture, current);
-                for n in loaded.notes.iter().chain(&notes) {
+                let (doc, grown) = files::page_at_least_screen(doc);
+                for n in loaded.notes.iter().chain(&notes).chain(&grown) {
                     eprintln!("note: {}: {n}", path.display());
                 }
                 self.set_picture(doc, extras, path);
@@ -583,6 +794,7 @@ impl PainterApp {
                     self.requester = None;
                     // Colours beyond the new palette would be invalid.
                     self.clamp_colors();
+                    self.clamp_scroll();
                 }
                 Err(e) => req.set_message(e.message),
             },
@@ -613,12 +825,16 @@ impl PainterApp {
     fn undo(&mut self) {
         self.finish_stroke();
         Self::report(self.engine.undo(), ErrorCode::NothingToUndo);
+        self.clamp_colors();
+        self.clamp_scroll();
         self.dirty = true;
     }
 
     fn redo(&mut self) {
         self.finish_stroke();
         Self::report(self.engine.redo(), ErrorCode::NothingToRedo);
+        self.clamp_colors();
+        self.clamp_scroll();
         self.dirty = true;
     }
 
@@ -727,6 +943,8 @@ impl PainterApp {
                     colors: Palette::dpaint_default_32().colors().to_vec(),
                 }),
                 "picture.screen_format" => self.open_screen_format(),
+                "picture.page_size" => self.open_page_size(),
+                "picture.show_page" => self.open_show_page(),
                 "picture.load" => self.open_file_requester(FileKind::LoadPicture),
                 "picture.save" => self.open_file_requester(FileKind::SavePicture),
                 "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -763,6 +981,7 @@ impl eframe::App for PainterApp {
         let ctx = ui.ctx().clone();
         let ppp = ctx.pixels_per_point();
         let area = ctx.content_rect();
+        self.clamp_scroll();
 
         // Integer scale in physical pixels, letterboxed and snapped to the device pixel grid.
         // Each screen pixel is shown fx×fy times larger (its shape in this display mode).
@@ -784,6 +1003,16 @@ impl eframe::App for PainterApp {
         }
         if self.ui.file_requester.is_some() {
             self.file_requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.ui.page_size_requester.is_some() {
+            self.page_size_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.show_page.is_some() {
+            self.show_page_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -832,9 +1061,11 @@ impl eframe::App for PainterApp {
         } else if let Some(pos) = hover {
             let (sx, sy) = to_screen(pos);
             let (ux, uy) = view.ui_pos((sx, sy));
-            // Page hits use screen pixels, which are page pixels.
+            // Screen pixels are page pixels, shifted by the scroll position.
+            let (px, py) = (sx + self.scroll.0, sy + self.scroll.1);
+            self.pointer_page = Some((px, py));
             let hit = match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
-                Hit::Page { .. } => Hit::Page { x: sx, y: sy },
+                Hit::Page { .. } => Hit::Page { x: px, y: py },
                 h => h,
             };
             let on_page = match hit {
@@ -854,7 +1085,7 @@ impl eframe::App for PainterApp {
             } else if press_l || press_r {
                 self.handle_press(hit, press_r);
             } else if (down_l || down_r) && rect.contains(pos) {
-                self.handle_drag(sx, sy);
+                self.handle_drag(px, py);
             }
         }
         if !(down_l || down_r) {
@@ -862,6 +1093,11 @@ impl eframe::App for PainterApp {
         }
         if self.ui.menu.active {
             // Keyboard shortcuts are ignored while the menu strip is shown.
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        self.page_scroll_input(&ctx, ppp, scale, view);
+        if self.show_page.is_some() {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -961,8 +1197,77 @@ impl PainterApp {
         }
     }
 
-    /// Pointer, wheel and keys while the file requester is open (it is modal).
-    fn file_requester_input(
+    /// Arrow keys (Alt: by a screen), `n`, Shift+S and the wheel/trackpad on the paint screen.
+    fn page_scroll_input(&mut self, ctx: &egui::Context, ppp: f32, scale: i32, view: View) {
+        let (events, mods) = ctx.input(|i| (i.events.clone(), i.modifiers));
+        let step = if mods.alt {
+            (view.screen_w, view.screen_h)
+        } else {
+            (SCROLL_STEP * view.ux, SCROLL_STEP * view.uy)
+        };
+        for event in events {
+            match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    let (dx, dy) = match key {
+                        egui::Key::ArrowLeft => (-step.0, 0),
+                        egui::Key::ArrowRight => (step.0, 0),
+                        egui::Key::ArrowUp => (0, -step.1),
+                        egui::Key::ArrowDown => (0, step.1),
+                        egui::Key::N if !repeat && !modifiers.any() => {
+                            if let Some(p) = self.pointer_page {
+                                self.centre_on(p);
+                            }
+                            continue;
+                        }
+                        egui::Key::S
+                            if !repeat
+                                && modifiers.shift
+                                && !(modifiers.ctrl || modifiers.alt || modifiers.command) =>
+                        {
+                            self.open_show_page();
+                            return;
+                        }
+                        _ => continue,
+                    };
+                    self.scroll_to(self.scroll.0 + dx, self.scroll.1 + dy);
+                }
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    // DeluxePainter addition: wheel and trackpad scroll the page. Positive
+                    // deltas move the content down/right, i.e. show the part above/left.
+                    let px = match unit {
+                        egui::MouseWheelUnit::Point => egui::vec2(
+                            delta.x * ppp / (scale * view.fx) as f32,
+                            delta.y * ppp / (scale * view.fy) as f32,
+                        ),
+                        egui::MouseWheelUnit::Line => egui::vec2(
+                            delta.x * (SCROLL_STEP * view.ux) as f32,
+                            delta.y * (SCROLL_STEP * view.uy) as f32,
+                        ),
+                        egui::MouseWheelUnit::Page => egui::vec2(
+                            delta.x * view.screen_w as f32,
+                            delta.y * view.screen_h as f32,
+                        ),
+                    };
+                    self.page_wheel -= px;
+                    let (dx, dy) = (self.page_wheel.x.trunc(), self.page_wheel.y.trunc());
+                    if dx != 0.0 || dy != 0.0 {
+                        self.page_wheel -= egui::vec2(dx, dy);
+                        self.scroll_to(self.scroll.0 + dx as i32, self.scroll.1 + dy as i32);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Pointer and keys in Show Page (screen pixels; any key but the arrows returns).
+    fn show_page_input(
         &mut self,
         ctx: &egui::Context,
         origin: egui::Pos2,
@@ -970,8 +1275,71 @@ impl PainterApp {
         scale: i32,
         view: View,
     ) {
-        let ui_screen = view.ui_screen();
-        let (rx, ry) = FileRequester::origin(ui_screen.width, ui_screen.height);
+        let (hover, press, down, events) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.events.clone(),
+            )
+        });
+        let pos = hover.map(|p| {
+            let v = (p - origin) * ppp;
+            (
+                (v.x / (scale * view.fx) as f32).floor() as i32,
+                (v.y / (scale * view.fy) as f32).floor() as i32,
+            )
+        });
+        if press && let Some(p) = pos {
+            self.req_pointer = Some(p);
+            self.show_page_event(ReqEvent::Press(p.0, p.1), false);
+        } else if down && let Some(p) = pos {
+            if self.req_pointer != Some(p) {
+                self.req_pointer = Some(p);
+                self.show_page_event(ReqEvent::Drag(p.0, p.1), false);
+            }
+        } else if !down && self.req_pointer.take().is_some() {
+            self.show_page_event(ReqEvent::Release, false);
+        }
+        for event in events {
+            if self.show_page.is_none() {
+                break;
+            }
+            if let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
+            } = event
+            {
+                let k = match key {
+                    egui::Key::ArrowLeft => ReqKey::Left,
+                    egui::Key::ArrowRight => ReqKey::Right,
+                    egui::Key::ArrowUp => ReqKey::Up,
+                    egui::Key::ArrowDown => ReqKey::Down,
+                    _ if repeat => continue,
+                    egui::Key::Enter => ReqKey::Enter,
+                    _ => ReqKey::Escape,
+                };
+                self.show_page_event(ReqEvent::Key(k), modifiers.alt);
+            }
+        }
+    }
+
+    /// Pointer, keys and wheel for a modal requester drawn on the UI layer with its top-left
+    /// at `at` (UI pixels); pointer positions come out requester-local. Also returns the time.
+    fn modal_events(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: i32,
+        view: View,
+        at: (i32, i32),
+    ) -> (Vec<ReqEvent>, u64) {
+        let (rx, ry) = at;
+        let mut out = Vec::new();
         let (hover, press, down, time, events) = ctx.input(|i| {
             (
                 i.pointer.hover_pos(),
@@ -994,24 +1362,19 @@ impl PainterApp {
         });
         if press && let Some(p) = pos {
             self.req_pointer = Some(p);
-            self.file_requester_event(ReqEvent::Press(p.0, p.1), now_ms);
+            out.push(ReqEvent::Press(p.0, p.1));
         } else if down && let Some(p) = pos {
             if self.req_pointer != Some(p) {
                 self.req_pointer = Some(p);
-                self.file_requester_event(ReqEvent::Drag(p.0, p.1), now_ms);
+                out.push(ReqEvent::Drag(p.0, p.1));
             }
         } else if !down && self.req_pointer.take().is_some() {
-            self.file_requester_event(ReqEvent::Release, now_ms);
+            out.push(ReqEvent::Release);
         }
         for event in events {
-            if self.ui.file_requester.is_none() {
-                break;
-            }
             match event {
                 egui::Event::Text(text) => {
-                    for c in text.chars() {
-                        self.file_requester_event(ReqEvent::Key(ReqKey::Char(c)), now_ms);
-                    }
+                    out.extend(text.chars().map(|c| ReqEvent::Key(ReqKey::Char(c))));
                 }
                 egui::Event::Key {
                     key, pressed: true, ..
@@ -1030,7 +1393,7 @@ impl PainterApp {
                         egui::Key::Escape => ReqKey::Escape,
                         _ => continue,
                     };
-                    self.file_requester_event(ReqEvent::Key(k), now_ms);
+                    out.push(ReqEvent::Key(k));
                 }
                 egui::Event::MouseWheel { unit, delta, .. } => {
                     // Positive y moves the content down, i.e. scrolls the list up.
@@ -1042,11 +1405,52 @@ impl PainterApp {
                     let rows = self.wheel.trunc();
                     if rows != 0.0 {
                         self.wheel -= rows;
-                        self.file_requester_event(ReqEvent::Scroll(rows as i32), now_ms);
+                        out.push(ReqEvent::Scroll(rows as i32));
                     }
                 }
                 _ => {}
             }
+        }
+        (out, now_ms)
+    }
+
+    /// Pointer, wheel and keys while the file requester is open (it is modal).
+    fn file_requester_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: i32,
+        view: View,
+    ) {
+        let ui_screen = view.ui_screen();
+        let at = FileRequester::origin(ui_screen.width, ui_screen.height);
+        let (events, now_ms) = self.modal_events(ctx, origin, ppp, scale, view, at);
+        for event in events {
+            if self.ui.file_requester.is_none() {
+                break;
+            }
+            self.file_requester_event(event, now_ms);
+        }
+    }
+
+    /// Pointer and keys while the Page Size requester is open (it is modal).
+    fn page_size_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: i32,
+        view: View,
+    ) {
+        let ui_screen = view.ui_screen();
+        let at = PageSizeRequester::origin(ui_screen.width, ui_screen.height);
+        let (events, _) = self.modal_events(ctx, origin, ppp, scale, view, at);
+        for event in events {
+            if self.ui.page_size_requester.is_none() {
+                break;
+            }
+            self.page_size_event(event);
         }
     }
 
@@ -1059,14 +1463,21 @@ impl PainterApp {
     ) {
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
-            let (screen, rgba) = match &self.requester {
-                Some(req) => {
+            let (screen, rgba) = match (&self.requester, &self.show_page) {
+                (Some(req), _) => {
                     let screen = req.render();
                     let rgba = to_rgba(&screen, &requester::palette(), 1, 1);
                     (screen, rgba)
                 }
-                None => {
-                    let screen = self.view().compose(self.page(), self.palette(), &self.ui);
+                (None, Some(sp)) => {
+                    let screen = sp.render(self.page(), self.palette().len());
+                    let rgba = to_rgba(&screen, self.palette(), 1, 1);
+                    (screen, rgba)
+                }
+                (None, None) => {
+                    let screen =
+                        self.view()
+                            .compose(self.page(), self.scroll, self.palette(), &self.ui);
                     let rgba = to_rgba(&screen, self.palette(), 1, 1);
                     (screen, rgba)
                 }
@@ -1284,11 +1695,16 @@ mod tests {
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
         assert!(app.ui.file_requester.is_none(), "loaded and closed");
         assert_eq!(app.engine.document().target(), before, "kept the screen");
-        // 320x256 LoRes: 7:6 shown on square pixels → 299x256.
-        assert_eq!((app.page().width(), app.page().height()), (299, 256));
+        // 320x256 LoRes: 7:6 shown on square pixels → 299x256, on a screen-sized page.
+        assert_eq!((app.page().width(), app.page().height()), (320, 256));
         let at = |x: i32| app.palette().get(app.page().get(x, 100).unwrap()).unwrap();
         assert_eq!(at(10), dpx_core::Rgb8::new(200, 40, 40));
         assert_eq!(at(290), dpx_core::Rgb8::new(40, 40, 200));
+        assert_eq!(
+            app.page().get(310, 100),
+            Some(0),
+            "rest of the page: colour 0"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1334,5 +1750,119 @@ mod tests {
             true,
         );
         assert_eq!(app.page(), &preview);
+    }
+
+    #[test]
+    fn page_size_requester_sets_an_undoable_bigger_page_and_scrolling_follows() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.ui.bg = 3;
+        app.handle_press(Hit::Page { x: 5, y: 5 }, false);
+        app.finish_stroke();
+        app.run_action(Action::Command("picture.page_size"), &ctx);
+        assert!(app.ui.page_size_requester.is_some());
+        let key = |app: &mut PainterApp, k| app.page_size_event(ReqEvent::Key(k));
+        // Too small: refused with the limits, requester stays open.
+        for _ in 0..3 {
+            key(&mut app, ReqKey::Backspace);
+        }
+        for c in "100".chars() {
+            key(&mut app, ReqKey::Char(c));
+        }
+        key(&mut app, ReqKey::Enter);
+        assert!(app.ui.page_size_requester.is_some());
+        assert_eq!(app.page().width(), 320);
+        // 640 x 512.
+        for _ in 0..3 {
+            key(&mut app, ReqKey::Backspace);
+        }
+        for c in "640".chars() {
+            key(&mut app, ReqKey::Char(c));
+        }
+        key(&mut app, ReqKey::Tab);
+        for _ in 0..3 {
+            key(&mut app, ReqKey::Backspace);
+        }
+        for c in "512".chars() {
+            key(&mut app, ReqKey::Char(c));
+        }
+        key(&mut app, ReqKey::Enter);
+        assert!(app.ui.page_size_requester.is_none());
+        assert_eq!((app.page().width(), app.page().height()), (640, 512));
+        assert_eq!(app.page().get(5, 5), Some(app.ui.fg), "picture kept");
+        assert_eq!(
+            app.page().get(600, 500),
+            Some(3),
+            "new area in the BG colour"
+        );
+
+        // Scrolling: clamped to the page; the screen shows the scrolled part.
+        app.scroll_to(1000, -10);
+        assert_eq!(app.scroll, (320, 0));
+        app.centre_on((330, 400));
+        assert_eq!(app.scroll, (170, 256), "as far as the page allows");
+        app.scroll_to(0, 0);
+        let screen = app
+            .view()
+            .compose(app.page(), (0, 0), app.palette(), &app.ui);
+        assert_eq!(screen.get(5, 100), Some(0));
+        let mut marked = app.page().clone();
+        marked.set(325, 300, 9);
+        let screen = app
+            .view()
+            .compose(&marked, (320, 200), app.palette(), &app.ui);
+        assert_eq!(
+            screen.get(5, 100),
+            Some(9),
+            "page pixel (325,300) at screen (5,100)"
+        );
+
+        // Undo restores the screen-sized page and clamps the scroll position.
+        app.scroll_to(300, 200);
+        app.undo();
+        assert_eq!((app.page().width(), app.page().height()), (320, 256));
+        assert_eq!(app.scroll, (0, 0));
+    }
+
+    #[test]
+    fn show_page_moves_the_view() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.run(Command::SetPageSize {
+            width: 640,
+            height: 512,
+            fill: 0,
+        });
+        app.run_action(Action::Command("picture.show_page"), &ctx);
+        let sp = app.show_page.as_ref().expect("Show Page open");
+        assert_eq!(sp.factor(), (2, 2));
+        // Grab the rectangle (160x128 at 0,0), drag it 40 right and 20 down, release.
+        app.show_page_event(ReqEvent::Press(10, 10), false);
+        app.show_page_event(ReqEvent::Drag(50, 30), false);
+        app.show_page_event(ReqEvent::Release, false);
+        assert!(app.show_page.is_none());
+        assert_eq!(app.scroll, (80, 40));
+        // Any other key returns without moving.
+        app.open_show_page();
+        app.show_page_event(ReqEvent::Key(ReqKey::Right), true);
+        app.show_page_event(ReqEvent::Key(ReqKey::Escape), false);
+        assert_eq!(app.scroll, (80, 40));
+    }
+
+    #[test]
+    fn a_small_picture_opens_on_a_screen_sized_page() {
+        let small = Document::from_picture(
+            IndexedImage::new(64, 48, 2),
+            Palette::dpaint_default_32(),
+            Target::default(),
+        );
+        let (doc, note) = files::page_at_least_screen(small);
+        assert_eq!((doc.page().width(), doc.page().height()), (320, 256));
+        assert_eq!(doc.page().get(63, 47), Some(2));
+        assert_eq!(doc.page().get(64, 0), Some(0));
+        assert!(note.unwrap().contains("64x48"));
+        let (same, note) = files::page_at_least_screen(doc.clone());
+        assert_eq!(same, doc);
+        assert!(note.is_none());
     }
 }

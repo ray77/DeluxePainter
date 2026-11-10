@@ -7,6 +7,7 @@ use dpx_core::{IndexedImage, Palette};
 use crate::file_requester::FileRequester;
 use crate::font::Font;
 use crate::menu::{self, MenuContext, MenuState, Pref, Prefs};
+use crate::page_size_requester::PageSizeRequester;
 use crate::pens::Pens;
 use crate::toolbox::{self, BUILTIN_BRUSHES, ICON, IconState, TOOL_ROWS, Tool};
 
@@ -85,6 +86,8 @@ pub struct UiState {
     pub menu: MenuState,
     /// Picture ▸ Load/Save while it is open (drawn over everything else).
     pub file_requester: Option<FileRequester>,
+    /// Picture ▸ Page Size while it is open.
+    pub page_size_requester: Option<PageSizeRequester>,
 }
 
 impl UiState {
@@ -115,6 +118,7 @@ impl Default for UiState {
             prefs: Prefs::default(),
             menu: MenuState::default(),
             file_requester: None,
+            page_size_requester: None,
         }
     }
 }
@@ -216,6 +220,9 @@ impl Screen {
             }
         }
         if let Some(req) = &ui.file_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.page_size_requester {
             req.draw(img, pens);
         }
     }

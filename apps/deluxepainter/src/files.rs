@@ -313,6 +313,24 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
     )
 }
 
+/// DeluxePaint pages are never smaller than the screen (ADR-10): a smaller picture is placed
+/// top-left on a screen-sized page of colour 0 (the background, transparent in brushes).
+/// Returns a note when the page grew. Used when the GUI opens a picture; `convert` keeps the
+/// picture's own size.
+pub fn page_at_least_screen(doc: Document) -> (Document, Option<String>) {
+    let (sw, sh) = doc.target().mode.size();
+    let (pw, ph) = (doc.page().width(), doc.page().height());
+    if pw >= sw && ph >= sh {
+        return (doc, None);
+    }
+    let (w, h) = (pw.max(sw), ph.max(sh));
+    let mut page = IndexedImage::new(w, h, 0);
+    page.blit(doc.page(), 0, 0);
+    let note = format!("page enlarged from {pw}x{ph} to the {w}x{h} screen, picture top-left");
+    let doc = Document::from_picture(page, doc.palette().clone(), doc.target());
+    (doc, Some(note))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveFormat {
     Ilbm,

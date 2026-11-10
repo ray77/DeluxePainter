@@ -196,7 +196,7 @@ Recommendation: implement the decoder as `prev = palette[0]` at x=0 of every row
 5. **AGA HiRes plane limit** (8 planes needs fetch mode 2/4 and bandwidth): no read table; [S11] covers only SuperHiRes.
 6. **PAL / HiRes / SuperHiRes pixel aspect pairs** as written by DPaint IV: unverified. Inspect BMHD of real DPaint IV AGA files.
 7. **DBLNTSC / DBLPAL ModeIDs** and which AGA scan-doubled modes DPaint IV offers: unverified.
-8. **DPaint IV page-size presets** and overscan option dimensions: check the manual PDF.
+8. **DPaint IV page-size presets**: NTSC LoRes read from the manual figure (Standard 320×200, Full Page 320×340, Overscan 368×241; ADR-10). PAL and other modes are derived, not verified.
 9. **Overscan width**: 362 [S5] vs 368/736 [S8]; reconcile with display database (DisplayInfo clip rectangles).
 10. **CMAP nibble variants**: confirm with real OCS-era files that the left-justified (0xN0) form really occurs in DPaint-written files, and how DPaint IV AGA writes its palette.
 11. **EHB CMAP length** (32 vs 64 entries written by DPaint IV): check real files.

@@ -66,6 +66,9 @@ pub enum Command {
         height: u32,
         retain: bool,
     },
+    /// Picture ▸ Page Size: the picture stays top-left; new area gets `fill` (the BG colour),
+    /// a smaller page crops (ADR-10).
+    SetPageSize { width: u32, height: u32, fill: u8 },
 }
 
 /// What a command changes; decides what the engine snapshots for undo.
@@ -165,6 +168,12 @@ impl Command {
                         "page {width}x{height} is outside 1..={MAX_PAGE_SIDE}"
                     )));
                 }
+                let (sw, sh) = mode.size();
+                if *width < sw || *height < sh {
+                    return Err(CommandError::invalid(format!(
+                        "page {width}x{height} is smaller than the {sw}x{sh} screen"
+                    )));
+                }
                 if *retain {
                     let kept = doc
                         .page
@@ -182,6 +191,22 @@ impl Command {
                     }
                 }
                 Ok(())
+            }
+            Command::SetPageSize {
+                width,
+                height,
+                fill,
+            } => {
+                color(*fill)?;
+                let mode = doc.target.mode;
+                if mode.page_fits(*width, *height) {
+                    Ok(())
+                } else {
+                    let ((min_w, min_h), (max_w, max_h)) = mode.page_limits();
+                    Err(CommandError::invalid(format!(
+                        "Page must be {min_w}x{min_h} to {max_w}x{max_h}"
+                    )))
+                }
             }
             Command::SetPalette { colors: new } => {
                 if new.len() == colors {
@@ -208,7 +233,7 @@ impl Command {
             | Command::ReplaceColor { .. }
             | Command::SwapColors { .. } => Footprint::Pixels(page),
             Command::SetPalette { .. } => Footprint::Palette,
-            Command::SetFormat { .. } => Footprint::Document,
+            Command::SetFormat { .. } | Command::SetPageSize { .. } => Footprint::Document,
         }
     }
 
@@ -251,6 +276,15 @@ impl Command {
                 doc.page = new_page;
                 doc.palette = resized_palette(&doc.palette, usize::from(*colors));
                 doc.target.mode = *mode;
+            }
+            Command::SetPageSize {
+                width,
+                height,
+                fill,
+            } => {
+                let mut new_page = IndexedImage::new(*width, *height, *fill);
+                new_page.blit(&doc.page, 0, 0);
+                doc.page = new_page;
             }
         }
     }

@@ -29,8 +29,10 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 - Picture ▸ Load/Save (ADR-8): DeluxePaint-style file requester on the paint screen (list, scroll bar, Drawer/Pattern/File, Disks/Assigns/Parent, AmigaDOS patterns, double-click, overwrite confirmation); ILBM saves write the document's CAMG, aspect and page size and keep CRNG/GRAB/transparent colour from the loaded file; `.png` names save PNG. Covered by unit tests and headless snapshots; not yet clicked through by hand in the window.
 - True-colour import (ADR-9): RGB/RGBA/greyscale PNG and JPEG (EXIF orientation) load through Picture ▸ Load, `--open` and the CLI. Pictures that fit a screen format keep their size; bigger ones are scaled to the current screen. New palette with the mode's colour count (exact when the picture has that few, 12-bit on OCS), median cut + k-means, Floyd–Steinberg; transparent pixels become pink colour 0, saved as the ILBM transparent colour. Verified by tests, real ILBMs round-tripped through RGB PNG, and release timings (see ADR-9).
 
+- Pages larger than the screen (ADR-10): pages are at least screen size and at most 1008×1024 (SuperHiRes up to its overscan width); Picture ▸ Page Size requester with Standard / Full Page / Overscan presets (undoable `SetPageSize`, new area in the BG colour); arrow keys, Alt+arrows, `n` and the mouse wheel scroll; Picture ▸ Show Page (Shift+S) shows the reduced page with a draggable rectangle. Verified by tests and snapshots; real key/wheel input not tried by hand.
+
 Next in Phase 2:
-1. Page larger than the screen (scrolling), overscan and custom screen sizes; pages at least screen size.
+1. Overscan screens and custom screen sizes (Screen Format ▸ Screen Size).
 2. Error diagnostics for broken files; more golden fixtures.
 3. Visible notes (e.g. "DPPS chunk not kept", "reduced to 256 colours") instead of stderr only.
 

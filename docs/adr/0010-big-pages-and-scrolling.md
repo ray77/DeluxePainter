@@ -1,0 +1,46 @@
+# ADR-10: Pages larger than the screen, Page Size, Show Page
+
+- Status: accepted (Phase 2, 2026-11-10)
+- Context: In DeluxePaint IV the page can be larger than the screen. It is never smaller than the screen, and pages up to 1008×1024 are recognised (AGA manual p.50, p.236). The arrow keys scroll the page, Alt+arrows scroll by a whole screen, and `n` centres the area under the pointer (p.51). Picture ▸ Page Size opens the "Set Page Size" requester with Width/Height fields and the presets Standard, Full Page and Overscan (figure 3.2: 320×200, 320×340, 368×241 for NTSC LoRes). Picture ▸ Show Page (`S`) shows the whole page, reduced if needed ("every other pixel"), with a rectangle that can be dragged or moved with the arrows (p.236).
+- Decision:
+  - **Limits (`DisplayMode::page_limits`):**
+    - The minimum is the screen size; the maximum is 1008×1024.
+    - SuperHiRes pages may be as wide as its overscan (1472). This is our extension: the manual names no AGA limit, and a 1280-wide screen would otherwise exceed 1008.
+    - `Command::SetPageSize { width, height, fill }` validates against these limits. It keeps the picture top-left, fills new area with `fill` (the GUI passes the BG colour) and crops when shrinking. It is undoable as a whole-document step.
+    - `SetFormat` now also refuses pages smaller than the new screen.
+  - **Presets:**
+    - **Standard** is the screen size.
+    - **Overscan** is the full video size: 368/736/1472 × 241/283 lines, laced 483/567 (HARDWARE_MODES.md §2; SuperHiRes is derived).
+    - **Full Page** is the screen width, with the height that gives the proportions of the manual's NTSC LoRes 320×340 under the mode's pixel aspect. Example: PAL LoRes 320×316. Values for modes other than NTSC LoRes are derived, not verified.
+  - **Page Size requester (`dpx_ui::page_size_requester`):**
+    - Drawn on the paint screen like the file requester, using the shared `dpx_ui::widgets`. The layout follows the manual figure; the measurements are ours.
+    - The fields take only digits (up to 4). Tab switches between the fields, Return means Ok, Esc means Cancel.
+    - Clicking a preset fills both fields. The preset that matches the fields is shown pressed.
+    - A refused size keeps the requester open and shows "Size min to max".
+  - **Opening pictures (GUI):**
+    - A picture smaller than its screen is placed top-left on a screen-sized page of colour 0, with a note.
+    - `convert` and `info` keep the picture's own size.
+  - **Scrolling:**
+    - The app keeps a scroll position, i.e. the page pixel at the screen's top-left. The screen shows that part of the page, and painting and Coords use page coordinates.
+    - Arrow keys scroll by 16 UI pixels (16 LoRes pixels, 32 HiRes pixels and so on). The manual gives no step, so this value is ours.
+    - Alt+arrows scroll by a screen, and `n` centres the pixel under the pointer as far as the page allows.
+    - Mouse wheel and trackpad scroll the page too. This is a DeluxePainter addition.
+    - The toolbox and title bar stay on top of the page, as in DeluxePaint.
+  - **Show Page (`dpx_ui::show_page`, Shift+S or the menu):**
+    - The page is reduced by whole factors (`ceil(page / screen)` per axis) by taking every n-th pixel, on colour 0.
+    - The rectangle is drawn in the complement of the colours under it, like the Amiga complement drawing mode.
+    - Pressing inside the rectangle grabs it; pressing outside centres it on the pointer. Releasing returns with that part in view.
+    - Arrows move the rectangle by one unit (the factor), Alt+arrows by a screen.
+    - Return keeps the new position. This is our addition: the manual only says that any key returns without moving.
+    - Any other key returns without moving the view.
+  - **Snapshot options for documentation:** `--page WxH`, `--scroll X,Y`, `--show-page`, `--page-size-requester`.
+- Verified:
+  - Unit tests for limits and presets, the command (limits, fill, crop, undo), Show Page (factor, rectangle, drag, keys, render), the requester, and app flows (requester → page → scroll clamp → undo, Show Page drag, small pictures).
+  - Headless snapshots of a self-made 640×512 PAL LoRes ILBM.
+  - The file requester renders pixel-identically to before the widgets refactor (compared against a build of the previous commit).
+  - The GUI starts.
+  - Not tested by hand: real key, wheel and trackpad input in the window.
+- Consequences:
+  - The text tool's page scrolling, Spare ▸ Copy to Spare of the visible part and Magnify's scrolling arrive with those features.
+  - **Overscan screens** and custom screen sizes (the Screen Format requester's Screen Size cycle) are the next step. They change the screen size, not only the page.
+  - Ctrl+arrows (screen position) are not modelled.

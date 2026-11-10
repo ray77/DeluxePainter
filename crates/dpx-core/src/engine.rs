@@ -395,16 +395,27 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        // A page smaller than the screen is refused.
+        let err = e
+            .execute(Command::SetFormat {
+                mode: hires,
+                colors: 16,
+                width: 100,
+                height: 50,
+                retain: false,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
         // Without retain the page is cleared, so 16 colours are fine.
         e.execute(Command::SetFormat {
             mode: hires,
             colors: 16,
-            width: 100,
-            height: 50,
+            width: 640,
+            height: 300,
             retain: false,
         })
         .unwrap();
-        assert_eq!(e.document().page(), &IndexedImage::new(100, 50, 0));
+        assert_eq!(e.document().page(), &IndexedImage::new(640, 300, 0));
 
         e.undo().unwrap();
         e.undo().unwrap();
@@ -428,11 +439,11 @@ mod tests {
             Palette::dpaint_default_32(),
             ocs,
         ));
-        let fmt = |mode, colors| Command::SetFormat {
+        let fmt = |mode: DisplayMode, colors| Command::SetFormat {
             mode,
             colors,
-            width: 8,
-            height: 8,
+            width: mode.size().0,
+            height: mode.size().1,
             retain: false,
         };
         let hires = DisplayMode::new(Video::Pal, Resolution::Hi, false);
@@ -488,5 +499,54 @@ mod tests {
         assert_eq!(out.affected, None);
         e.undo().unwrap();
         assert_eq!(e.document().page(), &IndexedImage::new(16, 8, 0));
+    }
+
+    #[test]
+    fn set_page_size_keeps_the_picture_fills_with_bg_and_undoes() {
+        use crate::{DisplayMode, Target};
+        let mut page = IndexedImage::new(320, 256, 0);
+        page.set(319, 255, 7);
+        let mut e = Engine::new(Document::from_picture(
+            page.clone(),
+            Palette::dpaint_default_32(),
+            Target::default(),
+        ));
+        let size = |width, height| Command::SetPageSize {
+            width,
+            height,
+            fill: 3,
+        };
+        e.execute(size(640, 400)).unwrap();
+        let d = e.document();
+        assert_eq!((d.page().width(), d.page().height()), (640, 400));
+        assert_eq!(d.page().get(319, 255), Some(7));
+        assert_eq!(d.page().get(320, 0), Some(3), "new area in the fill colour");
+        assert_eq!(d.page().get(0, 256), Some(3));
+        assert_eq!(d.target().mode, DisplayMode::PAL_LORES);
+        // Limits: never smaller than the screen, at most 1008x1024; fill must be a colour.
+        for bad in [
+            size(319, 256),
+            size(320, 255),
+            size(1009, 300),
+            size(400, 1025),
+        ] {
+            assert_eq!(e.execute(bad).unwrap_err().code, ErrorCode::InvalidArgument);
+        }
+        let err = e
+            .execute(Command::SetPageSize {
+                width: 320,
+                height: 256,
+                fill: 200,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        e.execute(size(1008, 1024)).unwrap();
+        // Shrinking crops.
+        e.execute(size(320, 256)).unwrap();
+        assert_eq!(e.document().page().get(319, 255), Some(7));
+        e.undo().unwrap();
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.document().page(), &page);
     }
 }

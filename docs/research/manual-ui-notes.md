@@ -310,7 +310,7 @@ Controls named in the text (screenshot too small to read layout):
 
 ### 3.3 Set Page Size (AGA p.235-236)
 Title "Set Page Size": **Width**, **Height** edit boxes; presets **Standard** (screen size), **Full Page** (printable page proportion), **Overscan** (full video area); Cancel, Ok.
-Clicking a preset fills the boxes (image suggests roughly 320x200 / 320x348 / 368x241 for NTSC Lo-Res; digits not fully legible). Minimum = screen resolution; recognised maximum 1008 x 1024 (needs fewer colours / memory).
+Clicking a preset fills the boxes (NTSC Lo-Res figure, read at 400 dpi: 320x200 / 320x340 / 368x241; Standard drawn selected). Fields read "Type in size:" / "Width:" / "Height:", presets under "Or select one:". Minimum = screen resolution; recognised maximum 1008 x 1024 (needs fewer colours / memory); p.50 says "1008 by 1008". Show Page (p.236): every n-th pixel when reduced; arrows move the rectangle one unit (page size / screen size), Alt+arrows by a screen; any key returns without repositioning; p.51: Space returns.
 
 ### 3.4 Palette: Color Mixer and Arrange (AGA p.226, p.244-248, p.267, p.89-96)
 Title "Color Mixer"; opened by right-click on Color Indicator, Palette>Mixer or `p`; replaces the palette strip; painting remains possible.
@@ -724,7 +724,7 @@ Introduced in 4.0 vs DeluxePaint III (What's New, AGA p.26-29): HAM, Control Pan
 * Brush handle: Appendix B (Alt-s/x/y/z) vs addendum (Alt-x cycles five positions) unreconciled.
 * Mix mode availability sentence is truncated across a page break and seems to repeat the HBrite condition (AGA p.248-249).
 * Process submenu: Tint/Hue/Value/On-Off confirmed; "None" implied by text only.
-* Page Size preset numbers (Full Page, Overscan) only roughly legible in the figure; PAL values not stated.
+* Page Size preset numbers: NTSC Lo-Res values legible at 400 dpi (320x340 Full Page, 368x241 Overscan); PAL values not stated.
 * Defaults not legible: Symmetry Order and Tile size, Move requester Count/Ease values, Spacing numbers. Stated: Translucency 50 %, Angle Step 90 degrees, Set Rate 30 fps, Print % Wide 100 / % High 0.
 * AGA Choose Display Mode requester: only a tiny screenshot (AGA p.6); control list inferred from text.
 * Move requester "Trails" is described but not visible in the figure; ease-in/out wording in the OCR may be swapped.
