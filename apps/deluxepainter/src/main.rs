@@ -11,6 +11,7 @@
 //!     [--drawer DIR] [--file NAME]      … listing DIR, with NAME in the File field
 //!     [--drawer-as TEXT]                … showing TEXT in the Drawer field (doc screenshots)
 //!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
+//!     [--commands FILE.json]            apply a JSON array of commands first (ADR-14)
 //!     [--show-page]                     show the Show Page view
 //!     [--page-size-requester]           show the Page Size requester
 //!     [--notes]                         show the notes of `--open` in the note requester
@@ -21,13 +22,13 @@
 
 mod browse;
 mod files;
+mod tools;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dpx_core::{
     Axis, Command, DisplayMode, Document, Engine, ErrorCode, IndexedImage, Palette, Rect, Target,
-    raster,
 };
 use dpx_ui::menu::{self, MENUS};
 use dpx_ui::requester::{self, ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
@@ -258,6 +259,12 @@ fn main() -> eframe::Result {
                 eprintln!("--page {spec}: {}", e.message);
                 std::process::exit(2);
             }
+        }
+        if let Some(file) = arg_value(&args, "--commands")
+            && let Err(e) = tools::run_command_file(&mut engine, &file)
+        {
+            eprintln!("--commands {e}");
+            std::process::exit(2);
         }
         let doc = engine.document().clone();
         let view = View::of_target(doc.target());
@@ -558,7 +565,10 @@ struct PainterApp {
     ui: UiState,
     texture: Option<egui::TextureHandle>,
     dirty: bool,
-    stroke: Option<Stroke>,
+    /// The drawing-tool gesture in progress (ADR-14).
+    stroke: Option<tools::Stroke>,
+    /// Grid, Symmetry, Magnify/Zoom and other tool settings.
+    tools: tools::ToolState,
     /// Picture ▸ Screen Format while it is open (shown on its own screen).
     requester: Option<ScreenFormatRequester>,
     /// Requester-screen pointer position while the left button is held.
@@ -589,16 +599,6 @@ struct PainterApp {
     snap: Snap,
 }
 
-/// A freehand stroke in progress: drawn into a preview copy of the page with the same raster
-/// code the engine uses, and committed as one [`Command::Stroke`] when the button is released.
-struct Stroke {
-    preview: IndexedImage,
-    brush: Vec<(i32, i32)>,
-    color: u8,
-    continuous: bool,
-    points: Vec<(i32, i32)>,
-}
-
 impl PainterApp {
     fn new() -> Self {
         let (w, h) = DisplayMode::PAL_LORES.size();
@@ -609,6 +609,7 @@ impl PainterApp {
             texture: None,
             dirty: true,
             stroke: None,
+            tools: tools::ToolState::default(),
             requester: None,
             req_pointer: None,
             picture_path: None,
@@ -1032,51 +1033,16 @@ impl PainterApp {
         }
     }
 
-    fn start_stroke(&mut self, x: i32, y: i32, color: u8) {
-        self.finish_stroke();
-        let brush = dpx_ui::toolbox::BUILTIN_BRUSHES[self.ui.brush].footprint();
-        let continuous = self.ui.tool == Tool::ContinuousFreehand;
-        let mut preview = self.engine.document().page().clone();
-        raster::stroke(&mut preview, &brush, color, &[(x, y)], continuous);
-        self.stroke = Some(Stroke {
-            preview,
-            brush,
-            color,
-            continuous,
-            points: vec![(x, y)],
-        });
-        self.dirty = true;
-    }
-
-    fn finish_stroke(&mut self) {
-        if let Some(s) = self.stroke.take() {
-            self.execute(Command::Stroke {
-                brush: s.brush,
-                color: s.color,
-                points: s.points,
-                continuous: s.continuous,
-            });
-        }
-    }
-
-    fn select_tool(&mut self, tool: Tool, filled_half: bool) {
-        match tool {
-            Tool::Undo => self.undo(),
-            Tool::Clear => self.run(Command::Clear { color: self.ui.bg }),
-            _ => {
-                self.ui.tool = tool;
-                self.ui.filled = filled_half;
-            }
-        }
-        self.dirty = true;
-    }
-
     fn handle_press(&mut self, hit: Hit, right: bool) {
         match hit {
             // DeluxePaint has one undo level; the right button on UNDO is our redo.
             Hit::Tool {
                 tool: Tool::Undo, ..
             } if right => self.redo(),
+            // Right-click on Zoom shrinks the magnification.
+            Hit::Tool {
+                tool: Tool::Zoom, ..
+            } if right => self.zoom(-1),
             Hit::Tool { tool, filled_half } => self.select_tool(tool, filled_half),
             Hit::Brush(i) => {
                 self.ui.brush = i;
@@ -1090,15 +1056,7 @@ impl PainterApp {
                 }
                 self.dirty = true;
             }
-            Hit::Page { x, y } => {
-                if matches!(
-                    self.ui.tool,
-                    Tool::DottedFreehand | Tool::ContinuousFreehand
-                ) {
-                    let color = if right { self.ui.bg } else { self.ui.fg };
-                    self.start_stroke(x, y, color);
-                }
-            }
+            Hit::Page { x, y } => self.press_page(x, y, right),
             Hit::TitleBar | Hit::Indicator | Hit::ToolboxBackground => {}
         }
     }
@@ -1138,27 +1096,6 @@ impl PainterApp {
                 _ => {}
             },
         }
-        self.dirty = true;
-    }
-
-    fn handle_drag(&mut self, x: i32, y: i32) {
-        let Some(s) = &mut self.stroke else {
-            return;
-        };
-        let last = *s.points.last().expect("a stroke starts with one point");
-        if last == (x, y) {
-            return;
-        }
-        // Stamping the previous point again changes nothing, so the preview equals the
-        // committed stroke (see `raster::stroke`).
-        raster::stroke(
-            &mut s.preview,
-            &s.brush,
-            s.color,
-            &[last, (x, y)],
-            s.continuous,
-        );
-        s.points.push((x, y));
         self.dirty = true;
     }
 }
@@ -1235,15 +1172,17 @@ impl eframe::App for PainterApp {
         }
 
         // Input.
-        let (hover, press_l, press_r, down_l, down_r) = ctx.input(|i| {
+        let (hover, press_l, press_r, down_l, down_r, shift) = ctx.input(|i| {
             (
                 i.pointer.hover_pos(),
                 i.pointer.primary_pressed(),
                 i.pointer.secondary_pressed(),
                 i.pointer.primary_down(),
                 i.pointer.secondary_down(),
+                i.modifiers.shift,
             )
         });
+        self.tools.shift = shift;
         let to_screen = |p: egui::Pos2| -> (i32, i32) {
             let v = (p - origin) * ppp;
             (
@@ -1278,14 +1217,16 @@ impl eframe::App for PainterApp {
         } else if let Some(pos) = hover {
             let (sx, sy) = to_screen(pos);
             let (ux, uy) = view.ui_pos((sx, sy));
-            // Screen pixels are page pixels, shifted by the scroll position. The screen may
-            // be larger than the page (ADR-13): there the pointer is off the page.
-            let (px, py) = (sx + self.scroll.0, sy + self.scroll.1);
-            self.pointer_page = Some((px, py));
-            let inside = self.page().bounds().contains(px, py);
+            // Screen pixels are page pixels, shifted by the scroll position (or magnified,
+            // ADR-14; `None` on the Magnify divider). The screen may be larger than the page
+            // (ADR-13): there the pointer is off the page.
+            let on = self.screen_to_page(view, (sx, sy));
+            if on.is_some() {
+                self.pointer_page = on;
+            }
+            let inside = on.filter(|&(px, py)| self.page().bounds().contains(px, py));
             let hit = match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
-                Hit::Page { .. } if inside => Some(Hit::Page { x: px, y: py }),
-                Hit::Page { .. } => None,
+                Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
                 h => Some(h),
             };
             let on_page = match hit {
@@ -1307,18 +1248,27 @@ impl eframe::App for PainterApp {
                     self.handle_press(hit, press_r);
                 }
             } else if (down_l || down_r) && rect.contains(pos) {
-                self.handle_drag(px, py);
+                if let Some((px, py)) = on {
+                    self.handle_drag(px, py);
+                }
+            } else if let Some(Hit::Page { x, y }) = hit {
+                self.handle_hover(x, y);
             }
         }
         if !(down_l || down_r) {
-            self.finish_stroke();
+            self.release();
         }
+        self.tick(&ctx);
         if self.ui.menu.active {
             // Keyboard shortcuts are ignored while the menu strip is shown.
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
-        self.page_scroll_input(&ctx, ppp, scale, view);
+        // Tool keys first: while typing text or magnifying they own the keyboard.
+        let keys_taken = self.tool_keys(&ctx);
+        if !keys_taken {
+            self.page_scroll_input(&ctx, ppp, scale, view);
+        }
         if self.show_page.is_some() {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
@@ -1354,7 +1304,7 @@ impl eframe::App for PainterApp {
         self.window_keys(&ctx);
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
-        if undo_key {
+        if undo_key && !self.typing() {
             if shift {
                 self.redo();
             } else {
@@ -1773,9 +1723,7 @@ impl PainterApp {
                     (screen, rgba)
                 }
                 (None, None) => {
-                    let screen =
-                        self.view()
-                            .compose(self.page(), self.scroll, self.palette(), &self.ui);
+                    let screen = self.compose_screen();
                     let rgba = to_rgba(&screen, self.palette(), 1, 1);
                     (screen, rgba)
                 }
