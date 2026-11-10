@@ -1,7 +1,8 @@
 //! Loading and saving pictures by file type, plus the headless `info` and `convert` commands.
 //!
 //! Formats: IFF ILBM and PNG in and out, JPEG in only. True-colour PNG and JPEG pictures are
-//! reduced to an indexed page when they are opened (ADR-9). Whatever a target format cannot
+//! reduced to an indexed page when they are opened (ADR-9). EHB pictures open as 64 free
+//! colours and HAM pictures are decoded and reduced like true colour (ADR-26). Whatever a target format cannot
 //! store is reported, never dropped silently.
 
 use std::collections::HashSet;
@@ -10,8 +11,10 @@ use std::path::Path;
 use dpx_core::quantize::{self, Dither, PaletteDepth, ReduceOptions, Reduction};
 use dpx_core::resample;
 use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Palette, Rgb8, RgbaImage, Target};
+use dpx_formats::ham::{HamKind, decode_ham};
 use dpx_formats::project::{self, Project, ProjectExtras, ProjectRange};
-use dpx_iff::{ColorRange, Compression, Ilbm, Masking, ilbm};
+use dpx_iff::ilbm::CAMG_EHB;
+use dpx_iff::{ColorRange, Compression, Ilbm, Masking, SpecialMode, ilbm};
 
 /// A loaded picture plus notes about anything that did not survive the import.
 pub struct Loaded {
@@ -143,7 +146,27 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     let bytes = std::fs::read(path).map_err(|e| with_path(path, read_error(&e)))?;
     match kind_of_bytes(&bytes) {
         Some(Kind::Ilbm) => {
-            let (pic, notes) = ilbm::read_with_notes(&bytes).map_err(|e| with_path(path, e))?;
+            let (mut pic, mut notes) =
+                ilbm::read_with_notes(&bytes).map_err(|e| with_path(path, e))?;
+            match pic.special {
+                None => {}
+                Some(SpecialMode::Ehb) => ehb_to_indexed(&mut pic, &mut notes),
+                Some(mode) => {
+                    let kind = if mode == SpecialMode::Ham6 {
+                        HamKind::Ham6
+                    } else {
+                        HamKind::Ham8
+                    };
+                    let image = decode_ham(kind, &pic.image, pic.palette.colors());
+                    return Ok(Loaded {
+                        picture: Picture::TrueColor {
+                            image,
+                            format: mode.name(),
+                        },
+                        notes,
+                    });
+                }
+            }
             Ok(Loaded {
                 picture: Picture::Ilbm(Box::new(pic)),
                 notes,
@@ -197,6 +220,30 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         }
         None => Err(with_path(path, unknown_type(&bytes))),
     }
+}
+
+/// Opens an Extra-Half-Brite ILBM as a plain 64-colour indexed picture: the palette becomes the
+/// 32 base colours plus their half-bright copies, the pixels stay exactly as they are, and the
+/// EHB flag leaves CAMG, so saving writes a 64-colour 6-plane ILBM (ADR-26). Colours 32-63 are
+/// derived with OCS precision (4 bit) when every base colour is a 12-bit value, else 8 bit.
+fn ehb_to_indexed(pic: &mut Ilbm, notes: &mut Vec<String>) {
+    let base = pic.palette.colors().to_vec();
+    let is_12_bit = |c: &Rgb8| [c.r, c.g, c.b].iter().all(|&v| v & 0x0F == v >> 4);
+    let depth = if pic.cmap_4bit_fixed || base.iter().all(is_12_bit) {
+        PaletteDepth::Rgb4
+    } else {
+        PaletteDepth::Rgb8
+    };
+    pic.palette =
+        Palette::new(dpx_formats::ehb::ehb_palette(&base, depth).to_vec()).expect("64 entries");
+    pic.special = None;
+    // A plain mode id marks 64 colours; without any CAMG the writer's output would read as HAM.
+    pic.camg = Some(pic.camg.unwrap_or(0) & !CAMG_EHB);
+    notes.push(
+        "Extra-Half-Brite picture: edited as 64 free colours (32-63 are the half-bright copies) \
+         until EHB editing exists; saving writes a 64-colour 6-plane ILBM, not EHB"
+            .into(),
+    );
 }
 
 /// `<path>: <first line>` with every further line indented by two spaces.
@@ -392,11 +439,23 @@ pub fn reduce_true_color(img: &RgbaImage, format: &str, current: Target) -> Redu
         transparent: TRANSPARENT_PINK,
     };
     let r = quantize::reduce(source, &opts);
+    let ham = format.starts_with("HAM");
     match r.reduction {
+        Reduction::Exact if ham => notes.push(format!(
+            "{format} picture opened as an indexed picture with its {} colours; HAM export comes later",
+            r.colors
+        )),
         Reduction::Exact => {}
         Reduction::Rounded => {
-            notes.push(format!("{} colours rounded to 12-bit OCS values", r.colors))
+            notes.push(format!("{} colours rounded to 12-bit OCS values", r.colors));
+            if ham {
+                notes.push(format!("{format} picture is indexed now; HAM export comes later"));
+            }
         }
+        Reduction::Quantized if ham => notes.push(format!(
+            "{format} picture reduced to {} colours (Floyd-Steinberg dithering); HAM export comes later",
+            r.colors
+        )),
         Reduction::Quantized => notes.push(format!(
             "{format} true colour reduced to {} colours (Floyd-Steinberg dithering)",
             r.colors
@@ -642,7 +701,11 @@ pub fn info(path: &Path) -> Result<String, String> {
     let mut out = String::new();
     let name = path.display();
     if let Picture::TrueColor { image, format } = &loaded.picture {
-        return Ok(true_color_info(&name.to_string(), image, format));
+        let mut text = true_color_info(&name.to_string(), image, format);
+        for n in &loaded.notes {
+            text += &format!("  note: {n}\n");
+        }
+        return Ok(text);
     }
     let (img, _) = loaded.picture.indexed().expect("indexed picture");
     match &loaded.picture {
@@ -778,8 +841,13 @@ fn true_color_info(name: &str, img: &RgbaImage, format: &str) -> String {
         .iter()
         .filter(|p| p.a < quantize::ALPHA_THRESHOLD)
         .count();
+    let kind = if format.starts_with("HAM") {
+        format!("IFF ILBM {format} (decoded to RGB)")
+    } else {
+        format!("{format} true colour")
+    };
     let mut out = format!(
-        "{name}: {format} true colour {}x{}, {} colours",
+        "{name}: {kind} {}x{}, {} colours",
         img.width(),
         img.height(),
         opaque.len()
@@ -904,13 +972,6 @@ mod tests {
                  FORMs in one file). DeluxePainter reads a single FORM ILBM.",
             ),
             (
-                "ham.iff",
-                fixture("broken-ham.iff"),
-                "<file>: HAM pictures arrive in Phase 5\n  CAMG at offset 96 ($60) is \
-                 $00000800: Hold-And-Modify with 6 bitplanes. DeluxePainter shows HAM and \
-                 Extra-Half-Brite pictures from Phase 5 on.",
-            ),
-            (
                 "run.iff",
                 fixture("broken-bad-run.iff"),
                 "<file>: BODY: bad ByteRun1 run, row 1\n  At offset 65 ($41) a ByteRun1 \
@@ -959,6 +1020,160 @@ mod tests {
         let (img, _) = loaded.picture.indexed().unwrap();
         assert!(img.pixels()[32..].iter().all(|&c| c == 0));
         assert!(info(&path).unwrap().contains(&format!("  note: {note}\n")));
+    }
+
+    fn iff_fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/dpx-iff/tests/data")
+            .join(name)
+    }
+
+    #[test]
+    fn ehb_opens_as_64_free_colours_with_exact_indices_and_saves_as_64_colour_ilbm() {
+        let path = iff_fixture("ehb-16x2.iff");
+        let raw = ilbm::read(&std::fs::read(&path).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.notes.len(), 1, "{:?}", loaded.notes);
+        assert!(
+            loaded.notes[0].starts_with("Extra-Half-Brite picture: edited as 64 free colours")
+                && loaded.notes[0].contains("saving writes a 64-colour 6-plane ILBM, not EHB"),
+            "{:?}",
+            loaded.notes
+        );
+        let (img, pal) = loaded.picture.indexed().unwrap();
+        assert_eq!(img, &raw.image, "indices are exact");
+        assert_eq!(pal.len(), 64);
+        assert!(img.pixels().iter().any(|&p| p >= 32));
+        for i in 0..32 {
+            let c = pal.colors()[i];
+            assert_eq!(pal.colors()[i], raw.palette.colors()[i]);
+            assert_eq!(
+                pal.colors()[i + 32],
+                Rgb8::new(c.r >> 1, c.g >> 1, c.b >> 1),
+                "entry {}",
+                i + 32
+            );
+        }
+        // Opening gives an AGA document with 64 colours; saving validates and writes 6 planes
+        // without the EHB flag, and reading that gives the same picture again.
+        let (doc, extras, _) = open_picture(loaded.picture, Target::default());
+        assert_eq!(doc.palette().len(), 64);
+        assert_eq!(doc.page().pixels(), raw.image.pixels());
+        let out = tmp("ehb-saved.iff");
+        let (bytes, notes) = encode_document(&doc, &extras, &out).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let (back, back_notes) = ilbm::read_with_notes(&bytes).unwrap();
+        assert!(back_notes.is_empty(), "{back_notes:?}");
+        assert_eq!(
+            (back.planes, back.special, back.palette.len()),
+            (6, None, 64)
+        );
+        assert_eq!(back.camg.unwrap() & 0x80, 0);
+        assert_eq!(&back.image, doc.page());
+        assert_eq!(&back.palette, doc.palette());
+        // ILBM -> ILBM conversion keeps it a plain 64-colour picture too.
+        let notes = convert(&path, &out).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let again = ilbm::read(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!((again.special, again.planes), (None, 6));
+        assert_eq!(again.image, raw.image);
+        assert_eq!(again.palette.len(), 64);
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn ham6_and_ham8_open_decoded_with_notes() {
+        let px = |p: &Picture| match p {
+            Picture::TrueColor { image, format } => (image.clone(), *format),
+            _ => panic!("expected a decoded picture"),
+        };
+        let c = |r, g, b| dpx_core::Rgba8::opaque(r, g, b);
+        // Palette entries of the fixtures: colour i = (37 i, 91 i + 5, 255 - i) as bytes.
+        let loaded = load(&iff_fixture("ham6-16x2.iff")).unwrap();
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        let (img, format) = px(&loaded.picture);
+        assert_eq!(format, "HAM6");
+        assert_eq!((img.width(), img.height()), (16, 2));
+        let p = img.pixels();
+        // set 1; blue = F; red = A (0xAA); green = 0; row 1: red = F from colour 0.
+        assert_eq!(
+            [p[0], p[1], p[2], p[3]],
+            [
+                c(37, 96, 254),
+                c(37, 96, 255),
+                c(170, 96, 255),
+                c(170, 0, 255)
+            ]
+        );
+        assert_eq!(p[16], c(255, 5, 255));
+        let (doc, _, notes) = open_picture(loaded.picture, Target::default());
+        assert_eq!(doc.page().width(), 16);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("HAM6 picture opened as an indexed picture with its ")
+                && notes[0].ends_with(" colours; HAM export comes later"),
+            "{notes:?}"
+        );
+
+        let loaded = load(&iff_fixture("ham8-16x2.iff")).unwrap();
+        let (img, format) = px(&loaded.picture);
+        assert_eq!(format, "HAM8");
+        let p = img.pixels();
+        // set 2; blue = 0x10 over the kept low bits; red = 0x20; green = 0; row 1 red = 0x3F.
+        assert_eq!(
+            [p[0], p[1], p[2], p[3]],
+            [
+                c(74, 187, 253),
+                c(74, 187, 65),
+                c(130, 187, 65),
+                c(130, 3, 65)
+            ]
+        );
+        assert_eq!(p[16], c(252, 5, 255));
+        let (_, _, notes) = open_picture(loaded.picture, Target::default());
+        assert!(notes[0].starts_with("HAM8 picture"), "{notes:?}");
+    }
+
+    #[test]
+    fn ham_with_many_colours_is_reduced_with_a_note_and_info_names_the_mode() {
+        // 64x64 HAM6 file made by patching the CAMG of a plain 6-plane file (the writer does
+        // not write HAM): thousands of colours, far more than the 256 of the default screen.
+        let mut img = IndexedImage::new(64, 64, 0);
+        for y in 0..64 {
+            for x in 0..64 {
+                img.set(x, y, ((x * 5 + y * 11 + x * y) % 64) as u8);
+            }
+        }
+        let pal = Palette::new((0..64).map(|i| Rgb8::new(i, 255 - i, i * 2)).collect()).unwrap();
+        let mut src = Ilbm::from_indexed(img, pal);
+        src.camg = Some(0);
+        let mut bytes = ilbm::write(&src, Compression::None).unwrap();
+        let at = bytes.windows(4).position(|w| w == b"CAMG").unwrap() + 8;
+        bytes[at..at + 4].copy_from_slice(&0x800u32.to_be_bytes());
+        let path = tmp("many-ham6.iff");
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(matches!(
+            loaded.picture,
+            Picture::TrueColor { format: "HAM6", .. }
+        ));
+        let (_, _, notes) = open_picture(loaded.picture, Target::default());
+        assert_eq!(
+            notes,
+            [
+                "HAM6 picture reduced to 256 colours (Floyd-Steinberg dithering); HAM export comes later"
+            ]
+        );
+        let text = info(&path).unwrap();
+        assert!(
+            text.contains("IFF ILBM HAM6 (decoded to RGB) 64x64"),
+            "{text}"
+        );
+        assert!(
+            text.contains("note: HAM6 picture reduced to 256 colours"),
+            "{text}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

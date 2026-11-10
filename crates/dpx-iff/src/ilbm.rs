@@ -1,8 +1,9 @@
 //! ILBM pictures: BMHD, CMAP (with the 4-bit fix), CAMG, CRNG/CCRT, GRAB and the BODY in
 //! interleaved bitplanes, uncompressed or ByteRun1 (`docs/IFF_SUPPORT_MATRIX.md` §2–3).
 //!
-//! EHB, HAM, DEEP and PBM files are detected and refused with a clear message; they are
-//! planned for later phases.
+//! EHB and HAM files are read as raw plane values: [`Ilbm::special`] names the mode and
+//! [`Ilbm::image`] holds the per-pixel plane value (ADR-26; the app decodes them with
+//! `dpx_formats`). DEEP, true-colour and PBM files are refused with a clear message.
 //!
 //! Diagnostics (ADR-17): errors say which chunk, at which file offset, and what is wrong,
 //! with a short first line for the file requester. Common writer quirks that leave the
@@ -20,6 +21,36 @@ use crate::iff::{self, Chunk, Form, FourCc, IffError, at, be_i16, be_u16, be_u32
 pub const CAMG_EHB: u32 = 0x0080;
 /// CAMG flag: Hold-And-Modify.
 pub const CAMG_HAM: u32 = 0x0800;
+
+/// A display mode whose pixels are not plain palette indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialMode {
+    /// Extra-Half-Brite: 6 planes, `palette` holds the 32 base colours.
+    Ehb,
+    /// Hold-And-Modify with 6 planes, `palette` holds the 16 Set colours.
+    Ham6,
+    /// Hold-And-Modify with 8 planes, `palette` holds the 64 Set colours.
+    Ham8,
+}
+
+impl SpecialMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            SpecialMode::Ehb => "EHB",
+            SpecialMode::Ham6 => "HAM6",
+            SpecialMode::Ham8 => "HAM8",
+        }
+    }
+
+    /// Palette entries the mode reads from the CMAP.
+    pub fn palette_len(self) -> usize {
+        match self {
+            SpecialMode::Ehb => 32,
+            SpecialMode::Ham6 => 16,
+            SpecialMode::Ham8 => 64,
+        }
+    }
+}
 
 /// Largest picture the reader accepts (64 megapixels, as for PNG and JPEG). Protects against
 /// corrupt BMHDs that would need gigabytes of memory.
@@ -100,9 +131,12 @@ pub struct RawChunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ilbm {
     pub image: IndexedImage,
-    /// `2^planes` entries (missing CMAP entries are black, surplus entries are dropped).
+    /// `2^planes` entries; for [`Ilbm::special`] pictures only the entries the mode reads
+    /// (EHB 32, HAM6 16, HAM8 64).
     pub palette: Palette,
     pub planes: u8,
+    /// EHB or HAM: `image` then holds raw plane values, not palette indices.
+    pub special: Option<SpecialMode>,
     pub masking: Masking,
     pub transparent_color: u16,
     /// Mask plane for [`Masking::HasMask`]: one entry per pixel, `true` = opaque.
@@ -138,7 +172,7 @@ pub enum ErrorKind {
     ShortChunk,
     /// BMHD values that make no sense (zero or absurd size, plane count or masking).
     BadHeader,
-    /// Valid IFF that DeluxePainter cannot read yet (HAM, EHB, true colour, compression).
+    /// Valid IFF that DeluxePainter cannot read yet (true colour, HAM with odd plane counts).
     Unsupported,
     /// Corrupt pixel data.
     BadBody,
@@ -330,35 +364,59 @@ fn check_bmhd(b: &Bmhd) -> Result<(), IlbmError> {
     }
 }
 
-/// Refuses display modes DeluxePainter cannot show yet (HAM, EHB: Phase 5).
-fn check_mode(planes: u8, camg: Option<(u32, usize)>) -> Result<(), IlbmError> {
-    let later = "DeluxePainter shows HAM and Extra-Half-Brite pictures from Phase 5 on.";
-    let refuse = |summary: &str, what: &str, (mode, offset): (u32, usize)| {
-        Err(IlbmError::new(
-            ErrorKind::Unsupported,
-            summary,
-            format!(
-                "CAMG at {} is ${mode:08X}: {what} with {planes} bitplanes. {later}",
-                at(offset)
-            ),
-        ))
-    };
+/// Finds out whether the file is EHB or HAM (HARDWARE_MODES.md sections 5-7). CAMG decides
+/// when present. Without CAMG, 6 planes are HAM6 (what the spec says) unless the CMAP has
+/// exactly 32 entries, which marks EHB (IFF_SUPPORT_MATRIX.md). Mode flags that cannot apply
+/// to the plane count are ignored with a note, except HAM, which is refused.
+fn special_mode(
+    planes: u8,
+    camg: Option<(u32, usize)>,
+    cmap_entries: Option<usize>,
+    notes: &mut Vec<String>,
+) -> Result<Option<SpecialMode>, IlbmError> {
     match camg {
-        Some(c) if c.0 & CAMG_HAM != 0 => {
-            refuse("HAM pictures arrive in Phase 5", "Hold-And-Modify", c)
+        Some((mode, offset)) if mode & CAMG_HAM != 0 => match planes {
+            6 => Ok(Some(SpecialMode::Ham6)),
+            8 => Ok(Some(SpecialMode::Ham8)),
+            n => Err(IlbmError::new(
+                ErrorKind::Unsupported,
+                format!("HAM with {n} bitplanes"),
+                format!(
+                    "CAMG at {} is ${mode:08X}: Hold-And-Modify, but HAM pictures have 6 \
+                     (HAM6) or 8 (HAM8) bitplanes and this file has {n}.",
+                    at(offset)
+                ),
+            )),
+        },
+        Some((mode, offset)) if mode & CAMG_EHB != 0 => {
+            if planes == 6 {
+                Ok(Some(SpecialMode::Ehb))
+            } else {
+                notes.push(format!(
+                    "CAMG at {} (${mode:08X}) asks for Extra-Half-Brite, which needs 6 \
+                     bitplanes (the file has {planes}): read as plain {} colours",
+                    at(offset),
+                    1usize << planes
+                ));
+                Ok(None)
+            }
         }
-        Some(c) if c.0 & CAMG_EHB != 0 => {
-            refuse("EHB pictures arrive in Phase 5", "Extra-Half-Brite", c)
+        Some(_) => Ok(None),
+        None if planes == 6 && cmap_entries == Some(32) => {
+            notes.push(
+                "no CAMG chunk, 6 bitplanes and a 32-colour CMAP: read as Extra-Half-Brite".into(),
+            );
+            Ok(Some(SpecialMode::Ehb))
         }
-        None if planes == 6 => Err(IlbmError::new(
-            ErrorKind::Unsupported,
-            "HAM/EHB arrive in Phase 5",
-            format!(
-                "6 bitplanes and no CAMG chunk: an Amiga shows this as HAM or \
-                 Extra-Half-Brite. {later}"
-            ),
-        )),
-        _ => Ok(()),
+        None if planes == 6 => {
+            notes.push(
+                "no CAMG chunk and 6 bitplanes: read as HAM6, as the IFF spec says (it could \
+                 also be a plain 64-colour picture)"
+                    .into(),
+            );
+            Ok(Some(SpecialMode::Ham6))
+        }
+        None => Ok(None),
     }
 }
 
@@ -379,6 +437,7 @@ fn parse_cmap(
     cmap: Option<&Chunk<'_>>,
     count: usize,
     planes: u8,
+    special: Option<SpecialMode>,
     notes: &mut Vec<String>,
 ) -> (Palette, bool) {
     let palette = |colors: Vec<Rgb8>| Palette::new(colors).expect("1..=256 entries");
@@ -433,7 +492,9 @@ fn parse_cmap(
         } else {
             format!("colours {count}-{} are", n - 1)
         };
-        let uses = if planes == 0 {
+        let uses = if let Some(m) = special {
+            format!("{} reads {count}", m.name())
+        } else if planes == 0 {
             format!("a palette holds at most {count}")
         } else {
             format!("{planes} bitplanes show {count}")
@@ -552,10 +613,17 @@ pub fn read_with_notes(bytes: &[u8]) -> Result<(Ilbm, Vec<String>), IlbmError> {
         ranges = ccrt;
     }
     check_bmhd(&bmhd)?;
-    if bmhd.planes > 0 {
-        // A palette-only file (no planes) has no pixels to interpret in a display mode.
-        check_mode(bmhd.planes, camg)?;
-    }
+    // A palette-only file (no planes) has no pixels to interpret in a display mode.
+    let special = if bmhd.planes > 0 {
+        special_mode(
+            bmhd.planes,
+            camg,
+            cmap.map(|c| c.data.len() / 3),
+            &mut notes,
+        )?
+    } else {
+        None
+    };
     if bmhd.masking == Masking::Lasso {
         notes.push(format!(
             "lasso masking is read as transparent colour {}; the outline fill is not done",
@@ -576,9 +644,9 @@ pub fn read_with_notes(bytes: &[u8]) -> Result<(Ilbm, Vec<String>), IlbmError> {
     let colors = if bmhd.planes == 0 {
         cmap.map_or(1, |c| (c.data.len() / 3).clamp(1, 256))
     } else {
-        1usize << bmhd.planes
+        special.map_or(1usize << bmhd.planes, SpecialMode::palette_len)
     };
-    let (palette, cmap_4bit_fixed) = parse_cmap(cmap, colors, bmhd.planes, &mut notes);
+    let (palette, cmap_4bit_fixed) = parse_cmap(cmap, colors, bmhd.planes, special, &mut notes);
     let (w, h) = (usize::from(bmhd.w), usize::from(bmhd.h));
     let (pixels, mask) = if bmhd.planes == 0 {
         (vec![0; w * h], None)
@@ -591,6 +659,7 @@ pub fn read_with_notes(bytes: &[u8]) -> Result<(Ilbm, Vec<String>), IlbmError> {
             .expect("w*h pixels"),
         palette,
         planes: bmhd.planes,
+        special,
         masking: bmhd.masking,
         transparent_color: bmhd.transparent_color,
         mask,
@@ -884,6 +953,7 @@ impl Ilbm {
             image,
             palette,
             planes,
+            special: None,
             masking: Masking::None,
             transparent_color: 0,
             mask: None,
@@ -914,6 +984,19 @@ pub fn write(ilbm: &Ilbm, compression: Compression) -> Result<Vec<u8>, IlbmError
     }
     if !(1..=8).contains(&ilbm.planes) {
         return invalid(format!("{} bitplanes (1..=8 supported)", ilbm.planes));
+    }
+    if let Some(m) = ilbm.special {
+        return invalid(format!(
+            "{} pictures cannot be written yet (decode them first)",
+            m.name()
+        ));
+    }
+    if let Some(c) = ilbm.camg
+        && c & (CAMG_HAM | CAMG_EHB) != 0
+    {
+        return invalid(format!(
+            "CAMG ${c:08X} asks for HAM or Extra-Half-Brite, which cannot be written yet"
+        ));
     }
     if ilbm.palette.len() > 1 << ilbm.planes {
         return invalid(format!(
@@ -1200,19 +1283,111 @@ mod tests {
         );
     }
 
+    /// A 6- or 8-plane file written by our writer with the given CAMG patched in (or the
+    /// CAMG chunk left out), and `cmap_colors` palette entries.
+    fn special_file(planes_colors: usize, camg: Option<u32>, cmap_colors: usize) -> Vec<u8> {
+        let mut src = sample(8, 3, planes_colors);
+        src.camg = Some(0);
+        let bytes = write(&src, Compression::ByteRun1).unwrap();
+        // Copy the chunks, shortening the CMAP and replacing or dropping the CAMG.
+        let form = iff::read_form(&bytes).unwrap();
+        let mut out = iff::FormWriter::new(*b"ILBM");
+        for c in &form.chunks {
+            match &c.id {
+                b"CMAP" => out.chunk(*b"CMAP", &c.data[..cmap_colors * 3]),
+                b"CAMG" => {
+                    if let Some(v) = camg {
+                        out.chunk(*b"CAMG", &v.to_be_bytes());
+                    }
+                }
+                id => out.chunk(*id, c.data),
+            }
+        }
+        out.finish()
+    }
+
+    #[test]
+    fn reads_ehb_and_ham_as_plane_values() {
+        let want = sample(8, 3, 64).image;
+        // CAMG EHB, 6 planes: raw indices 0..=63, 32 base colours.
+        let (e, notes) = read_with_notes(&special_file(64, Some(CAMG_EHB), 32)).unwrap();
+        assert_eq!(e.special, Some(SpecialMode::Ehb));
+        assert_eq!((e.palette.len(), e.planes), (32, 6));
+        assert_eq!(e.image, want);
+        assert!(notes.is_empty(), "{notes:?}");
+        // A 64-entry CMAP: only 32 are kept, and the note says so.
+        let (e, notes) = read_with_notes(&special_file(64, Some(CAMG_EHB), 64)).unwrap();
+        assert_eq!(e.palette.len(), 32);
+        assert_eq!(
+            notes,
+            ["CMAP has 64 colours but EHB reads 32: colours 32-63 are not kept"]
+        );
+        // CAMG HAM: 6 planes = HAM6 with 16 Set colours, 8 planes = HAM8 with 64.
+        let (h6, notes) = read_with_notes(&special_file(64, Some(CAMG_HAM), 16)).unwrap();
+        assert_eq!(
+            (h6.special, h6.palette.len()),
+            (Some(SpecialMode::Ham6), 16)
+        );
+        assert_eq!(h6.image, want);
+        assert!(notes.is_empty(), "{notes:?}");
+        let (h8, _) = read_with_notes(&special_file(256, Some(CAMG_HAM), 64)).unwrap();
+        assert_eq!(
+            (h8.special, h8.palette.len()),
+            (Some(SpecialMode::Ham8), 64)
+        );
+        // A plain mode id on 6 planes is a plain 64-colour picture; EHB flag on 5 planes is
+        // ignored with a note.
+        let (p, notes) = read_with_notes(&special_file(64, Some(0x0002_9000), 64)).unwrap();
+        assert_eq!((p.special, p.palette.len()), (None, 64));
+        assert!(notes.is_empty());
+        let (p, notes) = read_with_notes(&special_file(32, Some(CAMG_EHB), 32)).unwrap();
+        assert_eq!(p.special, None);
+        assert!(
+            notes[0].contains("needs 6 bitplanes (the file has 5)"),
+            "{notes:?}"
+        );
+        // No CAMG: 6 planes with a 32-entry CMAP are EHB, otherwise HAM6; 8 planes are plain.
+        let (e, notes) = read_with_notes(&special_file(64, None, 32)).unwrap();
+        assert_eq!(e.special, Some(SpecialMode::Ehb));
+        assert!(notes[0].starts_with("no CAMG chunk, 6 bitplanes and a 32-colour CMAP"));
+        let (h, notes) = read_with_notes(&special_file(64, None, 16)).unwrap();
+        assert_eq!(h.special, Some(SpecialMode::Ham6));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("no CAMG chunk and 6 bitplanes"))
+        );
+        let (p, _) = read_with_notes(&special_file(256, None, 256)).unwrap();
+        assert_eq!(p.special, None);
+    }
+
     #[test]
     fn refuses_unsupported_variants() {
         let mut src = sample(4, 2, 64);
+        // HAM and EHB are read now (see `reads_ehb_and_ham_as_plane_values`) but not written.
         src.camg = Some(CAMG_EHB);
-        let bytes = write(&src, Compression::None).unwrap();
-        let kind = |b: &[u8]| read(b).unwrap_err().kind;
-        assert_eq!(kind(&bytes), ErrorKind::Unsupported);
-        src.camg = None;
-        let bytes = write(&src, Compression::None).unwrap();
-        assert_eq!(kind(&bytes), ErrorKind::Unsupported);
+        let e = write(&src, Compression::None).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Invalid);
         src.camg = Some(CAMG_HAM);
-        let bytes = write(&src, Compression::None).unwrap();
-        assert_eq!(kind(&bytes), ErrorKind::Unsupported);
+        assert_eq!(
+            write(&src, Compression::None).unwrap_err().kind,
+            ErrorKind::Invalid
+        );
+        src.camg = None;
+        src.special = Some(SpecialMode::Ehb);
+        assert_eq!(
+            write(&src, Compression::None).unwrap_err().to_string(),
+            "cannot write ILBM: EHB pictures cannot be written yet (decode them first)"
+        );
+        // HAM with a plane count that is neither HAM6 nor HAM8 is refused when reading.
+        let mut five = sample(4, 2, 32);
+        five.camg = Some(0);
+        let mut bytes = write(&five, Compression::None).unwrap();
+        let at_camg = bytes.windows(4).position(|w| w == b"CAMG").unwrap() + 8;
+        bytes[at_camg..at_camg + 4].copy_from_slice(&CAMG_HAM.to_be_bytes());
+        let e = read(&bytes).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Unsupported);
+        assert_eq!(e.summary, "HAM with 5 bitplanes");
 
         let mut pbm = iff::FormWriter::new(*b"PBM ");
         pbm.chunk(*b"BMHD", &[0; 20]);

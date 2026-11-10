@@ -28,3 +28,5 @@
 - Consequences:
   - **Open integration step:** the app's Load handler (`main.rs`, not part of this change) passes the whole error text after `<path>: ` to the file requester, which draws the newline as `?` and clips the rest. It must pass only the first line (`e.lines().next()`); until then the requester shows the first line followed by `?` and the start of the details.
   - Other readers (ANIM, PBM, palette files) can reuse `iff::read_form`, the note conventions and the first-line contract.
+
+- Addendum (ADR-26): HAM and EHB pictures are no longer refused; the "arrive in Phase 5" messages are gone (HAM with a plane count other than 6/8 is still refused).
