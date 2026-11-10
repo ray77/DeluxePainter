@@ -13,6 +13,7 @@
 //!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
 //!     [--show-page]                     show the Show Page view
 //!     [--page-size-requester]           show the Page Size requester
+//!     [--palette-requester]             show the Color Mixer (selected colour = `--fg`)
 //!     [--notes]                         show the notes of `--open` in the note requester
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
@@ -332,6 +333,13 @@ fn main() -> eframe::Result {
                 req.set_file(&name);
             }
             ui.file_requester = Some(req);
+        }
+        if args.iter().any(|a| a == "--palette-requester") {
+            ui.palette_requester = Some(dpx_ui::PaletteRequester::new(
+                doc.palette(),
+                ui.fg,
+                doc.target().chipset,
+            ));
         }
         if args.iter().any(|a| a == "--page-size-requester") {
             ui.page_size_requester = Some(page_size_requester(&doc));
@@ -1110,6 +1118,15 @@ impl PainterApp {
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::PixelSize(p) => self.set_pixel_size(p),
             Action::Command(id) => match id {
+                "palette.mixer" => {
+                    self.finish_stroke();
+                    let doc = self.engine.document();
+                    self.ui.palette_requester = Some(dpx_ui::PaletteRequester::new(
+                        doc.palette(),
+                        self.ui.fg,
+                        doc.target().chipset,
+                    ));
+                }
                 "picture.flip_horizontal" => self.run(Command::Flip {
                     axis: Axis::Horizontal,
                 }),
@@ -1210,6 +1227,11 @@ impl eframe::App for PainterApp {
 
         if self.requester.is_some() {
             self.requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.palette_input(&ctx, origin, ppp, scale, view) {
+            self.palette_upload(&ctx);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -1702,6 +1724,97 @@ impl PainterApp {
         }
     }
 
+    /// The Color Mixer (Color ▸ Palette ▸ Mixer, ADR-16). While it is closed, the `p` key
+    /// opens it when no other requester, view or menu is open; while it is open, it gets the
+    /// pointer and keys (it is modal). Returns whether it is or was open this frame, so the
+    /// caller only paints.
+    fn palette_input(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: f32,
+        view: View,
+    ) -> bool {
+        if self.ui.palette_requester.is_none() {
+            let busy = self.ui.note_requester.is_some()
+                || self.ui.file_requester.is_some()
+                || self.ui.page_size_requester.is_some()
+                || self.show_page.is_some()
+                || self.ui.menu.active;
+            let p = ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.is_none());
+            if busy || !p {
+                return false;
+            }
+            // This frame's `p` must not reach the requester (it would close it again).
+            self.run_action(Action::Command("palette.mixer"), ctx);
+            return true;
+        }
+        let ui_screen = view.ui_screen();
+        let at = dpx_ui::PaletteRequester::origin(ui_screen.width, ui_screen.height);
+        let (events, _) = self.modal_events(ctx, origin, ppp, scale, view, at);
+        for event in events {
+            if self.ui.palette_requester.is_none() {
+                break;
+            }
+            self.palette_event(event);
+        }
+        true
+    }
+
+    /// Feeds one event to the Color Mixer; Ok sets the edited palette as one undoable
+    /// command and makes the selected colour the FG colour, Cancel drops the edits.
+    fn palette_event(&mut self, event: ReqEvent) {
+        let Some(req) = &mut self.ui.palette_requester else {
+            return;
+        };
+        let response = req.handle(event);
+        self.dirty = true;
+        match response {
+            dpx_ui::PaletteResponse::Continue => {}
+            dpx_ui::PaletteResponse::Cancel => self.ui.palette_requester = None,
+            dpx_ui::PaletteResponse::Ok => {
+                let Some(req) = self.ui.palette_requester.take() else {
+                    return;
+                };
+                self.ui.fg = req.selected();
+                if req.colors() != self.palette().colors() {
+                    self.run(Command::SetPalette {
+                        colors: req.colors().to_vec(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// While the Color Mixer is open, uploads the screen in the palette being edited, so
+    /// every change shows at once (the document palette changes only on Ok).
+    fn palette_upload(&mut self, ctx: &egui::Context) {
+        let Some(req) = &self.ui.palette_requester else {
+            return;
+        };
+        if !self.dirty && self.texture.is_some() {
+            return;
+        }
+        let palette = req.palette();
+        let screen = self
+            .view()
+            .compose(self.page(), self.scroll, &palette, &self.ui);
+        let rgba = to_rgba(&screen, &palette, 1, 1);
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [screen.width() as usize, screen.height() as usize],
+            &rgba,
+        );
+        match &mut self.texture {
+            Some(t) => t.set(image, egui::TextureOptions::NEAREST),
+            None => {
+                self.texture =
+                    Some(ctx.load_texture("screen", image, egui::TextureOptions::NEAREST));
+            }
+        }
+        self.dirty = false;
+    }
+
     /// Pointer and keys while the note requester is shown (it is modal).
     fn note_input(
         &mut self,
@@ -1815,6 +1928,94 @@ impl PainterApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs one egui pass with the `p` key pressed through the Color Mixer's input.
+    fn press_p(app: &mut PainterApp, ctx: &egui::Context) -> bool {
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.begin_pass(raw);
+        let view = app.view();
+        let shown = app.palette_input(ctx, egui::Pos2::ZERO, 1.0, 1.0, view);
+        // The font atlas upload is not needed in a test.
+        ctx.end_pass().textures_delta.clear();
+        shown
+    }
+
+    /// Drags the Color Mixer's slider `channel` all the way to the right.
+    fn slider_to_max(app: &mut PainterApp, channel: usize) {
+        let t = dpx_ui::PaletteRequester::slider_rect(channel);
+        // Steps right of the knob, then the knob itself to the far right.
+        app.palette_event(ReqEvent::Press(t.x + t.w - 2, t.y + 4));
+        app.palette_event(ReqEvent::Release);
+        for x in t.x..t.x + t.w {
+            app.palette_event(ReqEvent::Press(x, t.y + 4));
+            app.palette_event(ReqEvent::Drag(x + 400, t.y + 4));
+            app.palette_event(ReqEvent::Release);
+        }
+    }
+
+    #[test]
+    fn color_mixer_edits_live_and_commits_one_undoable_set_palette() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        let before = app.palette().clone();
+        app.ui.fg = 0;
+
+        // `p` opens it on the paint screen; the key press itself is not fed to it.
+        assert!(press_p(&mut app, &ctx));
+        let req = app
+            .ui
+            .palette_requester
+            .as_ref()
+            .expect("p opens the mixer");
+        assert_eq!(req.selected(), 0, "opens on the FG colour");
+        assert!(!app.engine.can_undo());
+
+        // Red of colour 0 to the maximum: the shown palette changes, the document not yet.
+        slider_to_max(&mut app, 0);
+        let req = app.ui.palette_requester.as_ref().unwrap();
+        assert_eq!(req.palette().get(0), Some(dpx_core::Rgb8::new(255, 0, 0)));
+        assert_eq!(app.palette(), &before);
+        // Pick colour 5 so Ok makes it the FG colour.
+        let c = app.ui.palette_requester.as_ref().unwrap().cell_rect(5);
+        app.palette_event(ReqEvent::Press(c.x + 2, c.y + 2));
+        app.palette_event(ReqEvent::Release);
+
+        // Return = Ok: one undoable SetPalette.
+        app.palette_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.ui.palette_requester.is_none());
+        assert_eq!(app.palette().get(0), Some(dpx_core::Rgb8::new(255, 0, 0)));
+        assert_eq!(&app.palette().colors()[1..], &before.colors()[1..]);
+        assert_eq!(app.ui.fg, 5);
+        app.undo();
+        assert_eq!(app.palette(), &before, "one undo restores the palette");
+        assert!(!app.engine.can_undo());
+
+        // Via the menu; Esc cancels and leaves the document as it was.
+        app.run_action(Action::Command("palette.mixer"), &ctx);
+        assert!(app.ui.palette_requester.is_some());
+        slider_to_max(&mut app, 1);
+        app.palette_event(ReqEvent::Key(ReqKey::Escape));
+        assert!(app.ui.palette_requester.is_none());
+        assert_eq!(app.palette(), &before);
+        assert!(!app.engine.can_undo(), "Cancel adds no undo step");
+
+        // Ok without changes adds no undo step either.
+        app.run_action(Action::Command("palette.mixer"), &ctx);
+        app.palette_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(!app.engine.can_undo());
+
+        // `p` does nothing while another requester is open.
+        app.open_page_size();
+        assert!(!press_p(&mut app, &ctx));
+        assert!(app.ui.palette_requester.is_none());
+    }
 
     #[test]
     fn menu_spec_parsing() {

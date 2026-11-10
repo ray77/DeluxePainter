@@ -93,6 +93,8 @@ pub struct UiState {
     pub page_size_requester: Option<PageSizeRequester>,
     /// Notes after Load/Save while shown (drawn over everything else).
     pub note_requester: Option<NoteRequester>,
+    /// Color ▸ Palette ▸ Mixer (the Color Mixer) while it is open.
+    pub palette_requester: Option<crate::palette_requester::PaletteRequester>,
 }
 
 impl UiState {
@@ -127,6 +129,7 @@ impl Default for UiState {
             file_requester: None,
             page_size_requester: None,
             note_requester: None,
+            palette_requester: None,
         }
     }
 }
@@ -271,6 +274,9 @@ impl Screen {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.note_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.palette_requester {
             req.draw(img, pens);
         }
     }

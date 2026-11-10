@@ -10,6 +10,7 @@ pub mod font;
 pub mod menu;
 pub mod note_requester;
 pub mod page_size_requester;
+pub mod palette_requester;
 pub mod pattern;
 pub mod pens;
 pub mod requester;
@@ -24,6 +25,7 @@ pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, P
 pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};
 pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};
+pub use palette_requester::{PaletteRequester, PaletteResponse};
 pub use pens::Pens;
 pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
 pub use screen::{Hit, PaintMode, Screen, UiState};
