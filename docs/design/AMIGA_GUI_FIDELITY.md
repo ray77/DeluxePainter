@@ -48,7 +48,7 @@ Measured on the 2× captures `inapp_gfx_03/04/05` (320×256 PAL LoRes) by averag
 | Title bar | rows 0–10: row 0 `shine`, rows 1–9 `face`, row 10 `dark`; text origin (3, 1) |
 | Depth gadget | 15×9 at (`w`−16, 1), two overlapping rectangles in `dark` |
 | Toolbox | x `w`−24 … `w`−1, `dark` background |
-| Brush block | (`x0`, 11), 23×20, `shine` top/left edge; 10 brushes: round 1/3/5/7, square 5/4/3/2, two scatter brushes |
+| Brush block | (`x0`, 11), 23×20, `shine` top/left edge; 10 brushes: round 1/3/5/7, square 5/4/3/2, two scatter brushes (3 and 5 pixels; the top dot of the 5-pixel one sits at toolbox x 18, y 24) |
 | Tool buttons | 9 rows from y 32, pitch 12, button 11×11 (`shine` top/left edge, `face` fill), 1-px `dark` gaps; icon 9×9 at (+1, +1) |
 | Split icons | outline shape + anti-diagonal outside the shape + fill where x+y ≥ 8; split freehand shows only the diagonal's corner ticks |
 | Selected tool | only the chosen variant, inverted (`face` on `dark`); filled circle = 7×7 disc |

@@ -377,7 +377,9 @@ const SQUARE_3: &[(i32, i32)] = &[
 ];
 const SQUARE_2: &[(i32, i32)] = &[(19, 20), (20, 20), (19, 21), (20, 21)];
 const SCATTER_SMALL: &[(i32, i32)] = &[(6, 26), (4, 27), (6, 28)];
-const SCATTER_LARGE: &[(i32, i32)] = &[(15, 26), (18, 27), (21, 27), (18, 29)];
+/// The "five-pixel" scatter brush; its top dot sits in the square row (measured in
+/// inapp_gfx_03/04/05 at toolbox x 18, y 24).
+const SCATTER_LARGE: &[(i32, i32)] = &[(18, 24), (15, 26), (18, 27), (21, 27), (18, 29)];
 
 /// Built-in brushes; index 0 (single pixel) is the start-up brush.
 pub const BUILTIN_BRUSHES: [BuiltinBrush; 10] = [
@@ -419,7 +421,7 @@ pub const BUILTIN_BRUSHES: [BuiltinBrush; 10] = [
     },
     BuiltinBrush {
         pixels: SCATTER_LARGE,
-        select_box: (14, 25, 9, 6),
+        select_box: (14, 23, 9, 8),
     },
 ];
 
@@ -573,5 +575,39 @@ mod tests {
     fn brush_footprints_are_centred() {
         assert_eq!(BUILTIN_BRUSHES[0].footprint(), vec![(0, 0)]);
         assert_eq!(BUILTIN_BRUSHES[3].footprint().len(), 37);
+    }
+
+    #[test]
+    fn brush_block_layout_is_consistent() {
+        // The manual names the scatter brushes "three- and five-pixel brushes".
+        assert_eq!(BUILTIN_BRUSHES[8].pixels.len(), 3);
+        assert_eq!(BUILTIN_BRUSHES[9].pixels.len(), 5);
+        let inside = |(x, y): (i32, i32), (bx, by, bw, bh): (i32, i32, i32, i32)| {
+            (bx..bx + bw).contains(&x) && (by..by + bh).contains(&y)
+        };
+        for (i, b) in BUILTIN_BRUSHES.iter().enumerate() {
+            for &p in b.pixels {
+                // Inner face area of the brush block: x 1..=22, y 12..=30.
+                assert!(
+                    inside(p, (1, 12, 22, 19)),
+                    "brush {i} pixel {p:?} outside block"
+                );
+                assert!(
+                    inside(p, b.select_box),
+                    "brush {i} pixel {p:?} outside its box"
+                );
+            }
+            // A selected (inverted) box must not swallow another brush's pixels.
+            for (j, other) in BUILTIN_BRUSHES.iter().enumerate() {
+                if i != j {
+                    for &p in other.pixels {
+                        assert!(
+                            !inside(p, b.select_box),
+                            "box {i} covers brush {j} at {p:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
