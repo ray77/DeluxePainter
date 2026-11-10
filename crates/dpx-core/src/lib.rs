@@ -8,6 +8,7 @@
 pub mod command;
 pub mod document;
 pub mod engine;
+pub mod gradient;
 pub mod image;
 pub mod mode;
 pub mod paint;
@@ -21,6 +22,7 @@ pub mod shapes;
 pub use command::{Axis, Command, CommandError, ErrorCode};
 pub use document::Document;
 pub use engine::{Engine, Outcome, Request};
+pub use gradient::{Direction as GradientDirection, FillType};
 pub use image::{IndexedImage, Rect};
 pub use mode::{Chipset, DisplayMode, Resolution, Target, Video};
 pub use paint::{BrushImage, DrawMode, PaintContext};

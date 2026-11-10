@@ -24,6 +24,7 @@
 mod browse;
 mod files;
 mod menu_actions;
+mod settings;
 mod tools;
 
 use std::path::{Path, PathBuf};
@@ -348,6 +349,9 @@ fn main() -> eframe::Result {
                 ui.fg,
                 doc.target().chipset,
             ));
+        }
+        if let Some(req) = settings::snapshot_requester(&args, &doc) {
+            ui.tool_requester = Some(req);
         }
         if args.iter().any(|a| a == "--page-size-requester") {
             ui.page_size_requester = Some(page_size_requester(&doc));
@@ -1075,6 +1079,14 @@ impl PainterApp {
             Hit::Tool {
                 tool: Tool::Zoom, ..
             } if right => self.zoom(-1),
+            // Right-click opens the tool's settings requester (ADR-20); the tool is selected
+            // like with a left click, except Grid and Symmetry, which stay as they are.
+            Hit::Tool { tool, filled_half } if right && settings::requester_for(tool).is_some() => {
+                if !matches!(tool, Tool::Grid | Tool::Symmetry) {
+                    self.select_tool(tool, filled_half);
+                }
+                self.open_tool_requester(tool);
+            }
             Hit::Tool { tool, filled_half } => self.select_tool(tool, filled_half),
             Hit::Brush(i) => {
                 self.ui.brush = i;
@@ -1128,6 +1140,9 @@ impl PainterApp {
                     colors: Palette::dpaint_default_32().colors().to_vec(),
                 }),
                 "picture.screen_format" => self.open_screen_format(),
+                // ADR-20 (settings.rs).
+                "stencil.make" | "stencil.remake" | "stencil.reverse" | "stencil.toggle"
+                | "stencil.free" => self.stencil_command(id),
                 "view.largest_pixel_size" => self.set_pixel_size(PixelSize(self.largest_step())),
                 "picture.page_size" => self.open_page_size(),
                 "picture.show_page" => self.open_show_page(),
@@ -1202,6 +1217,11 @@ impl eframe::App for PainterApp {
 
         if self.requester.is_some() {
             self.requester_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        if self.ui.tool_requester.is_some() {
+            self.tool_requester_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }

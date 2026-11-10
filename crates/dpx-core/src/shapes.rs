@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, CommandError, MAX_BRUSH_OFFSET, MAX_BRUSH_PIXELS};
+use crate::gradient;
 use crate::image::{IndexedImage, Rect};
 use crate::raster;
 
@@ -50,32 +51,60 @@ pub enum Shape {
     Dots { points: Vec<(i32, i32)> },
 }
 
-/// Cyclic point symmetry (the Symmetry tool): `order` copies of the shape, evenly rotated
-/// around `center`. Copies are rotated in displayed space, so with Be Square they stay round
-/// on non-square pixels: `aspect` is the displayed (width, height) of one pixel.
+/// Point symmetry (the Symmetry tool). Cyclic (the default): `order` copies of the shape,
+/// evenly rotated around `center`. With `mirror` (ADR-20): `order` rounded down to an even
+/// number of copies (at least 2), half of them rotated and the other half their mirror images
+/// (left <-> right), so order 2 is a plain mirror and order 4 mirrors both ways. Copies are
+/// made in displayed space, so with Be Square they stay round on non-square pixels: `aspect`
+/// is the displayed (width, height) of one pixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symmetry {
     pub center: (i32, i32),
     pub order: u8,
     #[serde(default = "square_pixels")]
     pub aspect: (u8, u8),
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mirror: bool,
 }
 
 fn square_pixels() -> (u8, u8) {
     (1, 1)
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl Symmetry {
+    /// Number of copies including the original.
+    pub fn count(&self) -> u8 {
+        if self.mirror {
+            (self.order & !1).max(2)
+        } else {
+            self.order.max(1)
+        }
+    }
+
     /// Copy `k` (0 = the original, unchanged) of point `p`.
     pub fn copy(&self, k: u8, p: (i32, i32)) -> (i32, i32) {
-        if k == 0 || self.order <= 1 {
+        let n = self.count();
+        if k == 0 || n <= 1 {
             return p;
         }
         let (ax, ay) = (f64::from(self.aspect.0), f64::from(self.aspect.1));
-        let angle = std::f64::consts::TAU * f64::from(k) / f64::from(self.order);
-        let (s, c) = angle.sin_cos();
-        let dx = f64::from(p.0 - self.center.0) * ax;
+        let mut dx = f64::from(p.0 - self.center.0) * ax;
         let dy = f64::from(p.1 - self.center.1) * ay;
+        // Mirror: odd copies are reflected first; the rotation step is that of n/2 copies.
+        let (turn, steps) = if self.mirror {
+            if k % 2 == 1 {
+                dx = -dx;
+            }
+            (k / 2, n / 2)
+        } else {
+            (k, n)
+        };
+        let angle = std::f64::consts::TAU * f64::from(turn) / f64::from(steps);
+        let (s, c) = angle.sin_cos();
         (
             self.center.0 + ((dx * c - dy * s) / ax).round() as i32,
             self.center.1 + ((dx * s + dy * c) / ay).round() as i32,
@@ -83,7 +112,7 @@ impl Symmetry {
     }
 
     fn copies(sym: Option<&Symmetry>) -> u8 {
-        sym.map_or(1, |s| s.order.max(1))
+        sym.map_or(1, Symmetry::count)
     }
 }
 
@@ -290,8 +319,8 @@ impl Command {
                 filled,
                 symmetry,
             } => shape.draw(img, brush, *color, *filled, symmetry.as_ref()),
-            Command::FloodFill { x, y, color } => {
-                raster::flood_fill(img, *x, *y, *color);
+            Command::FloodFill { x, y, color, fill } => {
+                gradient::flood_fill(img, *x, *y, *color, fill);
             }
             _ => return false,
         }
@@ -312,8 +341,8 @@ impl Command {
                 symmetry,
                 ..
             } => shape.bounds(brush, *filled, symmetry.as_ref()),
-            Command::FloodFill { x, y, color } => {
-                raster::flood_fill(&mut page.clone(), *x, *y, *color).unwrap_or_default()
+            Command::FloodFill { x, y, color, fill } => {
+                gradient::flood_fill(&mut page.clone(), *x, *y, *color, fill).unwrap_or_default()
             }
             _ => return None,
         };
@@ -564,6 +593,7 @@ mod tests {
             x: 2,
             y: 2,
             color: 2,
+            fill: crate::gradient::FillType::Solid,
         };
         assert_eq!(cmd.paint_bounds(&img), Some(Rect::new(2, 2, 1, 1)));
         cmd.paint(&mut img);
@@ -584,6 +614,7 @@ mod tests {
             center: (4, 4),
             order: 4,
             aspect: (1, 1),
+            mirror: false,
         };
         assert_eq!(sym.copy(0, (6, 3)), (6, 3));
         assert_eq!(sym.copy(1, (6, 4)), (4, 6));
@@ -622,6 +653,54 @@ mod tests {
     }
 
     #[test]
+    fn mirror_symmetry_reflects_and_rotates() {
+        let m = |order| Symmetry {
+            center: (10, 10),
+            order,
+            aspect: (1, 1),
+            mirror: true,
+        };
+        // Order 2: a left <-> right mirror only.
+        let two = m(2);
+        assert_eq!(two.count(), 2);
+        assert_eq!(two.copy(1, (14, 3)), (6, 3));
+        // Order 4: mirror both ways (copy 2 = half turn, copy 3 = up <-> down).
+        let four = m(4);
+        assert_eq!(four.copy(1, (14, 3)), (6, 3));
+        assert_eq!(four.copy(2, (14, 3)), (6, 17));
+        assert_eq!(four.copy(3, (14, 3)), (14, 17));
+        // Odd orders round down to an even number of copies; at least two.
+        assert_eq!(m(5).count(), 4);
+        assert_eq!(m(1).count(), 2);
+        // Cyclic is unchanged and `mirror` stays out of the JSON unless set.
+        let cyc = Symmetry {
+            mirror: false,
+            ..four
+        };
+        assert_eq!(cyc.count(), 4);
+        assert_eq!(cyc.copy(1, (14, 10)), (10, 14));
+        assert!(!serde_json::to_string(&cyc).unwrap().contains("mirror"));
+        let back: Symmetry = serde_json::from_str(&serde_json::to_string(&four).unwrap()).unwrap();
+        assert_eq!(back, four);
+        // A mirrored shape draws every copy.
+        let cmd = Command::Shape {
+            shape: Shape::Dots {
+                points: vec![(13, 8)],
+            },
+            brush: vec![(0, 0)],
+            color: 1,
+            filled: false,
+            symmetry: Some(four),
+        };
+        let mut img = IndexedImage::new(21, 21, 0);
+        cmd.paint(&mut img);
+        for p in [(13, 8), (7, 8), (7, 12), (13, 12)] {
+            assert_eq!(img.get(p.0, p.1), Some(1), "{p:?}");
+        }
+        assert_eq!(img.pixels().iter().filter(|&&p| p == 1).count(), 4);
+    }
+
+    #[test]
     fn json_shape_is_stable() {
         let cmd: Command = serde_json::from_str(
             r#"{"op":"shape","shape":{"kind":"rect","from":[1,2],"to":[3,4]},"color":5,"filled":true}"#,
@@ -644,6 +723,7 @@ mod tests {
             x: 1,
             y: 2,
             color: 3,
+            fill: crate::gradient::FillType::Solid,
         };
         assert_eq!(
             serde_json::to_string(&fill).unwrap(),

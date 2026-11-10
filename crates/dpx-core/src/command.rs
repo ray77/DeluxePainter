@@ -8,6 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::document::Document;
+use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
 use crate::mode::DisplayMode;
 use crate::palette::{Palette, Rgb8};
@@ -58,8 +59,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         symmetry: Option<Symmetry>,
     },
-    /// Fill tool: the 4-connected region of the colour at (`x`, `y`) becomes `color`.
-    FloodFill { x: i32, y: i32, color: u8 },
+    /// Fill tool: the 4-connected region of the colour at (`x`, `y`) becomes `color`, or with
+    /// a gradient `fill` (ADR-20) steps through its colour range.
+    FloodFill {
+        x: i32,
+        y: i32,
+        color: u8,
+        #[serde(default, skip_serializing_if = "FillType::is_solid")]
+        fill: FillType,
+    },
     /// Fills the whole page with one colour (CLR).
     Clear { color: u8 },
     /// Mirrors the page (Picture ▸ Flip).
@@ -180,8 +188,17 @@ impl Command {
                 color(*c)?;
                 shape.validate(brush, *filled, symmetry.as_ref())
             }
-            Command::FloodFill { x, y, color: c } => {
+            Command::FloodFill {
+                x,
+                y,
+                color: c,
+                fill,
+            } => {
                 color(*c)?;
+                if let FillType::Gradient { from, to, .. } = fill {
+                    color(*from)?;
+                    color(*to)?;
+                }
                 if x.abs() > MAX_COORD || y.abs() > MAX_COORD {
                     return Err(CommandError::invalid(format!(
                         "fill point must lie within ±{MAX_COORD}"

@@ -4,20 +4,26 @@
 //! committed result. Also the toolbox toggles (Grid, Symmetry, Magnify, Zoom), the tool keys
 //! and `--commands`.
 
+use dpx_core::gradient::range_for;
 use dpx_core::shapes::MAX_SHAPE_POINTS;
-use dpx_core::{Command, Engine, IndexedImage, Rect, Shape, Symmetry, raster};
+use dpx_core::{Command, Engine, FillType, IndexedImage, Rect, Shape, Symmetry, raster};
 use dpx_ui::font::{self, Font};
-use dpx_ui::{Pens, Pref, Tool, toolbox};
+use dpx_ui::{
+    FillSettings, GridSettings, Pens, Pref, SpacingMode, SpacingSettings, SymmetrySettings, Tool,
+    toolbox,
+};
 use eframe::egui;
 
 use crate::{PainterApp, View};
 
-/// Grid spacing in page pixels (the Gridding requester is not implemented yet).
+/// Default grid spacing in page pixels (the Gridding requester changes it).
 pub const GRID: i32 = 16;
-/// Cyclic symmetry order (the Symmetry requester is not implemented yet).
+/// Default cyclic symmetry order (the Symmetry requester changes it).
 pub const SYMMETRY_ORDER: u8 = 6;
-/// Airbrush spray radius in page pixels (horizontally; Be Square adjusts the height).
+/// Default airbrush spray radius in page pixels (horizontally; Be Square adjusts the height).
 pub const AIRBRUSH_RADIUS: i32 = 10;
+/// Default count of the Spacing requester (stamps, pixels or sprays per pixel).
+pub const SPACING_N: i32 = 8;
 /// Brush stamps the airbrush sprays per frame while the button is held.
 pub const SPRAYS_PER_FRAME: usize = 4;
 /// Magnify factors the Zoom tool steps through.
@@ -35,7 +41,17 @@ const TEXT_LINE: i32 = font::GLYPH_H + 2;
 #[derive(Clone, Debug)]
 pub struct ToolState {
     pub grid: bool,
+    /// Gridding requester: distance between grid points.
+    pub grid_size: GridSettings,
     pub symmetry: bool,
+    /// Symmetry requester: cyclic or mirror, number of points.
+    pub symmetry_settings: SymmetrySettings,
+    /// Spacing requester: how brush stamps are laid along a path, and the airbrush radius.
+    pub spacing: SpacingSettings,
+    /// Fill Type requester (the Fill tool).
+    pub fill: FillSettings,
+    /// Effect ▸ Stencil: the stencil while it is switched off (On/Off keeps it).
+    pub stencil_off: Option<Vec<bool>>,
     /// Magnify on: the page pixel at the centre of the magnified half.
     pub magnify: Option<(i32, i32)>,
     /// Index into [`ZOOMS`].
@@ -50,7 +66,22 @@ impl Default for ToolState {
     fn default() -> Self {
         Self {
             grid: false,
+            grid_size: GridSettings { x: GRID, y: GRID },
             symmetry: false,
+            symmetry_settings: SymmetrySettings {
+                mirror: false,
+                order: SYMMETRY_ORDER,
+            },
+            spacing: SpacingSettings {
+                mode: SpacingMode::Continuous,
+                n: SPACING_N,
+                airbrush_radius: AIRBRUSH_RADIUS,
+            },
+            fill: FillSettings {
+                gradient: None,
+                dither: false,
+            },
+            stencil_off: None,
             magnify: None,
             zoom: DEFAULT_ZOOM,
             shift: false,
@@ -80,6 +111,10 @@ pub struct Stroke {
     brush: Vec<(i32, i32)>,
     filled: bool,
     symmetry: Option<Symmetry>,
+    /// Spacing requester settings at the start of the gesture.
+    spacing: SpacingSettings,
+    /// Displayed pixel shape (Be Square), for the airbrush spacing.
+    aspect: (i32, i32),
     /// The button that started the gesture is still held.
     held: bool,
     kind: Kind,
@@ -203,7 +238,143 @@ fn text_pixels(at: (i32, i32), lines: &[String]) -> Vec<(i32, i32)> {
     out
 }
 
+/// Every pixel of the path through `points` (joined by Bresenham lines; `closed` also joins
+/// the last point to the first), without repeating the joints.
+fn dense_path(points: &[(i32, i32)], closed: bool) -> Vec<(i32, i32)> {
+    let mut out: Vec<(i32, i32)> = Vec::new();
+    let mut join = |a: (i32, i32), b: (i32, i32)| {
+        let line = raster::line_points(a, b);
+        out.extend(line.into_iter().skip(usize::from(!out.is_empty())));
+    };
+    for pair in points.windows(2) {
+        join(pair[0], pair[1]);
+    }
+    if closed && points.len() > 2 {
+        join(points[points.len() - 1], points[0]);
+    }
+    if out.is_empty() {
+        out.extend(points.first().copied());
+    }
+    out
+}
+
+/// A pseudo-random value in `0..range` from `a`, `b`, `c` alone, so a gesture that is redrawn
+/// from its points sprays the same pixels every time.
+fn hash_range(a: u64, b: u64, c: u64, range: u64) -> u64 {
+    let mut x = a
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+        .wrapping_add(c.wrapping_mul(0x1656_67B1_9E37_79F9));
+    x ^= x >> 31;
+    x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    x ^= x >> 29;
+    x % range.max(1)
+}
+
+/// Where the brush is stamped along a path for the Spacing requester (ADR-20). `Continuous`
+/// is not handled here (the stamps then form an unbroken line); the other modes give the
+/// stamp points: exactly `n` evenly spread, one every `n` pixels, or `n` sprays per pixel
+/// within the airbrush radius (`aspect` keeps the spray round on non-square pixels).
+fn spaced_points(
+    points: &[(i32, i32)],
+    closed: bool,
+    s: &SpacingSettings,
+    aspect: (i32, i32),
+) -> Vec<(i32, i32)> {
+    let path = dense_path(points, closed);
+    let n = s.n.max(1) as usize;
+    let mut out = match s.mode {
+        SpacingMode::Continuous => path,
+        SpacingMode::NTotal if path.len() <= 1 || n == 1 => path.into_iter().take(1).collect(),
+        SpacingMode::NTotal => {
+            let last = path.len() - 1;
+            (0..n).map(|i| path[i * last / (n - 1)]).collect()
+        }
+        SpacingMode::EveryN => path.into_iter().step_by(n).collect(),
+        SpacingMode::Airbrush => {
+            let (fx, fy) = aspect;
+            let rx = s.airbrush_radius.max(1);
+            let ry = (rx * fx / fy.max(1)).max(1);
+            let mut out = Vec::with_capacity(path.len() * n);
+            for (i, &(x, y)) in path.iter().enumerate() {
+                for k in 0..n {
+                    // Rejection sampling inside the ellipse; a few tries, then the centre.
+                    let (mut dx, mut dy) = (0, 0);
+                    for t in 0..8u64 {
+                        let seed = (i * n + k) as u64;
+                        let ddx = hash_range(seed, t, 1, 2 * rx as u64 + 1) as i32 - rx;
+                        let ddy = hash_range(seed, t, 2, 2 * ry as u64 + 1) as i32 - ry;
+                        if ddx * ddx * ry * ry + ddy * ddy * rx * rx <= rx * rx * ry * ry {
+                            (dx, dy) = (ddx, ddy);
+                            break;
+                        }
+                    }
+                    out.push((x + dx, y + dy));
+                }
+            }
+            out
+        }
+    };
+    out.truncate(MAX_SHAPE_POINTS);
+    out
+}
+
 impl Stroke {
+    /// Spacing other than Continuous applies to this gesture.
+    fn spaced(&self) -> bool {
+        self.spacing.mode != SpacingMode::Continuous
+            && matches!(
+                self.kind,
+                Kind::Freehand { .. }
+                    | Kind::Line { .. }
+                    | Kind::Curve { .. }
+                    | Kind::Rect { .. }
+                    | Kind::Circle { .. }
+                    | Kind::Ellipse { .. }
+                    | Kind::Polygon { .. }
+            )
+            && !(self.filled && !matches!(self.kind, Kind::Freehand { .. }))
+    }
+
+    /// The path of an outline gesture for [`spaced_points`], and whether it is closed.
+    fn outline_path(&self, commit: bool) -> Option<(Vec<(i32, i32)>, bool)> {
+        Some(match &self.kind {
+            Kind::Freehand { points, .. } => (points.clone(), false),
+            Kind::Line { from, to }
+            | Kind::Curve {
+                from,
+                to,
+                through: None,
+            } => (vec![*from, *to], false),
+            Kind::Curve {
+                from,
+                to,
+                through: Some(t),
+            } => (raster::curve_points(*from, *t, *to), false),
+            Kind::Rect { from, to } => (vec![*from, (to.0, from.1), *to, (from.0, to.1)], true),
+            Kind::Circle { center, to, aspect } => {
+                let (rx, ry) = circle_radius(*center, *to, *aspect);
+                (raster::ellipse_points(*center, rx, ry), true)
+            }
+            Kind::Ellipse { center, to } => (
+                raster::ellipse_points(*center, (to.0 - center.0).abs(), (to.1 - center.1).abs()),
+                true,
+            ),
+            Kind::Polygon {
+                points,
+                cursor,
+                closed,
+            } => {
+                let mut pts = points.clone();
+                if !commit && let Some(c) = cursor {
+                    pts.push(*c);
+                }
+                (pts, *closed)
+            }
+            _ => return None,
+        })
+    }
+
     fn shape(&self, shape: Shape, filled: bool) -> Command {
         let solid = filled && !matches!(shape, Shape::Dots { .. });
         Command::Shape {
@@ -253,6 +424,12 @@ impl Stroke {
     /// committed. They differ only for filled freehand and polygons (outline, then filled)
     /// and the polygon's rubber band (dropped).
     fn candidate(&self, commit: bool) -> Option<Command> {
+        if self.spaced()
+            && let Some((path, closed)) = self.outline_path(commit)
+        {
+            let points = spaced_points(&path, closed, &self.spacing, self.aspect);
+            return Some(self.shape(Shape::Dots { points }, false));
+        }
         let filled = self.filled;
         Some(match &self.kind {
             Kind::Freehand { points, continuous } => self.freehand(points.clone(), *continuous),
@@ -401,7 +578,7 @@ impl PainterApp {
     }
 
     /// Grid: tools that obey it (as listed in the manual) snap to the nearest grid point.
-    fn snap(&self, p: (i32, i32)) -> (i32, i32) {
+    pub(crate) fn snap(&self, p: (i32, i32)) -> (i32, i32) {
         let obeys = matches!(
             self.ui.tool,
             Tool::DottedFreehand
@@ -412,15 +589,41 @@ impl PainterApp {
                 | Tool::Text
         );
         if self.tools.grid && obeys {
-            let s = |v: i32| (v + GRID / 2).div_euclid(GRID) * GRID;
-            (s(p.0), s(p.1))
+            let GridSettings { x: gx, y: gy } = self.tools.grid_size;
+            (
+                (p.0 + gx / 2).div_euclid(gx) * gx,
+                (p.1 + gy / 2).div_euclid(gy) * gy,
+            )
         } else {
             p
         }
     }
 
+    /// The Fill tool's fill: solid, or a gradient through the colour range that holds FG
+    /// (ranges of the picture), else from FG to BG (ADR-20).
+    pub(crate) fn fill_type(&self) -> FillType {
+        let Some(direction) = self.tools.fill.gradient else {
+            return FillType::Solid;
+        };
+        let colors = self.palette().len();
+        let ranges: Vec<(u8, u8)> = self
+            .extras
+            .ranges
+            .iter()
+            .filter(|r| usize::from(r.high) < colors)
+            .map(|r| (r.low, r.high))
+            .collect();
+        let (from, to) = range_for(&ranges, self.ui.fg, self.ui.bg);
+        FillType::Gradient {
+            direction,
+            from,
+            to,
+            dither: self.tools.fill.dither,
+        }
+    }
+
     /// Symmetry for a new gesture: around the centre of the screen.
-    fn symmetry(&self) -> Option<Symmetry> {
+    pub(crate) fn symmetry(&self) -> Option<Symmetry> {
         if !self.tools.symmetry || matches!(self.ui.tool, Tool::Text | Tool::Fill) {
             return None;
         }
@@ -431,8 +634,9 @@ impl PainterApp {
                 self.scroll.0 + v.screen_w / 2,
                 self.scroll.1 + v.screen_h / 2,
             ),
-            order: SYMMETRY_ORDER,
+            order: self.tools.symmetry_settings.order,
             aspect: (fx as u8, fy as u8),
+            mirror: self.tools.symmetry_settings.mirror,
         })
     }
 
@@ -512,7 +716,8 @@ impl PainterApp {
                 lines: vec![String::new()],
             },
             Tool::Fill => {
-                self.run(Command::FloodFill { x, y, color });
+                let fill = self.fill_type();
+                self.run(Command::FloodFill { x, y, color, fill });
                 return;
             }
             _ => return,
@@ -525,11 +730,13 @@ impl PainterApp {
             brush: dpx_ui::toolbox::BUILTIN_BRUSHES[self.ui.brush].footprint(),
             filled: self.ui.filled && self.ui.tool.is_split(),
             symmetry: self.symmetry(),
+            spacing: self.tools.spacing,
+            aspect: self.aspect(),
             held: true,
             kind,
         };
         match &s.kind {
-            Kind::Freehand { continuous, .. } => {
+            Kind::Freehand { continuous, .. } if !s.spaced() => {
                 let first = s.freehand(vec![p], *continuous);
                 s.paint_more(&first);
             }
@@ -566,9 +773,14 @@ impl PainterApp {
                 }
                 points.push(p);
                 let continuous = *continuous;
-                let part = if continuous { vec![last, p] } else { vec![p] };
-                let cmd = s.freehand(part, continuous);
-                s.paint_more(&cmd);
+                if s.spaced() {
+                    // Stamps depend on the whole path: draw it again.
+                    s.redraw(page);
+                } else {
+                    let part = if continuous { vec![last, p] } else { vec![p] };
+                    let cmd = s.freehand(part, continuous);
+                    s.paint_more(&cmd);
+                }
             }
             Kind::Lasso { points } => {
                 let last = *points.last().expect("a stroke starts with one point");
@@ -703,7 +915,8 @@ impl PainterApp {
             return;
         }
         let at = *at;
-        let (rx, ry) = (AIRBRUSH_RADIUS, (AIRBRUSH_RADIUS * fx / fy).max(1));
+        let radius = self.tools.spacing.airbrush_radius;
+        let (rx, ry) = (radius, (radius * fx / fy).max(1));
         let mut new = Vec::with_capacity(n);
         while new.len() < n {
             let (dx, dy) = (self.tools.random(rx), self.tools.random(ry));
@@ -1001,6 +1214,13 @@ impl PainterApp {
             return;
         }
         match key {
+            // Fill Type and Spacing requesters (manual keyboard table).
+            ToolKey::Char('F') => {
+                self.open_tool_requester(Tool::Fill);
+            }
+            ToolKey::Char('V') => {
+                self.open_tool_requester(Tool::Line);
+            }
             ToolKey::Char('m') => self.toggle_magnify(self.pointer_page),
             ToolKey::Char('>') => self.zoom(1),
             ToolKey::Char('<') => self.zoom(-1),

@@ -95,6 +95,8 @@ pub struct UiState {
     pub note_requester: Option<NoteRequester>,
     /// Color ▸ Palette ▸ Mixer (the Color Mixer) while it is open.
     pub palette_requester: Option<crate::palette_requester::PaletteRequester>,
+    /// Gridding, Symmetry, Spacing, Fill Type or Make Stencil while open (ADR-20).
+    pub tool_requester: Option<crate::tool_requesters::ToolRequester>,
 }
 
 impl UiState {
@@ -130,6 +132,7 @@ impl Default for UiState {
             page_size_requester: None,
             note_requester: None,
             palette_requester: None,
+            tool_requester: None,
         }
     }
 }
@@ -278,6 +281,9 @@ impl Screen {
         }
         if let Some(req) = &ui.palette_requester {
             req.draw(img, pens);
+        }
+        if let Some(req) = &ui.tool_requester {
+            req.draw(img, pens, palette);
         }
     }
 

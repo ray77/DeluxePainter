@@ -613,6 +613,7 @@ mod tests {
             center: (8, 4),
             order: 6,
             aspect: (1, 1),
+            mirror: false,
         });
         let cases = [
             shape(
@@ -667,6 +668,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 color: 6,
+                fill: crate::gradient::FillType::Solid,
             },
         ];
         for cmd in cases {
@@ -702,6 +704,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 color: 3,
+                fill: crate::gradient::FillType::Solid,
             })
             .unwrap();
         assert_eq!(out.affected, Some(Rect::new(0, 0, 5, 8)));
@@ -712,6 +715,7 @@ mod tests {
                 x: 0,
                 y: 0,
                 color: 3,
+                fill: crate::gradient::FillType::Solid,
             })
             .unwrap();
         assert_eq!(out.affected, None);
@@ -789,6 +793,7 @@ mod tests {
                         center: (0, 0),
                         order: MAX_SYMMETRY_ORDER + 1,
                         aspect: (1, 1),
+                        mirror: false,
                     }),
                 ),
                 ErrorCode::InvalidArgument,
@@ -801,6 +806,7 @@ mod tests {
                         center: (0, 0),
                         order: 6,
                         aspect: (0, 1),
+                        mirror: false,
                     }),
                 ),
                 ErrorCode::InvalidArgument,
@@ -810,6 +816,7 @@ mod tests {
                     x: 0,
                     y: 0,
                     color: 32,
+                    fill: crate::gradient::FillType::Solid,
                 },
                 ErrorCode::PaletteRangeInvalid,
             ),
