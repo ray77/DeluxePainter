@@ -45,7 +45,7 @@ See [`docs/FEATURES.md`](docs/FEATURES.md) for the prioritised feature set and [
 
 ## Building
 
-Requires [rustup](https://rustup.rs); the toolchain version is pinned in `rust-toolchain.toml`.
+Requires [rustup](https://rustup.rs); the toolchain version is pinned in `rust-toolchain.toml`. A non-rustup Rust (for example Homebrew's `rust` formula) ignores that file; if `which cargo` does not point to `~/.cargo/bin/cargo`, put `~/.cargo/bin` first in `PATH` or remove the other Rust.
 
 ```bash
 cargo run -p deluxepainter --release
