@@ -1,8 +1,11 @@
 //! Basic raster algorithms on integer pixel coordinates.
 //!
 //! These will move to the `dpx-raster` crate once more tools exist (see ARCHITECTURE.md).
+//! The drawing commands stamp their brush with a [`Pen`], which sends every pixel through
+//! [`paint::plot`] so the drawing mode and the stencil apply (ADR-18).
 
 use crate::image::{IndexedImage, Rect};
+use crate::paint::{self, BrushImage, DrawMode, PaintContext};
 
 /// All points of a Bresenham line from `a` to `b`, inclusive.
 pub fn line_points(a: (i32, i32), b: (i32, i32)) -> Vec<(i32, i32)> {
@@ -62,14 +65,158 @@ pub fn stroke(
 
 /// Unclipped bounding rect of every pixel `stroke` can touch; `None` if `points` or `brush` is empty.
 pub fn stroke_bounds(brush: &[(i32, i32)], points: &[(i32, i32)]) -> Option<Rect> {
+    extent_bounds(Rect::from_points(brush)?, points)
+}
+
+/// Unclipped bounding rect of a brush whose pixels cover `extent` (relative to its hotspot)
+/// stamped at every one of `points`; `None` if `points` is empty.
+pub fn extent_bounds(extent: Rect, points: &[(i32, i32)]) -> Option<Rect> {
     let p = Rect::from_points(points)?;
-    let b = Rect::from_points(brush)?;
     Some(Rect::new(
-        p.x + b.x,
-        p.y + b.y,
-        p.w + b.w - 1,
-        p.h + b.h - 1,
+        p.x + extent.x,
+        p.y + extent.y,
+        p.w + extent.w - 1,
+        p.h + extent.h - 1,
     ))
+}
+
+/// The pixels of a custom brush relative to its handle; `None` for an empty brush.
+pub fn brush_extent(brush: &BrushImage) -> Option<Rect> {
+    (brush.width > 0 && brush.height > 0).then(|| {
+        Rect::new(
+            -brush.handle.0,
+            -brush.handle.1,
+            brush.width as i32,
+            brush.height as i32,
+        )
+    })
+}
+
+/// The colour custom brush pixel (`x`, `y`) paints, `None` where it paints nothing (ADR-18).
+/// `color` is FG, or BG when `right`.
+///
+/// - Color: the brush's shape (its non-transparent pixels) in `color`.
+/// - Replace: every pixel in its own colour, transparent ones too (they hold the BG colour of
+///   the pick-up); with the right button the whole rectangle in `color`.
+/// - Matte and every other mode: the brush's own colours, transparent pixels skipped; with the
+///   right button the shape in `color`.
+pub fn custom_color(
+    brush: &BrushImage,
+    x: i32,
+    y: i32,
+    mode: DrawMode,
+    color: u8,
+    right: bool,
+) -> Option<u8> {
+    let own = brush.get(x, y)?;
+    let opaque = Some(own) != brush.transparent;
+    match mode {
+        DrawMode::Color => opaque.then_some(color),
+        DrawMode::Replace => Some(if right { color } else { own }),
+        _ => opaque.then_some(if right { color } else { own }),
+    }
+}
+
+/// How a drawing command paints (ADR-18): the brush, the colour and the drawing mode. Every
+/// pixel goes through [`paint::plot`] with [`Pen::ctx`], so the stencil applies everywhere.
+#[derive(Clone, Copy, Debug)]
+pub struct Pen<'a> {
+    /// Built-in brush: pixel offsets from its hotspot, painted in `color`. Not used when
+    /// `custom` is set.
+    pub offsets: &'a [(i32, i32)],
+    /// Custom brush, painted as [`custom_color`] says.
+    pub custom: Option<&'a BrushImage>,
+    /// FG, or BG with the right button (`ctx.right`).
+    pub color: u8,
+    pub mode: DrawMode,
+    /// Palette, range, stencil, the page before the command and the button; `motion` is
+    /// set for each stamp.
+    pub ctx: PaintContext<'a>,
+}
+
+impl Pen<'_> {
+    /// The brush's pixels relative to its hotspot; `None` for an empty brush.
+    pub fn extent(&self) -> Option<Rect> {
+        match self.custom {
+            Some(b) => brush_extent(b),
+            None => Rect::from_points(self.offsets),
+        }
+    }
+
+    /// Stamps the brush with its hotspot at (`x`, `y`); `motion` is the movement since the
+    /// previous stamp of the same path.
+    pub fn stamp(&self, img: &mut IndexedImage, x: i32, y: i32, motion: (i32, i32)) {
+        let ctx = PaintContext { motion, ..self.ctx };
+        let Some(b) = self.custom else {
+            for &(dx, dy) in self.offsets {
+                paint::plot(img, x + dx, y + dy, self.color, self.mode, &ctx);
+            }
+            return;
+        };
+        // Only the brush rows and columns that land on the image.
+        let (ox, oy) = (x - b.handle.0, y - b.handle.1);
+        let (w, h) = (b.width as i32, b.height as i32);
+        let (x0, x1) = ((-ox).max(0), (img.width() as i32 - ox).min(w));
+        let (y0, y1) = ((-oy).max(0), (img.height() as i32 - oy).min(h));
+        for by in y0..y1 {
+            for bx in x0..x1 {
+                if let Some(c) = custom_color(b, bx, by, self.mode, self.color, ctx.right) {
+                    paint::plot(img, ox + bx, oy + by, c, self.mode, &ctx);
+                }
+            }
+        }
+    }
+
+    /// One pixel in the pen's colour (filled shapes).
+    pub fn dot(&self, img: &mut IndexedImage, x: i32, y: i32) {
+        let ctx = PaintContext {
+            motion: (0, 0),
+            ..self.ctx
+        };
+        paint::plot(img, x, y, self.color, self.mode, &ctx);
+    }
+}
+
+/// Stamps a [`Pen`] along a path and remembers the previous stamp, for each stamp's motion.
+pub struct Stamper<'a> {
+    pen: Pen<'a>,
+    last: Option<(i32, i32)>,
+}
+
+impl<'a> Stamper<'a> {
+    pub fn new(pen: Pen<'a>) -> Self {
+        Self { pen, last: None }
+    }
+
+    /// One stamp at `p`.
+    pub fn at(&mut self, img: &mut IndexedImage, p: (i32, i32)) {
+        let motion = self.last.map_or((0, 0), |l| (p.0 - l.0, p.1 - l.1));
+        self.last = Some(p);
+        self.pen.stamp(img, p.0, p.1, motion);
+    }
+
+    /// A stamp on every pixel of the Bresenham line from `a` to `b`, both ends included.
+    pub fn line(&mut self, img: &mut IndexedImage, a: (i32, i32), b: (i32, i32)) {
+        for p in line_points(a, b) {
+            self.at(img, p);
+        }
+    }
+}
+
+/// [`stroke`] with a [`Pen`]: the brush stamped at every point, or with `continuous` on every
+/// pixel of the lines between consecutive points. Shared ends are stamped twice, as in
+/// [`stroke`], so a stroke painted in parts gives the same stamps in the same order.
+pub fn stroke_pen(img: &mut IndexedImage, pen: &Pen, points: &[(i32, i32)], continuous: bool) {
+    let mut s = Stamper::new(*pen);
+    if continuous && points.len() > 1 {
+        for pair in points.windows(2) {
+            s.line(img, pair[0], pair[1]);
+        }
+    } else {
+        for &p in points {
+            s.at(img, p);
+        }
+    }
 }
 
 /// Rounds `num / den` to the nearest integer (halves up); `den` must be positive.
@@ -165,43 +312,68 @@ pub fn curve_points(a: (i32, i32), through: (i32, i32), b: (i32, i32)) -> Vec<(i
 /// also sets every pixel on its edges, so the outline drawn with a 1-pixel brush always lies
 /// inside the filled shape. Clipped to the image.
 pub fn fill_polygon(img: &mut IndexedImage, points: &[(i32, i32)], color: u8) {
+    let (w, h) = (img.width(), img.height());
+    polygon_pixels(points, w, h, |x, y| img.set(x, y, color));
+}
+
+/// [`fill_polygon`] with a [`Pen`]: every pixel of the shape is plotted once, in the pen's
+/// colour and mode.
+pub fn fill_polygon_pen(img: &mut IndexedImage, points: &[(i32, i32)], pen: &Pen) {
+    let (w, h) = (img.width(), img.height());
+    polygon_pixels(points, w, h, |x, y| pen.dot(img, x, y));
+}
+
+/// Calls `f` once for every pixel [`fill_polygon`] paints in a `width`×`height` image, row by
+/// row.
+fn polygon_pixels(points: &[(i32, i32)], width: u32, height: u32, mut f: impl FnMut(i32, i32)) {
     let Some(bounds) = Rect::from_points(points) else {
         return;
     };
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let (y0, y1) = (bounds.y.max(0), (bounds.y + bounds.h - 1).min(h - 1));
-    if y0 <= y1 {
-        let mut rows: Vec<Vec<f64>> = vec![Vec::new(); (y1 - y0 + 1) as usize];
-        for (i, &a) in points.iter().enumerate() {
-            let b = points[(i + 1) % points.len()];
-            if a.1 == b.1 {
-                continue;
-            }
-            let (top, bot) = if a.1 < b.1 { (a, b) } else { (b, a) };
-            let (dx, dy) = (f64::from(bot.0 - top.0), f64::from(bot.1 - top.1));
-            // Half-open in y, so a vertex shared by two edges is counted once.
-            for y in top.1.max(y0)..bot.1.min(y1 + 1) {
-                let x = f64::from(top.0) + f64::from(y - top.1) * dx / dy;
-                rows[(y - y0) as usize].push(x);
-            }
+    let clip = bounds.intersect(Rect::new(0, 0, width as i32, height as i32));
+    if clip.is_empty() {
+        return;
+    }
+    let mut mask = vec![false; clip.w as usize * clip.h as usize];
+    let mut mark = |x: i32, y: i32| {
+        if clip.contains(x, y) {
+            mask[(y - clip.y) as usize * clip.w as usize + (x - clip.x) as usize] = true;
         }
-        for (r, xs) in rows.iter_mut().enumerate() {
-            xs.sort_by(f64::total_cmp);
-            let y = y0 + r as i32;
-            for &[a, b] in xs.as_chunks::<2>().0 {
-                let xa = (a.ceil() as i32).max(0);
-                let xb = (b.floor() as i32).min(w - 1);
-                if xa <= xb {
-                    img.hline(xa, xb, y, color);
-                }
+    };
+    let (y0, y1) = (clip.y, clip.y + clip.h - 1);
+    let mut rows: Vec<Vec<f64>> = vec![Vec::new(); (y1 - y0 + 1) as usize];
+    for (i, &a) in points.iter().enumerate() {
+        let b = points[(i + 1) % points.len()];
+        if a.1 == b.1 {
+            continue;
+        }
+        let (top, bot) = if a.1 < b.1 { (a, b) } else { (b, a) };
+        let (dx, dy) = (f64::from(bot.0 - top.0), f64::from(bot.1 - top.1));
+        // Half-open in y, so a vertex shared by two edges is counted once.
+        for y in top.1.max(y0)..bot.1.min(y1 + 1) {
+            let x = f64::from(top.0) + f64::from(y - top.1) * dx / dy;
+            rows[(y - y0) as usize].push(x);
+        }
+    }
+    for (r, xs) in rows.iter_mut().enumerate() {
+        xs.sort_by(f64::total_cmp);
+        let y = y0 + r as i32;
+        for &[a, b] in xs.as_chunks::<2>().0 {
+            let xa = (a.ceil() as i32).max(clip.x);
+            let xb = (b.floor() as i32).min(clip.x + clip.w - 1);
+            for x in xa..=xb {
+                mark(x, y);
             }
         }
     }
     for (i, &a) in points.iter().enumerate() {
         let b = points[(i + 1) % points.len()];
         for (x, y) in line_points(a, b) {
-            img.set(x, y, color);
+            mark(x, y);
         }
+    }
+    let w = clip.w as usize;
+    for (i, _) in mask.iter().enumerate().filter(|(_, on)| **on) {
+        f(clip.x + (i % w) as i32, clip.y + (i / w) as i32);
     }
 }
 

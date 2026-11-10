@@ -1,14 +1,16 @@
 //! Drawing-tool shapes (ADR-14): the geometry of [`Command::Shape`], cyclic symmetry, and
 //! [`Command::paint`], which draws a pixel command into any image. Front-ends preview a shape
 //! by painting the candidate command into a copy of the page, so the preview is exactly what
-//! the engine commits.
+//! the engine commits. Every pixel is painted through [`crate::paint::plot`] (ADR-18).
 
 use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, CommandError, MAX_BRUSH_OFFSET, MAX_BRUSH_PIXELS};
 use crate::gradient;
 use crate::image::{IndexedImage, Rect};
-use crate::raster;
+use crate::paint::PaintContext;
+use crate::palette::Palette;
+use crate::raster::{self, Pen, Stamper};
 
 /// Largest absolute shape coordinate (points, centres) and radius.
 pub const MAX_SHAPE_COORD: i32 = 16_384;
@@ -171,9 +173,11 @@ impl Shape {
         !filled || matches!(self, Shape::Dots { .. })
     }
 
+    /// `custom`: a custom brush replaces `brush`, which may then be empty.
     pub(crate) fn validate(
         &self,
         brush: &[(i32, i32)],
+        custom: bool,
         filled: bool,
         symmetry: Option<&Symmetry>,
     ) -> Result<(), CommandError> {
@@ -200,7 +204,7 @@ impl Shape {
                 "shape coordinates must lie within ±{MAX_SHAPE_COORD}"
             ));
         }
-        let need_brush = self.uses_brush(filled);
+        let need_brush = self.uses_brush(filled) && !custom;
         if (need_brush && brush.is_empty()) || brush.len() > MAX_BRUSH_PIXELS {
             return invalid(format!(
                 "brush must have 1..={MAX_BRUSH_PIXELS} pixels, got {}",
@@ -232,46 +236,58 @@ impl Shape {
         Ok(())
     }
 
-    /// Draws the shape (and its symmetric copies) into `img`.
-    fn draw(
-        &self,
-        img: &mut IndexedImage,
-        brush: &[(i32, i32)],
-        color: u8,
-        filled: bool,
-        symmetry: Option<&Symmetry>,
-    ) {
+    /// The outline's points for each symmetric copy (copy 0 = the shape itself).
+    fn copies(&self, filled: bool, symmetry: Option<&Symmetry>) -> (Path, Vec<Vec<(i32, i32)>>) {
         let path = self.path(filled);
-        for k in 0..Symmetry::copies(symmetry) {
-            let points: Vec<(i32, i32)> = match symmetry {
+        let copies = (0..Symmetry::copies(symmetry))
+            .map(|k| match symmetry {
                 Some(s) if k > 0 => path.points.iter().map(|&p| s.copy(k, p)).collect(),
                 _ => path.points.clone(),
-            };
-            if path.dots {
-                for &(x, y) in &points {
-                    raster::stamp(img, brush, x, y, color);
+            })
+            .collect();
+        (path, copies)
+    }
+
+    /// Draws the shape (and its symmetric copies) into `img` with `pen`. Outlines and dots
+    /// visit the copies point by point (each copy keeps its own stamp motion), so a shape
+    /// painted in parts gives the same stamps in the same order as the whole shape.
+    fn draw(&self, img: &mut IndexedImage, pen: &Pen, filled: bool, symmetry: Option<&Symmetry>) {
+        let (path, copies) = self.copies(filled, symmetry);
+        if filled && !path.dots {
+            for points in &copies {
+                raster::fill_polygon_pen(img, points, pen);
+            }
+            return;
+        }
+        let mut stampers: Vec<Stamper> = copies.iter().map(|_| Stamper::new(*pen)).collect();
+        let n = path.points.len();
+        if path.dots || n == 1 {
+            for i in 0..n {
+                for (s, points) in stampers.iter_mut().zip(&copies) {
+                    s.at(img, points[i]);
                 }
-            } else if filled {
-                raster::fill_polygon(img, &points, color);
-            } else {
-                stroke_path(img, brush, color, &points, path.closed);
+            }
+            return;
+        }
+        // Lines between consecutive points, then back to the first when closed.
+        let close = (path.closed && n > 2).then_some((n - 1, 0));
+        for (a, b) in (1..n).map(|i| (i - 1, i)).chain(close) {
+            for (s, points) in stampers.iter_mut().zip(&copies) {
+                s.line(img, points[a], points[b]);
             }
         }
     }
 
-    /// Unclipped bounding rect of every pixel [`Self::draw`] can touch.
-    fn bounds(&self, brush: &[(i32, i32)], filled: bool, symmetry: Option<&Symmetry>) -> Rect {
-        let path = self.path(filled);
+    /// Unclipped bounding rect of every pixel [`Self::draw`] can touch; `extent` = the
+    /// brush's pixels relative to its hotspot.
+    fn bounds(&self, extent: Option<Rect>, filled: bool, symmetry: Option<&Symmetry>) -> Rect {
+        let (_, copies) = self.copies(filled, symmetry);
         let mut all = Rect::default();
-        for k in 0..Symmetry::copies(symmetry) {
-            let points: Vec<(i32, i32)> = match symmetry {
-                Some(s) if k > 0 => path.points.iter().map(|&p| s.copy(k, p)).collect(),
-                _ => path.points.clone(),
-            };
+        for points in &copies {
             let r = if self.uses_brush(filled) {
-                raster::stroke_bounds(brush, &points)
+                extent.and_then(|e| raster::extent_bounds(e, points))
             } else {
-                Rect::from_points(&points)
+                Rect::from_points(points)
             };
             all = all.union(r.unwrap_or_default());
         }
@@ -279,46 +295,86 @@ impl Shape {
     }
 }
 
-/// Stamps `brush` along the lines through `points` (and back to the first when `closed`).
-fn stroke_path(
-    img: &mut IndexedImage,
-    brush: &[(i32, i32)],
-    color: u8,
-    points: &[(i32, i32)],
-    closed: bool,
-) {
-    raster::stroke(img, brush, color, points, true);
-    if closed && points.len() > 2 {
-        raster::stroke(
-            img,
-            brush,
-            color,
-            &[points[points.len() - 1], points[0]],
-            true,
-        );
-    }
-}
-
 impl Command {
-    /// Draws a page-pixel command (Stroke, Shape, FloodFill) into `img` exactly as the engine
-    /// applies it; returns `false` (and does nothing) for other commands. Front-ends use it
-    /// to preview a tool's candidate command on a copy of the page. The command should be
-    /// valid for the document (see [`crate::Engine::execute`]).
-    pub fn paint(&self, img: &mut IndexedImage) -> bool {
-        match self {
+    /// The pen a Stroke or Shape paints with (ADR-18); `before` is the page before the
+    /// command. `None` for other commands.
+    pub fn pen<'a>(&'a self, before: &'a IndexedImage, palette: &'a Palette) -> Option<Pen<'a>> {
+        let (brush, color, custom, mode, range, stencil, right) = match self {
             Command::Stroke {
                 brush,
                 color,
-                points,
-                continuous,
-            } => raster::stroke(img, brush, *color, points, *continuous),
-            Command::Shape {
-                shape,
+                custom,
+                mode,
+                range,
+                stencil,
+                right,
+                ..
+            }
+            | Command::Shape {
                 brush,
                 color,
-                filled,
-                symmetry,
-            } => shape.draw(img, brush, *color, *filled, symmetry.as_ref()),
+                custom,
+                mode,
+                range,
+                stencil,
+                right,
+                ..
+            } => (brush, color, custom, mode, range, stencil, right),
+            _ => return None,
+        };
+        Some(Pen {
+            offsets: brush,
+            custom: custom.as_ref(),
+            color: *color,
+            mode: *mode,
+            ctx: PaintContext {
+                palette,
+                range: *range,
+                stencil: stencil.as_deref(),
+                before,
+                motion: (0, 0),
+                right: *right,
+            },
+        })
+    }
+
+    /// The pixels of a Stroke's or Shape's brush relative to its hotspot (the custom brush if
+    /// there is one); `None` for an empty brush and other commands.
+    fn brush_extent(&self) -> Option<Rect> {
+        match self {
+            Command::Stroke { brush, custom, .. } | Command::Shape { brush, custom, .. } => {
+                match custom {
+                    Some(b) => raster::brush_extent(b),
+                    None => Rect::from_points(brush),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Draws a page-pixel command (Stroke, Shape, FloodFill) into `img` exactly as the engine
+    /// applies it; returns `false` (and does nothing) for other commands. Front-ends use it
+    /// to preview a tool's candidate command on a copy of the page. `before` is the page
+    /// before the command (the drawing modes and the stencil read it); a gesture previewed in
+    /// parts passes the page before the gesture. `palette` is the document's. The command
+    /// should be valid for the document (see [`crate::Engine::execute`]).
+    pub fn paint(&self, img: &mut IndexedImage, before: &IndexedImage, palette: &Palette) -> bool {
+        if let Some(pen) = self.pen(before, palette) {
+            match self {
+                Command::Stroke {
+                    points, continuous, ..
+                } => raster::stroke_pen(img, &pen, points, *continuous),
+                Command::Shape {
+                    shape,
+                    filled,
+                    symmetry,
+                    ..
+                } => shape.draw(img, &pen, *filled, symmetry.as_ref()),
+                _ => unreachable!("only strokes and shapes have a pen"),
+            }
+            return true;
+        }
+        match self {
             Command::FloodFill { x, y, color, fill } => {
                 gradient::flood_fill(img, *x, *y, *color, fill);
             }
@@ -331,16 +387,16 @@ impl Command {
     /// none); `None` for commands that are not page-pixel commands.
     pub fn paint_bounds(&self, page: &IndexedImage) -> Option<Rect> {
         let r = match self {
-            Command::Stroke { brush, points, .. } => {
-                raster::stroke_bounds(brush, points).unwrap_or_default()
-            }
+            Command::Stroke { points, .. } => self
+                .brush_extent()
+                .and_then(|e| raster::extent_bounds(e, points))
+                .unwrap_or_default(),
             Command::Shape {
                 shape,
-                brush,
                 filled,
                 symmetry,
                 ..
-            } => shape.bounds(brush, *filled, symmetry.as_ref()),
+            } => shape.bounds(self.brush_extent(), *filled, symmetry.as_ref()),
             Command::FloodFill { x, y, color, fill } => {
                 gradient::flood_fill(&mut page.clone(), *x, *y, *color, fill).unwrap_or_default()
             }
@@ -353,6 +409,7 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paint::{BrushImage, DrawMode};
 
     /// The image as rows of `#` (colour 1) and `.` (colour 0); other colours as digits.
     fn rows(img: &IndexedImage) -> Vec<String> {
@@ -377,12 +434,23 @@ mod tests {
             color: 1,
             filled,
             symmetry: None,
+            custom: None,
+            mode: DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right: false,
         }
+    }
+
+    /// [`Command::paint`] on `img`, with `img` as the page before and the default palette.
+    fn paint(cmd: &Command, img: &mut IndexedImage) -> bool {
+        let before = img.clone();
+        cmd.paint(img, &before, &Palette::dpaint_default_32())
     }
 
     fn painted(w: u32, h: u32, cmd: &Command) -> Vec<String> {
         let mut img = IndexedImage::new(w, h, 0);
-        assert!(cmd.paint(&mut img));
+        assert!(paint(cmd, &mut img));
         // The bounds cover every changed pixel.
         let r = cmd.paint_bounds(&IndexedImage::new(w, h, 0)).unwrap();
         for y in 0..h as i32 {
@@ -596,7 +664,7 @@ mod tests {
             fill: crate::gradient::FillType::Solid,
         };
         assert_eq!(cmd.paint_bounds(&img), Some(Rect::new(2, 2, 1, 1)));
-        cmd.paint(&mut img);
+        paint(&cmd, &mut img);
         assert_eq!(
             rows(&img),
             [".....", ".###.", ".#2#.", ".###.", "....."].map(String::from)
@@ -620,15 +688,15 @@ mod tests {
         assert_eq!(sym.copy(1, (6, 4)), (4, 6));
         assert_eq!(sym.copy(2, (6, 4)), (2, 4));
         assert_eq!(sym.copy(3, (6, 4)), (4, 2));
-        let cmd = Command::Shape {
-            shape: Shape::Dots {
+        let mut cmd = shape(
+            Shape::Dots {
                 points: vec![(7, 4)],
             },
-            brush: vec![(0, 0)],
-            color: 1,
-            filled: false,
-            symmetry: Some(sym),
-        };
+            false,
+        );
+        if let Command::Shape { symmetry, .. } = &mut cmd {
+            *symmetry = Some(sym);
+        }
         assert_eq!(
             painted(9, 9, &cmd),
             [
@@ -691,9 +759,15 @@ mod tests {
             color: 1,
             filled: false,
             symmetry: Some(four),
+            custom: None,
+            mode: DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right: false,
         };
         let mut img = IndexedImage::new(21, 21, 0);
-        cmd.paint(&mut img);
+        let before = img.clone();
+        cmd.paint(&mut img, &before, &Palette::dpaint_default_32());
         for p in [(13, 8), (7, 8), (7, 12), (13, 12)] {
             assert_eq!(img.get(p.0, p.1), Some(1), "{p:?}");
         }
@@ -717,7 +791,17 @@ mod tests {
                 color: 5,
                 filled: true,
                 symmetry: None,
+                custom: None,
+                mode: DrawMode::Matte,
+                range: None,
+                stencil: None,
+                right: false,
             }
+        );
+        assert_eq!(
+            serde_json::to_string(&cmd).unwrap(),
+            r#"{"op":"shape","shape":{"kind":"rect","from":[1,2],"to":[3,4]},"brush":[],"color":5,"filled":true}"#,
+            "unset paint fields are left out"
         );
         let fill = Command::FloodFill {
             x: 1,
@@ -731,6 +815,193 @@ mod tests {
         );
         let sym: Symmetry = serde_json::from_str(r#"{"center":[160,128],"order":6}"#).unwrap();
         assert_eq!(sym.aspect, (1, 1));
+    }
+
+    /// A 3×2 custom brush with colour 0 transparent: `.5.` over `66.`; handle (1, 1).
+    fn brush() -> BrushImage {
+        BrushImage::from_image(
+            &IndexedImage::from_pixels(3, 2, vec![0, 5, 0, 6, 6, 0]).unwrap(),
+            Some(0),
+        )
+    }
+
+    /// One stamp of `brush()` at (2, 2) on a 5×4 page of colour 9.
+    fn stamped(mode: DrawMode, color: u8, right: bool, stencil: Option<Vec<bool>>) -> Vec<String> {
+        let mut cmd = shape(
+            Shape::Dots {
+                points: vec![(2, 2)],
+            },
+            false,
+        );
+        if let Command::Shape {
+            brush: offsets,
+            color: c,
+            custom,
+            mode: m,
+            stencil: s,
+            right: r,
+            ..
+        } = &mut cmd
+        {
+            offsets.clear();
+            *c = color;
+            *custom = Some(brush());
+            *m = mode;
+            *s = stencil;
+            *r = right;
+        }
+        let mut img = IndexedImage::new(5, 4, 9);
+        img.set(3, 1, 1);
+        assert!(paint(&cmd, &mut img));
+        rows(&img)
+    }
+
+    #[test]
+    fn custom_brush_matte_color_and_replace() {
+        // Matte: the brush's own colours; its transparent colour 0 lets the page show.
+        assert_eq!(
+            stamped(DrawMode::Matte, 3, false, None),
+            ["99999", "995#9", "96699", "99999"].map(String::from)
+        );
+        // Color: the brush's shape in the given colour (FG).
+        assert_eq!(
+            stamped(DrawMode::Color, 3, false, None),
+            ["99999", "993#9", "93399", "99999"].map(String::from)
+        );
+        // Replace: the whole rectangle, transparent pixels in their own colour (the BG of
+        // the pick-up).
+        assert_eq!(
+            stamped(DrawMode::Replace, 3, false, None),
+            ["99999", "9.5.9", "966.9", "99999"].map(String::from)
+        );
+        // Right button (colour = BG 4): Matte and Color paint the shape in BG, Replace the
+        // whole rectangle.
+        for mode in [DrawMode::Matte, DrawMode::Color] {
+            assert_eq!(
+                stamped(mode, 4, true, None),
+                ["99999", "994#9", "94499", "99999"].map(String::from),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            stamped(DrawMode::Replace, 4, true, None),
+            ["99999", "94449", "94449", "99999"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn the_stencil_protects_colours_from_every_path() {
+        let mut stencil = vec![false; 256];
+        stencil[9] = true;
+        // Only the pixel of colour 1 is not protected.
+        assert_eq!(
+            stamped(DrawMode::Replace, 3, false, Some(stencil.clone())),
+            ["99999", "999.9", "99999", "99999"].map(String::from)
+        );
+        // Filled shapes and outlines with a built-in brush too.
+        for filled in [true, false] {
+            let mut cmd = shape(
+                Shape::Rect {
+                    from: (0, 0),
+                    to: (4, 3),
+                },
+                filled,
+            );
+            if let Command::Shape { stencil: s, .. } = &mut cmd {
+                *s = Some(stencil.clone());
+            }
+            let mut img = IndexedImage::new(5, 4, 9);
+            img.fill_rect(0, 0, 2, 4, 2);
+            paint(&cmd, &mut img);
+            assert_eq!(img.get(4, 0), Some(9), "protected");
+            assert_eq!(img.get(0, 0), Some(1), "painted");
+            assert_eq!(img.get(1, 1), Some(if filled { 1 } else { 2 }));
+        }
+    }
+
+    #[test]
+    fn a_custom_brush_painted_in_parts_equals_the_whole_shape() {
+        let sym = Symmetry {
+            center: (16, 16),
+            order: 5,
+            aspect: (1, 1),
+            mirror: false,
+        };
+        let pts = vec![(20, 18), (26, 10), (12, 24), (30, 30), (21, 5)];
+        let with_brush = |outline: Shape| {
+            let mut cmd = shape(outline, false);
+            if let Command::Shape {
+                custom, symmetry, ..
+            } = &mut cmd
+            {
+                *custom = Some(brush());
+                *symmetry = Some(sym);
+            }
+            cmd
+        };
+        for dots in [true, false] {
+            let make = |points: Vec<(i32, i32)>| {
+                with_brush(if dots {
+                    Shape::Dots { points }
+                } else {
+                    Shape::Polygon {
+                        points,
+                        closed: false,
+                    }
+                })
+            };
+            let page = IndexedImage::new(32, 32, 0);
+            let mut whole = page.clone();
+            make(pts.clone()).paint(&mut whole, &page, &Palette::dpaint_default_32());
+            let mut parts = page.clone();
+            for k in 0..pts.len() {
+                let part = if dots {
+                    vec![pts[k]]
+                } else {
+                    pts[k.saturating_sub(1)..=k].to_vec()
+                };
+                make(part).paint(&mut parts, &page, &Palette::dpaint_default_32());
+            }
+            assert_eq!(rows(&parts), rows(&whole), "dots={dots}");
+            // The bounds cover every stamp of every copy.
+            let r = make(pts.clone()).paint_bounds(&page).unwrap();
+            for y in 0..32 {
+                for x in 0..32 {
+                    if whole.get(x, y) != Some(0) {
+                        assert!(r.contains(x, y), "({x},{y}) outside {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_brush_json_round_trips() {
+        let mut cmd = shape(
+            Shape::Dots {
+                points: vec![(1, 1)],
+            },
+            false,
+        );
+        if let Command::Shape {
+            custom,
+            mode,
+            range,
+            right,
+            ..
+        } = &mut cmd
+        {
+            *custom = Some(brush());
+            *mode = DrawMode::Replace;
+            *range = Some((2, 7));
+            *right = true;
+        }
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            json.contains(r#""mode":"replace""#) && json.contains(r#""right":true"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
     }
 
     #[test]

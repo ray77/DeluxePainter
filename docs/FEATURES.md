@@ -57,6 +57,8 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P0 | Antialiasing **off** by default for all tools | |
 | P3 | Perspective, bend/shear, metamorph | |
 
+**Custom brushes (ADR-18), done:** Brush Selector rectangle pick-up (`b`; left = copy, right = cut, Shift = square, BG or AutoTransp corner colour transparent, handle centred, Matte afterwards), `B` and right-click on the Brush Selector bring the last brush back, a built-in brush click drops it. Every brush tool (freehand, line, curve, shape outlines, airbrush, symmetry copies) stamps it, and it follows the pointer as a preview. Matte, Color and Replace paint as in DeluxePaint; the Mode menu's mode, the colour range holding FG and the stencil reach every stroke and shape command, filled shapes included. Open: lasso/polygon pick-up, AnimBrush, the other modes' pixel effects (separate work), flood fill through the stencil.
+
 ## 4. Colour
 
 | P | Feature | Notes |

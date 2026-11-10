@@ -11,8 +11,8 @@ use crate::document::Document;
 use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
 use crate::mode::DisplayMode;
+use crate::paint::{BrushImage, DrawMode};
 use crate::palette::{Palette, Rgb8};
-use crate::raster;
 use crate::shapes::{Shape, Symmetry};
 
 /// Most points one stroke may carry.
@@ -40,15 +40,36 @@ pub enum Axis {
 pub enum Command {
     /// Freehand stroke (Dotted / Continuous Freehand): the brush is stamped at every point and,
     /// if `continuous`, along Bresenham lines between consecutive points.
+    ///
+    /// Strokes and shapes paint every pixel through [`crate::paint::plot`] (ADR-18): `custom`,
+    /// `mode`, `range`, `stencil` and `right` are optional in JSON and left out when unset.
     Stroke {
-        /// Brush pixels as offsets from its hotspot.
+        /// Built-in brush pixels as offsets from its hotspot (may be empty with `custom`).
+        #[serde(default)]
         brush: Vec<(i32, i32)>,
+        /// FG, or BG with the right button.
         color: u8,
         points: Vec<(i32, i32)>,
         continuous: bool,
+        /// Custom brush (Brush Selector); replaces `brush`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom: Option<BrushImage>,
+        /// Drawing mode (Mode menu).
+        #[serde(default, skip_serializing_if = "is_default")]
+        mode: DrawMode,
+        /// Colour range `low..=high` for Shade and Cycle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<(u8, u8)>,
+        /// Stencil: 256 entries, `true` protects that colour on the page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stencil: Option<Vec<bool>>,
+        /// Painted with the right mouse button.
+        #[serde(default, skip_serializing_if = "is_default")]
+        right: bool,
     },
     /// A drawing-tool shape (ADR-14): the brush stamped along the outline, or with `filled` a
     /// solid shape in `color` (the brush is not used). With `symmetry`, rotated copies too.
+    /// The paint fields are those of [`Command::Stroke`].
     Shape {
         shape: Shape,
         #[serde(default)]
@@ -58,6 +79,16 @@ pub enum Command {
         filled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         symmetry: Option<Symmetry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom: Option<BrushImage>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        mode: DrawMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<(u8, u8)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stencil: Option<Vec<bool>>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        right: bool,
     },
     /// Fill tool: the 4-connected region of the colour at (`x`, `y`) becomes `color`, or with
     /// a gradient `fill` (ADR-20) steps through its colour range.
@@ -145,10 +176,14 @@ impl Command {
                 brush,
                 color: c,
                 points,
+                custom,
+                range,
+                stencil,
                 ..
             } => {
                 color(*c)?;
-                if brush.is_empty() || brush.len() > MAX_BRUSH_PIXELS {
+                validate_paint(doc, custom.as_ref(), *range, stencil.as_deref())?;
+                if (brush.is_empty() && custom.is_none()) || brush.len() > MAX_BRUSH_PIXELS {
                     return Err(CommandError::invalid(format!(
                         "brush must have 1..={MAX_BRUSH_PIXELS} pixels, got {}",
                         brush.len()
@@ -184,9 +219,14 @@ impl Command {
                 color: c,
                 filled,
                 symmetry,
+                custom,
+                range,
+                stencil,
+                ..
             } => {
                 color(*c)?;
-                shape.validate(brush, *filled, symmetry.as_ref())
+                validate_paint(doc, custom.as_ref(), *range, stencil.as_deref())?;
+                shape.validate(brush, custom.is_some(), *filled, symmetry.as_ref())
             }
             Command::FloodFill {
                 x,
@@ -331,9 +371,9 @@ impl Command {
     pub(crate) fn footprint(&self, doc: &Document) -> Footprint {
         let page = doc.page.bounds();
         match self {
-            Command::Stroke { brush, points, .. } => Footprint::Pixels(
-                raster::stroke_bounds(brush, points).map_or(Rect::default(), |r| r.intersect(page)),
-            ),
+            Command::Stroke { .. } => {
+                Footprint::Pixels(self.paint_bounds(&doc.page).unwrap_or_default())
+            }
             Command::Shape { .. } | Command::FloodFill { .. } => {
                 Footprint::Pixels(self.paint_bounds(&doc.page).unwrap_or_default())
             }
@@ -360,14 +400,9 @@ impl Command {
     pub(crate) fn apply(&self, doc: &mut Document) {
         let page = &mut doc.page;
         match self {
-            Command::Stroke {
-                brush,
-                color,
-                points,
-                continuous,
-            } => raster::stroke(page, brush, *color, points, *continuous),
-            Command::Shape { .. } | Command::FloodFill { .. } => {
-                self.paint(page);
+            Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
+                let before = page.clone();
+                self.paint(page, &before, &doc.palette);
             }
             Command::Clear { color } => {
                 let (w, h) = (page.width() as i32, page.height() as i32);
@@ -443,6 +478,85 @@ impl Command {
             }
         }
     }
+}
+
+/// `skip_serializing_if` for fields that are left out when they have their default value.
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// Largest absolute brush handle coordinate (the handle may lie outside the brush).
+pub const MAX_HANDLE: i32 = 2 * MAX_PAGE_SIDE as i32;
+
+/// Checks the paint fields of a Stroke or Shape (ADR-18): a custom brush whose pixel count
+/// matches its size, at most the target's largest page, colours inside the palette; a colour
+/// range inside the palette; a stencil with one entry per possible colour (256).
+fn validate_paint(
+    doc: &Document,
+    custom: Option<&BrushImage>,
+    range: Option<(u8, u8)>,
+    stencil: Option<&[bool]>,
+) -> Result<(), CommandError> {
+    let colors = doc.palette.len();
+    let outside = |c: u8, what: &str| {
+        CommandError::new(
+            ErrorCode::PaletteRangeInvalid,
+            format!("{what} colour {c} is outside the palette (0..{colors})"),
+        )
+    };
+    if let Some(b) = custom {
+        let (_, (max_w, max_h)) = doc.target.page_limits();
+        let (max_w, max_h) = (max_w.min(MAX_PAGE_SIDE), max_h.min(MAX_PAGE_SIDE));
+        if !(1..=max_w).contains(&b.width) || !(1..=max_h).contains(&b.height) {
+            return Err(CommandError::invalid(format!(
+                "brush {}x{} must be 1x1 to {max_w}x{max_h}",
+                b.width, b.height
+            )));
+        }
+        let n = b.width as usize * b.height as usize;
+        if b.pixels.len() != n {
+            return Err(CommandError::invalid(format!(
+                "brush {}x{} needs {n} pixels, got {}",
+                b.width,
+                b.height,
+                b.pixels.len()
+            )));
+        }
+        if b.handle.0.abs() > MAX_HANDLE || b.handle.1.abs() > MAX_HANDLE {
+            return Err(CommandError::invalid(format!(
+                "brush handle must lie within ±{MAX_HANDLE}"
+            )));
+        }
+        if let Some(&max) = b.pixels.iter().max()
+            && usize::from(max) >= colors
+        {
+            return Err(outside(max, "brush"));
+        }
+        if let Some(t) = b.transparent
+            && usize::from(t) >= colors
+        {
+            return Err(outside(t, "transparent"));
+        }
+    }
+    if let Some((low, high)) = range {
+        if low > high {
+            return Err(CommandError::invalid(format!(
+                "colour range {low}..={high} is empty"
+            )));
+        }
+        if usize::from(high) >= colors {
+            return Err(outside(high, "range"));
+        }
+    }
+    if let Some(s) = stencil
+        && s.len() != 256
+    {
+        return Err(CommandError::invalid(format!(
+            "stencil must have 256 entries, got {}",
+            s.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Checks a page passed in a command: `width`×`height` pixels, all inside the palette.
@@ -558,7 +672,17 @@ mod tests {
                 color: 1,
                 points: vec![(3, 4), (5, 6)],
                 continuous: true,
+                custom: None,
+                mode: DrawMode::Matte,
+                range: None,
+                stencil: None,
+                right: false,
             }
+        );
+        // Without the paint fields set, the JSON stays as it was before ADR-18.
+        assert_eq!(
+            serde_json::to_string(&stroke).unwrap(),
+            r#"{"op":"stroke","brush":[[0,0]],"color":1,"points":[[3,4],[5,6]],"continuous":true}"#
         );
         let pal = Command::SetPalette {
             colors: vec![Rgb8::new(1, 2, 3)],

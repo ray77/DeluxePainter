@@ -197,7 +197,7 @@ mod tests {
     use super::*;
     use crate::command::Axis;
     use crate::raster;
-    use crate::{IndexedImage, Rgb8};
+    use crate::{BrushImage, DrawMode, IndexedImage, Rgb8};
 
     fn engine() -> Engine {
         Engine::new(Document::new(16, 8, Palette::dpaint_default_32()))
@@ -209,6 +209,11 @@ mod tests {
             color,
             points: points.to_vec(),
             continuous: true,
+            custom: None,
+            mode: DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right: false,
         }
     }
 
@@ -325,19 +330,15 @@ mod tests {
     fn invalid_commands_change_nothing() {
         let mut e = engine();
         let before = e.document().clone();
+        let mut no_brush = stroke(1, &[(0, 0)]);
+        if let Command::Stroke { brush, .. } = &mut no_brush {
+            brush.clear();
+        }
         let cases = [
             (stroke(32, &[(0, 0)]), ErrorCode::PaletteRangeInvalid),
             (stroke(1, &[]), ErrorCode::InvalidArgument),
             (stroke(1, &[(MAX_POINT, 0)]), ErrorCode::InvalidArgument),
-            (
-                Command::Stroke {
-                    brush: vec![],
-                    color: 1,
-                    points: vec![(0, 0)],
-                    continuous: false,
-                },
-                ErrorCode::InvalidArgument,
-            ),
+            (no_brush, ErrorCode::InvalidArgument),
             (
                 Command::ReplaceColor { from: 0, to: 200 },
                 ErrorCode::PaletteRangeInvalid,
@@ -603,7 +604,25 @@ mod tests {
             color: 4,
             filled,
             symmetry,
+            custom: None,
+            mode: DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right: false,
         }
+    }
+
+    /// A Shape without a built-in brush (`brush` empty), else like [`shape`].
+    fn bare_shape(shape: crate::Shape, color: u8, filled: bool) -> Command {
+        let mut cmd = self::shape(shape, filled, None);
+        if let Command::Shape {
+            brush, color: c, ..
+        } = &mut cmd
+        {
+            brush.clear();
+            *c = color;
+        }
+        cmd
     }
 
     #[test]
@@ -676,7 +695,7 @@ mod tests {
             e.execute(stroke(2, &[(0, 3), (15, 3)])).unwrap();
             let before = e.document().page().clone();
             let mut preview = before.clone();
-            assert!(cmd.paint(&mut preview));
+            assert!(cmd.paint(&mut preview, &before, e.document().palette()));
             let out = e.execute(cmd.clone()).unwrap();
             assert_eq!(e.document().page(), &preview, "{cmd:?}");
             assert_ne!(&preview, &before, "{cmd:?} changes something");
@@ -733,23 +752,11 @@ mod tests {
         };
         let cases = [
             (
-                Command::Shape {
-                    shape: line.clone(),
-                    brush: vec![],
-                    color: 1,
-                    filled: false,
-                    symmetry: None,
-                },
+                bare_shape(line.clone(), 1, false),
                 ErrorCode::InvalidArgument,
             ),
             (
-                Command::Shape {
-                    shape: line.clone(),
-                    brush: vec![(0, 0)],
-                    color: 99,
-                    filled: false,
-                    symmetry: None,
-                },
+                bare_shape(line.clone(), 99, true),
                 ErrorCode::PaletteRangeInvalid,
             ),
             (
@@ -825,18 +832,122 @@ mod tests {
             assert_eq!(e.execute(cmd.clone()).unwrap_err().code, code, "{cmd:?}");
         }
         // A filled shape needs no brush.
-        e.execute(Command::Shape {
-            shape: Shape::Rect {
+        e.execute(bare_shape(
+            Shape::Rect {
                 from: (0, 0),
                 to: (2, 2),
             },
-            brush: vec![],
-            color: 1,
-            filled: true,
-            symmetry: None,
-        })
+            1,
+            true,
+        ))
         .unwrap();
         e.undo().unwrap();
         assert_eq!(e.document().page(), before.page());
+    }
+
+    /// A 3×2 brush with colour 0 transparent: `.5.` over `66.`.
+    fn small_brush() -> BrushImage {
+        BrushImage::from_image(
+            &IndexedImage::from_pixels(3, 2, vec![0, 5, 0, 6, 6, 0]).unwrap(),
+            Some(0),
+        )
+    }
+
+    /// A stroke of `points` with the custom brush only (no built-in brush).
+    fn custom_stroke(brush: BrushImage, mode: DrawMode, points: &[(i32, i32)]) -> Command {
+        let mut cmd = stroke(3, points);
+        if let Command::Stroke {
+            brush: offsets,
+            custom,
+            mode: m,
+            ..
+        } = &mut cmd
+        {
+            offsets.clear();
+            *custom = Some(brush);
+            *m = mode;
+        }
+        cmd
+    }
+
+    #[test]
+    fn a_custom_brush_stroke_is_one_undo_step_and_replays() {
+        let mut e = engine();
+        e.execute(Command::Clear { color: 9 }).unwrap();
+        let before = e.document().page().clone();
+        let cmd = custom_stroke(small_brush(), DrawMode::Matte, &[(2, 2), (10, 5)]);
+        let mut preview = before.clone();
+        cmd.paint(&mut preview, &before, e.document().palette());
+        let out = e.execute(cmd).unwrap();
+        assert_eq!(e.document().page(), &preview, "preview = result");
+        // The handle (1, 1) sits on each point: brush pixel (1, 0) = 5 lands one row above.
+        assert_eq!(e.document().page().get(2, 1), Some(5));
+        assert_eq!(e.document().page().get(1, 1), Some(9), "transparent pixel");
+        // The undo footprint covers the custom brush around every point.
+        let r = out.affected.unwrap();
+        for y in 0..8 {
+            for x in 0..16 {
+                if preview.get(x, y) != before.get(x, y) {
+                    assert!(r.contains(x, y), "({x},{y}) outside {r:?}");
+                }
+            }
+        }
+        e.undo().unwrap();
+        assert_eq!(e.document().page(), &before);
+        e.redo().unwrap();
+        assert_eq!(e.document().page(), &preview);
+    }
+
+    #[test]
+    fn paint_fields_are_validated() {
+        let mut e = engine();
+        let ok = custom_stroke(small_brush(), DrawMode::Replace, &[(3, 3)]);
+        e.execute(ok.clone()).unwrap();
+        let with = |f: &dyn Fn(&mut BrushImage)| {
+            let mut b = small_brush();
+            f(&mut b);
+            custom_stroke(b, DrawMode::Matte, &[(3, 3)])
+        };
+        let mut long_stencil = ok.clone();
+        let mut bad_range = ok.clone();
+        let mut outside_range = ok.clone();
+        if let (
+            Command::Stroke { stencil, .. },
+            Command::Stroke { range, .. },
+            Command::Stroke { range: outside, .. },
+        ) = (&mut long_stencil, &mut bad_range, &mut outside_range)
+        {
+            *stencil = Some(vec![false; 255]);
+            *range = Some((4, 2));
+            *outside = Some((20, 40));
+        }
+        let cases = [
+            (
+                with(&|b| {
+                    b.pixels.pop();
+                }),
+                ErrorCode::InvalidArgument,
+            ),
+            (with(&|b| b.pixels[1] = 32), ErrorCode::PaletteRangeInvalid),
+            (
+                with(&|b| b.transparent = Some(40)),
+                ErrorCode::PaletteRangeInvalid,
+            ),
+            (
+                with(&|b| {
+                    b.width = 2000;
+                    b.pixels = vec![1; 2000 * 2];
+                }),
+                ErrorCode::InvalidArgument,
+            ),
+            (with(&|b| b.height = 0), ErrorCode::InvalidArgument),
+            (long_stencil, ErrorCode::InvalidArgument),
+            (bad_range, ErrorCode::InvalidArgument),
+            (outside_range, ErrorCode::PaletteRangeInvalid),
+        ];
+        for (cmd, code) in cases {
+            assert_eq!(e.execute(cmd.clone()).unwrap_err().code, code, "{cmd:?}");
+        }
+        assert_eq!(e.document().revision(), 1, "nothing else ran");
     }
 }

@@ -97,7 +97,15 @@ Toolbox settings (ADR-20): right-click Grid, Symmetry or Fill, or the freehand, 
   <img src="docs/design/screenshots/phase3-requesters.png" alt="The Fill Type requester" width="400">
 </p>
 
-Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--fill-requester`, `--grid-requester`, `--symmetry-requester`, `--spacing-requester`, `--stencil-requester [--protect 1,2,3]`, `--palette-requester`, `--range-requester`, `--notes` (the notes of `--open`), `--font-preview out.png`.
+Custom brushes (ADR-18): the Brush Selector (`b`) picks up the part of the page you drag over (right button: cut, leaving BG behind, one undo step; Shift: square); the BG colour becomes transparent and the mode switches to Matte, then the previous tool comes back. Every brush tool stamps the custom brush, which also follows the pointer over the page. Matte paints its own colours, Color its shape in FG (BG with the right button), Replace the whole rectangle. `B` or a right-click on the Brush Selector brings the last brush back; clicking a built-in brush drops it. The snapshot below was made with `--commands docs/design/screenshots/phase3-brushes.json --pick 24,34,25,25 --brush-commands docs/design/screenshots/phase3-brushes-stamps.json` (`--pick X,Y,W,H` picks up a brush after `--commands`; `--brush-commands FILE.json` then runs commands that stamp it).
+
+<p align="center">
+  <img src="docs/design/screenshots/phase3-brushes.png" alt="A picked-up brush stamped in Matte, Replace and Color, with Dotted Freehand and a Color-mode curve" width="400">
+</p>
+
+Paint modes and the Brush menu (ADR-19): `dpx_core::paint::plot` implements Smear, Shade, Blend, Cycle, Smooth, Mix and HBrite. The Brush menu flips, rotates by 90 degrees, doubles/halves, outlines/trims and recolours the custom brush, moves its handle, and loads/saves brush files (IFF ILBM). Items that need a drag (Stretch, Any Angle, Shear, Bend, Place) stay ghosted. `DPX_MODES_PNG=out.png cargo test -p deluxepainter mode_demo` renders the mode demo `docs/design/screenshots/phase3-modes.png`.
+
+Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--fill-requester`, `--grid-requester`, `--symmetry-requester`, `--spacing-requester`, `--stencil-requester [--protect 1,2,3]`, `--palette-requester`, `--range-requester`, , `--notes` (the notes of `--open`), `--font-preview out.png`.
 
 ## MCP server (spike)
 
@@ -117,8 +125,6 @@ Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu 
 ## Project files (.dpxproj)
 
 The lossless project format is a ZIP with a JSON manifest and one indexed PNG per layer; see [`docs/PROJECT_FORMAT.md`](docs/PROJECT_FORMAT.md). On the command line, `deluxepainter info x.dpxproj` describes a project and `deluxepainter convert a.iff b.dpxproj` (and back) converts. Wiring it into the Save and Export menus is still to do.
-
-Paint modes and the Brush menu (ADR-19): `dpx_core::paint::plot` implements Smear, Shade, Blend, Cycle, Smooth, Mix and HBrite. The Brush menu flips, rotates by 90 degrees, doubles/halves, outlines/trims and recolours the custom brush, moves its handle, and loads/saves brush files (IFF ILBM). Items that need a drag (Stretch, Any Angle, Shear, Bend, Place) stay ghosted. `DPX_MODES_PNG=out.png cargo test -p deluxepainter mode_demo` renders the mode demo `docs/design/screenshots/phase3-modes.png`.
 
 ## License
 

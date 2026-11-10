@@ -1,0 +1,7 @@
+[
+{"op":"shape","shape":{"kind":"dots","points":[[100,46]]},"color":4},
+{"op":"shape","shape":{"kind":"dots","points":[[170,46]]},"color":4,"mode":"replace"},
+{"op":"shape","shape":{"kind":"dots","points":[[240,46]]},"color":4,"mode":"color"},
+{"op":"stroke","points":[[30,126],[63,112],[96,128],[129,112],[162,128],[195,112],[228,128],[261,114]],"color":4,"continuous":false},
+{"op":"shape","shape":{"kind":"curve","from":[40,226],"to":[270,226],"through":[155,178]},"color":5,"mode":"color"}
+]
