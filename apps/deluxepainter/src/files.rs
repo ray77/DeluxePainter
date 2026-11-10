@@ -10,6 +10,7 @@ use std::path::Path;
 use dpx_core::quantize::{self, Dither, PaletteDepth, ReduceOptions, Reduction};
 use dpx_core::resample;
 use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Palette, Rgb8, RgbaImage, Target};
+use dpx_formats::project::{self, Project, ProjectExtras, ProjectRange};
 use dpx_iff::{ColorRange, Compression, Ilbm, Masking, ilbm};
 
 /// A loaded picture plus notes about anything that did not survive the import.
@@ -30,6 +31,8 @@ pub enum Picture {
         image: RgbaImage,
         format: &'static str,
     },
+    /// A `.dpxproj` project: document, extras and spare page, all lossless (ADR-23).
+    Project(Box<Project>),
 }
 
 impl Picture {
@@ -38,6 +41,7 @@ impl Picture {
         match self {
             Picture::Ilbm(i) => Some((&i.image, &i.palette)),
             Picture::Png { image, palette } => Some((image, palette)),
+            Picture::Project(p) => Some((p.document.page(), p.document.palette())),
             Picture::TrueColor { .. } => None,
         }
     }
@@ -46,7 +50,7 @@ impl Picture {
     pub fn camg(&self) -> Option<u32> {
         match self {
             Picture::Ilbm(i) => i.camg,
-            Picture::Png { .. } | Picture::TrueColor { .. } => None,
+            Picture::Png { .. } | Picture::TrueColor { .. } | Picture::Project(_) => None,
         }
     }
 }
@@ -56,6 +60,45 @@ enum Kind {
     Ilbm,
     Png,
     Jpeg,
+    Project,
+}
+
+impl From<&PictureExtras> for ProjectExtras {
+    fn from(e: &PictureExtras) -> Self {
+        Self {
+            ranges: e
+                .ranges
+                .iter()
+                .map(|r| ProjectRange {
+                    rate: r.rate,
+                    flags: r.flags,
+                    low: r.low,
+                    high: r.high,
+                })
+                .collect(),
+            grab: e.grab,
+            transparent_color: e.transparent_color,
+        }
+    }
+}
+
+impl From<&ProjectExtras> for PictureExtras {
+    fn from(e: &ProjectExtras) -> Self {
+        Self {
+            ranges: e
+                .ranges
+                .iter()
+                .map(|r| ColorRange {
+                    rate: r.rate,
+                    flags: r.flags,
+                    low: r.low,
+                    high: r.high,
+                })
+                .collect(),
+            grab: e.grab,
+            transparent_color: e.transparent_color,
+        }
+    }
 }
 
 fn kind_of_bytes(bytes: &[u8]) -> Option<Kind> {
@@ -65,6 +108,8 @@ fn kind_of_bytes(bytes: &[u8]) -> Option<Kind> {
         Some(Kind::Png)
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some(Kind::Jpeg)
+    } else if project::is_zip(bytes) {
+        Some(Kind::Project)
     } else {
         None
     }
@@ -79,12 +124,13 @@ fn kind_of_path(path: &Path) -> Result<Kind, String> {
     match ext.as_deref() {
         Some("iff" | "ilbm" | "lbm") => Ok(Kind::Ilbm),
         Some("png") => Ok(Kind::Png),
+        Some("dpxproj") => Ok(Kind::Project),
         Some("jpg" | "jpeg") => Err(format!(
-            "{}: JPEG is import-only (DeluxePainter writes .iff/.ilbm/.lbm and .png)",
+            "{}: JPEG is import-only (DeluxePainter writes .iff/.ilbm/.lbm, .png and .dpxproj)",
             path.display()
         )),
         _ => Err(format!(
-            "{}: unsupported output type (DeluxePainter writes .iff/.ilbm/.lbm and .png)",
+            "{}: unsupported output type (DeluxePainter writes .iff/.ilbm/.lbm, .png and .dpxproj)",
             path.display()
         )),
     }
@@ -139,6 +185,13 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                     image,
                     format: "JPEG",
                 },
+                notes: Vec::new(),
+            })
+        }
+        Some(Kind::Project) => {
+            let project = project::read_project(&bytes).map_err(|e| with_path(path, e))?;
+            Ok(Loaded {
+                picture: Picture::Project(Box::new(project)),
                 notes: Vec::new(),
             })
         }
@@ -222,8 +275,15 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
     let (image, palette) = picture
         .indexed()
         .ok_or_else(|| "true-colour picture must be reduced before saving".to_string())?;
+    if matches!(picture, Picture::Project(_)) && kind != Kind::Project {
+        return Err("a project is exported through the document: use convert".into());
+    }
     let mut notes = Vec::new();
     let bytes = match kind {
+        Kind::Project => match picture {
+            Picture::Project(p) => project::write_project(p).map_err(|e| e.to_string())?,
+            _ => return Err("only a project is saved as is: use convert".into()),
+        },
         Kind::Ilbm | Kind::Jpeg => {
             let ilbm = match picture {
                 Picture::Ilbm(i) => (**i).clone(),
@@ -358,6 +418,15 @@ pub fn reduce_true_color(img: &RgbaImage, format: &str, current: Target) -> Redu
 /// CAMG and size; true-colour ones are reduced ([`reduce_true_color`], which scales pictures
 /// too big for any screen to `current`). Returns notes about everything that is not kept.
 pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtras, Vec<String>) {
+    if let Picture::Project(p) = &picture {
+        // Lossless: the document and extras come back as saved (the spare page is not
+        // part of the app's state yet).
+        let mut notes = Vec::new();
+        if p.spare.is_some() {
+            notes.push("spare page not kept (not supported yet)".to_string());
+        }
+        return (p.document.clone(), PictureExtras::from(&p.extras), notes);
+    }
     if let Picture::TrueColor { image, format } = &picture {
         let r = reduce_true_color(image, format, current);
         let extras = PictureExtras {
@@ -408,7 +477,7 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
             (i.image, i.palette)
         }
         Picture::Png { image, palette } => (image, palette),
-        Picture::TrueColor { .. } => unreachable!("handled above"),
+        Picture::TrueColor { .. } | Picture::Project(_) => unreachable!("handled above"),
     };
     (
         Document::from_picture(image, palette, target),
@@ -439,10 +508,12 @@ pub fn page_at_least_screen(doc: Document) -> (Document, Option<String>) {
 pub enum SaveFormat {
     Ilbm,
     Png,
+    /// The lossless project (`.dpxproj`, ADR-23).
+    Project,
 }
 
-/// Picture ▸ Save picks the format by name: `.png` writes PNG; everything else writes IFF
-/// ILBM, because Amiga names often have no extension or tags like `.LoRes`.
+/// Picture ▸ Save picks the format by name: `.png` writes PNG, `.dpxproj` the lossless
+/// project; everything else writes IFF ILBM, because Amiga names often have no extension or tags like `.LoRes`.
 pub fn save_format(path: &Path) -> Result<SaveFormat, String> {
     let ext = path
         .extension()
@@ -450,8 +521,9 @@ pub fn save_format(path: &Path) -> Result<SaveFormat, String> {
         .map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("png") => Ok(SaveFormat::Png),
+        Some("dpxproj") => Ok(SaveFormat::Project),
         Some("jpg" | "jpeg") => Err("JPEG is import-only: use .iff or .png".into()),
-        Some("gif" | "bmp" | "tif" | "tiff" | "webp" | "dpxproj") => {
+        Some("gif" | "bmp" | "tif" | "tiff" | "webp") => {
             Err("DeluxePainter saves pictures as IFF or PNG".into())
         }
         _ => Ok(SaveFormat::Ilbm),
@@ -499,6 +571,12 @@ pub fn encode_document(
             }
             let bytes = ilbm::write(&out, Compression::ByteRun1).map_err(|e| e.to_string())?;
             Ok((bytes, notes))
+        }
+        SaveFormat::Project => {
+            // Lossless: nothing is dropped, even ranges outside the palette stay.
+            let project = Project::new(doc.clone(), ProjectExtras::from(extras));
+            let bytes = project::write_project(&project).map_err(|e| e.to_string())?;
+            Ok((bytes, Vec::new()))
         }
         SaveFormat::Png => {
             let mut drops = vec![format!("display mode {}", doc.target().mode.name())];
@@ -627,6 +705,50 @@ pub fn info(path: &Path) -> Result<String, String> {
                 palette.len()
             );
         }
+        Picture::Project(p) => {
+            let doc = &p.document;
+            let t = doc.target();
+            out += &format!(
+                "{name}: DeluxePainter project (dpxproj format {}) {}x{}, {} colours\n",
+                project::FORMAT_VERSION,
+                img.width(),
+                img.height(),
+                doc.palette().len()
+            );
+            out += &format!(
+                "  target: {:?} {}, screen {}x{}\n  1 frame, 1 layer{}\n",
+                t.chipset,
+                t.mode.name(),
+                t.screen.0,
+                t.screen.1,
+                match &p.spare {
+                    Some(s) => format!(", spare page {}x{}", s.width(), s.height()),
+                    None => String::new(),
+                }
+            );
+            for (n, r) in p.extras.ranges.iter().enumerate() {
+                let r = ColorRange {
+                    rate: r.rate,
+                    flags: r.flags,
+                    low: r.low,
+                    high: r.high,
+                };
+                out += &format!(
+                    "  range {n}: colours {}-{}, {:.1} steps/s{}{}\n",
+                    r.low,
+                    r.high,
+                    r.steps_per_second(),
+                    if r.active() { ", active" } else { "" },
+                    if r.reverse() { ", reverse" } else { "" }
+                );
+            }
+            if let Some((x, y)) = p.extras.grab {
+                out += &format!("  grab: {x},{y}\n");
+            }
+            if let Some(c) = p.extras.transparent_color {
+                out += &format!("  transparent colour: {c}\n");
+            }
+        }
         Picture::TrueColor { .. } => unreachable!("handled above"),
     }
     let used = {
@@ -682,10 +804,16 @@ fn true_color_info(name: &str, img: &RgbaImage, format: &str) -> String {
 /// `deluxepainter convert <in> <out>`. True-colour input is reduced as on opening, for the
 /// default screen (PAL LoRes, AGA), and written with its display mode.
 pub fn convert(input: &Path, output: &Path) -> Result<Vec<String>, String> {
-    kind_of_path(output)?;
+    let out_kind = kind_of_path(output)?;
     let loaded = load(input)?;
     let mut notes = loaded.notes;
-    if let Picture::TrueColor { .. } = loaded.picture {
+    // True colour is reduced, and projects are written from or read into a document; ILBM and
+    // PNG pictures otherwise convert directly so ILBM → ILBM keeps every chunk.
+    let via_document = matches!(
+        (&loaded.picture, out_kind),
+        (Picture::TrueColor { .. }, _) | (Picture::Project(_), _) | (_, Kind::Project)
+    );
+    if via_document {
         let (doc, extras, opened) = open_picture(loaded.picture, Target::default());
         notes.extend(opened);
         let (bytes, saved) = encode_document(&doc, &extras, output)?;
@@ -888,6 +1016,124 @@ mod tests {
         assert_eq!(f("noext"), Ok(SaveFormat::Ilbm));
         assert!(f("a.jpg").unwrap_err().contains("import-only"));
         assert!(f("a.gif").is_err());
+        assert_eq!(f("Venus.DPXPROJ"), Ok(SaveFormat::Project));
+    }
+
+    /// An ILBM written the way the app writes it, with extras, in its own drawer.
+    fn sample_ilbm(dir: &Path) -> std::path::PathBuf {
+        use dpx_core::{Resolution, Video};
+        let mut img = IndexedImage::new(640, 512, 0);
+        img.set(3, 4, 7);
+        img.set(639, 511, 31);
+        let target = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Pal, Resolution::Hi, true),
+        );
+        let doc = Document::from_picture(img, Palette::dpaint_default_32(), target);
+        let extras = PictureExtras {
+            ranges: vec![ColorRange {
+                rate: 2560,
+                flags: 1,
+                low: 20,
+                high: 27,
+            }],
+            grab: Some((5, -6)),
+            transparent_color: Some(3),
+        };
+        let path = dir.join("sample.iff");
+        let (bytes, _) = encode_document(&doc, &extras, &path).unwrap();
+        write_atomic(&path, &bytes).unwrap();
+        path
+    }
+
+    fn own_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dpx-files-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn convert_ilbm_to_project_and_back_gives_identical_ilbm_bytes() {
+        let dir = own_dir("proj-rt");
+        let iff = sample_ilbm(&dir);
+        let proj = dir.join("sample.dpxproj");
+        let back = dir.join("back.iff");
+        assert!(convert(&iff, &proj).unwrap().is_empty());
+        assert!(convert(&proj, &back).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(&iff).unwrap(),
+            std::fs::read(&back).unwrap(),
+            "ILBM -> dpxproj -> ILBM"
+        );
+        // The project is a ZIP whatever its name, and loads as a project.
+        let renamed = dir.join("noext");
+        std::fs::copy(&proj, &renamed).unwrap();
+        assert!(matches!(
+            load(&renamed).unwrap().picture,
+            Picture::Project(_)
+        ));
+        // dpxproj -> dpxproj and -> png work; the project is deterministic.
+        let again = dir.join("again.dpxproj");
+        convert(&proj, &again).unwrap();
+        assert_eq!(
+            std::fs::read(&proj).unwrap(),
+            std::fs::read(&again).unwrap()
+        );
+        let png = dir.join("sample.png");
+        let notes = convert(&proj, &png).unwrap();
+        assert!(notes.iter().any(|n| n.contains("CRNG")), "{notes:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_opens_with_document_and_extras_unchanged() {
+        let dir = own_dir("proj-open");
+        let iff = sample_ilbm(&dir);
+        let (doc, extras, _) = open_picture(load(&iff).unwrap().picture, Target::default());
+        let proj = dir.join("p.dpxproj");
+        let (bytes, notes) = encode_document(&doc, &extras, &proj).unwrap();
+        assert!(notes.is_empty());
+        write_atomic(&proj, &bytes).unwrap();
+        let (doc2, extras2, notes) = open_picture(load(&proj).unwrap().picture, Target::default());
+        assert!(notes.is_empty());
+        assert_eq!(doc2, doc);
+        assert_eq!(extras2, extras);
+        // Ranges outside the palette stay in a project (an ILBM would drop them).
+        let mut wild = extras.clone();
+        wild.ranges.push(ColorRange {
+            rate: 1,
+            flags: 0,
+            low: 40,
+            high: 50,
+        });
+        let (bytes, notes) = encode_document(&doc, &wild, &proj).unwrap();
+        assert!(notes.is_empty());
+        write_atomic(&proj, &bytes).unwrap();
+        let (_, back, _) = open_picture(load(&proj).unwrap().picture, Target::default());
+        assert_eq!(back, wild);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn info_describes_a_project_and_bad_projects_say_why() {
+        let dir = own_dir("proj-info");
+        let iff = sample_ilbm(&dir);
+        let proj = dir.join("i.dpxproj");
+        convert(&iff, &proj).unwrap();
+        let text = info(&proj).unwrap();
+        assert!(text.contains("DeluxePainter project (dpxproj format 1) 640x512, 32 colours"));
+        assert!(text.contains("PAL:High Res Laced"), "{text}");
+        assert!(text.contains("range 0: colours 20-27"), "{text}");
+        assert!(text.contains("grab: 5,-6"), "{text}");
+        assert!(text.contains("transparent colour: 3"), "{text}");
+        assert!(text.contains("colours used: 3"), "{text}");
+        // A cut-off project: short first line after the path.
+        let bytes = std::fs::read(&proj).unwrap();
+        let cut = dir.join("cut.dpxproj");
+        std::fs::write(&cut, &bytes[..bytes.len() / 2]).unwrap();
+        let e = info(&cut).unwrap_err();
+        assert!(e.contains("Not a DeluxePainter project"), "{e}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

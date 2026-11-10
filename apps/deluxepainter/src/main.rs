@@ -19,8 +19,8 @@
 //!     [--notes]                         show the notes of `--open` in the note requester
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
-//! `deluxepainter info <file>`           describe an IFF ILBM, PNG or JPEG picture
-//! `deluxepainter convert <in> <out>`    convert to IFF ILBM or PNG
+//! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
+//! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
 mod browse;
 mod files;
