@@ -113,9 +113,10 @@ impl Prefs {
     }
 }
 
-/// Size of one interface (LoRes) pixel, a DeluxePainter preference (ADR-13). `Fixed(n)` is
-/// n points (logical pixels) per interface pixel; the app turns it into a whole number of
-/// physical pixels. `Auto` is the largest size at which the picture's whole screen fits.
+/// Size of one interface (LoRes) pixel, a DeluxePainter preference (ADR-13). `Fixed(h)` is
+/// h half points (logical pixels) per interface pixel, i.e. whole and half steps from 1x
+/// (`Fixed(2)`) to 8x (`Fixed(16)`). `Auto` is the largest step at which the picture's whole
+/// screen fits the window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PixelSize {
     #[default]
@@ -124,8 +125,9 @@ pub enum PixelSize {
 }
 
 impl PixelSize {
-    pub const MIN: u8 = 1;
-    pub const MAX: u8 = 8;
+    /// Smallest and largest fixed size, in half points (1x and 8x).
+    pub const MIN: u8 = 2;
+    pub const MAX: u8 = 16;
 }
 
 /// What a menu item does.
@@ -513,14 +515,21 @@ pub static MENUS: [Menu; 7] = [
                 "Pixel Size",
                 &[
                     pixel_size("Auto", Key::Amiga('0'), PixelSize::Auto),
-                    pixel_size("1x", Key::None, PixelSize::Fixed(1)),
-                    pixel_size("2x", Key::None, PixelSize::Fixed(2)),
-                    pixel_size("3x", Key::None, PixelSize::Fixed(3)),
-                    pixel_size("4x", Key::None, PixelSize::Fixed(4)),
-                    pixel_size("5x", Key::None, PixelSize::Fixed(5)),
-                    pixel_size("6x", Key::None, PixelSize::Fixed(6)),
-                    pixel_size("7x", Key::None, PixelSize::Fixed(7)),
-                    pixel_size("8x", Key::None, PixelSize::Fixed(8)),
+                    pixel_size("1x", Key::None, PixelSize::Fixed(2)),
+                    pixel_size("1.5x", Key::None, PixelSize::Fixed(3)),
+                    pixel_size("2x", Key::None, PixelSize::Fixed(4)),
+                    pixel_size("2.5x", Key::None, PixelSize::Fixed(5)),
+                    pixel_size("3x", Key::None, PixelSize::Fixed(6)),
+                    pixel_size("3.5x", Key::None, PixelSize::Fixed(7)),
+                    pixel_size("4x", Key::None, PixelSize::Fixed(8)),
+                    pixel_size("4.5x", Key::None, PixelSize::Fixed(9)),
+                    pixel_size("5x", Key::None, PixelSize::Fixed(10)),
+                    pixel_size("5.5x", Key::None, PixelSize::Fixed(11)),
+                    pixel_size("6x", Key::None, PixelSize::Fixed(12)),
+                    pixel_size("6.5x", Key::None, PixelSize::Fixed(13)),
+                    pixel_size("7x", Key::None, PixelSize::Fixed(14)),
+                    pixel_size("7.5x", Key::None, PixelSize::Fixed(15)),
+                    pixel_size("8x", Key::None, PixelSize::Fixed(16)),
                 ],
             ),
         ],
@@ -1030,14 +1039,18 @@ mod tests {
         let labels: Vec<_> = items.iter().map(|i| i.label).collect();
         assert_eq!(
             labels,
-            ["Auto", "1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x"]
+            [
+                "Auto", "1x", "1.5x", "2x", "2.5x", "3x", "3.5x", "4x", "4.5x", "5x", "5.5x", "6x",
+                "6.5x", "7x", "7.5x", "8x"
+            ]
         );
         assert_eq!(items[0].key, Key::Amiga('0'));
         assert_eq!(items[0].action(), Some(Action::PixelSize(PixelSize::Auto)));
-        for n in PixelSize::MIN..=PixelSize::MAX {
+        // Whole and half steps: item i is i+1 half points.
+        for h in PixelSize::MIN..=PixelSize::MAX {
             assert_eq!(
-                items[n as usize].action(),
-                Some(Action::PixelSize(PixelSize::Fixed(n)))
+                items[usize::from(h) - 1].action(),
+                Some(Action::PixelSize(PixelSize::Fixed(h)))
             );
         }
     }
@@ -1077,10 +1090,10 @@ mod tests {
         assert!(sb.x >= 0 && sb.x + sb.w <= 320 && sb.y + sb.h <= 256);
         // Move horizontally into the submenu level with the parent item, then down to "3x".
         st.pointer(320, 256, sb.x + sb.w / 2, sb.item_top(0) + 2);
-        st.pointer(320, 256, sb.x + sb.w / 2, sb.item_top(3) + 2);
+        st.pointer(320, 256, sb.x + sb.w / 2, sb.item_top(5) + 2);
         assert_eq!(
             st.hovered_action(&ctx()),
-            Some(Action::PixelSize(PixelSize::Fixed(3)))
+            Some(Action::PixelSize(PixelSize::Fixed(6)))
         );
         // Drawing with the submenu open must not panic.
         let pens = Pens::from_palette(&Palette::dpaint_default_32());

@@ -20,7 +20,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Magnify window (split view: normal + zoomed) | DPaint's signature zoom |
 | P1 | Spare page (swap, copy, merge front/back) | |
 | P1 | Hide/show toolbox and menu bar for full-screen painting | |
-| P0 | Layout: screen sized to the window at an integer pixel size (Prefs ▸ Pixel Size Auto/1x–8x, Cmd/Ctrl +/−/0), dark pattern beyond the page, full screen with Ctrl+Cmd+F / F11 | done (ADR-13); grey work area, movable requesters and status line dropped by the fidelity directive |
+| P0 | Layout: screen sized to the window in whole and half pixel-size steps (Prefs ▸ Pixel Size Auto/1x–8x, Cmd/Ctrl +/−/0), dark pattern beyond the page, full screen with Ctrl+Cmd+F / F11 | done (ADR-13); grey work area, movable requesters and status line dropped by the fidelity directive |
 | P1 | Layout preference "Classic screen": fixed 640×512 (PAL) / 640×400 (NTSC) virtual screen, letterboxed | decided, design option A |
 
 ## 2. Documents & hardware targets

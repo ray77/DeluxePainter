@@ -57,7 +57,7 @@ Headless snapshot of the start screen (used for visual comparison tests):
 cargo run -p deluxepainter -- --snapshot screen.png --scale 2
 ```
 
-Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` or UNDO undo, `Shift+U` or right-click on UNDO redo (64 steps); `F10` hide/show toolbox and title bar, `F9` title bar only. The screen fills the window: Prefs ▸ Pixel Size (or Cmd/Ctrl + `+`, `−`, `0` for bigger, smaller, Auto) sets how big the pixels are; Ctrl+Cmd+F (macOS) or F11 switches full screen.
+Controls so far: left mouse = FG colour, right mouse = BG colour; click toolbox buttons, brushes and palette cells; hold the right mouse button on the title bar for the menus (release on an item to select it, click the left button to select several Prefs at once); `F1`–`F8` paint modes; `U` or UNDO undo, `Shift+U` or right-click on UNDO redo (64 steps); `F10` hide/show toolbox and title bar, `F9` title bar only. The screen fills the window: it scales in whole and half steps, and Prefs ▸ Pixel Size (or Cmd/Ctrl + `+`, `−`, `0` for half a step bigger, smaller, Auto) fixes the pixel size; Ctrl+Cmd+F (macOS) or F11 switches full screen.
 
 Pictures: IFF ILBM and indexed PNG in and out; true-colour PNG and JPEG in (HAM/EHB come later). True-colour pictures get a new palette with the mode's colour count and Floyd–Steinberg dithering; pictures bigger than any screen are scaled to the current screen; transparent pixels become pink colour 0 (ADR-9). `info` shows how a picture will open:
 

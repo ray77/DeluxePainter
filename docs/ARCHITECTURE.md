@@ -98,7 +98,7 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
 ```
 
 - The **whole visible UI**, including the zoomed canvas viewport, is software-rendered into one RGBA framebuffer at "Amiga screen" resolution. egui only provides the window, input, clipboard and the GPU blit.
-- Integer scale computed in **physical** pixels so Retina/Windows 150 % stay crisp: Prefs ▸ Pixel Size `Auto` = the largest scale at which the document's whole screen fits, or `1x`–`8x` points per UI pixel (ADR-13).
+- Scale in whole and half points per UI pixel, computed in **physical** pixels (Retina: every step sharp; 1× displays: half steps give uneven nearest-neighbour pixels, never blur): Prefs ▸ Pixel Size `Auto` = the largest step at which the document's whole screen fits, or `1x`–`8x` (ADR-13).
 - Screen size: the window divided by the scale, in whole UI pixels (layout C, ADR-13). Beyond the page a dark pattern is shown. A fixed classic screen (layout A) is a possible later preference.
 - Because rendering is pure CPU code, **UI screenshots are deterministic** and testable headless (golden PNGs) and available to MCP (`get_ui_screenshot`).
 - Colour cycling is a display-time palette rotation; document pixels never change while cycling.
