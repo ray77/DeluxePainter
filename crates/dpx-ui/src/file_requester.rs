@@ -77,6 +77,10 @@ mod geom {
 pub enum FileKind {
     LoadPicture,
     SavePicture,
+    /// Picture ▸ Delete..: the action button asks Yes/No before it answers (ADR-15).
+    DeleteFile,
+    LoadPalette,
+    SavePalette,
 }
 
 impl FileKind {
@@ -84,13 +88,17 @@ impl FileKind {
         match self {
             FileKind::LoadPicture => "Load Picture",
             FileKind::SavePicture => "Save Picture",
+            FileKind::DeleteFile => "Delete File",
+            FileKind::LoadPalette => "Load Palette",
+            FileKind::SavePalette => "Save Palette",
         }
     }
 
     fn action(self) -> &'static str {
         match self {
-            FileKind::LoadPicture => "Load",
-            FileKind::SavePicture => "Save",
+            FileKind::LoadPicture | FileKind::LoadPalette => "Load",
+            FileKind::SavePicture | FileKind::SavePalette => "Save",
+            FileKind::DeleteFile => "Delete",
         }
     }
 }
@@ -151,7 +159,8 @@ pub enum FileResponse {
     /// The app lists the place and calls [`FileRequester::set_listing`] (or `set_message`).
     Browse(Browse),
     /// Load/Save chosen. `overwrite` is true once the user confirmed replacing a file (see
-    /// [`FileRequester::ask_overwrite`]).
+    /// [`FileRequester::ask_overwrite`]); for [`FileKind::DeleteFile`] it is always true (the
+    /// deletion was confirmed).
     Accept {
         drawer: String,
         file: String,
@@ -399,6 +408,10 @@ impl FileRequester {
         let file = self.file.text();
         if file.trim().is_empty() {
             self.message = Some("Enter a file name".into());
+            return FileResponse::Continue;
+        }
+        if self.kind == FileKind::DeleteFile && !overwrite {
+            self.ask_overwrite();
             return FileResponse::Continue;
         }
         self.confirm = false;
@@ -791,7 +804,12 @@ impl FileRequester {
             r.w - 12,
             pens.dark,
         );
-        centred(img, r.x, r.w, r.y + 20, "exists. Replace it?", pens.dark);
+        let question = if self.kind == FileKind::DeleteFile {
+            "Delete this file?"
+        } else {
+            "exists. Replace it?"
+        };
+        centred(img, r.x, r.w, r.y + 20, question, pens.dark);
         for b in [Button::Yes, Button::No] {
             draw_button(img, b.rect(), b.label(self.kind), self.pressed(b), pens);
         }
@@ -1072,6 +1090,45 @@ mod tests {
         r.ask_overwrite();
         r.handle(ReqEvent::Key(ReqKey::Escape), 0);
         assert!(!r.confirm, "Escape answers No");
+    }
+
+    #[test]
+    fn delete_asks_yes_or_no_first() {
+        let mut r = req(FileKind::DeleteFile);
+        assert_eq!(r.kind().title(), "Delete File");
+        r.set_file("zebra.iff");
+        // The Delete button only asks; No goes back, Yes answers with the file.
+        assert_eq!(click(&mut r, Button::Action), FileResponse::Continue);
+        assert!(r.confirm);
+        assert_eq!(click(&mut r, Button::No), FileResponse::Continue);
+        assert!(!r.confirm);
+        assert_eq!(
+            r.handle(ReqEvent::Key(ReqKey::Enter), 0),
+            FileResponse::Continue
+        );
+        assert!(r.confirm, "Return asks too");
+        assert_eq!(
+            click(&mut r, Button::Yes),
+            FileResponse::Accept {
+                drawer: "/x".into(),
+                file: "zebra.iff".into(),
+                overwrite: true,
+            }
+        );
+        // A double-click on a file asks as well.
+        r.handle(ReqEvent::Press(20, row_y(2)), 0);
+        assert_eq!(
+            r.handle(ReqEvent::Press(20, row_y(2)), 100),
+            FileResponse::Continue
+        );
+        assert!(r.confirm);
+        let pens = Pens::from_palette(&Palette::dpaint_default_32());
+        let img = r.render(&pens);
+        assert_eq!((img.width(), img.height()), (WIDTH as u32, HEIGHT as u32));
+        // Palette requesters have their own titles and buttons.
+        assert_eq!(FileKind::LoadPalette.title(), "Load Palette");
+        assert_eq!(FileKind::SavePalette.action(), "Save");
+        assert_eq!(FileKind::DeleteFile.action(), "Delete");
     }
 
     #[test]

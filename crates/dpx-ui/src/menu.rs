@@ -562,14 +562,53 @@ impl Action {
         }
     }
 
+    /// Commands not in [`IMPLEMENTED`] are ghosted; Mode, Prefs and Pixel Size items always
+    /// work (HBrite only on EHB screens).
     pub fn enabled(self, ctx: &MenuContext) -> bool {
         match self {
             Action::Mode(PaintMode::HBrite) => ctx.ehb,
-            Action::Command("color.recompute") => ctx.ham,
+            Action::Command(id) => {
+                IMPLEMENTED.contains(&id) && (id != "color.recompute" || ctx.ham)
+            }
             _ => true,
         }
     }
 }
+
+/// Menu commands that do something; every other command item is ghosted (ADR-15). Later
+/// features add their ids here.
+pub const IMPLEMENTED: &[&str] = &[
+    // Picture
+    "picture.load",
+    "picture.save",
+    "picture.delete",
+    "picture.flip_horizontal",
+    "picture.flip_vertical",
+    "spare.swap",
+    "spare.copy",
+    "spare.merge_front",
+    "spare.merge_back",
+    "spare.delete",
+    "picture.page_size",
+    "picture.show_page",
+    "picture.screen_format",
+    "app.about",
+    "app.quit",
+    // Color
+    "color.cycle",
+    "palette.mixer",
+    "palette.restore",
+    "palette.default",
+    "palette.load",
+    "palette.save",
+    "color.bg_to_fg",
+    "color.swap_bg_fg",
+    // Effect
+    "background.fix",
+    "background.free",
+    // Prefs
+    "view.largest_pixel_size",
+];
 
 impl Item {
     fn action(&self) -> Option<Action> {
@@ -579,9 +618,18 @@ impl Item {
         }
     }
 
+    /// A submenu item is ghosted when all of its items are.
     fn enabled(&self, ctx: &MenuContext) -> bool {
-        self.action().is_none_or(|a| a.enabled(ctx))
+        match self.entry {
+            Entry::Action(a) => a.enabled(ctx),
+            Entry::Submenu(items) => items.iter().any(|it| it.enabled(ctx)),
+        }
     }
+}
+
+/// Whether menu `menu` has at least one enabled item (its title is ghosted otherwise).
+pub fn menu_enabled(menu: usize, ctx: &MenuContext) -> bool {
+    MENUS[menu].items.iter().any(|it| it.enabled(ctx))
 }
 
 struct Glyphs {
@@ -843,19 +891,37 @@ pub fn draw(
     img.fill_rect(0, 0, screen_w, geom::STRIP_H, pens.face);
     for (i, slot) in title_slots().iter().enumerate() {
         let selected = state.menu == Some(i);
+        let enabled = menu_enabled(i, ctx);
         if selected {
             img.fill_rect(slot.x, 0, slot.w, geom::TITLE_HL_H, pens.select);
         }
-        let pen = if selected { pens.shine } else { pens.dark };
+        let pen = match (selected, enabled) {
+            (true, _) => pens.shine,
+            (false, true) => pens.dark,
+            (false, false) => pens.ghost.unwrap_or(pens.dark),
+        };
         font.draw(img, slot.x + geom::SLOT_TEXT_DX, 1, MENUS[i].title, pen);
+        if !enabled && !selected && pens.ghost.is_none() {
+            let b = BoxLayout {
+                x: slot.x - geom::BORDER_X,
+                y: 0,
+                w: slot.w + 2 * geom::BORDER_X,
+                h: geom::ITEM_H,
+                text_dx: 0,
+                items: 0,
+            };
+            checker_ghost(img, &b, 0, pens.face);
+        }
     }
     let Some(m) = state.menu else {
         return;
     };
     let mbox = menu_box(m, screen_w, screen_h);
     draw_box(img, pens, ctx, &mbox, MENUS[m].items, state.item);
+    // A ghosted item opens no submenu (as in Intuition).
     if let Some(it) = state.item
         && let Entry::Submenu(items) = MENUS[m].items[it].entry
+        && MENUS[m].items[it].enabled(ctx)
     {
         let sbox = submenu_box(&mbox, it, items, screen_w, screen_h);
         draw_box(img, pens, ctx, &sbox, items, state.sub_item);
@@ -1171,6 +1237,79 @@ mod tests {
             img.get(b.w + 5, 9),
             Some(pens.face),
             "strip row 9 outside the box"
+        );
+    }
+
+    /// Command ids of all items, submenus included.
+    fn command_ids(items: &[Item], out: &mut Vec<&'static str>) {
+        for it in items {
+            match it.entry {
+                Entry::Action(Action::Command(id)) => out.push(id),
+                Entry::Action(_) => {}
+                Entry::Submenu(sub) => command_ids(sub, out),
+            }
+        }
+    }
+
+    #[test]
+    fn unimplemented_commands_are_ghosted() {
+        let c = ctx();
+        let mut ids = Vec::new();
+        for m in &MENUS {
+            command_ids(m.items, &mut ids);
+        }
+        for id in IMPLEMENTED {
+            assert!(ids.contains(id), "{id} is no menu item");
+        }
+        assert!(Action::Command("picture.load").enabled(&c));
+        assert!(Action::Command("spare.swap").enabled(&c));
+        assert!(!Action::Command("picture.print").enabled(&c));
+        assert!(!Action::Command("stencil.make").enabled(&c));
+        assert!(!Action::Command("color.recompute").enabled(&c));
+        // Mode, Prefs and Pixel Size items stay enabled.
+        assert!(Action::Mode(PaintMode::Matte).enabled(&c));
+        assert!(Action::Pref(Pref::FastFb).enabled(&c));
+        assert!(Action::PixelSize(PixelSize(4)).enabled(&c));
+        // Menus and submenus with nothing enabled are ghosted as a whole.
+        let menu = |t: &str| MENUS.iter().position(|m| m.title == t).unwrap();
+        assert!(!menu_enabled(menu("Brush"), &c));
+        assert!(!menu_enabled(menu("Anim"), &c));
+        assert!(menu_enabled(menu("Picture"), &c));
+        let effect = &MENUS[menu("Effect")];
+        let item = |label: &str| effect.items.iter().find(|i| i.label == label).unwrap();
+        assert!(!item("Stencil").enabled(&c));
+        assert!(item("Background").enabled(&c));
+    }
+
+    #[test]
+    fn a_ghosted_submenu_does_not_open() {
+        let pens = Pens::from_palette(&Palette::dpaint_default_32());
+        let m = MENUS.iter().position(|m| m.title == "Effect").unwrap();
+        let draw_with = |item: usize| {
+            let mut img = IndexedImage::new(320, 256, 200);
+            let st = MenuState {
+                active: true,
+                menu: Some(m),
+                item: Some(item),
+                sub_item: None,
+            };
+            draw(&mut img, &pens, &ctx(), &st, 320, 256);
+            img
+        };
+        let b = menu_box(m, 320, 256);
+        let sub = |item: usize| {
+            let Entry::Submenu(items) = MENUS[m].items[item].entry else {
+                panic!("item {item} is a submenu");
+            };
+            submenu_box(&b, item, items, 320, 256)
+        };
+        // Stencil (item 0) is ghosted: nothing opens; Background (item 2) opens.
+        let s = sub(0);
+        assert_eq!(draw_with(0).get(s.x + s.w / 2, s.y + s.h - 1), Some(200));
+        let s = sub(2);
+        assert_eq!(
+            draw_with(2).get(s.x + s.w / 2, s.y + s.h - 1),
+            Some(pens.dark)
         );
     }
 

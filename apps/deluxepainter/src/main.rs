@@ -22,6 +22,7 @@
 
 mod browse;
 mod files;
+mod menu_actions;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -587,6 +588,8 @@ struct PainterApp {
     pointer_page: Option<(i32, i32)>,
     /// Picture ▸ Show Page while it is shown.
     show_page: Option<ShowPage>,
+    /// Spare page, fixed background, colour cycling, palette to restore (ADR-15).
+    menu_data: menu_actions::MenuData,
     /// The window as of the last frame; `None` before the first one (and in tests).
     window: Option<Window>,
     /// The window is full screen or maximized: it cannot snap, so the screen is centred at
@@ -627,6 +630,7 @@ impl PainterApp {
             page_wheel: egui::Vec2::ZERO,
             pointer_page: None,
             show_page: None,
+            menu_data: menu_actions::MenuData::default(),
             window: None,
             free: false,
             monitor: None,
@@ -636,6 +640,7 @@ impl PainterApp {
 
     /// Replaces the document with a loaded picture (not undoable, like DeluxePaint's Load).
     fn set_picture(&mut self, doc: Document, extras: files::PictureExtras, path: PathBuf) {
+        self.menu_data.loaded_palette = Some(doc.palette().clone());
         self.stroke = None;
         self.engine = Engine::new(doc);
         self.extras = extras;
@@ -801,6 +806,7 @@ impl PainterApp {
                 match kind {
                     FileKind::LoadPicture => self.load_picture(path),
                     FileKind::SavePicture => self.save_picture(path, overwrite),
+                    other => self.menu_file_accept(other, &path, overwrite),
                 }
             }
         }
@@ -865,8 +871,11 @@ impl PainterApp {
         }
     }
 
+    /// The palette shown on screen: the document palette, or its cycled version while
+    /// Color ▸ Cycle is on (ADR-15). Commands read `self.engine.document().palette()`.
     fn palette(&self) -> &Palette {
-        self.engine.document().palette()
+        self.menu_data
+            .shown_palette(self.engine.document().palette())
     }
 
     /// The screen currently shown: the requester screen or the document's display mode.
@@ -1005,6 +1014,7 @@ impl PainterApp {
     /// Executes a command; a pending stroke is committed first so the order stays intact.
     fn run(&mut self, command: Command) {
         self.finish_stroke();
+        let command = self.with_fixed_background(command);
         self.execute(command);
     }
 
@@ -1152,6 +1162,20 @@ impl PainterApp {
                 "picture.load" => self.open_file_requester(FileKind::LoadPicture),
                 "picture.save" => self.open_file_requester(FileKind::SavePicture),
                 "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                // ADR-15 (menu_actions.rs).
+                "spare.swap" => self.swap_spare(),
+                "spare.copy" => self.copy_to_spare(),
+                "spare.merge_front" => self.merge_spare(true),
+                "spare.merge_back" => self.merge_spare(false),
+                "spare.delete" => self.delete_page(),
+                "picture.delete" => self.open_file_requester(FileKind::DeleteFile),
+                "app.about" => self.show_about(),
+                "color.cycle" => self.toggle_cycling(ctx.input(|i| i.time)),
+                "palette.restore" => self.restore_palette(),
+                "palette.load" => self.open_file_requester(FileKind::LoadPalette),
+                "palette.save" => self.open_file_requester(FileKind::SavePalette),
+                "background.fix" => self.fix_background(),
+                "background.free" => self.free_background(),
                 _ => {}
             },
         }
@@ -1374,6 +1398,7 @@ impl eframe::App for PainterApp {
             }
         });
         self.window_keys(&ctx);
+        self.menu_keys(&ctx);
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
         if undo_key {
