@@ -90,14 +90,17 @@ fn kind_of_path(path: &Path) -> Result<Kind, String> {
     }
 }
 
+/// Loads a picture file. Errors read `<path>: <short line>` followed by indented detail lines
+/// (ADR-17): the short line (at most 34 characters) fits the file requester's message line,
+/// the whole text is meant for stderr and the CLI.
 pub fn load(path: &Path) -> Result<Loaded, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| with_path(path, read_error(&e)))?;
     match kind_of_bytes(&bytes) {
         Some(Kind::Ilbm) => {
-            let pic = ilbm::read(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            let (pic, notes) = ilbm::read_with_notes(&bytes).map_err(|e| with_path(path, e))?;
             Ok(Loaded {
                 picture: Picture::Ilbm(Box::new(pic)),
-                notes: Vec::new(),
+                notes,
             })
         }
         Some(Kind::Png) => {
@@ -112,7 +115,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                         notes: Vec::new(),
                     });
                 }
-                Err(e) => return Err(format!("{}: {e}", path.display())),
+                Err(e) => return Err(with_path(path, e)),
             };
             let mut notes = Vec::new();
             if !pic.transparent_entries.is_empty() {
@@ -130,8 +133,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
             })
         }
         Some(Kind::Jpeg) => {
-            let image =
-                dpx_formats::read_jpeg(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            let image = dpx_formats::read_jpeg(&bytes).map_err(|e| with_path(path, e))?;
             Ok(Loaded {
                 picture: Picture::TrueColor {
                     image,
@@ -140,11 +142,76 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
                 notes: Vec::new(),
             })
         }
-        None => Err(format!(
-            "{}: unknown file type (DeluxePainter reads IFF ILBM, PNG and JPEG)",
-            path.display()
-        )),
+        None => Err(with_path(path, unknown_type(&bytes))),
     }
+}
+
+/// `<path>: <first line>` with every further line indented by two spaces.
+fn with_path(path: &Path, e: impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    let mut lines = text.lines();
+    let mut out = format!("{}: {}", path.display(), lines.next().unwrap_or_default());
+    for l in lines {
+        out += "\n  ";
+        out += l;
+    }
+    out
+}
+
+/// A file that cannot be read at all: short line plus the system's reason.
+fn read_error(e: &std::io::Error) -> String {
+    let summary = match e.kind() {
+        std::io::ErrorKind::NotFound => "File not found",
+        std::io::ErrorKind::PermissionDenied => "No permission to read the file",
+        std::io::ErrorKind::IsADirectory => "That is a drawer",
+        _ => "Cannot read the file",
+    };
+    format!("{summary}\n{e}")
+}
+
+/// Names what a file is when it is none of the picture formats DeluxePainter reads.
+fn unknown_type(bytes: &[u8]) -> String {
+    let start = |magic: &[u8]| bytes.starts_with(magic);
+    let (summary, what) = if bytes.is_empty() {
+        return "File is empty\nThe file has 0 bytes.".into();
+    } else if start(b"GIF8") {
+        ("GIF pictures cannot be loaded", "a GIF picture")
+    } else if start(b"BM") && bytes.len() >= 14 {
+        ("BMP pictures cannot be loaded", "a BMP picture")
+    } else if start(b"II*\0") || start(b"MM\0*") {
+        ("TIFF pictures cannot be loaded", "a TIFF picture")
+    } else if start(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        ("WebP pictures cannot be loaded", "a WebP picture")
+    } else if start(b"PP20") {
+        (
+            "PowerPacker file: unpack it first",
+            "packed with PowerPacker; decrunch it and load the result",
+        )
+    } else if start(b"XPKF") {
+        (
+            "XPK-packed file: unpack it first",
+            "packed with XPK; unpack it and load the result",
+        )
+    } else if bytes.get(2..5) == Some(b"-lh") || start(b"LZX") || start(b"PK\x03\x04") {
+        (
+            "Archive: unpack it first",
+            "an archive (LhA, LZX or ZIP); unpack it and load the picture inside",
+        )
+    } else if start(&[0x00, 0x00, 0x03, 0xF3]) {
+        ("Amiga program, not a picture", "an Amiga program")
+    } else if start(b"LIST") || start(b"CAT ") {
+        // IFF containers of several FORMs: dpx-iff names them.
+        return dpx_iff::iff::IffError::NotIff(bytes[..4].try_into().expect("4 bytes")).to_string();
+    } else {
+        ("Unknown file type", "")
+    };
+    let head: Vec<String> = bytes.iter().take(4).map(|b| format!("{b:02X}")).collect();
+    let is = if what.is_empty() {
+        format!("this file starts with {}", head.join(" "))
+    } else {
+        format!("this file is {what}")
+    };
+    format!("{summary}\nDeluxePainter reads IFF ILBM, PNG and JPEG pictures; {is}.")
 }
 
 /// Writes `picture` in the format given by the file extension; returns notes about metadata
@@ -610,6 +677,131 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dpx-files-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    /// Writes `bytes` to a file of its own drawer and loads it; returns the error text with
+    /// the path replaced by `<file>`.
+    fn load_error(name: &str, bytes: &[u8]) -> String {
+        let dir = std::env::temp_dir().join(format!("dpx-files-diag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let e = match load(&path) {
+            Ok(_) => panic!("{name}: expected an error"),
+            Err(e) => e,
+        };
+        let _ = std::fs::remove_file(&path);
+        e.replace(&path.display().to_string(), "<file>")
+    }
+
+    /// The part of a load error the file requester shows: the first line without the path.
+    fn requester_line(e: &str) -> &str {
+        let first = e.lines().next().unwrap();
+        first.strip_prefix("<file>: ").unwrap_or(first)
+    }
+
+    #[test]
+    fn broken_and_foreign_files_get_short_first_lines_and_details() {
+        let fixture = |name: &str| {
+            std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../crates/dpx-iff/tests/data")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let png = {
+            let pal = Palette::new(vec![Rgb8::BLACK, Rgb8::WHITE]).unwrap();
+            let good = dpx_formats::write_png(&IndexedImage::new(8, 8, 1), &pal).unwrap();
+            good[..good.len() - 20].to_vec()
+        };
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            (
+                "empty.iff",
+                vec![],
+                "<file>: File is empty\n  The file has 0 bytes.",
+            ),
+            (
+                "pic.gif",
+                b"GIF89a\x01\x00\x01\x00".to_vec(),
+                "<file>: GIF pictures cannot be loaded\n  DeluxePainter reads IFF ILBM, PNG \
+                 and JPEG pictures; this file is a GIF picture.",
+            ),
+            (
+                "crunched",
+                b"PP20\x09\x0a\x0a\x0a".to_vec(),
+                "<file>: PowerPacker file: unpack it first\n  DeluxePainter reads IFF ILBM, \
+                 PNG and JPEG pictures; this file is packed with PowerPacker; decrunch it and \
+                 load the result.",
+            ),
+            (
+                "notes.txt",
+                b"hello".to_vec(),
+                "<file>: Unknown file type\n  DeluxePainter reads IFF ILBM, PNG and JPEG \
+                 pictures; this file starts with 68 65 6C 6C.",
+            ),
+            (
+                "group.iff",
+                b"LIST\0\0\0\x04ILBM".to_vec(),
+                "<file>: IFF LIST files: not supported yet\n  The file is an IFF LIST (several \
+                 FORMs in one file). DeluxePainter reads a single FORM ILBM.",
+            ),
+            (
+                "ham.iff",
+                fixture("broken-ham.iff"),
+                "<file>: HAM pictures arrive in Phase 5\n  CAMG at offset 96 ($60) is \
+                 $00000800: Hold-And-Modify with 6 bitplanes. DeluxePainter shows HAM and \
+                 Extra-Half-Brite pictures from Phase 5 on.",
+            ),
+            (
+                "run.iff",
+                fixture("broken-bad-run.iff"),
+                "<file>: BODY: bad ByteRun1 run, row 1\n  At offset 65 ($41) a ByteRun1 \
+                 repeat of 4 bytes does not fit: plane 0 of row 1 has 2 of its 2 bytes left. \
+                 The BODY is corrupt (or packed across rows, which ILBM does not allow).",
+            ),
+            (
+                "cut.png",
+                png,
+                "<file>: PNG file is cut off\n  The PNG decoder reports: unexpected end of file",
+            ),
+            (
+                "cut.jpg",
+                include_bytes!("../../../crates/dpx-formats/tests/data/red-blue-16x8.jpg")[..40]
+                    .to_vec(),
+                "<file>: JPEG file is cut off\n  The JPEG decoder reports: I/O errors Not \
+                 enough bytes, expected 64 but found 15",
+            ),
+        ];
+        // The file requester's message line is 264 - 12 = 252 pixels of the UI font wide.
+        let font = dpx_ui::font::Font::builtin();
+        for (name, bytes, want) in cases {
+            let e = load_error(name, &bytes);
+            assert_eq!(e, want, "{name}");
+            let line = requester_line(&e);
+            assert!(line.chars().count() <= 34, "{name}: {line}");
+            assert!(font.text_width(line) <= 252, "{name}: {line}");
+        }
+        let Err(missing) = load(Path::new("/nonexistent-dpx-drawer/pic.iff")) else {
+            panic!("expected an error");
+        };
+        assert!(
+            missing.starts_with("/nonexistent-dpx-drawer/pic.iff: File not found\n  "),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn tolerated_ilbm_quirks_reach_the_notes_and_info() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/dpx-iff/tests/data/broken-body-cut.iff");
+        let loaded = load(&path).unwrap();
+        let note = "BODY ends in row 2 of 4, plane 0 (the file ends inside the BODY, 9 of 16 \
+                    bytes): the rest of the picture is colour 0";
+        assert_eq!(loaded.notes, [note]);
+        let (img, _) = loaded.picture.indexed().unwrap();
+        assert!(img.pixels()[32..].iter().all(|&c| c == 0));
+        assert!(info(&path).unwrap().contains(&format!("  note: {note}\n")));
     }
 
     #[test]

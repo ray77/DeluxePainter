@@ -4,22 +4,38 @@
 
 use std::fmt;
 
-/// Errors while unpacking.
+/// Errors while unpacking one row. Positions are offsets into the source slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnpackError {
-    /// The input ended before `len` bytes were produced.
-    Truncated,
-    /// A run or literal would write past `len` bytes (corrupt data).
-    Overrun,
+    /// The input ended before the row was complete; `done` of its bytes were produced.
+    Truncated { done: usize },
+    /// The control byte at `at` asks for `count` bytes (a repeat or a literal), but only
+    /// `left` bytes of the row remain (corrupt data, or data packed across rows).
+    Overrun {
+        at: usize,
+        count: usize,
+        left: usize,
+        repeat: bool,
+    },
 }
 
 impl fmt::Display for UnpackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            UnpackError::Truncated => {
-                f.write_str("ByteRun1 data ended before the row was complete")
-            }
-            UnpackError::Overrun => f.write_str("ByteRun1 run or literal exceeds the row length"),
+        match *self {
+            UnpackError::Truncated { done } => write!(
+                f,
+                "ByteRun1 data ended after {done} bytes, before the row was complete"
+            ),
+            UnpackError::Overrun {
+                at,
+                count,
+                left,
+                repeat,
+            } => write!(
+                f,
+                "ByteRun1 {} of {count} bytes at {at} exceeds the {left} bytes left in the row",
+                if repeat { "repeat" } else { "literal" }
+            ),
         }
     }
 }
@@ -33,28 +49,37 @@ pub fn unpack_row(src: &[u8], len: usize) -> Result<(Vec<u8>, usize), UnpackErro
     let mut out = Vec::with_capacity(len);
     let mut pos = 0usize;
     while out.len() < len {
-        let &ctrl = src.get(pos).ok_or(UnpackError::Truncated)?;
+        let truncated = |out: &Vec<u8>| UnpackError::Truncated { done: out.len() };
+        let at = pos;
+        let &ctrl = src.get(pos).ok_or_else(|| truncated(&out))?;
         pos += 1;
         let n = ctrl as i8;
         if n == -128 {
             continue;
         }
-        if n >= 0 {
-            let count = n as usize + 1;
-            if count > len - out.len() {
-                return Err(UnpackError::Overrun);
-            }
-            let chunk = src.get(pos..pos + count).ok_or(UnpackError::Truncated)?;
-            out.extend_from_slice(chunk);
-            pos += count;
+        let repeat = n < 0;
+        let count = if repeat {
+            1 + (-(n as i16)) as usize
         } else {
-            let count = 1 + (-(n as i16)) as usize;
-            if count > len - out.len() {
-                return Err(UnpackError::Overrun);
-            }
-            let &b = src.get(pos).ok_or(UnpackError::Truncated)?;
+            n as usize + 1
+        };
+        let left = len - out.len();
+        if count > left {
+            return Err(UnpackError::Overrun {
+                at,
+                count,
+                left,
+                repeat,
+            });
+        }
+        if repeat {
+            let &b = src.get(pos).ok_or_else(|| truncated(&out))?;
             pos += 1;
             out.resize(out.len() + count, b);
+        } else {
+            let chunk = src.get(pos..pos + count).ok_or_else(|| truncated(&out))?;
+            out.extend_from_slice(chunk);
+            pos += count;
         }
     }
     Ok((out, pos))
@@ -178,22 +203,47 @@ mod tests {
 
     #[test]
     fn truncated_input() {
-        assert_eq!(unpack_row(&[], 1), Err(UnpackError::Truncated));
-        assert_eq!(unpack_row(&[0x02, 1, 2], 3), Err(UnpackError::Truncated));
-        assert_eq!(unpack_row(&[0xFE], 3), Err(UnpackError::Truncated));
-        assert_eq!(unpack_row(&[0x80], 1), Err(UnpackError::Truncated));
+        let t = |done| Err(UnpackError::Truncated { done });
+        assert_eq!(unpack_row(&[], 1), t(0));
+        assert_eq!(unpack_row(&[0x02, 1, 2], 3), t(0));
+        assert_eq!(unpack_row(&[0xFE], 3), t(0));
+        assert_eq!(unpack_row(&[0x80], 1), t(0));
+        assert_eq!(unpack_row(&[0x00, 7, 0x01, 8], 3), t(1));
     }
 
     #[test]
     fn overrun_detected() {
         assert_eq!(
             unpack_row(&[0x03, 1, 2, 3, 4], 2),
-            Err(UnpackError::Overrun)
+            Err(UnpackError::Overrun {
+                at: 0,
+                count: 4,
+                left: 2,
+                repeat: false
+            })
         );
-        assert_eq!(unpack_row(&[0xFE, 9], 2), Err(UnpackError::Overrun));
         assert_eq!(
-            unpack_row(&[0x00, 1, 0xFF, 2], 2),
-            Err(UnpackError::Overrun)
+            unpack_row(&[0xFE, 9], 2),
+            Err(UnpackError::Overrun {
+                at: 0,
+                count: 3,
+                left: 2,
+                repeat: true
+            })
+        );
+        let e = unpack_row(&[0x00, 1, 0xFF, 2], 2).unwrap_err();
+        assert_eq!(
+            e,
+            UnpackError::Overrun {
+                at: 2,
+                count: 2,
+                left: 1,
+                repeat: true
+            }
+        );
+        assert_eq!(
+            e.to_string(),
+            "ByteRun1 repeat of 2 bytes at 2 exceeds the 1 bytes left in the row"
         );
     }
 

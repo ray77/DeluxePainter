@@ -3,18 +3,27 @@
 //!
 //! EHB, HAM, DEEP and PBM files are detected and refused with a clear message; they are
 //! planned for later phases.
+//!
+//! Diagnostics (ADR-17): errors say which chunk, at which file offset, and what is wrong,
+//! with a short first line for the file requester. Common writer quirks that leave the
+//! picture intact (or recoverable) are tolerated and reported as notes, see
+//! [`read_with_notes`].
 
 use std::fmt;
 
 use dpx_core::{IndexedImage, Palette, Rgb8};
 
-use crate::byterun1;
-use crate::iff::{self, FourCc, IffError, be_i16, be_u16, be_u32};
+use crate::byterun1::{self, UnpackError};
+use crate::iff::{self, Chunk, Form, FourCc, IffError, at, be_i16, be_u16, be_u32};
 
 /// CAMG flag: Extra-Half-Brite.
 pub const CAMG_EHB: u32 = 0x0080;
 /// CAMG flag: Hold-And-Modify.
 pub const CAMG_HAM: u32 = 0x0800;
+
+/// Largest picture the reader accepts (64 megapixels, as for PNG and JPEG). Protects against
+/// corrupt BMHDs that would need gigabytes of memory.
+pub const MAX_PIXELS: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Masking {
@@ -116,35 +125,63 @@ pub struct Ilbm {
     pub cmap_4bit_fixed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IlbmError {
-    Iff(IffError),
-    /// A FORM of another type (e.g. PBM, ANIM).
-    NotIlbm(String),
-    MissingBmhd,
-    MissingBody,
-    /// A chunk is shorter than its fixed layout.
-    ShortChunk(String),
-    /// Valid IFF that DeluxePainter cannot handle yet.
-    Unsupported(String),
-    /// Corrupt or truncated pixel data.
-    BadBody(String),
+/// What kind of problem an [`IlbmError`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Not an IFF FORM, or the container is broken ([`IffError`]).
+    Iff,
+    /// A FORM of another type (PBM, ACBM, ANIM, 8SVX …).
+    NotIlbm,
+    /// BMHD or BODY is missing.
+    MissingChunk,
+    /// A fixed-layout chunk is shorter than its layout or cut off by the end of the file.
+    ShortChunk,
+    /// BMHD values that make no sense (zero or absurd size, plane count or masking).
+    BadHeader,
+    /// Valid IFF that DeluxePainter cannot read yet (HAM, EHB, true colour, compression).
+    Unsupported,
+    /// Corrupt pixel data.
+    BadBody,
     /// The picture cannot be written as described (export validation).
-    Invalid(String),
+    Invalid,
+}
+
+/// Why an ILBM could not be read or written.
+///
+/// `Display` gives [`IlbmError::summary`] as the first line and the details below it, so
+/// callers can show the first line in a one-line message and print the whole text to the
+/// terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IlbmError {
+    pub kind: ErrorKind,
+    /// One short line (at most 34 characters) for the file requester's message line.
+    pub summary: String,
+    /// Which chunk, which offset, what exactly is wrong; may be empty.
+    pub details: String,
+}
+
+impl IlbmError {
+    fn new(kind: ErrorKind, summary: impl Into<String>, details: impl Into<String>) -> Self {
+        Self {
+            kind,
+            summary: summary.into(),
+            details: details.into(),
+        }
+    }
+
+    /// An export validation error: one line, no details.
+    fn invalid(what: String) -> Self {
+        Self::new(ErrorKind::Invalid, format!("cannot write ILBM: {what}"), "")
+    }
 }
 
 impl fmt::Display for IlbmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IlbmError::Iff(e) => write!(f, "{e}"),
-            IlbmError::NotIlbm(t) => write!(f, "IFF FORM type {t} is not ILBM"),
-            IlbmError::MissingBmhd => write!(f, "ILBM without BMHD chunk"),
-            IlbmError::MissingBody => write!(f, "ILBM without BODY chunk"),
-            IlbmError::ShortChunk(id) => write!(f, "{id} chunk is too short"),
-            IlbmError::Unsupported(what) => write!(f, "not supported yet: {what}"),
-            IlbmError::BadBody(what) => write!(f, "corrupt BODY: {what}"),
-            IlbmError::Invalid(what) => write!(f, "cannot write ILBM: {what}"),
+        f.write_str(&self.summary)?;
+        if !self.details.is_empty() {
+            write!(f, "\n{}", self.details)?;
         }
+        Ok(())
     }
 }
 
@@ -152,11 +189,13 @@ impl std::error::Error for IlbmError {}
 
 impl From<IffError> for IlbmError {
     fn from(e: IffError) -> Self {
-        IlbmError::Iff(e)
+        IlbmError::new(ErrorKind::Iff, e.summary(), e.details())
     }
 }
 
 struct Bmhd {
+    /// File offset of the BMHD chunk header.
+    offset: usize,
     w: u16,
     h: u16,
     planes: u8,
@@ -169,18 +208,67 @@ struct Bmhd {
     page_height: i16,
 }
 
-fn parse_bmhd(d: &[u8]) -> Result<Bmhd, IlbmError> {
-    if d.len() < 20 {
-        return Err(IlbmError::ShortChunk("BMHD".into()));
+/// A chunk that is shorter than its fixed layout: why, in words.
+fn too_short(c: &Chunk<'_>, need: usize) -> String {
+    let id = iff::name(c.id);
+    if c.is_cut() && c.size >= need {
+        format!(
+            "{id} at {} is cut off: the file ends after {} of its {} bytes",
+            at(c.offset),
+            c.data.len(),
+            c.size
+        )
+    } else {
+        format!(
+            "{id} at {} has {}, {need} needed",
+            at(c.offset),
+            iff::byte_count(c.data.len())
+        )
     }
-    let masking = Masking::from_u8(d[9])
-        .ok_or_else(|| IlbmError::Unsupported(format!("masking type {}", d[9])))?;
+}
+
+fn parse_bmhd(c: &Chunk<'_>) -> Result<Bmhd, IlbmError> {
+    let d = c.data;
+    if d.len() < 20 {
+        let summary = if c.is_cut() {
+            "Picture header (BMHD) is cut off"
+        } else {
+            "Picture header (BMHD) too short"
+        };
+        return Err(IlbmError::new(
+            ErrorKind::ShortChunk,
+            summary,
+            format!("{}.", too_short(c, 20)),
+        ));
+    }
+    let masking = Masking::from_u8(d[9]).ok_or_else(|| {
+        IlbmError::new(
+            ErrorKind::BadHeader,
+            format!("Unknown masking type {}", d[9]),
+            format!(
+                "BMHD at {} says masking {}; ILBM knows 0 (none), 1 (mask plane), \
+                 2 (transparent colour) and 3 (lasso).",
+                at(c.offset),
+                d[9]
+            ),
+        )
+    })?;
     let compression = match d[10] {
         0 => Compression::None,
         1 => Compression::ByteRun1,
-        c => return Err(IlbmError::Unsupported(format!("compression type {c}"))),
+        n => {
+            return Err(IlbmError::new(
+                ErrorKind::Unsupported,
+                format!("Unknown compression type {n}"),
+                format!(
+                    "BMHD at {} says compression {n}; ILBM knows 0 (none) and 1 (ByteRun1).",
+                    at(c.offset)
+                ),
+            ));
+        }
     };
     Ok(Bmhd {
+        offset: c.offset,
         w: be_u16(&d[0..2]),
         h: be_u16(&d[2..4]),
         planes: d[8],
@@ -194,12 +282,133 @@ fn parse_bmhd(d: &[u8]) -> Result<Bmhd, IlbmError> {
     })
 }
 
+/// Refuses headers that cannot be decoded: zero or absurd size, plane counts outside 0..=8.
+fn check_bmhd(b: &Bmhd) -> Result<(), IlbmError> {
+    let (w, h) = (usize::from(b.w), usize::from(b.h));
+    if w == 0 || h == 0 {
+        return Err(IlbmError::new(
+            ErrorKind::BadHeader,
+            format!("Bad picture size {w}x{h}"),
+            format!(
+                "BMHD at {} says {w}x{h} pixels; a picture needs at least 1x1.",
+                at(b.offset)
+            ),
+        ));
+    }
+    if w * h > MAX_PIXELS {
+        return Err(IlbmError::new(
+            ErrorKind::BadHeader,
+            format!("Picture too big: {w}x{h}"),
+            format!(
+                "BMHD at {} says {w}x{h} pixels; DeluxePainter reads pictures up to 64 \
+                 megapixels. The header may be corrupt.",
+                at(b.offset)
+            ),
+        ));
+    }
+    match b.planes {
+        0..=8 => Ok(()),
+        24 | 32 => Err(IlbmError::new(
+            ErrorKind::Unsupported,
+            format!("{}-bit ILBM: not supported yet", b.planes),
+            format!(
+                "BMHD at {} says {} bitplanes: a true-colour ILBM. DeluxePainter reads 1 to 8 \
+                 bitplanes for now.",
+                at(b.offset),
+                b.planes
+            ),
+        )),
+        n => Err(IlbmError::new(
+            ErrorKind::BadHeader,
+            format!("Bad BMHD: {n} bitplanes"),
+            format!(
+                "BMHD at {} says {n} bitplanes; ILBM pictures have 1 to 8 (or 24 and 32 for \
+                 true colour).",
+                at(b.offset)
+            ),
+        )),
+    }
+}
+
+/// Refuses display modes DeluxePainter cannot show yet (HAM, EHB: Phase 5).
+fn check_mode(planes: u8, camg: Option<(u32, usize)>) -> Result<(), IlbmError> {
+    let later = "DeluxePainter shows HAM and Extra-Half-Brite pictures from Phase 5 on.";
+    let refuse = |summary: &str, what: &str, (mode, offset): (u32, usize)| {
+        Err(IlbmError::new(
+            ErrorKind::Unsupported,
+            summary,
+            format!(
+                "CAMG at {} is ${mode:08X}: {what} with {planes} bitplanes. {later}",
+                at(offset)
+            ),
+        ))
+    };
+    match camg {
+        Some(c) if c.0 & CAMG_HAM != 0 => {
+            refuse("HAM pictures arrive in Phase 5", "Hold-And-Modify", c)
+        }
+        Some(c) if c.0 & CAMG_EHB != 0 => {
+            refuse("EHB pictures arrive in Phase 5", "Extra-Half-Brite", c)
+        }
+        None if planes == 6 => Err(IlbmError::new(
+            ErrorKind::Unsupported,
+            "HAM/EHB arrive in Phase 5",
+            format!(
+                "6 bitplanes and no CAMG chunk: an Amiga shows this as HAM or \
+                 Extra-Half-Brite. {later}"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A picture without a CMAP: a grey ramp, so it is at least visible.
+fn grey_ramp(count: usize) -> Vec<Rgb8> {
+    let max = (count - 1).max(1);
+    (0..count)
+        .map(|i| {
+            let v = (i * 255 / max) as u8;
+            Rgb8::new(v, v, v)
+        })
+        .collect()
+}
+
 /// Expands a CMAP to exactly `count` entries; returns the palette and whether the 4-bit fix
-/// was applied.
-fn parse_cmap(d: Option<&[u8]>, count: usize) -> (Palette, bool) {
-    let bytes = d.unwrap_or(&[]);
+/// was applied. Anything that does not fit is reported in `notes`.
+fn parse_cmap(
+    cmap: Option<&Chunk<'_>>,
+    count: usize,
+    planes: u8,
+    notes: &mut Vec<String>,
+) -> (Palette, bool) {
+    let palette = |colors: Vec<Rgb8>| Palette::new(colors).expect("1..=256 entries");
+    let Some(c) = cmap else {
+        if planes > 0 {
+            notes.push("no CMAP chunk: a grey palette is used".into());
+        }
+        return (palette(grey_ramp(count)), false);
+    };
+    let bytes = c.data;
     let n = bytes.len() / 3;
-    let fix = n > 0 && bytes[..n * 3].iter().all(|b| b & 0x0F == 0);
+    if bytes.len() % 3 != 0 {
+        notes.push(format!(
+            "CMAP at {} has {} bytes, not a multiple of 3: the last {} ignored",
+            at(c.offset),
+            bytes.len(),
+            match bytes.len() % 3 {
+                1 => "byte is",
+                _ => "2 bytes are",
+            }
+        ));
+    }
+    if n == 0 {
+        notes.push(format!(
+            "CMAP at {} holds no complete colour: a grey palette is used",
+            at(c.offset)
+        ));
+        return (palette(grey_ramp(count)), false);
+    }
+    let fix = bytes[..n * 3].iter().all(|b| b & 0x0F == 0);
     let fixed = |v: u8| if fix { v | (v >> 4) } else { v };
     let mut colors: Vec<Rgb8> = bytes
         .as_chunks::<3>()
@@ -207,26 +416,53 @@ fn parse_cmap(d: Option<&[u8]>, count: usize) -> (Palette, bool) {
         .iter()
         .map(|c| Rgb8::new(fixed(c[0]), fixed(c[1]), fixed(c[2])))
         .collect();
-    if d.is_none() {
-        // No CMAP at all: a grey ramp, so the picture is at least visible.
-        let max = (count - 1).max(1);
-        colors = (0..count)
-            .map(|i| {
-                let v = (i * 255 / max) as u8;
-                Rgb8::new(v, v, v)
-            })
-            .collect();
+    let colours = |n: usize| if n == 1 { "colour" } else { "colours" };
+    if n < count {
+        let missing = if count - n == 1 {
+            format!("colour {n} is")
+        } else {
+            format!("colours {n}-{} are", count - 1)
+        };
+        notes.push(format!(
+            "CMAP has {n} {} for {count} ({planes} bitplanes): {missing} black",
+            colours(n)
+        ));
+    } else if n > count {
+        let dropped = if n - count == 1 {
+            format!("colour {count} is")
+        } else {
+            format!("colours {count}-{} are", n - 1)
+        };
+        let uses = if planes == 0 {
+            format!("a palette holds at most {count}")
+        } else {
+            format!("{planes} bitplanes show {count}")
+        };
+        notes.push(format!(
+            "CMAP has {n} colours but {uses}: {dropped} not kept"
+        ));
     }
     colors.resize(count, Rgb8::BLACK);
-    (Palette::new(colors).expect("1..=256 entries"), fix)
+    (palette(colors), fix)
 }
 
-/// Reads an ILBM file.
+/// Reads an ILBM file. Tolerated quirks are dropped silently here; use [`read_with_notes`]
+/// to tell the user about them.
 pub fn read(bytes: &[u8]) -> Result<Ilbm, IlbmError> {
-    let (form_type, chunks) = iff::parse_form(bytes)?;
-    if &form_type != b"ILBM" {
-        return Err(IlbmError::NotIlbm(iff::id_str(form_type)));
+    read_with_notes(bytes).map(|(ilbm, _)| ilbm)
+}
+
+/// Reads an ILBM file and returns notes (lower-case sentences) about everything that was
+/// tolerated rather than refused (ADR-17): container quirks from [`iff::read_form`], short
+/// or odd CMAPs, a BODY that ends early (the rest of the picture is colour 0), short CAMG,
+/// CRNG, CCRT or GRAB chunks (ignored), chunks with invalid ids, chunks after the BODY,
+/// lasso masking (read as transparent colour).
+pub fn read_with_notes(bytes: &[u8]) -> Result<(Ilbm, Vec<String>), IlbmError> {
+    let form = iff::read_form(bytes)?;
+    if &form.form_type != b"ILBM" {
+        return Err(foreign_form(form.form_type));
     }
+    let mut notes = form.notes.clone();
     let mut bmhd = None;
     let mut cmap = None;
     let mut camg = None;
@@ -235,86 +471,122 @@ pub fn read(bytes: &[u8]) -> Result<Ilbm, IlbmError> {
     let mut ccrt = Vec::new();
     let mut grab = None;
     let mut other_chunks = Vec::new();
-    for c in &chunks {
-        let short = || IlbmError::ShortChunk(iff::id_str(c.id));
+    for (i, c) in form.chunks.iter().enumerate() {
+        let mut fixed = |need: usize| {
+            let d = c.data.get(..need);
+            if d.is_none() {
+                notes.push(format!("{}: ignored", too_short(c, need)));
+            }
+            d
+        };
         match &c.id {
-            b"BMHD" => bmhd = Some(parse_bmhd(c.data)?),
-            b"CMAP" => cmap = Some(c.data),
-            b"CAMG" if c.data.len() >= 4 => camg = Some(be_u32(c.data)),
+            b"BMHD" => bmhd = Some(parse_bmhd(c)?),
+            b"CMAP" => cmap = Some(c),
+            b"CAMG" => {
+                if let Some(d) = fixed(4) {
+                    camg = Some((be_u32(d), c.offset));
+                }
+            }
             b"CRNG" => {
-                let d = c.data.get(..8).ok_or_else(short)?;
-                ranges.push(ColorRange {
-                    rate: be_u16(&d[2..4]),
-                    flags: be_u16(&d[4..6]),
-                    low: d[6],
-                    high: d[7],
-                });
+                if let Some(d) = fixed(8) {
+                    ranges.push(ColorRange {
+                        rate: be_u16(&d[2..4]),
+                        flags: be_u16(&d[4..6]),
+                        low: d[6],
+                        high: d[7],
+                    });
+                }
             }
             b"CCRT" => {
-                let d = c.data.get(..14).ok_or_else(short)?;
-                ccrt.push(ccrt_to_range(d));
+                if let Some(d) = fixed(14) {
+                    ccrt.push(ccrt_to_range(d));
+                }
             }
             b"GRAB" => {
-                let d = c.data.get(..4).ok_or_else(short)?;
-                grab = Some((be_i16(&d[0..2]), be_i16(&d[2..4])));
+                if let Some(d) = fixed(4) {
+                    grab = Some((be_i16(&d[0..2]), be_i16(&d[2..4])));
+                }
             }
             b"BODY" => {
-                body = Some(c.data);
+                body = Some(c);
+                let after: Vec<String> = form.chunks[i + 1..]
+                    .iter()
+                    .map(|c| iff::name(c.id))
+                    .collect();
+                if !after.is_empty() {
+                    notes.push(format!(
+                        "{} after the BODY not read: {}",
+                        if after.len() == 1 { "chunk" } else { "chunks" },
+                        list(&after)
+                    ));
+                }
                 break;
             }
-            b"DEEP" => return Err(IlbmError::Unsupported("true-colour DEEP ILBM".into())),
+            b"DEEP" => {
+                return Err(IlbmError::new(
+                    ErrorKind::Unsupported,
+                    "DEEP ILBM: not supported yet",
+                    format!(
+                        "The DEEP chunk at {} holds true-colour pixels. DeluxePainter reads \
+                         1 to 8 bitplanes for now.",
+                        at(c.offset)
+                    ),
+                ));
+            }
+            id if !iff::is_valid_id(id) => notes.push(format!(
+                "chunk with the invalid id {} at {} skipped ({})",
+                iff::quoted(*id),
+                at(c.offset),
+                iff::byte_count(c.data.len())
+            )),
             _ => other_chunks.push(RawChunk {
                 id: c.id,
                 data: c.data.to_vec(),
             }),
         }
     }
-    let bmhd = bmhd.ok_or(IlbmError::MissingBmhd)?;
+    let Some(mut bmhd) = bmhd else {
+        return Err(missing_bmhd(&form, body));
+    };
     if ranges.is_empty() {
         ranges = ccrt;
     }
-    if bmhd.w == 0 || bmhd.h == 0 {
-        return Err(IlbmError::Unsupported("zero-sized picture".into()));
-    }
-    if bmhd.planes > 8 {
-        return Err(IlbmError::Unsupported(format!(
-            "{}-plane (true-colour) ILBM",
-            bmhd.planes
-        )));
-    }
-    let mode = camg.unwrap_or(0);
-    if mode & CAMG_HAM != 0 {
-        return Err(IlbmError::Unsupported(
-            "HAM pictures (planned for Phase 5)".into(),
-        ));
-    }
-    if mode & CAMG_EHB != 0 {
-        return Err(IlbmError::Unsupported(
-            "Extra-Half-Brite pictures (planned for Phase 5)".into(),
-        ));
-    }
-    if bmhd.planes == 6 && camg.is_none() {
-        return Err(IlbmError::Unsupported(
-            "6-plane picture without CAMG (HAM or EHB, planned for Phase 5)".into(),
-        ));
+    check_bmhd(&bmhd)?;
+    if bmhd.planes > 0 {
+        // A palette-only file (no planes) has no pixels to interpret in a display mode.
+        check_mode(bmhd.planes, camg)?;
     }
     if bmhd.masking == Masking::Lasso {
-        return Err(IlbmError::Unsupported("lasso masking".into()));
+        notes.push(format!(
+            "lasso masking is read as transparent colour {}; the outline fill is not done",
+            bmhd.transparent_color
+        ));
+        bmhd.masking = Masking::TransparentColor;
+    }
+    if let Some(offset) = form.cut_header
+        && body.is_some()
+    {
+        notes.push(format!(
+            "{} stray bytes at the end of the file are ignored (at {})",
+            bytes.len() - offset,
+            at(offset)
+        ));
     }
 
     let colors = if bmhd.planes == 0 {
-        cmap.map_or(1, |d| (d.len() / 3).clamp(1, 256))
+        cmap.map_or(1, |c| (c.data.len() / 3).clamp(1, 256))
     } else {
         1usize << bmhd.planes
     };
-    let (palette, cmap_4bit_fixed) = parse_cmap(cmap, colors);
+    let (palette, cmap_4bit_fixed) = parse_cmap(cmap, colors, bmhd.planes, &mut notes);
     let (w, h) = (usize::from(bmhd.w), usize::from(bmhd.h));
     let (pixels, mask) = if bmhd.planes == 0 {
         (vec![0; w * h], None)
     } else {
-        decode_body(&bmhd, body.ok_or(IlbmError::MissingBody)?)?
+        let body = body.ok_or_else(|| missing_body(&form, bmhd.planes))?;
+        decode_body(&bmhd, body, &mut notes)?
     };
-    Ok(Ilbm {
+    let ilbm = Ilbm {
         image: IndexedImage::from_pixels(u32::from(bmhd.w), u32::from(bmhd.h), pixels)
             .expect("w*h pixels"),
         palette,
@@ -327,12 +599,137 @@ pub fn read(bytes: &[u8]) -> Result<Ilbm, IlbmError> {
         y_aspect: bmhd.y_aspect,
         page_width: bmhd.page_width,
         page_height: bmhd.page_height,
-        camg,
+        camg: camg.map(|(v, _)| v),
         ranges,
         grab,
         other_chunks,
         cmap_4bit_fixed,
-    })
+    };
+    Ok((ilbm, notes))
+}
+
+/// `a, b, c`: at most eight names, then `and N more`.
+fn list(names: &[String]) -> String {
+    const MAX: usize = 8;
+    let shown = &names[..names.len().min(MAX)];
+    let mut s = shown.join(", ");
+    if names.len() > MAX {
+        s += &format!(" and {} more", names.len() - MAX);
+    }
+    s
+}
+
+/// The chunks of a FORM for an error message: `BMHD at 12, CMAP at 40`.
+fn chunk_list(form: &Form<'_>) -> String {
+    if form.chunks.is_empty() {
+        return "none".into();
+    }
+    let names: Vec<String> = form
+        .chunks
+        .iter()
+        .map(|c| format!("{} at {}", iff::name(c.id), c.offset))
+        .collect();
+    list(&names)
+}
+
+/// Why the file may have lost chunks at its end, as a sentence (or empty).
+fn truncation(form: &Form<'_>) -> String {
+    if let Some(offset) = form.cut_header {
+        format!(
+            "The file ends inside a chunk header at {}: it is truncated. ",
+            at(offset)
+        )
+    } else if let Some(c) = form.chunks.last().filter(|c| c.is_cut()) {
+        format!(
+            "The file ends inside the {} chunk at {} ({} of {} bytes): it is truncated. ",
+            iff::name(c.id),
+            at(c.offset),
+            c.data.len(),
+            c.size
+        )
+    } else if form.missing > 0 {
+        format!(
+            "The file is {} shorter than its FORM header says: it is truncated. ",
+            iff::byte_count(form.missing)
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn missing_bmhd(form: &Form<'_>, body: Option<&Chunk<'_>>) -> IlbmError {
+    let before = body.map_or(String::new(), |b| {
+        format!(" before the BODY at {}", at(b.offset))
+    });
+    IlbmError::new(
+        ErrorKind::MissingChunk,
+        "No picture header (BMHD missing)",
+        format!(
+            "There is no BMHD chunk{before}. {}Chunks found: {}.",
+            truncation(form),
+            chunk_list(form)
+        ),
+    )
+}
+
+fn missing_body(form: &Form<'_>, planes: u8) -> IlbmError {
+    IlbmError::new(
+        ErrorKind::MissingChunk,
+        "No pixel data (BODY missing)",
+        format!(
+            "BMHD says {planes} bitplanes, but there is no BODY chunk. {}Chunks found: {}.",
+            truncation(form),
+            chunk_list(form)
+        ),
+    )
+}
+
+/// The error for a FORM that is not an ILBM; known picture formats are named.
+fn foreign_form(t: FourCc) -> IlbmError {
+    let name = iff::name(t);
+    let (summary, details) = match &t {
+        b"PBM " => (
+            "PBM pictures: not supported yet".to_string(),
+            "This is a FORM PBM picture (chunky pixels, as written by DeluxePaint on the PC). \
+             DeluxePainter reads FORM ILBM for now."
+                .to_string(),
+        ),
+        b"ACBM" => (
+            "ACBM pictures: not supported yet".to_string(),
+            "This is a FORM ACBM picture (contiguous bitplanes, as written by AmigaBASIC \
+             programs). DeluxePainter reads FORM ILBM for now."
+                .to_string(),
+        ),
+        b"ANIM" => (
+            "ANIM files arrive in Phase 6".to_string(),
+            "This is an IFF ANIM animation. DeluxePainter loads animations from Phase 6 on; \
+             until then it reads single FORM ILBM pictures."
+                .to_string(),
+        ),
+        b"DEEP" | b"RGBN" | b"RGB8" | b"TVPP" => (
+            format!("{name} pictures: not supported yet"),
+            format!(
+                "This is a true-colour FORM {name} picture. DeluxePainter reads FORM ILBM \
+                 with 1 to 8 bitplanes."
+            ),
+        ),
+        _ => {
+            let what = match &t {
+                b"8SVX" | b"AIFF" | b"16SV" => " (a sound)",
+                b"SMUS" => " (a music score)",
+                b"FTXT" => " (text)",
+                _ => "",
+            };
+            (
+                format!("IFF FORM {name}: not a picture"),
+                format!(
+                    "DeluxePainter loads FORM ILBM pictures; this file is an IFF FORM \
+                     {name}{what}."
+                ),
+            )
+        }
+    };
+    IlbmError::new(ErrorKind::NotIlbm, summary, details)
 }
 
 /// CCRT (Graphicraft) → CRNG semantics: direction 0 off, 1 forward, -1 reverse; the delay
@@ -362,8 +759,24 @@ fn row_bytes(w: usize) -> usize {
     w.div_ceil(16) * 2
 }
 
-/// Decodes interleaved bitplanes into indices (+ mask plane).
-fn decode_body(bmhd: &Bmhd, body: &[u8]) -> Result<(Vec<u8>, Option<Vec<bool>>), IlbmError> {
+/// `plane 3` or `mask plane`.
+fn plane_name(p: usize, planes: usize) -> String {
+    if p == planes {
+        "mask plane".into()
+    } else {
+        format!("plane {p}")
+    }
+}
+
+/// Decodes interleaved bitplanes into indices (+ mask plane). A BODY that ends early is
+/// tolerated: every plane row that is not complete stays 0 (colour 0, mask transparent) and
+/// a note says where the data ended. A ByteRun1 run that does not fit its row is an error.
+fn decode_body(
+    bmhd: &Bmhd,
+    body: &Chunk<'_>,
+    notes: &mut Vec<String>,
+) -> Result<(Vec<u8>, Option<Vec<bool>>), IlbmError> {
+    let data = body.data;
     let (w, h) = (usize::from(bmhd.w), usize::from(bmhd.h));
     let rb = row_bytes(w);
     let planes = usize::from(bmhd.planes);
@@ -372,21 +785,51 @@ fn decode_body(bmhd: &Bmhd, body: &[u8]) -> Result<(Vec<u8>, Option<Vec<bool>>),
     let mut pixels = vec![0u8; w * h];
     let mut mask = has_mask.then(|| vec![false; w * h]);
     let mut pos = 0;
-    for y in 0..h {
+    let mut cut = None;
+    'rows: for y in 0..h {
         for p in 0..rows_per_line {
             let row: std::borrow::Cow<[u8]> = match bmhd.compression {
-                Compression::None => {
-                    let r = body.get(pos..pos + rb).ok_or_else(|| {
-                        IlbmError::BadBody(format!("data ends in row {y}, plane {p}"))
-                    })?;
-                    pos += rb;
-                    r.into()
-                }
+                Compression::None => match data.get(pos..pos + rb) {
+                    Some(r) => {
+                        pos += rb;
+                        r.into()
+                    }
+                    None => {
+                        cut = Some((y, p));
+                        break 'rows;
+                    }
+                },
                 Compression::ByteRun1 => {
-                    let (r, used) = byterun1::unpack_row(&body[pos.min(body.len())..], rb)
-                        .map_err(|e| IlbmError::BadBody(format!("row {y}, plane {p}: {e}")))?;
-                    pos += used;
-                    r.into()
+                    match byterun1::unpack_row(&data[pos.min(data.len())..], rb) {
+                        Ok((r, used)) => {
+                            pos += used;
+                            r.into()
+                        }
+                        Err(UnpackError::Truncated { .. }) => {
+                            cut = Some((y, p));
+                            break 'rows;
+                        }
+                        Err(UnpackError::Overrun {
+                            at: run_at,
+                            count,
+                            left,
+                            repeat,
+                        }) => {
+                            let offset = body.offset + 8 + pos + run_at;
+                            return Err(IlbmError::new(
+                                ErrorKind::BadBody,
+                                format!("BODY: bad ByteRun1 run, row {y}"),
+                                format!(
+                                    "At {} a ByteRun1 {} of {count} bytes does not fit: {} of row \
+                                 {y} has {left} of its {rb} bytes left. The BODY is corrupt (or \
+                                 packed across rows, which ILBM does not allow).",
+                                    at(offset),
+                                    if repeat { "repeat" } else { "literal" },
+                                    plane_name(p, planes)
+                                ),
+                            ));
+                        }
+                    }
                 }
             };
             let line = y * w;
@@ -403,6 +846,29 @@ fn decode_body(bmhd: &Bmhd, body: &[u8]) -> Result<(Vec<u8>, Option<Vec<bool>>),
                 }
             }
         }
+    }
+    if let Some((y, p)) = cut {
+        let why = if body.is_cut() {
+            "the file ends inside the BODY"
+        } else {
+            "the BODY chunk is too short"
+        };
+        let size = match bmhd.compression {
+            Compression::None => format!(", {} of {} bytes", data.len(), rb * rows_per_line * h),
+            Compression::ByteRun1 => String::new(),
+        };
+        notes.push(if y == 0 && p == 0 {
+            format!(
+                "BODY at {} holds no pixel data ({why}{size}): the picture is colour 0",
+                at(body.offset)
+            )
+        } else {
+            format!(
+                "BODY ends in row {y} of {h}, {} ({why}{size}): the rest of the picture is \
+                 colour 0",
+                plane_name(p, planes)
+            )
+        });
     }
     Ok((pixels, mask))
 }
@@ -441,7 +907,7 @@ pub fn planes_for(colors: usize) -> u8 {
 /// Writes an ILBM file. Nothing is reduced silently: pixels outside the palette, a palette
 /// larger than the plane count allows, or an inconsistent mask are errors.
 pub fn write(ilbm: &Ilbm, compression: Compression) -> Result<Vec<u8>, IlbmError> {
-    let invalid = |m: String| Err(IlbmError::Invalid(m));
+    let invalid = |m: String| Err(IlbmError::invalid(m));
     let (w, h) = (ilbm.image.width(), ilbm.image.height());
     if w == 0 || h == 0 || w > u32::from(u16::MAX) || h > u32::from(u16::MAX) {
         return invalid(format!("picture size {w}x{h} is outside 1..=65535"));
@@ -597,7 +1063,8 @@ mod tests {
             f.chunk(*b"BMHD", &bmhd);
             f.chunk(*b"CMAP", &cmap);
             f.chunk(*b"BODY", &body);
-            let pic = read(&f.finish()).unwrap();
+            let (pic, notes) = read_with_notes(&f.finish()).unwrap();
+            assert!(notes.is_empty(), "{notes:?}");
             assert_eq!(pic.image.pixels(), &expected);
             assert_eq!((pic.page_width, pic.page_height), (320, 200));
             assert_eq!((pic.x_aspect, pic.y_aspect), (10, 11));
@@ -626,7 +1093,8 @@ mod tests {
             }
             for comp in [Compression::None, Compression::ByteRun1] {
                 let bytes = write(&src, comp).unwrap();
-                let back = read(&bytes).unwrap();
+                let (back, notes) = read_with_notes(&bytes).unwrap();
+                assert!(notes.is_empty(), "{notes:?}");
                 assert_eq!(back.image, src.image, "{w}x{h} {colors} {comp:?}");
                 assert_eq!(back.palette, src.palette);
                 assert_eq!(back.compression, comp);
@@ -695,36 +1163,41 @@ mod tests {
     }
 
     #[test]
-    fn short_cmap_is_padded_to_the_plane_count() {
+    fn more_planes_than_the_body_holds_reads_with_notes() {
         let src = sample(16, 1, 4);
         let mut bytes = write(&src, Compression::None).unwrap();
-        // Patch BMHD planes from 2 to 3: 8 colours expected, CMAP has 4.
+        // Patch BMHD planes from 2 to 3: 8 colours expected, CMAP has 4, and the BODY now
+        // lacks a plane row. Both are tolerated with a note instead of a panic.
         let planes_at = 12 + 8 + 8;
         bytes[planes_at] = 3;
-        // The BODY now lacks a plane per row, so it must fail cleanly rather than panic.
-        assert!(matches!(read(&bytes), Err(IlbmError::BadBody(_))));
+        let (pic, notes) = read_with_notes(&bytes).unwrap();
+        assert_eq!(pic.palette.len(), 8);
+        assert_eq!(
+            notes,
+            [
+                "CMAP has 4 colours for 8 (3 bitplanes): colours 4-7 are black",
+                "BODY ends in row 0 of 1, plane 2 (the BODY chunk is too short, 4 of 6 bytes): \
+                 the rest of the picture is colour 0",
+            ]
+        );
     }
 
     #[test]
     fn writer_refuses_silent_loss() {
         let mut src = sample(4, 4, 4);
         src.palette = Palette::new(vec![Rgb8::BLACK; 2]).unwrap();
-        assert!(matches!(
-            write(&src, Compression::None),
-            Err(IlbmError::Invalid(_))
-        ));
+        let invalid = |r: Result<Vec<u8>, IlbmError>| r.unwrap_err().kind == ErrorKind::Invalid;
+        assert!(invalid(write(&src, Compression::None)));
         let mut src = sample(4, 4, 4);
         src.planes = 1;
-        assert!(matches!(
-            write(&src, Compression::None),
-            Err(IlbmError::Invalid(_))
-        ));
+        assert!(invalid(write(&src, Compression::None)));
         let mut src = sample(4, 4, 4);
         src.masking = Masking::HasMask;
-        assert!(matches!(
-            write(&src, Compression::None),
-            Err(IlbmError::Invalid(_))
-        ));
+        let e = write(&src, Compression::None).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "cannot write ILBM: mask plane does not match the masking type"
+        );
     }
 
     #[test]
@@ -732,17 +1205,20 @@ mod tests {
         let mut src = sample(4, 2, 64);
         src.camg = Some(CAMG_EHB);
         let bytes = write(&src, Compression::None).unwrap();
-        assert!(matches!(read(&bytes), Err(IlbmError::Unsupported(_))));
+        let kind = |b: &[u8]| read(b).unwrap_err().kind;
+        assert_eq!(kind(&bytes), ErrorKind::Unsupported);
         src.camg = None;
         let bytes = write(&src, Compression::None).unwrap();
-        assert!(matches!(read(&bytes), Err(IlbmError::Unsupported(_))));
+        assert_eq!(kind(&bytes), ErrorKind::Unsupported);
         src.camg = Some(CAMG_HAM);
         let bytes = write(&src, Compression::None).unwrap();
-        assert!(matches!(read(&bytes), Err(IlbmError::Unsupported(_))));
+        assert_eq!(kind(&bytes), ErrorKind::Unsupported);
 
         let mut pbm = iff::FormWriter::new(*b"PBM ");
         pbm.chunk(*b"BMHD", &[0; 20]);
-        assert_eq!(read(&pbm.finish()), Err(IlbmError::NotIlbm("PBM ".into())));
+        let e = read(&pbm.finish()).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotIlbm);
+        assert_eq!(e.summary, "PBM pictures: not supported yet");
     }
 
     #[test]

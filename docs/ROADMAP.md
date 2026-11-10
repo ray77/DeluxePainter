@@ -37,8 +37,10 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 
 - Window scaling (ADR-13, owner request): the window snaps to the picture's screen in whole and half pixel-size steps (1x–8x), so the picture fills it without bars; Prefs ▸ Pixel Size and Cmd/Ctrl +/−/0; full screen (Ctrl+Cmd+F / F11) centres the screen at the largest step. Verified by tests; dragging, keys and full screen not tried by hand.
 
+- File diagnostics (ADR-17): broken and foreign files give a short first line for the file requester plus details (chunk, offset, values) on stderr and in `info`; foreign formats are named (PBM, ACBM, ANIM, LIST, GIF, PowerPacker …); HAM/EHB say "arrive in Phase 5". Harmless quirks (BODY ending early → colour 0, odd CMAP sizes, missing pad bytes, wrong FORM sizes, trailing data, short CRNG/CAMG, lasso) load with a note. Golden fixtures built byte by byte from the spec (1–8 planes, odd widths, ByteRun1, mask, CRNG, 4-bit CMAP, truncated and broken variants) with exact pixels and texts. Verified by tests and CLI output; the app's Load handler still has to show only the first line in the file requester (main.rs, open).
+
 Next in Phase 2:
-1. Error diagnostics for broken files; more golden fixtures.
+1. Picture ▸ Load shows only the first line of a load error in the file requester (`e.lines().next()` in main.rs, ADR-17).
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 
