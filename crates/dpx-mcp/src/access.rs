@@ -147,11 +147,17 @@ impl FileAccess {
     pub fn resolve_write(&self, path: &str, overwrite: bool) -> Result<PathBuf, ToolError> {
         self.require_on()?;
         // A name must end in a file name, not `..` or `.`; checked on the raw input because
-        // Windows verbatim (`\\?\`) paths do not interpret `..` once joined.
-        if !matches!(
-            Path::new(path).components().next_back(),
-            Some(std::path::Component::Normal(_))
-        ) {
+        // Windows verbatim (`\\?\`) paths do not interpret `..` once joined. Paths with a
+        // Windows prefix (UNC, device, drive) go to the lexical check below instead, so a
+        // device path such as `\\.\PHYSICALDRIVE0` is refused as PATH_NOT_ALLOWED.
+        let mut comps = Path::new(path).components();
+        let has_prefix = matches!(comps.next(), Some(std::path::Component::Prefix(_)));
+        if !has_prefix
+            && !matches!(
+                Path::new(path).components().next_back(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
             return Err(ToolError::invalid(format!("{path}: not a file name")));
         }
         let abs = self.absolute(path)?;
