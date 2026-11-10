@@ -14,6 +14,7 @@ authors = ["Dominik Schmidt"]
 dpx-core = { path = "crates/dpx-core" }
 dpx-formats = { path = "crates/dpx-formats" }
 dpx-iff = { path = "crates/dpx-iff" }
+dpx-mcp = { path = "crates/dpx-mcp" }
 dpx-ui = { path = "crates/dpx-ui" }
 eframe = "0.37"
 png = "0.18"

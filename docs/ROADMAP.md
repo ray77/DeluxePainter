@@ -58,4 +58,4 @@ Done (verified by tests and headless snapshots):
 Next:
 1. Zoom/Magnify and pixel grid.
 2. Requester framework (Screen Format first) and HiRes geometry.
-3. MCP spike (`app_status`, `new_document`, `get_document_state`) on top of the engine, and CI on macOS/Windows/Linux.
+3. ~~MCP spike and CI~~ Written (ADR-21): `deluxepainter mcp` (rmcp, stdio, headless engine) with `app_status`, `new_document`, `get_document_state`, tested end to end by spawning the binary on macOS. `.github/workflows/ci.yml` runs the gate on macOS/Windows/Linux but has not run yet; Windows/Linux and real MCP clients are unverified.
