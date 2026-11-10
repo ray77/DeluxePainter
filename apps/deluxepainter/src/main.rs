@@ -196,6 +196,7 @@ fn main() -> eframe::Result {
             files::convert(Path::new(input), Path::new(output))
                 .map(|notes| notes.iter().for_each(|n| eprintln!("note: {n}"))),
         ),
+        (Some("mcp"), []) => exit_with(dpx_mcp::run_stdio_blocking().map_err(|e| e.to_string())),
         (Some("info" | "convert"), _) => {
             eprintln!("usage: deluxepainter info <file> | convert <in> <out>");
             std::process::exit(2);

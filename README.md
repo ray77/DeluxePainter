@@ -87,6 +87,21 @@ Menus that work (everything else is ghosted until it exists, ADR-15): Picture â–
 
 Snapshot options: `--palette gold16`, `--fg N`, `--tool NAME[:filled]`, `--menu M[:I[:S]]` (open menu M, highlight item I and sub item S), `--open picture.iff` (also PNG/JPEG), `--requester` (Screen Format requester), `--file-requester load|save` with `--drawer DIR`, `--file NAME`, `--drawer-as TEXT` (Load/Save requester), `--page WxH`, `--scroll X,Y`, `--commands FILE.json` (run a JSON array of commands first, e.g. `docs/design/screenshots/phase3-tools.json`), `--show-page`, `--page-size-requester`, `--notes` (the notes of `--open`), `--font-preview out.png`.
 
+## MCP server (spike)
+
+`deluxepainter mcp` runs a headless [MCP](https://modelcontextprotocol.io) server on stdin/stdout (rmcp; stdout carries protocol messages only, logs go to stderr). It is off unless a client starts it. Tools so far: `app_status`, `new_document`, `get_document_state` (ADR-21). Example client configuration:
+
+```json
+{
+  "mcpServers": {
+    "deluxepainter": {
+      "command": "/path/to/deluxepainter",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
 ## License
 
 Copyright Â© 2026 Dominik Schmidt. DeluxePainter is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You may use, modify and share it for any **noncommercial** purpose. Commercial use requires a separate license from the author.
