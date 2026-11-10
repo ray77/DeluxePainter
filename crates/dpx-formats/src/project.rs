@@ -270,7 +270,10 @@ fn zip_entries(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, ProjectError> {
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .last_modified_time(zip::DateTime::default())
-        .unix_permissions(0o644);
+        .unix_permissions(0o644)
+        // The "made by" host byte would otherwise follow the OS (Dos on Windows), so the same
+        // document gave different bytes per platform.
+        .system(zip::System::Unix);
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, data) in entries {
         zip.start_file(name.as_str(), options)
