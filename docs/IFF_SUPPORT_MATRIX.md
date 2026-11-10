@@ -159,9 +159,9 @@ Encoder guidance from [S2]: emit a 2-byte repeat as a run only when it is not be
 | masking 1 (mask plane) | to alpha | from alpha | early | verified |
 | masking 2 (transparent colour) | to alpha | when brush marks a colour | early | verified |
 | masking 3 (lasso) | flood-fill from edge on import | not written | mid | verified; low value |
-| EHB (6 planes, CAMG 0x80) | expand with half-brightness lookup | export keep 6 planes + 32-entry CMAP | mid | see HARDWARE_MODES.md section 6; codec `dpx_formats::ehb` exists (ADR-25), not yet wired into the app |
-| HAM6 | decode with rules from section 7 there | encoder later | mid | decoder and greedy encoder exist in `dpx_formats::ham` (ADR-25), not yet wired into the app |
-| HAM8 / AGA 8 planes | same, 8-bit CMAP | same | mid | codec exists (ADR-25), not yet wired; control-bit layout needs validation against a real file |
+| EHB (6 planes, CAMG 0x80) | expand with half-brightness lookup | export keep 6 planes + 32-entry CMAP | mid | see HARDWARE_MODES.md section 6; Load opens it as a 64-colour indexed picture (ADR-26), saves 64-colour non-EHB; real EHB export later |
+| HAM6 | decode with rules from section 7 there | encoder later | mid | decoder and greedy encoder exist in `dpx_formats::ham` (ADR-25); Load decodes and reduces like true colour (ADR-26), HAM export later |
+| HAM8 / AGA 8 planes | same, 8-bit CMAP | same | mid | codec exists (ADR-25), Load wired (ADR-26); control-bit layout needs validation against a real file |
 | 7-8 plane indexed | full | full | mid | |
 | CMAP depth conversion | 4 -> 8 bit heuristic | 8-bit replicated | early | |
 | PBM / DEEP | detect + message | none | later | |
@@ -276,11 +276,12 @@ Crate `dpx-iff` (`iff`, `byterun1`, `ilbm`), used by `deluxepainter info|convert
 | BODY 1–8 planes, uncompressed and ByteRun1, mask plane (masking 1), masking 2 flag + transparent colour kept | done, tested |
 | Unknown chunks before BODY (DPPS, DPPV, TINY …) | kept and re-emitted before BODY |
 | Writer | canonical order BMHD, CMAP, GRAB, CAMG, CRNG*, other chunks, BODY; CMAP written in replicated 8-bit form; refuses pixels outside the palette, a palette larger than the plane count, and inconsistent masks |
-| Refused with a clear message | HAM, EHB, 6 planes without CAMG, >8 planes / DEEP, other FORM types (PBM, ACBM, ANIM …); broken files with chunk and offset, see §9 |
+| EHB / HAM6 / HAM8 | read as raw plane values (`Ilbm::special`, CMAP cut to 32 / 16 / 64 entries); the app opens EHB as 64 free colours and HAM as decoded RGB reduced like true colour (ADR-26) |
+| Refused with a clear message | HAM with other plane counts, >8 planes / DEEP, other FORM types (PBM, ACBM, ANIM …); broken files with chunk and offset, see §9 |
 | Tolerated with a note (§9) | lasso masking (read as transparent colour), BODY ending early, odd CMAP sizes, short CAMG/CRNG/CCRT/GRAB, missing pad bytes, wrong FORM sizes, trailing data |
 | GUI Picture ▸ Save (ADR-8) | writes CAMG from the document target (AGA full mode id, OCS 16-bit), BMHD aspect and page size from the display mode, CRNG/GRAB/transparent colour kept from the loaded file; private chunks (DPPS, DPPV, TINY) and mask planes are not carried over after editing, with a note |
 | True-colour PNG/JPEG → ILBM (ADR-9) | reduced to the mode's colour count, saved with that mode's CAMG; transparent pixels → masking 2 with transparent colour 0 (pink); `convert photo.jpg out.iff` uses the default screen (AGA PAL LoRes) |
-| Not done | EHB/HAM/AGA mode interpretation (Phase 5), CMAP low-nibble variant, chunks after BODY, ANIM |
+| Not done | EHB/HAM editing and export (Phase 5; the writer refuses HAM/EHB), CMAP low-nibble variant, chunks after BODY, ANIM |
 
 Verification on six real DeluxePaint-era pictures (320×200, 5 and 8 planes, ByteRun1, masking 0/2, 4-bit CMAPs, DPPS/DPPV/TINY, up to 16 CRNG): pixels and palettes of our PNG export, our ILBM rewrite and a PNG → ILBM round trip all match an independent Python ILBM decoder read with Pillow. Rewritten files are not byte-identical to the originals: the CMAP is written in replicated form (0xNN instead of 0xN0) and chunks are written in canonical order.
 
@@ -307,7 +308,7 @@ Every read error is a short first line (at most 34 characters / 252 UI-font pixe
 | planes 9–23, 25–31, > 32 | `Bad BMHD: 12 bitplanes` | allowed counts |
 | planes 24 / 32 | `24-bit ILBM: not supported yet` | |
 | masking > 3 / compression > 1 | `Unknown masking type 7` / `Unknown compression type 2` | known values |
-| CAMG HAM / EHB, 6 planes without CAMG | `HAM pictures arrive in Phase 5` / `EHB …` / `HAM/EHB arrive in Phase 5` | CAMG offset and value |
+| CAMG HAM with a plane count other than 6 or 8 | `HAM with 5 bitplanes` | CAMG offset and value |
 | DEEP chunk inside an ILBM | `DEEP ILBM: not supported yet` | offset |
 | ByteRun1 run or literal longer than the rest of its row | `BODY: bad ByteRun1 run, row 12` | file offset of the control byte, run length, plane, bytes left |
 | PNG / JPEG decoder errors | `PNG file is cut off`, `PNG file is damaged`, `JPEG file is cut off`, `JPEG cannot be decoded`, `JPEG variant not supported` … | the decoder's own reason |

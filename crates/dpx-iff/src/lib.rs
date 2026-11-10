@@ -5,4 +5,4 @@ pub mod byterun1;
 pub mod iff;
 pub mod ilbm;
 
-pub use ilbm::{ColorRange, Compression, Ilbm, IlbmError, Masking};
+pub use ilbm::{ColorRange, Compression, Ilbm, IlbmError, Masking, SpecialMode};

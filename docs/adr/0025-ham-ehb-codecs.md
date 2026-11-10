@@ -9,3 +9,5 @@
 - Verified: hand-computed unit tests (set, modify R/G/B, line reset, HAM8 low-bit hold, EHB values), HAM-legal round trip with zero error, determinism. Encode time 320x256 (release, synthetic gradient, quantiser included): HAM6 about 11 ms, HAM8 about 21 ms. Example gradient quality: HAM6 mean error about 8, HAM8 about 2 (Euclidean RGB).
 - Not verified: HAM8 control bits against a real HAM8 file (top planes per [S4] assumed; [S11] disagrees); control-code mapping and per-line start colour against real files/HRM; behaviour of AGA "64 colour without EHB"; no real HAM/EHB file was available (the ILBM reader still refuses them, so no raw plane access). The greedy encoder does not look ahead (no fringing optimisation).
 - Next: the ILBM reader/writer must expose raw plane values for HAM/EHB, then app wiring.
+
+- Addendum (ADR-26): the ILBM reader now hands over raw plane values and Load opens EHB/HAM; the "still refuses" remarks above are superseded.

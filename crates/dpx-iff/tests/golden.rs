@@ -686,37 +686,6 @@ fn refused() -> Vec<(&'static str, Vec<u8>, ErrorKind, String)> {
         "Unknown compression type 2\nBMHD at offset 12 ($C) says compression 2; ILBM knows 0 \
          (none) and 1 (ByteRun1).",
     );
-    let six = |mode: Option<u32>, colors: usize| {
-        let p = pic(16, 2, 6);
-        let mut chunks = vec![bmhd(16, 2, 6, 0, 0, 0), cmap(&palette(colors))];
-        chunks.extend(mode.map(camg));
-        chunks.push(chunk(b"BODY", &body_data(&p, 0)));
-        form(b"ILBM", &chunks)
-    };
-    add(
-        "ham",
-        six(Some(0x800), 16),
-        ErrorKind::Unsupported,
-        "HAM pictures arrive in Phase 5\nCAMG at offset 96 ($60) is $00000800: Hold-And-Modify \
-         with 6 bitplanes. DeluxePainter shows HAM and Extra-Half-Brite pictures from Phase 5 \
-         on.",
-    );
-    add(
-        "ehb",
-        six(Some(0x80), 32),
-        ErrorKind::Unsupported,
-        "EHB pictures arrive in Phase 5\nCAMG at offset 144 ($90) is $00000080: \
-         Extra-Half-Brite with 6 bitplanes. DeluxePainter shows HAM and Extra-Half-Brite \
-         pictures from Phase 5 on.",
-    );
-    add(
-        "six-no-camg",
-        six(None, 32),
-        ErrorKind::Unsupported,
-        "HAM/EHB arrive in Phase 5\n6 bitplanes and no CAMG chunk: an Amiga shows \
-         this as HAM or Extra-Half-Brite. DeluxePainter shows HAM and Extra-Half-Brite \
-         pictures from Phase 5 on.",
-    );
     add(
         "deep",
         with_bmhd(bmhd(16, 2, 2, 0, 0, 0), &[chunk(b"DEEP", &[0; 8])]),
@@ -735,6 +704,96 @@ fn refused() -> Vec<(&'static str, Vec<u8>, ErrorKind, String)> {
     v
 }
 
+/// HAM6 pixels (6 planes, CMAP of 16): control in bits 4-5. Row 0 sets colour 1, then modifies
+/// blue, red, green; row 1 starts with a red modify from colour 0. The rest sets colour x.
+fn ham6_pic() -> Pic {
+    let mut p = pic(16, 2, 6);
+    for (i, v) in p.pixels.iter_mut().enumerate() {
+        *v = (i % 16) as u8;
+    }
+    p.pixels[..4].copy_from_slice(&[0x01, 0x1F, 0x2A, 0x30]);
+    p.pixels[16] = 0x2F;
+    p.palette = palette(16);
+    p
+}
+
+/// HAM8 pixels (8 planes, CMAP of 64): control in bits 6-7, data in bits 0-5.
+fn ham8_pic() -> Pic {
+    let mut p = pic(16, 2, 8);
+    for (i, v) in p.pixels.iter_mut().enumerate() {
+        *v = (i % 64) as u8;
+    }
+    p.pixels[..4].copy_from_slice(&[0x02, 0x50, 0xA0, 0xC0]);
+    p.pixels[16] = 0xBF;
+    p.palette = palette(64);
+    p
+}
+
+/// EHB: 6 planes, indices up to 63, CMAP of 32.
+fn ehb_pic() -> Pic {
+    let mut p = pic(16, 2, 6);
+    p.pixels[0] = 63;
+    p.pixels[1] = 32;
+    p.palette = palette(32);
+    p
+}
+
+/// 6-plane / HAM8 files for the modes the reader hands over as raw plane values.
+fn special_files() -> Vec<(&'static str, Vec<u8>)> {
+    let ehb = ehb_pic();
+    vec![
+        ("ham6", file(&ham6_pic(), 0, &[camg(0x800)])),
+        ("ham8", file(&ham8_pic(), 0, &[camg(0x800)])),
+        ("ehb", file(&ehb, 0, &[camg(0x80)])),
+        // Without CAMG: 32 CMAP entries mean EHB, anything else HAM6.
+        ("ehb-no-camg", file(&ehb, 0, &[])),
+        ("ham6-no-camg", file(&ham6_pic(), 0, &[])),
+    ]
+}
+
+#[test]
+fn ham_and_ehb_files_are_read_as_raw_plane_values() {
+    use dpx_iff::SpecialMode::{Ehb, Ham6, Ham8};
+    let all = special_files();
+    let get = |n: &str| all.iter().find(|f| f.0 == n).unwrap().1.clone();
+    for (name, pic, mode, entries, note) in [
+        ("ham6", ham6_pic(), Ham6, 16, None),
+        ("ham8", ham8_pic(), Ham8, 64, None),
+        ("ehb", ehb_pic(), Ehb, 32, None),
+        (
+            "ehb-no-camg",
+            ehb_pic(),
+            Ehb,
+            32,
+            Some("no CAMG chunk, 6 bitplanes and a 32-colour CMAP: read as Extra-Half-Brite"),
+        ),
+        (
+            "ham6-no-camg",
+            ham6_pic(),
+            Ham6,
+            16,
+            Some(
+                "no CAMG chunk and 6 bitplanes: read as HAM6, as the IFF spec says (it could \
+                 also be a plain 64-colour picture)",
+            ),
+        ),
+    ] {
+        let (got, notes) = read(&get(name));
+        assert_eq!(got.special, Some(mode), "{name}");
+        assert_eq!(
+            got.image.pixels(),
+            &pic.pixels[..],
+            "{name}: raw plane values"
+        );
+        assert_eq!(got.palette.colors(), &pic.palette[..entries], "{name}");
+        assert_eq!(got.planes, pic.planes, "{name}");
+        assert_eq!(
+            notes,
+            note.map(String::from).into_iter().collect::<Vec<_>>()
+        );
+    }
+}
+
 /// 16×2, 1 plane, ByteRun1: row 0 is fine, row 1 repeats 4 bytes into a 2-byte row.
 /// BMHD 12, CMAP 40 (6 bytes), BODY 54, data at 62; the bad control byte is data byte 3.
 fn bad_run() -> Vec<u8> {
@@ -751,7 +810,7 @@ fn bad_run() -> Vec<u8> {
 #[test]
 fn refused_files_have_exact_short_and_long_texts() {
     let all = refused();
-    assert_eq!(all.len(), 22);
+    assert_eq!(all.len(), 19);
     for (name, bytes, kind, text) in all {
         let e = error(&bytes);
         assert_eq!(e.to_string(), text, "{name}");
@@ -780,6 +839,14 @@ fn checked_in() -> Vec<(&'static str, Vec<u8>)> {
             .map(|r| r.1.clone())
             .expect("fixture")
     };
+    let special_files = special_files();
+    let special = |name: &str| {
+        special_files
+            .iter()
+            .find(|f| f.0 == name)
+            .map(|f| f.1.clone())
+            .expect("fixture")
+    };
     vec![
         (
             "golden-8planes-byterun1-65x3.iff",
@@ -793,7 +860,9 @@ fn checked_in() -> Vec<(&'static str, Vec<u8>)> {
         ("broken-body-cut.iff", cut[..68 + 9].to_vec()),
         ("broken-bad-run.iff", bad_run()),
         ("broken-no-body.iff", get("no-body")),
-        ("broken-ham.iff", get("ham")),
+        ("ham6-16x2.iff", special("ham6")),
+        ("ham8-16x2.iff", special("ham8")),
+        ("ehb-16x2.iff", special("ehb")),
     ]
 }
 

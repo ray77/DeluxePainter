@@ -14,6 +14,8 @@ deliberate builder change run `DPX_BLESS=1 cargo test -p dpx-iff --test golden`.
 | `broken-body-cut.iff` | 16x4, 2 planes, file ends 9 bytes into the BODY | loads; rows 2-3 colour 0; note |
 | `broken-bad-run.iff` | ByteRun1 repeat run longer than its row | error `BODY: bad ByteRun1 run, row 1` |
 | `broken-no-body.iff` | file ends inside the CMAP | error `No pixel data (BODY missing)` |
-| `broken-ham.iff` | 6 planes with CAMG HAM | error `HAM pictures arrive in Phase 5` |
+| `ham6-16x2.iff` | 16x2, 6 planes, CMAP of 16, CAMG HAM (formerly `broken-ham.iff`, which was refused) | raw plane values, `special` = HAM6; no notes |
+| `ham8-16x2.iff` | 16x2, 8 planes, CMAP of 64, CAMG HAM | `special` = HAM8; no notes |
+| `ehb-16x2.iff` | 16x2, 6 planes, CMAP of 32, CAMG EHB | `special` = EHB; no notes |
 
 Try them with `deluxepainter info <file>`.
