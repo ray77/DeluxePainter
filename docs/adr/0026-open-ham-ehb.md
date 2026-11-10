@@ -12,3 +12,4 @@
 - Consequences: a HAM picture is lossy on load (reduced to the screen's palette) and its saved copy is plain indexed. Phase 4/5 replace this with the RGBA layer plus raw planes (ADR-4), where the same reader output feeds the layer and the original planes stay the source of truth.
 
 Note: a plain 6-plane ILBM is always written with a CAMG chunk (0), so it can never read back as HAM6; HAM load notes every dropped CRNG/GRAB/mask/extra chunk.
+- Review fix (fix/mcp): MCP `open_picture` follows this ADR for EHB (64 free colours, EHB bit cleared) and refuses HAM with UNSUPPORTED_FILE_TYPE.

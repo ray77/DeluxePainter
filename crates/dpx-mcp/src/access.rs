@@ -71,12 +71,32 @@ impl FileAccess {
         self.dirs.iter().any(|d| canonical.starts_with(d))
     }
 
-    /// True if the path, without touching the file system, names a place inside an approved
-    /// directory and never uses `..`. Decides whether a missing path may be reported as such
-    /// (outside the approved directories nothing is revealed).
+    /// True if `p`, normalised without touching the file system, lies inside an approved
+    /// directory (no `..` escaping, same drive/UNC/device prefix as the directory).
     fn lexically_inside(&self, p: &Path) -> bool {
-        !p.components().any(|c| matches!(c, Component::ParentDir))
-            && self.dirs.iter().any(|d| p.starts_with(d))
+        lexical_parts(p).is_some_and(|parts| {
+            self.dirs
+                .iter()
+                .any(|d| lexical_parts(d).is_some_and(|dp| parts.starts_with(&dp)))
+        })
+    }
+
+    /// True if the nearest existing ancestor of `p` (or `p` itself) canonicalises to a place
+    /// inside an approved directory. Only then may a missing path be reported as missing.
+    fn nearest_existing_inside(&self, p: &Path) -> bool {
+        for anc in p.ancestors() {
+            match anc.canonicalize() {
+                Ok(c) => return self.inside(&c),
+                // A dangling link exists but leads somewhere unknown: say nothing about it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if anc.symlink_metadata().is_ok() {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        false
     }
 
     fn not_allowed(&self, path: &str) -> ToolError {
@@ -90,9 +110,16 @@ impl FileAccess {
     pub fn resolve_read(&self, path: &str) -> Result<PathBuf, ToolError> {
         self.require_on()?;
         let abs = self.absolute(path)?;
+        // Nothing outside the approved directories may be touched, so check lexically first.
+        let Some(abs) = lexical_normalize(&abs).filter(|a| self.lexically_inside(a)) else {
+            return Err(self.not_allowed(path));
+        };
         let canon = match abs.canonicalize() {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.lexically_inside(&abs) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && self.nearest_existing_inside(&abs) =>
+            {
                 return Err(ToolError::new(
                     "FILE_NOT_FOUND",
                     format!("{path}: not found"),
@@ -128,12 +155,18 @@ impl FileAccess {
             return Err(ToolError::invalid(format!("{path}: not a file name")));
         }
         let abs = self.absolute(path)?;
+        let Some(abs) = lexical_normalize(&abs).filter(|a| self.lexically_inside(a)) else {
+            return Err(self.not_allowed(path));
+        };
         let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
             return Err(ToolError::invalid(format!("{path}: not a file name")));
         };
         let canon_parent = match parent.canonicalize() {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.lexically_inside(parent) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && self.nearest_existing_inside(parent) =>
+            {
                 return Err(ToolError::new(
                     "DIR_NOT_FOUND",
                     format!("{path}: the directory does not exist"),
@@ -187,16 +220,26 @@ impl FileAccess {
                 })?;
             return f.write_all(bytes).map_err(io);
         }
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = target
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let tmp = target.with_file_name(format!(".{name}.dpx-tmp-{}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let tmp = target.with_file_name(format!(
+            ".{name}.dpx-tmp-{}-{}-{nanos:x}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // `create_new` fails if the name exists; then it is not ours and must stay.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(io)?;
         let result = (|| {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
             std::fs::rename(&tmp, target)
@@ -206,6 +249,71 @@ impl FileAccess {
         }
         result.map_err(io)
     }
+}
+
+/// Key of a Windows path prefix; verbatim and plain forms of one drive or share are equal.
+/// Portable so it can be unit-tested everywhere.
+fn prefix_key(p: std::path::Prefix<'_>) -> String {
+    use std::path::Prefix::*;
+    let lower = |s: &std::ffi::OsStr| s.to_string_lossy().to_lowercase();
+    match p {
+        Disk(d) | VerbatimDisk(d) => format!("disk:{}", (d as char).to_ascii_lowercase()),
+        UNC(a, b) | VerbatimUNC(a, b) => format!("unc:{}\\{}", lower(a), lower(b)),
+        Verbatim(s) => format!("verbatim:{}", lower(s)),
+        DeviceNS(s) => format!("device:{}", lower(s)),
+    }
+}
+
+/// The path as comparable parts (prefix key, root, names), `.` and `..` resolved lexically.
+/// `None` if `..` would climb above the root or the prefix.
+fn lexical_parts(p: &Path) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut floor = 0;
+    for c in p.components() {
+        match c {
+            Component::Prefix(x) => {
+                parts.push(prefix_key(x.kind()));
+                floor = parts.len();
+            }
+            Component::RootDir => {
+                parts.push("/".into());
+                floor = parts.len();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.len() <= floor {
+                    return None;
+                }
+                parts.pop();
+            }
+            Component::Normal(n) => {
+                let n = n.to_string_lossy();
+                parts.push(if cfg!(windows) {
+                    n.to_lowercase()
+                } else {
+                    n.into_owned()
+                });
+            }
+        }
+    }
+    Some(parts)
+}
+
+/// `p` with `.` and `..` removed lexically (nothing is read from disk); `None` if `..` climbs
+/// above the root.
+fn lexical_normalize(p: &Path) -> Option<PathBuf> {
+    lexical_parts(p)?;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -288,6 +396,120 @@ pub(crate) mod tests {
         std::fs::create_dir(allowed.join("s")).unwrap();
         std::fs::write(allowed.join("a.iff"), b"x").unwrap();
         assert!(a.resolve_read("s/../a.iff").is_ok());
+    }
+
+    #[test]
+    fn lexical_parts_refuse_escapes_and_compare_prefixes() {
+        assert!(lexical_parts(Path::new("/a/../..")).is_none());
+        assert_eq!(
+            lexical_parts(Path::new("/a/./b/../c")),
+            lexical_parts(Path::new("/a/c"))
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c")).unwrap(),
+            Path::new("/a/c")
+        );
+        use std::ffi::OsStr;
+        use std::path::Prefix::*;
+        assert_eq!(
+            prefix_key(Disk(b'C')),
+            prefix_key(VerbatimDisk(b'c')),
+            "plain and verbatim drive are one place"
+        );
+        assert_ne!(prefix_key(Disk(b'C')), prefix_key(Disk(b'D')));
+        let (h, s) = (OsStr::new("Host"), OsStr::new("Share"));
+        assert_eq!(prefix_key(UNC(h, s)), prefix_key(VerbatimUNC(h, s)));
+        assert_ne!(prefix_key(UNC(h, s)), prefix_key(Disk(b'C')));
+        assert_ne!(
+            prefix_key(DeviceNS(OsStr::new("C"))),
+            prefix_key(Disk(b'C'))
+        );
+        assert_ne!(
+            prefix_key(Verbatim(OsStr::new("C:"))),
+            prefix_key(Disk(b'C'))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_and_device_paths_are_refused_without_touching_them() {
+        let allowed = scratch("unc");
+        let a = FileAccess::new([allowed.clone()]).unwrap();
+        for p in [
+            r"\\attacker.invalid\s\a.iff",
+            r"\\?\UNC\attacker.invalid\s\a.iff",
+            r"\\.\PHYSICALDRIVE0",
+            r"\\?\GLOBALROOT\x",
+        ] {
+            assert_eq!(code(a.resolve_read(p)), "PATH_NOT_ALLOWED", "{p}");
+            assert_eq!(code(a.resolve_write(p, true)), "PATH_NOT_ALLOWED", "{p}");
+        }
+    }
+
+    #[test]
+    fn outside_paths_are_refused_before_any_file_system_access() {
+        let allowed = scratch("lex");
+        let a = FileAccess::new([allowed]).unwrap();
+        let p = std::env::temp_dir().join("dpx-no-such-dir-xyz/q.iff");
+        assert_eq!(
+            code(a.resolve_read(p.to_str().unwrap())),
+            "PATH_NOT_ALLOWED"
+        );
+        assert_eq!(
+            code(a.resolve_write(p.to_str().unwrap(), false)),
+            "PATH_NOT_ALLOWED"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_do_not_reveal_whether_outside_paths_exist() {
+        use std::os::unix::fs::symlink;
+        let allowed = scratch("orc");
+        let outside = scratch("orc-out");
+        std::fs::write(outside.join("exists.iff"), b"x").unwrap();
+        symlink(&outside, allowed.join("link")).unwrap();
+        symlink(outside.join("nope"), allowed.join("dangling")).unwrap();
+        let a = FileAccess::new([allowed.clone()]).unwrap();
+        assert_eq!(code(a.resolve_read("link/exists.iff")), "PATH_NOT_ALLOWED");
+        assert_eq!(code(a.resolve_read("link/missing.iff")), "PATH_NOT_ALLOWED");
+        assert_eq!(code(a.resolve_read("dangling")), "PATH_NOT_ALLOWED");
+        assert_eq!(
+            code(a.resolve_write("link/x.iff", false)),
+            "PATH_NOT_ALLOWED"
+        );
+        assert_eq!(
+            code(a.resolve_write("link/nodir/x.iff", false)),
+            "PATH_NOT_ALLOWED"
+        );
+        // Inside, missing things are still reported as missing.
+        assert_eq!(code(a.resolve_read("missing.iff")), "FILE_NOT_FOUND");
+        assert_eq!(code(a.resolve_write("nodir/x.iff", false)), "DIR_NOT_FOUND");
+    }
+
+    #[test]
+    fn overwrite_temp_names_are_per_call_and_foreign_files_survive() {
+        let d = scratch("tmp");
+        let target = d.join("keep.iff");
+        let old = d.join(format!(".keep.iff.dpx-tmp-{}", std::process::id()));
+        std::fs::write(&old, b"user data").unwrap();
+        FileAccess::write_file(&target, b"one", true).unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), b"user data");
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let t = target.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        FileAccess::write_file(&t, b"two", true).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2, "no temp left");
     }
 
     #[cfg(unix)]

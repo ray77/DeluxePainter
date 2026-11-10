@@ -4,8 +4,9 @@
 //! because the app crate depends on this one. True-colour PNG and JPEG need the app's colour
 //! reduction (ADR-9) and are not supported here (ADR-24).
 
-use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Rgb8, Target};
-use dpx_iff::{Ilbm, Masking, ilbm};
+use dpx_core::quantize::PaletteDepth;
+use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Palette, Rgb8, Target};
+use dpx_iff::{Ilbm, Masking, SpecialMode, ilbm};
 
 use crate::error::ToolError;
 
@@ -50,6 +51,26 @@ fn bad_file(path: &str, e: impl std::fmt::Display) -> ToolError {
     ToolError::new("INVALID_FILE", format!("{path}: {e}"))
 }
 
+/// EHB as 64 free colours, like the app's Load: the half-bright copies become real palette
+/// entries and the EHB bit is cleared so the file reads as a plain 64-colour picture.
+fn ehb_to_indexed(pic: &mut Ilbm, notes: &mut Vec<String>) {
+    let base = pic.palette.colors().to_vec();
+    let is_12_bit = |c: &Rgb8| [c.r, c.g, c.b].iter().all(|&v| v & 0x0F == v >> 4);
+    let depth = if pic.cmap_4bit_fixed || base.iter().all(is_12_bit) {
+        PaletteDepth::Rgb4
+    } else {
+        PaletteDepth::Rgb8
+    };
+    pic.palette =
+        Palette::new(dpx_formats::ehb::ehb_palette(&base, depth).to_vec()).expect("64 entries");
+    pic.special = None;
+    pic.camg = Some(pic.camg.unwrap_or(0) & !ilbm::CAMG_EHB);
+    notes.push(
+        "Extra-Half-Brite picture: opened as 64 free colours (32-63 are the half-bright copies); saving writes a 64-colour 6-plane ILBM, not EHB"
+            .into(),
+    );
+}
+
 /// Decodes an indexed ILBM or PNG into a document at revision 0 plus notes about whatever
 /// the document model does not keep.
 pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>), ToolError> {
@@ -58,8 +79,17 @@ pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>
     }
     let mut notes = Vec::new();
     let (image, palette, camg, page_fields) = if bytes.starts_with(b"FORM") {
-        let (i, n) = ilbm::read_with_notes(bytes).map_err(|e| bad_file(name, e))?;
+        let (mut i, n) = ilbm::read_with_notes(bytes).map_err(|e| bad_file(name, e))?;
         notes.extend(n);
+        match i.special {
+            Some(SpecialMode::Ham6 | SpecialMode::Ham8) => {
+                return Err(unsupported(format!(
+                    "{name}: HAM pictures cannot be opened over MCP (HAM is decoded to true colour and reduced by the app); open an indexed ILBM or PNG"
+                )));
+            }
+            Some(SpecialMode::Ehb) => ehb_to_indexed(&mut i, &mut notes),
+            None => {}
+        }
         if !i.ranges.is_empty() {
             notes.push(format!(
                 "{} colour-cycling ranges not kept (not in the document model yet)",
@@ -258,7 +288,34 @@ pub fn encode_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dpx_core::Palette;
+
+    fn data(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/../dpx-iff/tests/data/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn ehb_opens_as_64_colours_and_saves() {
+        let (d, notes) = decode_picture("e", &data("ehb-16x2.iff")).unwrap();
+        assert_eq!(d.palette().len(), 64);
+        let max = d.page().pixels().iter().copied().max().unwrap();
+        assert!(usize::from(max) < 64);
+        assert!(notes.iter().any(|n| n.contains("Extra-Half-Brite")));
+        encode_document(&d, Format::Ilbm).unwrap();
+        encode_document(&d, Format::Png).unwrap();
+    }
+
+    #[test]
+    fn ham_is_refused() {
+        for f in ["ham6-16x2.iff", "ham8-16x2.iff"] {
+            let e = decode_picture("h", &data(f)).unwrap_err();
+            assert_eq!(e.code, "UNSUPPORTED_FILE_TYPE", "{f}");
+            assert!(e.message.contains("HAM"));
+        }
+    }
 
     fn doc() -> Document {
         let mut page = IndexedImage::new(320, 256, 0);

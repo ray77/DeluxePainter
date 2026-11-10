@@ -532,7 +532,37 @@ impl Painter {
 }
 
 #[tool_handler(name = "deluxepainter")]
-impl ServerHandler for Painter {}
+impl ServerHandler for Painter {
+    /// Like the generated handler, but argument deserialisation errors become ordinary
+    /// `INVALID_ARGUMENT: ...` error results (ADR-24) instead of JSON-RPC errors.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        match Self::tool_router().call(tcc).await? {
+            rmcp::model::CallToolResponse::Complete(r) => Ok(invalid_argument(r).into()),
+            other => Ok(other),
+        }
+    }
+}
+
+/// rmcp reports a tool-argument deserialisation failure as an `isError` result reading
+/// `failed to deserialize parameters: ...`; this rewrites it to `INVALID_ARGUMENT: ...`.
+fn invalid_argument(r: CallToolResult) -> CallToolResult {
+    const PREFIX: &str = "failed to deserialize parameters:";
+    if r.is_error == Some(true)
+        && let Some(detail) = r
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .and_then(|t| t.text.strip_prefix(PREFIX))
+    {
+        return error_result(&ToolError::invalid(detail.trim_start()));
+    }
+    r
+}
 
 const USAGE: &str = "usage: deluxepainter mcp [--allow-dir DIR]...";
 
