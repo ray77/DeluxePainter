@@ -615,11 +615,13 @@ impl Action {
 }
 
 /// Brush items need a brush: only Load.. works without one and Restore needs a picked-up one.
+/// Color ▸ Palette ▸ Use Brush Palette needs one too (ADR-39).
 fn brush_item_usable(id: &str, ctx: &MenuContext) -> bool {
     match id {
         "brush.load" => true,
         "brush.restore" => ctx.can_restore,
         _ if id.starts_with("brush.") => ctx.has_brush,
+        "palette.use_brush" => ctx.has_brush,
         _ => true,
     }
 }
@@ -656,14 +658,14 @@ pub const IMPLEMENTED: &[&str] = &[
     // Effect
     "background.fix",
     "background.free",
-    // Effect > Stencil (ADR-20); Show, Paint, Load and Save stay ghosted.
+    // Effect > Stencil (ADR-20); Show, Load and Save follow with ADR-31, Paint with ADR-39.
     "stencil.make",
     "stencil.remake",
     "stencil.reverse",
     "stencil.toggle",
     "stencil.free",
-    // Palette ops and effects (ADR-31); Use Brush Palette (brushes carry no palette) and
-    // Background > Lock FG (needs an area stencil) stay ghosted.
+    // Palette ops and effects (ADR-31); Use Brush Palette and Background > Lock FG follow
+    // with ADR-39.
     "palette.arrange",
     "color.remap",
     "color_set.load",
@@ -735,6 +737,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "brush.to_spare",
     "brush.swap_spare",
     "brush.remap",
+    // ADR-39: Use Brush Palette (needs a brush), Recompute (HAM screens only), Stencil ▸ Paint
+    // and Background ▸ Lock FG. Picture ▸ Print stays ghosted (no printer output).
+    "palette.use_brush",
+    "color.recompute",
+    "stencil.paint",
+    "background.lock_fg",
 ];
 
 impl Item {
@@ -1395,8 +1403,9 @@ mod tests {
         assert!(Action::Command("spare.swap").enabled(&c));
         assert!(!Action::Command("picture.print").enabled(&c));
         assert!(Action::Command("stencil.make").enabled(&c));
-        assert!(!Action::Command("stencil.paint").enabled(&c));
+        assert!(Action::Command("stencil.paint").enabled(&c));
         assert!(!Action::Command("color.recompute").enabled(&c));
+        assert!(!Action::Command("palette.use_brush").enabled(&c));
         // Mode, Prefs and Pixel Size items stay enabled.
         assert!(Action::Mode(PaintMode::Matte).enabled(&c));
         assert!(Action::Pref(Pref::FastFb).enabled(&c));
@@ -1417,6 +1426,7 @@ mod tests {
         assert!(Action::Command("brush.flip_horizontal").enabled(&with));
         assert!(Action::Command("brush.restore").enabled(&with));
         assert!(Action::Command("brush.stretch").enabled(&with));
+        assert!(Action::Command("palette.use_brush").enabled(&with));
         assert!(
             !Action::Command("brush.metamorph").enabled(&with),
             "Metamorph: ghosted"

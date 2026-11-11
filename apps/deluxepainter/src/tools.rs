@@ -140,9 +140,23 @@ struct Ink {
     right: bool,
     /// Effect menu: Translucency, Process, AntiAlias (ADR-31).
     fx: dpx_core::PaintFx,
+    /// The area stencil (ADR-39): every command of the gesture is wrapped in it, so the
+    /// preview spares the same pixels as the engine.
+    area: Option<dpx_core::AreaStencil>,
 }
 
 impl Ink {
+    /// `cmd` under the area stencil, if there is one.
+    fn stenciled(&self, cmd: Command) -> Command {
+        match &self.area {
+            Some(area) => Command::Stenciled {
+                area: area.clone(),
+                command: Box::new(cmd),
+            },
+            None => cmd,
+        }
+    }
+
     /// Whether parts of a stroke may be painted on top of each other: the modes that only set
     /// colours. The others depend on the order and motion of every stamp, so the preview is
     /// painted again as a whole.
@@ -572,8 +586,19 @@ impl Stroke {
 
     /// The command this gesture stands for: as shown while drawing, or (`commit`) as
     /// committed. They differ only for filled freehand and polygons (outline, then filled)
-    /// and the polygon's rubber band (dropped).
+    /// and the polygon's rubber band (dropped). Under the area stencil (ADR-39).
     fn candidate(&self, commit: bool) -> Option<Command> {
+        self.bare_candidate(commit).map(|c| self.ink.stenciled(c))
+    }
+
+    /// The command the gesture shows now (ADR-39: Stencil ▸ Paint paints it into the mask
+    /// view); `None` for the Brush Selector's frame.
+    pub(crate) fn preview_command(&self) -> Option<Command> {
+        self.candidate(false)
+    }
+
+    /// [`Self::candidate`] without the area stencil.
+    fn bare_candidate(&self, commit: bool) -> Option<Command> {
         if self.spaced()
             && let Some((path, closed)) = self.outline_path(commit)
         {
@@ -696,6 +721,7 @@ impl Stroke {
     /// document page (the page before the gesture). A part the engine would refuse is not
     /// shown, so nothing appears that vanishes on release.
     fn paint_more(&mut self, cmd: &Command, page: &IndexedImage, palette: &Palette) {
+        let cmd = &self.ink.stenciled(cmd.clone());
         if cmd.check_paint(page, palette).is_err() {
             return;
         }
@@ -909,6 +935,7 @@ impl PainterApp {
         ink.mode = DrawMode::Matte;
         ink.range = None;
         ink.stencil = None;
+        ink.area = None;
         let mut s = Stroke {
             preview: doc.page().clone(),
             drawn: Rect::default(),
@@ -1057,6 +1084,7 @@ impl PainterApp {
             stencil: self.stencil.clone(),
             right,
             fx: self.menu_data.effects.fx(),
+            area: self.active_area().cloned(),
         }
     }
 

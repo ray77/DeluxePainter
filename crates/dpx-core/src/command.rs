@@ -198,6 +198,14 @@ pub enum Command {
     /// Color ▸ Palette ▸ Arrange (ADR-31): reorders the palette, `order[new] = old` (a
     /// permutation of all entries), and renumbers the pixels so the picture looks the same.
     ArrangePalette { order: Vec<u8> },
+    /// An area stencil over a painting command (ADR-39; Effect ▸ Stencil ▸ Paint, Background ▸
+    /// Lock FG): `command` (Stroke, Shape, FloodFill, Clear, or a SetPage of the page's size,
+    /// such as CLR on a fixed background) paints as usual, but the pixels `area` protects
+    /// keep their colour. `area` has the page's size.
+    Stenciled {
+        area: crate::stencil::AreaStencil,
+        command: Box<Command>,
+    },
 }
 
 impl Command {
@@ -312,6 +320,17 @@ impl Command {
                     )));
                 }
                 return Ok(());
+            }
+            Command::Stenciled { area, command } => {
+                check_area(area, page)?;
+                return match **command {
+                    Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
+                        command.check_paint(page, palette)
+                    }
+                    _ => Err(CommandError::invalid(
+                        "only strokes, shapes and fills paint page pixels".into(),
+                    )),
+                };
             }
             _ => {
                 return Err(CommandError::invalid(
@@ -484,6 +503,25 @@ impl Command {
             | Command::DeleteFrames { .. }
             | Command::GotoFrame { .. }
             | Command::SetFrameRate { .. } => unreachable!("frame commands are checked above"),
+            Command::Stenciled { area, command } => {
+                check_area(area, &doc.page)?;
+                let same = |w: u32, h: u32| (w, h) == (doc.page.width(), doc.page.height());
+                match **command {
+                    Command::Stroke { .. }
+                    | Command::Shape { .. }
+                    | Command::FloodFill { .. }
+                    | Command::Clear { .. } => {}
+                    Command::SetPage { width, height, .. } if same(width, height) => {}
+                    _ => {
+                        return Err(CommandError::invalid(
+                            "an area stencil covers strokes, shapes, fills, CLR and a page of \
+                             the same size only"
+                                .into(),
+                        ));
+                    }
+                }
+                command.validate(doc)
+            }
             Command::ArrangePalette { order } => {
                 if crate::remap::is_permutation(order, colors) {
                     Ok(())
@@ -530,6 +568,7 @@ impl Command {
             | Command::DeleteFrames { .. } => Footprint::Frames,
             Command::GotoFrame { .. } | Command::SetFrameRate { .. } => Footprint::Setting,
             Command::ArrangePalette { .. } => Footprint::Document,
+            Command::Stenciled { command, .. } => command.footprint(doc),
         }
     }
 
@@ -540,7 +579,10 @@ impl Command {
         }
         let page = &mut doc.page;
         match self {
-            Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
+            Command::Stroke { .. }
+            | Command::Shape { .. }
+            | Command::FloodFill { .. }
+            | Command::Stenciled { .. } => {
                 let before = page.clone();
                 self.paint(page, &before, &doc.palette);
             }
@@ -730,6 +772,21 @@ fn validate_paint(
         )));
     }
     Ok(())
+}
+
+/// An area stencil (ADR-39) must have the page's size.
+fn check_area(area: &crate::stencil::AreaStencil, page: &IndexedImage) -> Result<(), CommandError> {
+    if area.fits(page) {
+        Ok(())
+    } else {
+        Err(CommandError::invalid(format!(
+            "area stencil {}x{} does not fit the {}x{} page",
+            area.width(),
+            area.height(),
+            page.width(),
+            page.height()
+        )))
+    }
 }
 
 /// Checks a page passed in a command: `width`×`height` pixels, all inside the palette.

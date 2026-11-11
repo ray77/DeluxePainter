@@ -926,6 +926,7 @@ mod tests {
                             palette: &pal,
                             range: None,
                             stencil: None,
+                            area: None,
                             before: &page,
                             motion: (0, 0),
                             right: false,

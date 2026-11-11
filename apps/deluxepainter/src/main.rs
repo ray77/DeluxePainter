@@ -24,6 +24,7 @@
 //!     [--light-table [LIST]]            Light Table on (previous,next,two_back,spare,dim)
 //!     [--anim-requester KIND]           show an Anim requester: count, add, copy, delete,
 //!                                       goto or rate
+//!     [--stencil-paint X,Y,W,H]         Stencil ▸ Paint with that rectangle painted (ADR-39)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -38,6 +39,7 @@ mod config;
 mod effects;
 mod files;
 mod menu_actions;
+mod palette_stencil;
 mod recovery;
 mod settings;
 mod tools;
@@ -451,6 +453,16 @@ fn main() -> eframe::Result {
             Document::from_picture(page, doc.palette().clone(), doc.target())
         } else {
             doc
+        };
+        // ADR-39: the Stencil ▸ Paint view.
+        let doc = match arg_value(&args, "--stencil-paint") {
+            Some(spec) => {
+                palette_stencil::snapshot_view(&spec, &doc, &mut ui).unwrap_or_else(|e| {
+                    eprintln!("--stencil-paint: {e}");
+                    std::process::exit(2);
+                })
+            }
+            None => doc,
         };
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
@@ -1294,11 +1306,16 @@ impl PainterApp {
     /// Executes a command; a pending stroke is committed first so the order stays intact.
     fn run(&mut self, command: Command) {
         self.finish_stroke();
-        let command = self.with_fixed_background(command);
+        // ADR-15 CLR on a fixed background, under the area stencil of ADR-39.
+        let command = self.with_background_and_area(command);
         self.execute(command);
     }
 
     fn execute(&mut self, command: Command) {
+        // ADR-39: Stencil ▸ Paint takes painting commands; the area stencil joins the rest.
+        let Some(command) = self.area_route(command) else {
+            return;
+        };
         if let Err(e) = self.engine.execute(command) {
             eprintln!("command rejected: {e}");
         }
@@ -1307,6 +1324,9 @@ impl PainterApp {
 
     fn undo(&mut self) {
         self.finish_stroke();
+        if self.stencil_paint_undo(false) {
+            return;
+        }
         Self::report(self.engine.undo(), ErrorCode::NothingToUndo);
         self.clamp_colors();
         self.clamp_scroll();
@@ -1315,6 +1335,9 @@ impl PainterApp {
 
     fn redo(&mut self) {
         self.finish_stroke();
+        if self.stencil_paint_undo(true) {
+            return;
+        }
         Self::report(self.engine.redo(), ErrorCode::NothingToRedo);
         self.clamp_colors();
         self.clamp_scroll();
@@ -1377,6 +1400,9 @@ impl PainterApp {
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::PixelSize(p) => self.set_pixel_size(p),
             Action::Command(id) => match id {
+                // ADR-39 (palette_stencil.rs): its own items, and the Stencil items while there
+                // is an area stencil; other items end Stencil ▸ Paint first.
+                id if self.takes_adr39(id) => self.adr39_action(id),
                 "color.ranges" => self.open_ranges(),
                 "palette.mixer" => {
                     self.finish_stroke();
@@ -1744,6 +1770,7 @@ impl eframe::App for PainterApp {
         if !was_typing {
             self.menu_keys(&ctx);
             self.anim_keys(&ctx);
+            self.palette_stencil_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
@@ -2251,6 +2278,7 @@ impl PainterApp {
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
             self.prepare_anim_view();
+            self.prepare_stencil_view();
             let (screen, rgba) = match (&self.requester, &self.show_page) {
                 (Some(req), _) => {
                     let screen = req.render();
@@ -2307,7 +2335,7 @@ mod tests {
 
     /// One full `ui()` pass at time `t` with `events`; returns when egui wants the next
     /// pass (the real window repaints only then, unless the pointer moves).
-    fn ui_pass(
+    pub(crate) fn ui_pass(
         app: &mut PainterApp,
         ctx: &egui::Context,
         t: f64,
@@ -2329,7 +2357,7 @@ mod tests {
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
     }
 
-    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+    pub(crate) fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: None,
@@ -2341,7 +2369,7 @@ mod tests {
 
     /// Presses and releases `key` at `t`, then runs passes only when egui asks for them
     /// (as the idle real window does) until `until`; `seen` is called after every pass.
-    fn press_and_idle(
+    pub(crate) fn press_and_idle(
         app: &mut PainterApp,
         ctx: &egui::Context,
         key: egui::Key,
@@ -2434,7 +2462,7 @@ mod tests {
 
     /// The window point (1280×1024 test window, 1 pixel per point) over UI pixel (`x`, `y`),
     /// after a pass has laid the screen out.
-    fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
+    pub(crate) fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
         let (view, scale) = app.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
@@ -2449,7 +2477,7 @@ mod tests {
 
     /// UI pixels over the title of the menu holding `id`, over the item whose submenu holds
     /// it, and over `id` itself (from the menu geometry, checked with the pointer tracking).
-    fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
+    pub(crate) fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
         let (w, h) = app.view().ui_size();
         let wanted = Action::Command(id);
         let (m, item, sub) = MENUS

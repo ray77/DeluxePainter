@@ -616,8 +616,8 @@ mod tests {
             assert!(Action::Command(id).enabled(&PainterApp::new().ui.menu_context()));
         }
         assert!(
-            !IMPLEMENTED.contains(&"stencil.paint"),
-            "Paint is still open (ADR-31)"
+            IMPLEMENTED.contains(&"stencil.paint"),
+            "Paint came with ADR-39"
         );
     }
 

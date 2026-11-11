@@ -110,6 +110,10 @@ fn command_bytes(command: &Command) -> u64 {
         Command::SetPage { pixels, .. } | Command::MergePage { pixels, .. } => pixels.len() as u64,
         Command::SetPalette { colors } => 3 * colors.len() as u64,
         Command::ArrangePalette { order } => order.len() as u64,
+        // ADR-39: the mask (shared between commands, counted for each).
+        Command::Stenciled { area, command } => {
+            u64::from(area.width()) * u64::from(area.height()) + command_bytes(command)
+        }
         _ => 0,
     }
 }

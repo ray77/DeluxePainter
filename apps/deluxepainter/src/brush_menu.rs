@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use dpx_core::{BrushImage, IndexedImage, Palette, brush_ops};
-use dpx_iff::ilbm::{self, Compression, Ilbm, Masking};
+use dpx_iff::ilbm::{self, ColorRange, Compression, Ilbm, Masking};
 use dpx_ui::FileKind;
 
 use crate::tools::XformKind;
@@ -16,10 +16,16 @@ use crate::{PainterApp, files, note_requester};
 /// Title of the note requester after Brush ▸ Load.
 const BRUSH_LOADED: &str = "Brush loaded";
 
-/// A brush as an ILBM file: BMHD masking 2 with the transparent colour, the handle in GRAB
-/// and the palette in CMAP (brush files carry their palette, manual AGA p.242).
-pub fn encode_brush(brush: &BrushImage, palette: &Palette) -> Result<Vec<u8>, String> {
+/// A brush as an ILBM file: BMHD masking 2 with the transparent colour, the handle in GRAB,
+/// the palette in CMAP and the colour ranges in CRNG (brush files carry their palette and
+/// cycling data, manual AGA p.242, p.267; ranges since ADR-39).
+pub fn encode_brush(
+    brush: &BrushImage,
+    palette: &Palette,
+    ranges: &[ColorRange],
+) -> Result<Vec<u8>, String> {
     let mut file = Ilbm::from_indexed(brush.to_image(), palette.clone());
+    file.ranges = ranges.to_vec();
     if let Some(t) = brush.transparent {
         file.masking = Masking::TransparentColor;
         file.transparent_color = u16::from(t);
@@ -31,8 +37,18 @@ pub fn encode_brush(brush: &BrushImage, palette: &Palette) -> Result<Vec<u8>, St
 
 /// A brush from an ILBM file. Its colours are fitted to `page_palette` where the palettes
 /// differ (the picture palette stays as it is); the second value is how many colours had
-/// to change. A mask plane becomes a transparent colour that no opaque pixel uses.
+/// to change. A mask plane becomes a transparent colour that no opaque pixel uses. (The app
+/// loads with [`read_brush`] and [`fit_brush`], ADR-39.)
+#[cfg(test)]
 pub fn decode_brush(bytes: &[u8], page_palette: &Palette) -> Result<(BrushImage, usize), String> {
+    let (brush, palette, _) = read_brush(bytes)?;
+    Ok(fit_brush(&brush, &palette, page_palette))
+}
+
+/// A brush file as it is (ADR-39): the brush in the file's colour numbers, the file's palette
+/// and its colour ranges. A mask plane becomes a transparent colour that no opaque pixel
+/// uses.
+pub fn read_brush(bytes: &[u8]) -> Result<(BrushImage, Palette, Vec<ColorRange>), String> {
     let file = ilbm::read(bytes).map_err(|e| e.summary)?;
     let (width, height) = (file.image.width(), file.image.height());
     let mut pixels = file.image.pixels().to_vec();
@@ -56,16 +72,35 @@ pub fn decode_brush(bytes: &[u8], page_palette: &Palette) -> Result<(BrushImage,
             transparent = Some(t);
         }
     }
-    // Fit the colours: indices whose colour differs from the page palette's go to the
-    // nearest page colour. The transparent colour keeps its index.
+    let image = IndexedImage::from_pixels(width, height, pixels).ok_or("bad brush size")?;
+    let mut brush = BrushImage::from_image(&image, transparent);
+    if let Some((x, y)) = file.grab {
+        brush.handle = (
+            i32::from(x).clamp(0, width as i32 - 1),
+            i32::from(y).clamp(0, height as i32 - 1),
+        );
+    }
+    Ok((brush, file.palette, file.ranges))
+}
+
+/// `brush` (colour numbers of `file_palette`) with its colours fitted to `page_palette`: numbers
+/// whose colour differs from the page palette's go to the nearest page colour, the
+/// transparent colour keeps its number. The second value is how many colours had to change.
+pub fn fit_brush(
+    brush: &BrushImage,
+    file_palette: &Palette,
+    page_palette: &Palette,
+) -> (BrushImage, usize) {
+    let transparent = brush.transparent;
     let mut map: [Option<u8>; 256] = [None; 256];
     let mut changed = 0;
-    for &p in &pixels {
+    let mut out = brush.clone();
+    for &p in &brush.pixels {
         let slot = &mut map[usize::from(p)];
         if slot.is_some() {
             continue;
         }
-        let want = file.palette.get(p);
+        let want = file_palette.get(p);
         let to = match want {
             Some(c) if page_palette.get(p) != Some(c) => {
                 changed += usize::from(Some(p) != transparent);
@@ -75,18 +110,10 @@ pub fn decode_brush(bytes: &[u8], page_palette: &Palette) -> Result<(BrushImage,
         };
         *slot = Some(if Some(p) == transparent { p } else { to });
     }
-    for p in &mut pixels {
+    for p in &mut out.pixels {
         *p = map[usize::from(*p)].unwrap_or(*p);
     }
-    let image = IndexedImage::from_pixels(width, height, pixels).ok_or("bad brush size")?;
-    let mut brush = BrushImage::from_image(&image, transparent);
-    if let Some((x, y)) = file.grab {
-        brush.handle = (
-            i32::from(x).clamp(0, width as i32 - 1),
-            i32::from(y).clamp(0, height as i32 - 1),
-        );
-    }
-    Ok((brush, changed))
+    (out, changed)
 }
 
 impl PainterApp {
@@ -184,9 +211,12 @@ impl PainterApp {
     fn load_brush(&mut self, path: &Path) {
         let result = std::fs::read(path)
             .map_err(|e| e.to_string())
-            .and_then(|b| decode_brush(&b, self.engine.document().palette()));
+            .and_then(|b| read_brush(&b));
         match result {
-            Ok((brush, changed)) => {
+            Ok((own, palette, ranges)) => {
+                let (brush, changed) = fit_brush(&own, &palette, self.engine.document().palette());
+                // ADR-39: Use Brush Palette needs the file's own palette and ranges.
+                self.remember_loaded_brush(own, palette, ranges, brush.clone());
                 self.custom_brush = Some(brush.clone());
                 self.picked_brush = Some(brush);
                 self.tools.brush_palette = Some(self.engine.document().palette().clone());
@@ -220,7 +250,7 @@ impl PainterApp {
         let Some(brush) = &self.custom_brush else {
             return;
         };
-        let bytes = encode_brush(brush, self.engine.document().palette());
+        let bytes = encode_brush(brush, self.engine.document().palette(), &self.extras.ranges);
         match bytes.and_then(|b| files::write_atomic(path, &b)) {
             Ok(()) => self.ui.file_requester = None,
             Err(e) => {
@@ -343,7 +373,7 @@ mod tests {
         let mut other = Palette::dpaint_default_32().colors().to_vec();
         other[5] = Rgb8::new(1, 2, 3);
         let other = Palette::new(other).unwrap();
-        let bytes = encode_brush(&brush(), &other).unwrap();
+        let bytes = encode_brush(&brush(), &other, &[]).unwrap();
         let page = Palette::dpaint_default_32();
         let (b, changed) = decode_brush(&bytes, &page).unwrap();
         assert_eq!(changed, 1);
@@ -468,6 +498,7 @@ mod tests {
                     palette: &pal,
                     range: Some((4, 15)),
                     stencil: None,
+                    area: None,
                     before: &before,
                     motion,
                     right: false,
