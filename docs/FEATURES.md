@@ -14,6 +14,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P0 | Colour indicator + palette under the toolbox, FG = left mouse, BG = right mouse, AGA page selector for 256 colours; `[ ]` / `{ }` step FG/BG | |
 | P0 | Canvas zoom (1–16×), pan, pixel grid; coordinates with lower-left (DPaint default) or upper-left origin | |
 | P1 | F10 hide toolbox + bar, F9 bar only, Shift-F10 all panels; `S` show page | |
+| P1 | Tooltips: English name and shortcut of the toolbox and Control Panel button under the resting pointer (a DeluxePainter addition, owner request) | done (ADR-41): after 0.5 s, the next button at once, hidden under menus, requesters and playback; split buttons name the half under the pointer |
 | P1 | Keyboard navigation in requesters (AGA addition) | |
 | P0 | Undo / redo (multi-level) | DPaint had one level; we keep the button, add history |
 | P1 | Requesters (modal, keyboard: Enter/Esc/Tab): Screen Format, Page Size, Palette, Fill Type, Spacing, Grid, Symmetry, Font, File | Square corners, 1-px bevels |
@@ -49,14 +50,14 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Airbrush, spacing (N total / every Nth / airbrush / continuous) | Spacing requester; airbrush done (ADR-14), Spacing requester and airbrush radius done (ADR-20) |
 | P0 | Pipette (pick colour) | |
 | P1 | Brush pick-up (rectangle, lasso), last brush, custom brush stamping | |
-| P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | flip, rotate 90, halve/double, outline/trim, handle centre/corner, BG/FG colour items, load/save brush files (ILBM) done (ADR-19); stretch, any angle, shear, bend, place handle (drag gestures), spare brush and Remap done (ADR-30); Metamorph open |
+| P1 | Brush transforms: flip H/V, rotate 90°/any, stretch/halve/double, outline/trim, handle | flip, rotate 90, halve/double, outline/trim, handle centre/corner, BG/FG colour items, load/save brush files (ILBM) done (ADR-19); stretch, any angle, shear, bend, place handle (drag gestures), spare brush and Remap done (ADR-30); Brush ▸ Spare ▸ Metamorph.. (Alt+`m`) done (ADR-36) |
 | P1 | Text tool with bitmap fonts | original fonts only; UI font done (ADR-14), Choose Font open |
 | P1 | Grid snap, symmetry (point/mirror, N-fold) | Grid and cyclic symmetry done (ADR-14); Gridding and Symmetry requesters (X/Y spacing, cyclic or mirror, order 2–40) done (ADR-20); tile open |
-| P1 | Stencil (protect colours) | Effect ▸ Stencil Make.. / Remake / Reverse / On-Off / Free done (ADR-20); Show, Load, Save done (ADR-31, own JSON file), Paint and Background ▸ Lock FG open (area stencil); painting code honouring it is wired separately (ADR-18) |
+| P1 | Stencil (protect colours) | Effect ▸ Stencil Make.. / Remake / Reverse / On-Off / Free done (ADR-20); Show, Load, Save done (ADR-31, own JSON file); Stencil ▸ Paint (Ctrl+`s`) and Background ▸ Lock FG done as an area stencil that tools, Fill and CLR paint around (ADR-39); painted stencils are not saved, and fills and CLR still ignore the colour stencil |
 | P1 | Paint modes (F1–F8 + menu): Matte, Color, Replace, Smear, Shade, Blend, Cycle, Smooth, Mix, HBrite | implemented in `paint::plot` (ADR-19, Mix is a guess); the tools call it once custom brushes are wired |
 | P2 | Effects: Translucency, Process, AntiAlias (off/low/high, off by default), fixed Background | Effect menu; Translucency, Process, AntiAlias (custom brushes) done (ADR-31) |
 | P0 | Antialiasing **off** by default for all tools | |
-| P3 | Perspective, bend/shear, metamorph | |
+| P3 | Perspective, bend/shear, metamorph | bend/shear done (ADR-30); Effect ▸ Perspective done: Do, FillScreen, Reset, Center, Settings.., keypad keys on the main keys (ADR-37); Metamorph done (ADR-36); the Perspective fill type stays ghosted |
 
 **Custom brushes (ADR-18), done:** Brush Selector rectangle pick-up (`b`; left = copy, right = cut, Shift = square, BG or AutoTransp corner colour transparent, handle centred, Matte afterwards), `B` and right-click on the Brush Selector bring the last brush back, a built-in brush click drops it. Every brush tool (freehand, line, curve, shape outlines, airbrush, symmetry copies) stamps it, and it follows the pointer as a preview. Matte, Color and Replace paint as in DeluxePaint; the Mode menu's mode, the colour range holding FG and the stencil reach every stroke and shape command, filled shapes included. Open: lasso/polygon pick-up, AnimBrush, the other modes' pixel effects (separate work), flood fill through the stencil.
 
@@ -65,7 +66,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P | Feature | Notes |
 |---|---|---|
 | P0 | Colour mixer: RGB/HSV sliders, spread, copy, exchange, undo; AGA "Scale" RGB4→RGB8 | docked as a strip at the bottom like DPaint |
-| P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | Arrange and picture Remap done (ADR-31); Color Set Load/Save = palette files; Use Brush Palette and brush remap open |
+| P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | Arrange and picture Remap done (ADR-31); Color Set Load/Save = palette files; brush Remap done (ADR-30); Use Brush Palette done, Recompute only on HAM screens, so ghosted for now (ADR-39) |
 | P2 | Colour cycling: 8 ranges × up to 32 colours, rate 0–63, direction, live preview (display-only) | Range requester (bottom strip); CRNG/CCRT; Tab cycles on screen, also under requesters/menus and during playback (ADR-35) |
 
 Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester (range 1–8, span by two clicks or a drag, rate 0–63, direction, active, clear) with two inactive default ranges on new pictures; the requester is not yet a bottom strip, has no colour beads/free RGB values, Random/Dither or Undo/Revert, and the ranges are not yet used by gradient fills, Shade or Cycle modes.
@@ -96,14 +97,19 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 
 ## 7. Animation
 
-| P | Feature |
-|---|---|
-| P2 | Frames: add/copy/delete/set count, frame rate, go to, play / play once / ping-pong |
-| P2 | Light table (onion skin: previous / two back / next / spare) |
+| P | Feature | Notes |
+|---|---|---|
+| P2 | Frames: add/copy/delete/set count, frame rate, go to, play / play once / ping-pong | done (ADR-28); Set Range, loop and play once backward, Shift+`1`–`5` done (ADR-38) |
+| P2 | Light table (onion skin: previous / two back / next / spare) | done (ADR-28) |
+| P2 | Animation Control Panel, Method | done (ADR-38); Method changes nothing here (it only describes DeluxePaint's memory use) |
+| P2 | AnimBrush pick-up and settings | done (ADR-36) |
+| P3 | Move requester (path/rotation with easing), metamorph | Move done (ADR-38; its Fill, Load and Save stay ghosted); Metamorph done (ADR-36) |
 
-**Frames and Light Table (ADR-28), done:** a document holds 1–999 frames (at most 128 MiB of frame pixels); every page command paints the current frame and undo steps back to the frame they changed. Anim ▸ Frames ▸ Set #.. / Add Frames.. / Copy Frames.. / Delete Frames.., Control ▸ Set Rate.. / Previous (`1`) / Next (`2`) / Goto.. (`3`) / Play (`4`) / Play once (`5`) / Ping-pong (`6`), Alt+`=` adds a frame; playback only redraws (Esc, Space or a click stops, Left/Right change the rate). The title bar shows `n/total` with several frames. Effect ▸ LightTable (`l`; Alt+`l` Dim; Ctrl+`1`–`4` Two Back / Previous / Next / Spare; Merge, undoable) shows the other frames through the BG colour, dimmed by nearest palette colours, on screen only. **IFF ANIM files (ADR-32), done:** Anim ▸ Load.. (and Picture ▸ Load..) opens a FORM ANIM as a multi-frame document, Anim ▸ Save.. (or Export.. with a `.anim` name) writes IFF ANIM (op 5, closing loop frames); `info` and `convert` handle `.anim`, MCP `open_picture` / `save_picture` too. Export to a picture format still writes the current frame with a note. Open: Set Range, Control Panel, Method, Move, AnimBrush, animpainting, per-frame palettes, the multi-frame Clear requester, menu check marks for the LightTable items.
-| P2 | AnimBrush pick-up and settings |
-| P3 | Move requester (path/rotation with easing), metamorph |
+**Frames and Light Table (ADR-28), done:** a document holds 1–999 frames (at most 128 MiB of frame pixels); every page command paints the current frame and undo steps back to the frame they changed. Anim ▸ Frames ▸ Set #.. / Add Frames.. / Copy Frames.. / Delete Frames.., Control ▸ Set Rate.. / Previous (`1`) / Next (`2`) / Goto.. (`3`) / Play (`4`) / Play once (`5`) / Ping-pong (`6`), Alt+`=` adds a frame; playback only redraws (Esc, Space or a click stops, Left/Right change the rate). The title bar shows `n/total` with several frames. Effect ▸ LightTable (`l`; Alt+`l` Dim; Ctrl+`1`–`4` Two Back / Previous / Next / Spare; Merge, undoable) shows the other frames through the BG colour, dimmed by nearest palette colours, on screen only. **IFF ANIM files (ADR-32), done:** Anim ▸ Load.. (and Picture ▸ Load..) opens a FORM ANIM as a multi-frame document, Anim ▸ Save.. (or Export.. with a `.anim` name) writes IFF ANIM (op 5, closing loop frames); `info` and `convert` handle `.anim`, MCP `open_picture` / `save_picture` too. Export to a picture format still writes the current frame with a note. Open: animpainting (Alt held while drawing), per-frame palettes, the multi-frame Clear requester, menu check marks for the LightTable items, `r` (reverse) and the arrow keys during playback as listed in DeluxePaint's key table.
+
+**AnimBrush and Metamorph (ADR-36), done:** Anim ▸ AnimBrush ▸ Pick up.. (or Alt held with the Brush Selector) takes one cel per frame from the current frame on; every stamp paints the next cel (Settings..: Duration, Current cel, forward / backward / ping-pong). Use, Free, Load.. and Save.. (IFF ANIM with transparent colour and handle), `B` and a right-click on the Brush Selector bring it back; `7` / `8` step through the cels, Shift+`7` / Shift+`8` jump to the first / last. Brush transforms change every cel. Brush ▸ Spare ▸ Metamorph.. (Alt+`m`) morphs the custom brush into the spare brush as a new AnimBrush. One command (`anim_brush_paint`) for GUI, CLI and MCP.
+
+**Anim control and Move (ADR-38), done:** Control ▸ Set Range.. limits Play once, Ping-pong and Play once backward to a range of frames (not Play, as in the reference; owner question in ADR-38); Control ▸ Panel On/Off (Alt+`a`) shows the control bar with a frame slider and ten buttons at the bottom of the screen; Method is a Compressed / Expanded pair. Anim ▸ Move.. (`M`) moves and turns the brush in 3D over the frames (distance and angle X/Y/Z, ease in/out, Cyclic, Go From / Come To, Record forward / in place / backward, Preview, Trails, Draw); the whole move is one undo step (`move_brush`).
 
 ## 8. MCP (automation)
 

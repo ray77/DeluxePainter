@@ -1,0 +1,5 @@
+[
+ {"op":"shape","shape":{"kind":"rect","from":[2,2],"to":[31,23]},"color":2,"filled":true},
+ {"op":"shape","shape":{"kind":"rect","from":[8,6],"to":[25,19]},"color":5,"filled":true},
+ {"op":"shape","shape":{"kind":"rect","from":[14,10],"to":[19,15]},"color":3,"filled":true}
+]

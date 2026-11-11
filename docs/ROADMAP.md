@@ -45,10 +45,12 @@ Done since (night of 2026-11-10/11, parallel agent waves; verified by unit/app t
 - Phase 5 groundwork: EHB and HAM6/HAM8 codecs (ADR-25); EHB/HAM pictures open (ADR-26); HAM export not yet.
 - Phase 6 start: animation frames, Anim menu, playback, Light Table (ADR-28); IFF ANIM op-5 read/write (ADR-29) wired into Load / Anim ▸ Save / Export (ADR-32).
 - Phase 7 start: MCP server with painting, viewing and file tools in approved directories (ADR-21, 24).
+- Autosave and crash recovery (ADR-34); settings file (ADR-33).
+- Wave 7 (2026-11-11): every menu item but Picture ▸ Print now works. AnimBrush and Metamorph (ADR-36), Effect ▸ Perspective (ADR-37), Set Range, Control Panel, Method and Move (ADR-38), Use Brush Palette, Stencil ▸ Paint, Background ▸ Lock FG and Recompute for HAM screens (ADR-39). Also: colour cycling keeps running under requesters, menus and playback (ADR-35); faster debug builds and one frame less display latency (ADR-40); tooltips for the toolbox and Control Panel buttons (ADR-41).
 - CI on macOS, Windows and Linux (GitHub Actions).
 - An independent code review found 20 issues (2 high: a hostile .dpxproj could exhaust memory; MCP opened HAM/EHB wrongly); fixes are in progress.
 
-Still open: hand testing in the window; AnimBrush, Move, Perspective, Metamorph, Print, layers (Phase 4), HAM export, autosave.
+Still open: hand testing in the window; layers (Phase 4); EHB/HAM export (Phase 5); animpainting (Alt while drawing), per-frame palettes, Move ▸ Fill / Load / Save, the Perspective, Brush and Wrap fill types. Picture ▸ Print stays out of scope (ADR-39).
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 
