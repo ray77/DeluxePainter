@@ -20,6 +20,8 @@ pub mod image;
 pub mod mode;
 pub mod paint;
 pub mod palette;
+// Effect > Perspective (ADR-37).
+pub mod perspective;
 pub mod quantize;
 pub mod raster;
 pub mod remap;

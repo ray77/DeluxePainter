@@ -624,6 +624,8 @@ fn brush_item_usable(id: &str, ctx: &MenuContext) -> bool {
     match id {
         "brush.load" => true,
         "brush.restore" => ctx.can_restore,
+        // Perspective turns the custom brush (ADR-37).
+        "perspective.do" | "perspective.fill_screen" => ctx.has_brush,
         _ if id.starts_with("brush.") => ctx.has_brush,
         _ => true,
     }
@@ -760,6 +762,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "animbrush.use",
     "animbrush.free",
     "brush.metamorph",
+    // ADR-37: Effect > Perspective (Do and FillScreen need a custom brush).
+    "perspective.do",
+    "perspective.fill_screen",
+    "perspective.reset",
+    "perspective.center",
+    "perspective.settings",
 ];
 
 impl Item {
@@ -1480,15 +1488,28 @@ mod tests {
         let item = |label: &str| effect.items.iter().find(|i| i.label == label).unwrap();
         assert!(item("Stencil").enabled(&c), "some Stencil items work");
         assert!(item("LightTable").enabled(&c));
-        assert!(!item("Perspective").enabled(&c));
         assert!(item("Background").enabled(&c));
+        // Perspective (ADR-37): Reset, Center and Settings always; Do and FillScreen need a
+        // custom brush.
+        assert!(item("Perspective").enabled(&c));
+        assert!(Action::Command("perspective.settings").enabled(&c));
+        assert!(!Action::Command("perspective.do").enabled(&c));
+        assert!(!Action::Command("perspective.fill_screen").enabled(&c));
+        assert!(Action::Command("perspective.do").enabled(&with));
+        assert!(Action::Command("perspective.fill_screen").enabled(&with));
     }
 
     #[test]
     fn a_ghosted_submenu_does_not_open() {
         let pens = Pens::from_palette(&Palette::dpaint_default_32());
-        let m = MENUS.iter().position(|m| m.title == "Effect").unwrap();
-        let draw_with = |item: usize| {
+        // The pixel at the bottom middle of the submenu of `label` in menu `title`.
+        let bottom = |title: &str, label: &str| {
+            let m = MENUS.iter().position(|m| m.title == title).unwrap();
+            let item = MENUS[m]
+                .items
+                .iter()
+                .position(|i| i.label == label)
+                .unwrap();
             let mut img = IndexedImage::new(320, 256, 200);
             let st = MenuState {
                 active: true,
@@ -1497,23 +1518,15 @@ mod tests {
                 sub_item: None,
             };
             draw(&mut img, &pens, &ctx(), &st, 320, 256);
-            img
-        };
-        let b = menu_box(m, 320, 256);
-        let sub = |item: usize| {
             let Entry::Submenu(items) = MENUS[m].items[item].entry else {
-                panic!("item {item} is a submenu");
+                panic!("{label} is a submenu");
             };
-            submenu_box(&b, item, items, 320, 256)
+            let s = submenu_box(&menu_box(m, 320, 256), item, items, 320, 256);
+            img.get(s.x + s.w / 2, s.y + s.h - 1)
         };
-        // Perspective (item 6) is ghosted: nothing opens; Background (item 2) opens.
-        let s = sub(6);
-        assert_eq!(draw_with(6).get(s.x + s.w / 2, s.y + s.h - 1), Some(200));
-        let s = sub(2);
-        assert_eq!(
-            draw_with(2).get(s.x + s.w / 2, s.y + s.h - 1),
-            Some(pens.dark)
-        );
+        // Brush > Size is ghosted without a brush: nothing opens; Effect > Background opens.
+        assert_eq!(bottom("Brush", "Size"), Some(200));
+        assert_eq!(bottom("Effect", "Background"), Some(pens.dark));
     }
 
     #[test]
