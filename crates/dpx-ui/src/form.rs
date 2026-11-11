@@ -208,6 +208,12 @@ impl Form {
         self.fields[field].text.text().parse().unwrap_or(0)
     }
 
+    /// Sets numeric field `field` (a requester's own button filled it in, ADR-37).
+    pub fn set_number(&mut self, field: usize, value: i32) {
+        self.fields[field].text.set(&value.to_string());
+        self.message = None;
+    }
+
     fn button_rect(&self, ok: bool) -> Rect {
         let y = self.size.1 - BUTTON_H - 5;
         let x = if ok { self.size.0 - BUTTON_W - 6 } else { 6 };

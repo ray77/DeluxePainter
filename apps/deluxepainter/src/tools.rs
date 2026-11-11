@@ -1060,6 +1060,41 @@ impl PainterApp {
         }
     }
 
+    /// One stamp of `brush` (its handle at the top-left) at `at`, painted like the tools
+    /// paint: the Mode menu's mode (Matte with `matte`), the range holding FG, the stencil and
+    /// the effects, in FG or with `right` in BG (Effect > Perspective, ADR-37).
+    pub(crate) fn brush_stamp(
+        &self,
+        brush: BrushImage,
+        at: (i32, i32),
+        right: bool,
+        matte: bool,
+    ) -> Command {
+        let ink = self.ink(right);
+        Command::Stroke {
+            brush: Vec::new(),
+            color: ink.color,
+            points: vec![at],
+            continuous: false,
+            custom: Some(brush),
+            mode: if matte { DrawMode::Matte } else { ink.mode },
+            range: ink.range,
+            stencil: ink.stencil,
+            right,
+            fx: ink.fx,
+        }
+    }
+
+    /// A gesture is under way (not just the custom brush following the pointer), or a Brush
+    /// menu gesture is armed.
+    pub(crate) fn gesture_in_progress(&self) -> bool {
+        self.tools.xform.is_some()
+            || self
+                .stroke
+                .as_ref()
+                .is_some_and(|s| !matches!(s.kind, Kind::Hover { .. }))
+    }
+
     /// Whether the selected tool stamps the brush (outlines, freehand, airbrush).
     fn stamps_brush(&self) -> bool {
         match self.ui.tool {
@@ -1076,7 +1111,7 @@ impl PainterApp {
     /// The custom brush at the pointer (`at`; `None` = off the page) while a tool that stamps
     /// it is selected and no gesture is in progress. Shown in the preview, never committed.
     pub(crate) fn hover_brush(&mut self, at: Option<(i32, i32)>) {
-        if self.tools.xform.is_some() {
+        if self.tools.xform.is_some() || self.perspective.busy() {
             return;
         }
         let idle = self.stroke.is_none() && self.custom_brush.is_none();
@@ -1329,6 +1364,9 @@ impl PainterApp {
         if self.tools.xform.is_some() {
             return self.xform_move(x, y);
         }
+        if self.perspective.busy() {
+            return self.perspective_move(x, y);
+        }
         let p = self.snap((x, y));
         let aspect = self.aspect();
         let shift = self.tools.shift;
@@ -1402,6 +1440,9 @@ impl PainterApp {
     pub(crate) fn handle_hover(&mut self, x: i32, y: i32) {
         if self.tools.xform.is_some() {
             return self.xform_move(x, y);
+        }
+        if self.perspective.busy() {
+            return self.perspective_move(x, y);
         }
         if self
             .stroke

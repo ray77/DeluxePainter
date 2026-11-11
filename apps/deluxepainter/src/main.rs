@@ -38,6 +38,7 @@ mod config;
 mod effects;
 mod files;
 mod menu_actions;
+mod perspective;
 mod recovery;
 mod settings;
 mod tools;
@@ -318,6 +319,19 @@ fn main() -> eframe::Result {
             };
             if let Err(e) = tools::run_xform_spec(&mut engine, brush, &spec) {
                 eprintln!("--brush-xforms {e}");
+                std::process::exit(2);
+            }
+        }
+        // ADR-37: perspective stamps and FillScreen of the picked brush.
+        if let Some(spec) = arg_value(&args, "--perspective") {
+            let Some(brush) = &picked else {
+                eprintln!("--perspective needs --pick");
+                std::process::exit(2);
+            };
+            let screen = View::of_target(engine.document().target());
+            let size = (screen.screen_w, screen.screen_h);
+            if let Err(e) = perspective::run_spec(&mut engine, brush, &spec, size) {
+                eprintln!("--perspective {e}");
                 std::process::exit(2);
             }
         }
@@ -822,6 +836,8 @@ struct PainterApp {
     config: Option<config::ConfigStore>,
     /// Autosave, recovery and the quit question (ADR-34).
     autosave: autosave::State,
+    /// Effect > Perspective (ADR-37, perspective.rs).
+    perspective: perspective::PerspectiveState,
 }
 
 impl PainterApp {
@@ -857,6 +873,7 @@ impl PainterApp {
             anim: anim::AnimState::default(),
             config: None,
             autosave: autosave::State::default(),
+            perspective: perspective::PerspectiveState::default(),
         }
     }
 
@@ -1286,6 +1303,10 @@ impl PainterApp {
         if let Some(shown) = &self.anim.shown {
             return shown;
         }
+        // ADR-37: the perspective brush, its wire frame and the cross hairs.
+        if let Some(shown) = &self.perspective.shown {
+            return shown;
+        }
         self.stroke
             .as_ref()
             .map_or(self.engine.document().page(), |s| &s.preview)
@@ -1331,6 +1352,10 @@ impl PainterApp {
     }
 
     fn handle_press(&mut self, hit: Hit, right: bool) {
+        // ADR-37: perspective mode stamps on the page, ends on a tool, places the centre.
+        if self.perspective_press(hit, right) {
+            return;
+        }
         match hit {
             // DeluxePaint has one undo level; the right button on UNDO is our redo.
             Hit::Tool {
@@ -1456,6 +1481,8 @@ impl PainterApp {
                 | "process.value"
                 | "translucency.toggle"
                 | "translucency.settings" => self.effect_action(id),
+                // ADR-37 (perspective.rs).
+                id if id.starts_with("perspective.") => self.perspective_action(id),
                 // ADR-19 (brush_menu.rs).
                 id if id.starts_with("brush.") => self.brush_action(id),
                 _ => {}
@@ -1490,6 +1517,8 @@ impl eframe::App for PainterApp {
         self.ui.has_brush = self.custom_brush.is_some();
         self.ui.can_restore = self.picked_brush.is_some();
         self.refresh_effects();
+        // ADR-37: perspective mode ends with its brush or tool; its title-bar angles.
+        self.refresh_perspective(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             self.close_requested(&ctx);
         }
@@ -1704,6 +1733,8 @@ impl eframe::App for PainterApp {
         // Tool keys first: while typing text or magnifying they own the keyboard. Keys that
         // arrive in the pass whose Esc ends the text are text keys too.
         let was_typing = self.typing();
+        // ADR-37: the keypad belongs to perspective mode (the tools do not see its keys).
+        self.perspective_keys(&ctx);
         let keys_taken = self.tool_keys(&ctx);
         if !keys_taken {
             self.page_scroll_input(&ctx, ppp, scale, view);
@@ -2250,6 +2281,7 @@ impl PainterApp {
         self.cycle_tick(ctx.input(|i| i.time));
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
+            self.prepare_perspective_view();
             self.prepare_anim_view();
             let (screen, rgba) = match (&self.requester, &self.show_page) {
                 (Some(req), _) => {
@@ -2269,6 +2301,7 @@ impl PainterApp {
                 }
             };
             self.anim.shown = None;
+            self.perspective.shown = None;
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [screen.width() as usize, screen.height() as usize],
                 &rgba,
@@ -2307,7 +2340,7 @@ mod tests {
 
     /// One full `ui()` pass at time `t` with `events`; returns when egui wants the next
     /// pass (the real window repaints only then, unless the pointer moves).
-    fn ui_pass(
+    pub(crate) fn ui_pass(
         app: &mut PainterApp,
         ctx: &egui::Context,
         t: f64,
@@ -2329,7 +2362,7 @@ mod tests {
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
     }
 
-    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+    pub(crate) fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: None,
@@ -2434,7 +2467,7 @@ mod tests {
 
     /// The window point (1280×1024 test window, 1 pixel per point) over UI pixel (`x`, `y`),
     /// after a pass has laid the screen out.
-    fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
+    pub(crate) fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
         let (view, scale) = app.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
@@ -2449,7 +2482,7 @@ mod tests {
 
     /// UI pixels over the title of the menu holding `id`, over the item whose submenu holds
     /// it, and over `id` itself (from the menu geometry, checked with the pointer tracking).
-    fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
+    pub(crate) fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
         let (w, h) = app.view().ui_size();
         let wanted = Action::Command(id);
         let (m, item, sub) = MENUS

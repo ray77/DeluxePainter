@@ -96,6 +96,15 @@ pub fn snapshot_requester(args: &[String], doc: &Document) -> Option<ToolRequest
         }
         return Some(ToolRequester::Arrange(r));
     }
+    // ADR-37: Effect > Perspective > Settings.. for a 32x24 brush.
+    if has("--perspective-requester") {
+        return Some(ToolRequester::Perspective(
+            dpx_ui::PerspectiveRequester::new(
+                dpx_ui::PerspectiveSettings::defaults((32, 24)),
+                Some((32, 24)),
+            ),
+        ));
+    }
     if has("--translucency-requester") {
         return Some(ToolRequester::Translucency(
             dpx_ui::TranslucencyRequester::new(50),
@@ -217,6 +226,7 @@ impl PainterApp {
                     ToolRequester::Fill(r) => self.tools.fill = r.settings(),
                     ToolRequester::Arrange(r) => self.apply_arrange(r.order()),
                     ToolRequester::Translucency(r) => self.set_translucency(&r),
+                    ToolRequester::Perspective(r) => self.apply_perspective_settings(&r),
                     ToolRequester::Stencil(r) => {
                         // No colour protected is no stencil.
                         self.tools.stencil_off = None;

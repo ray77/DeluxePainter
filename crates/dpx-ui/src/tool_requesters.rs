@@ -8,6 +8,7 @@ use dpx_core::{GradientDirection, IndexedImage, Palette, Rect};
 use crate::arrange_requester::ArrangeRequester;
 use crate::form::{Form, FormResponse};
 use crate::pens::Pens;
+use crate::perspective_requester::PerspectiveRequester;
 use crate::requester::ReqEvent;
 use crate::stencil_requester::StencilRequester;
 
@@ -321,6 +322,8 @@ pub enum ToolRequester {
     Arrange(ArrangeRequester),
     /// Effect ▸ Translucency ▸ Settings.. (ADR-31).
     Translucency(TranslucencyRequester),
+    /// Effect ▸ Perspective ▸ Settings.. (ADR-37).
+    Perspective(PerspectiveRequester),
 }
 
 impl ToolRequester {
@@ -331,6 +334,7 @@ impl ToolRequester {
             ToolRequester::Spacing(r) => Some(&r.form),
             ToolRequester::Fill(r) => Some(&r.form),
             ToolRequester::Translucency(r) => Some(&r.form),
+            ToolRequester::Perspective(r) => Some(&r.form),
             ToolRequester::Stencil(_) | ToolRequester::Arrange(_) => None,
         }
     }
@@ -360,6 +364,7 @@ impl ToolRequester {
             ToolRequester::Stencil(r) => r.handle(event),
             ToolRequester::Arrange(r) => r.handle(event),
             ToolRequester::Translucency(r) => r.form.handle(event).into(),
+            ToolRequester::Perspective(r) => r.handle(event).into(),
         }
     }
 
@@ -368,6 +373,7 @@ impl ToolRequester {
         match self {
             ToolRequester::Stencil(r) => r.render(pens, palette),
             ToolRequester::Arrange(r) => r.render(pens, palette),
+            ToolRequester::Perspective(r) => r.render(pens),
             _ => self.form().expect("a form requester").render(pens),
         }
     }

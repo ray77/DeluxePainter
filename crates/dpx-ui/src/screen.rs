@@ -115,6 +115,9 @@ pub struct UiState {
     /// Effect flags shown after the paint mode in the title bar (A/a, P, S/s, T; ADR-31); the
     /// app keeps them in sync.
     pub flags: String,
+    /// Perspective mode: the brush's X/Y/Z rotation (or position) at the right of the title
+    /// bar; Prefs > Coords takes its place (ADR-37).
+    pub perspective: Option<String>,
 }
 
 impl UiState {
@@ -160,6 +163,7 @@ impl Default for UiState {
             anim_requester: None,
             frame_counter: None,
             flags: String::new(),
+            perspective: None,
         }
     }
 }
@@ -351,8 +355,12 @@ impl Screen {
             &title,
             pens.dark,
         );
-        if let Some((x, y)) = ui.coords.filter(|_| ui.prefs.get(Pref::Coords)) {
-            let text = format!("{x:4} {y:4}");
+        let right = match ui.coords.filter(|_| ui.prefs.get(Pref::Coords)) {
+            Some((x, y)) => Some(format!("{x:4} {y:4}")),
+            None if ui.prefs.get(Pref::Coords) => None,
+            None => ui.perspective.clone(),
+        };
+        if let Some(text) = right {
             let tx = w - geom::DEPTH_W - 3 - font.text_width(&text);
             font.draw(img, tx, geom::TITLE_TEXT_Y, &text, pens.dark);
         }
@@ -707,6 +715,36 @@ mod tests {
         let on = screen.render(&page, &pal, &ui);
         let differs = (200..300).any(|x| (1..9).any(|y| off.get(x, y) != on.get(x, y)));
         assert!(differs, "coordinates appear only with Prefs > Coords");
+    }
+
+    #[test]
+    fn perspective_angles_show_unless_coords_are_on() {
+        let pal = Palette::dpaint_default_32();
+        let page = IndexedImage::new(320, 256, 0);
+        let screen = Screen::new(320, 256);
+        let right = |ui: &UiState| {
+            let img = screen.render(&page, &pal, ui);
+            (200..300)
+                .flat_map(|x| (1..9).map(move |y| (x, y)))
+                .map(|(x, y)| img.get(x, y))
+                .collect::<Vec<_>>()
+        };
+        let plain = UiState::default();
+        let mut ui = UiState {
+            perspective: Some("   0    0   45".into()),
+            ..UiState::default()
+        };
+        let angles = right(&ui);
+        assert_ne!(angles, right(&plain), "the angles show");
+        // Coords takes its place (AGA p.286), also while the pointer is off the page.
+        ui.prefs.set(Pref::Coords, true);
+        assert_eq!(right(&ui), right(&plain));
+        ui.coords = Some((123, 45));
+        let with_coords = UiState {
+            perspective: None,
+            ..ui.clone()
+        };
+        assert_eq!(right(&ui), right(&with_coords));
     }
 
     #[test]
