@@ -2259,6 +2259,124 @@ impl PainterApp {
 mod tests {
     use super::*;
 
+    /// One full `ui()` pass at time `t` with `events`; returns when egui wants the next
+    /// pass (the real window repaints only then, unless the pointer moves).
+    fn ui_pass(
+        app: &mut PainterApp,
+        ctx: &egui::Context,
+        t: f64,
+        events: Vec<egui::Event>,
+    ) -> std::time::Duration {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 1024.0),
+            )),
+            time: Some(t),
+            events,
+            ..Default::default()
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+        // The font atlas and screen uploads are not needed in a test.
+        out.textures_delta.clear();
+        out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Presses and releases `key` at `t`, then runs passes only when egui asks for them
+    /// (as the idle real window does) until `until`; `seen` is called after every pass.
+    fn press_and_idle(
+        app: &mut PainterApp,
+        ctx: &egui::Context,
+        key: egui::Key,
+        t: f64,
+        until: f64,
+        mut seen: impl FnMut(&PainterApp),
+    ) {
+        let text = match key {
+            egui::Key::Num4 => vec![egui::Event::Text("4".into())],
+            _ => vec![],
+        };
+        let mut events = vec![key_event(key, true)];
+        events.extend(text);
+        let mut delay = ui_pass(app, ctx, t, events);
+        let mut t = t + 1.0 / 60.0;
+        delay = delay.min(ui_pass(app, ctx, t, vec![key_event(key, false)]));
+        while t < until {
+            assert!(
+                delay < std::time::Duration::from_secs(1),
+                "no repaint requested at t = {t}"
+            );
+            // At most one pass per display frame.
+            t += delay.as_secs_f64().max(1.0 / 60.0);
+            delay = ui_pass(app, ctx, t, vec![]);
+            seen(app);
+        }
+    }
+
+    #[test]
+    fn key_4_plays_every_frame_through_the_real_ui_loop() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.engine
+            .execute(Command::SetFrameCount { count: 3 })
+            .unwrap();
+        for frame in 0..3 {
+            app.engine.execute(Command::GotoFrame { frame }).unwrap();
+            let color = frame as u8 + 1;
+            app.engine.execute(Command::Clear { color }).unwrap();
+        }
+        app.engine.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let mut shown = std::collections::BTreeSet::new();
+        let mut counters = std::collections::BTreeSet::new();
+        press_and_idle(&mut app, &ctx, egui::Key::Num4, 0.1, 1.0, |app| {
+            shown.insert(app.anim.playing.expect("still playing").shown);
+            counters.extend(app.ui.frame_counter);
+        });
+        assert_eq!(shown.len(), 3, "all frames shown: {shown:?}");
+        assert_eq!(counters.len(), 3, "the title counter follows: {counters:?}");
+        // Esc stops; the frame on screen becomes the current frame.
+        ui_pass(
+            &mut app,
+            &ctx,
+            1.1,
+            vec![key_event(egui::Key::Escape, true)],
+        );
+        assert!(app.anim.playing.is_none());
+    }
+
+    #[test]
+    fn tab_cycles_colours_through_the_real_ui_loop() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        // Colours 8-15 at 11 steps per second, like a waterfall picture.
+        app.extras.ranges = vec![dpx_iff::ilbm::ColorRange {
+            rate: 3072,
+            flags: 1,
+            low: 8,
+            high: 15,
+        }];
+        let doc = app.engine.document().palette().clone();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let mut palettes = std::collections::BTreeSet::new();
+        press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 1.0, |app| {
+            palettes.insert(format!("{:?}", &app.palette().colors()[8..16]));
+        });
+        assert!(palettes.len() >= 8, "{} palettes in 0.9 s", palettes.len());
+        assert_eq!(app.engine.document().palette(), &doc, "display only");
+    }
+
     /// Runs one egui pass with the `p` key pressed through the Color Mixer's input.
     fn press_p(app: &mut PainterApp, ctx: &egui::Context) -> bool {
         let mut raw = egui::RawInput::default();
