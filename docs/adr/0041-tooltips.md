@@ -1,0 +1,60 @@
+# ADR-41: Tooltips naming the tools
+
+- Status: accepted (2026-11-11; the owner asked for English tooltips naming the tools; the details below were decided without the owner)
+- Context:
+  - The owner asked for "an English tooltip with the name of the tools".
+  - DeluxePaint IV AGA has no tooltips: the toolbox shows icons only, and the names and keys are in the manual. This is a DeluxePainter addition, like the off-page pattern (ADR-13).
+  - The visible interface is our own software-rendered pixel UI (ADR-3); no egui widgets. egui runs a pass only on input or when asked for one, so a tooltip that appears after a delay must ask for its own pass.
+  - The keys that select tools and run panel buttons are spread over several handlers (`tools.rs` tool keys, `menu_actions.rs`, `anim.rs`, `anim_control.rs`, `main.rs` for `u`). A key printed in a tooltip must be one that really does the same on the paint screen.
+- Decision:
+  - **Targets:** the 18 toolbox tool buttons and, while it is shown, the buttons of the Animation Control Panel (ADR-38). Split buttons (Continuous Freehand, Rectangle, Circle, Ellipse, Polygon) name the half under the pointer: the upper-left half the outline / continuous variant, the lower-right half the filled one; the text changes at once when the pointer crosses the diagonal. No tooltips for the built-in brushes, palette cells, colour indicator, title bar, page, the panel's slider, requesters or menus.
+  - **Text:** one line, the English name, two spaces, then the paint-screen key that does the same, if there is one. Letters as typed (a capital means Shift with the letter), modifiers as `Shift+1`, `Ctrl+1`, `Alt+=` (Alt is Option on macOS). The tool names are `Tool::name()`; the split halves and the panel buttons are named in our own words after what they do (no manual text):
+
+    | Button | Tooltip |
+    |---|---|
+    | Dotted Freehand | `Dotted Freehand  s` |
+    | Continuous Freehand, upper-left / lower-right | `Continuous Freehand  d` / `Filled Freehand  D` |
+    | Line | `Straight Line  v` |
+    | Curve | `Curve  q` |
+    | Fill | `Fill  f` |
+    | Airbrush | `Airbrush` |
+    | Rectangle | `Rectangle  r` / `Filled Rectangle  R` |
+    | Circle | `Circle  c` / `Filled Circle  C` |
+    | Ellipse | `Ellipse  e` / `Filled Ellipse  E` |
+    | Polygon | `Polygon` / `Filled Polygon` |
+    | Brush Selector | `Brush Selector  b` |
+    | Text | `Text  t` |
+    | Grid | `Grid  g` |
+    | Symmetry | `Symmetry  /` |
+    | Magnify | `Magnify  m` |
+    | Zoom | `Zoom  >` |
+    | UNDO | `Undo  u` |
+    | CLR | `Clear  K` |
+    | Panel: First / Last Frame | `First Frame  Shift+1` / `Last Frame  Shift+2` |
+    | Panel: loop / play once backward | `Loop Backward  Shift+4` / `Play Once Backward  Shift+5` |
+    | Panel: previous / next | `Previous Frame  1` / `Next Frame  2` |
+    | Panel: play once / loop / ping-pong | `Play Once  5` / `Loop  4` / `Ping-Pong  6` |
+    | Panel: add / delete | `Add Frame  Alt+=` / `Delete Frame` |
+    | Panel: Go To | `Repeat Go To  Shift+3` |
+    | Panel: Light Table and its toggles | `Light Table  l`, `Light Table: Two Back  Ctrl+1`, `Light Table: Previous  Ctrl+2`, `Light Table: Next  Ctrl+3`, `Light Table: Spare  Ctrl+4` |
+
+  - **When:** after the pointer has rested 0.5 s on the same target (tool and half, or panel button); moving on the same target does not start the delay again. Once a tooltip shows, moving straight onto another target shows that one at once; leaving all targets (page, palette, brushes, the 1-pixel gaps between buttons, the slider, outside the window) hides it, and the next one waits the full delay again. Hidden, and the delay starts again afterwards: on any mouse button press and while a button is held; while the menu strip is shown; while a requester, note, file requester, Show Page, playback or the Move preview is open (`PainterApp::modal_open`); a tool tooltip while the toolbox is hidden (F10) and a panel tooltip while the panel is off (their buttons are not hit then, and `Tooltip::layout` draws no box for a button that is not shown).
+  - **Repaints:** while the pointer rests and the tooltip is not shown yet, the pass asks egui for one more pass when the delay is over (`request_repaint_after(remaining)`), so an idle window shows it. Once it shows, it asks for nothing (no repaint loop). The screen is redrawn (`dirty`) only when the shown tooltip changes.
+  - **Look:** drawn in UI (LoRes) pixels by `Screen::draw_ui`, last, over everything, so it scales with the interface in HiRes and laced screens. A box filled with the face pen, a 1-pixel dark border, square corners, the text in the dark pen with the built-in font, 2 blank columns left and right of the text, 12 pixels high (border, a blank row, the 8 font rows, a blank row, border: one free row above the capitals and below the descenders, as compact as the 11-pixel title bar).
+  - **Place:** toolbox buttons: the box lies left of the toolbox, its right edge 2 pixels left of the toolbox (two free columns), its top at the top of the hovered button. Panel buttons: above the panel (two free rows), its left edge at the button's left edge, pushed left so that it ends at the panel's right end (it never covers the toolbox). Always clamped inside the screen; a text wider than the screen would be cut (none is). It never covers the hovered button.
+  - **Code:** `crates/dpx-ui/src/tooltip.rs` holds the texts (`for_tool`, `for_panel_button`, `tool_key`, `panel_key`), `TooltipTarget::of_hit`, `Tooltip::layout` and `Tooltip::draw`; `UiState::tooltip` (default `None`) is what is drawn; `Screen::tool_button` gives a tool's button rectangle. `apps/deluxepainter/src/tooltip.rs` holds the state machine (target, since when, shown): `tooltip_hover` is fed from the hover branch of `PainterApp::ui` with the hit under the pointer and egui's time, `tooltip_guard` runs at the start of every upload and clears it while the menu strip or a modal is open (every path of `ui()` ends in an upload, so a key that opens a requester or starts playback in the same pass also hides the tooltip before it is drawn, and the modal paths never feed the hover state).
+  - **One source for the keys:** the keys exist only in the `dpx-ui` text table. The app tests rest the pointer on every target until its tooltip shows, press the key the tooltip names (as egui-winit sends it) and compare the result with a click on that button (half) on a second app in the same state. A key that does not do what the button does fails the test.
+  - **Snapshots:** `--hover X,Y` (UI pixels) renders the screen with the tooltip a rested pointer at X,Y shows; it combines with `--anim-panel`, `--tool`, `--frames`, `--palette` and the other snapshot options, and shows none while `--menu` or a requester option is given. It prints a note when nothing with a tooltip lies at X,Y.
+- Decided without the owner:
+  - Tooltips at all (the request), their English texts, the 0.5 s delay, the look and the places above.
+  - `Clear  K` although `k` clears too (`menu_actions.rs`); `K` is the key of the manual's keyboard table (ADR-14). Grid is shown as `g` (`G` works too). Zoom shows `>` (zoom in, as a left click; the right click and `<` zoom out).
+  - The Go To button is named "Repeat Go To" after what a left click does (the frame of the last Go To; the Go to Frame requester before any Go To and with Ctrl or the right button); Shift-3 does the same.
+  - "Loop" for the forward loop button (key `4`, Anim ▸ Control ▸ Play) next to "Loop Backward".
+  - Airbrush, Polygon (both halves) and Delete Frame show no key: none selects or runs them.
+  - The gaps between toolbox buttons count as leaving the targets (as asked), so moving slowly from one button to the next can hide the tooltip on the 1-pixel gap and wait the delay again.
+- Verified:
+  - Unit tests (`dpx-ui`): the text of every tool and both halves of every split tool, and of every panel button (exact strings, font characters only); targets from hits on both halves of every button and every panel button, none for brushes, palette, indicator, title bar, page, slider and gaps; every box inside the screen beside its button and never over it, for every target on 320×200 (the smallest UI screen), 320×256, 368×241, 368×283 and 352×272 with the toolbox shown and hidden; long texts clamped and cut with the border intact; border, square corners (the corner pixels are the border pen, the pixels inside them face) and the text exactly as the font draws it; drawn last over page, toolbox and panel (the screen with the tooltip equals the screen without it plus the box), scaled 2×2 in a laced HiRes screen; nothing drawn for a hidden toolbox or panel.
+  - App tests (`apps/deluxepainter/src/tooltip.rs`) through `PainterApp::ui` with real egui pointer, key and modifier events: no tooltip before 0.5 s; the repaint delay while resting is at most the remaining time (0.5 s at first, at most 0.2 s after moving on the same button), the next idle pass shows it, and then egui asks for no pass (`Duration::MAX`), also after pointer moves on the button; the box on the composed screen; the next button, the other half of a split button and further buttons at once; a gap, a brush, the palette and the page hide it and the next button waits again; pointer gone; a left press hides it, nothing while held, the delay again after the release; a right click on Zoom; the menu strip, Picture ▸ Page Size.. picked from it (no tooltip under the requester, the delay again after Esc), `F` opening the Fill Type requester while it shows; `4` starting playback under a panel tooltip; F10 under a resting pointer, no tool tooltips without the toolbox, panel tooltips over the full-width panel, Alt-a switching the panel off; every panel button in turn (each at once), the box above the panel, none on the slider and the gap; every one of the 20 tool keys and the 16 panel keys (with and without an earlier Go To) does exactly what a click on its button does; `--hover` parsing.
+  - Mutation check (each piece reverted once, the app tests run through `cargo test -p deluxepainter`): showing at once instead of after the delay failed 4 tests; no hiding on a press 1; no repaint request 9; no modal check in the guard 2; no guard call before the upload 2; the next target waiting the delay again 2; moving on the same target restarting the delay 9; leaving the targets keeping it shown 3. One mutation survived: without the menu-strip check in the guard nothing fails, because the strip opens only with a right press on the title bar (which already hides the tooltip and resets the delay) and the hover branch does not run while it is shown; the check stays as a guard. A second guard check (hide when the toolbox or panel is gone) also survived in a first run and was removed, since the hit test and `Tooltip::layout` already cover it.
+  - Snapshots (`--snapshot … --scale 3`, looked at): `--hover 300,48` shows "Straight Line  v" left of the toolbox at the Line button's top, two free columns before the toolbox; on a page cleared to colour 7 the 1-pixel black border and square corners show; `--tool rectangle:filled --hover 305,77` shows "Filled Rectangle  R" (also cropped at scale 8: border, corners, gap); `--anim-panel --frames 4 --hover 66,250` shows "Next Frame  2" above the panel at the button's left edge; `--light-table --hover 288,250` shows "Light Table: Spare  Ctrl+4" pushed left to end at the panel's right end, off the palette; on the 320×200 NTSC screen (`--commands` with a `set_format`) `--hover 3,183` shows "First Frame  Shift+1" at the left edge above the panel and `--hover 300,132` "Undo  u"; `--hover 100,100` on the page prints the note and shows none.
+  - Not verified: a real pointer and keyboard in the window (the owner declines remote control of the app; the tests drive `ui()` with the events egui-winit sends), the keys on non-US layouts beyond what the key handlers already document (Shift-digits are read from the physical key; `Alt+=` is Alt with the `=` or `+` key), Windows and Linux.

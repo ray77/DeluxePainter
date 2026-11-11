@@ -29,6 +29,8 @@
 //!     [--anim-panel]                    show the Animation Control Panel (ADR-38)
 //!     [--anim-control range|move]       show the Set Range or Move requester (ADR-38)
 //!     [--stencil-paint X,Y,W,H]         Stencil ▸ Paint with that rectangle painted (ADR-39)
+//!     [--hover X,Y]                     the tooltip a pointer resting on UI pixel X,Y shows
+//!                                       (ADR-41)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -50,6 +52,7 @@ mod perspective;
 mod recovery;
 mod settings;
 mod tools;
+mod tooltip;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -503,6 +506,13 @@ fn main() -> eframe::Result {
                 recovery::format_utc(recovery::unix_now()),
             ));
         }
+        // ADR-41: the tooltip of a resting pointer.
+        if let Err(e) =
+            tooltip::snapshot_hover(&args, doc.palette().len(), &view.ui_screen(), &mut ui)
+        {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
         if args.iter().any(|a| a == "--show-page") {
             let sp = ShowPage::new(
                 (doc.page().width(), doc.page().height()),
@@ -874,6 +884,8 @@ struct PainterApp {
     animbrush: animbrush::AnimBrushState,
     /// Effect > Perspective (ADR-37, perspective.rs).
     perspective: perspective::PerspectiveState,
+    /// Tooltips over the toolbox and the Control Panel (ADR-41, tooltip.rs).
+    tooltip: tooltip::State,
 }
 
 impl PainterApp {
@@ -912,6 +924,7 @@ impl PainterApp {
             autosave: autosave::State::default(),
             animbrush: animbrush::AnimBrushState::default(),
             perspective: perspective::PerspectiveState::default(),
+            tooltip: tooltip::State::default(),
         }
     }
 
@@ -1767,6 +1780,8 @@ impl eframe::App for PainterApp {
                 Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
                 h => Some(h),
             };
+            // ADR-41 (tooltip.rs).
+            self.tooltip_hover(&ctx, hit);
             let on_page = match hit {
                 Some(Hit::Page { x, y }) => Some((x, y)),
                 _ => None,
@@ -1799,6 +1814,7 @@ impl eframe::App for PainterApp {
             }
         } else {
             self.hover_brush(None);
+            self.tooltip_hover(&ctx, None);
         }
         if !(down_l || down_r) {
             self.release();
@@ -2358,6 +2374,8 @@ impl PainterApp {
         rect: egui::Rect,
         area: egui::Rect,
     ) {
+        // ADR-41: no tooltip over (or under) a menu, requester or playback opened this pass.
+        self.tooltip_guard();
         // The shown cycling palette follows palette and range changes made earlier in this
         // pass (the clock at the top of `ui()` ran before them).
         self.cycle_tick(ctx.input(|i| i.time));
@@ -3694,7 +3712,7 @@ mod tests {
     /// A key pressed and let go in one pass with `modifiers` held, as egui-winit reports
     /// it: the logical key (what the layout types, when egui has a name for it, else the
     /// physical key), the physical key and the typed text.
-    fn chord(
+    pub(crate) fn chord(
         key: egui::Key,
         physical: egui::Key,
         modifiers: egui::Modifiers,
@@ -3716,11 +3734,15 @@ mod tests {
     }
 
     /// A plain key pressed and let go in one pass.
-    fn tap(key: egui::Key) -> Vec<egui::Event> {
+    pub(crate) fn tap(key: egui::Key) -> Vec<egui::Event> {
         vec![key_event(key, true), key_event(key, false)]
     }
 
-    fn pointer_button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+    pub(crate) fn pointer_button(
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) -> egui::Event {
         egui::Event::PointerButton {
             pos,
             button,
@@ -3731,7 +3753,7 @@ mod tests {
 
     /// A click with `button` on UI pixel `at`: down in one pass, up in the next; returns
     /// the repaint delay egui asks for after it.
-    fn click_ui(
+    pub(crate) fn click_ui(
         app: &mut PainterApp,
         ctx: &egui::Context,
         t: f64,
@@ -3785,7 +3807,7 @@ mod tests {
     }
 
     /// UI pixels over the title of the menu holding the top-level item `id` and over it.
-    fn menu_item_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 2] {
+    pub(crate) fn menu_item_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 2] {
         let (w, h) = app.view().ui_size();
         let wanted = Action::Command(id);
         let (m, item) = MENUS
