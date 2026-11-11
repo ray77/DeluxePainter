@@ -8,9 +8,11 @@
 //! Keys while perspective mode is on (egui reports the keypad as the main keys, so both act):
 //! `7`/`8`, `4`/`5`, `1`/`2` turn about x, y, z by -1/+1 degree (Shift: by the Angle Step),
 //! `9`/`6`/`3` reset that axis (Shift: fix it), `0` resets the angles (Shift: everything but
-//! the centre), `-` FillScreen, `.` Center, `;`/`'` move along the fixed axis (`:`/`"`
-//! farther), `<`/`>` observer distance, `\` angles or position in the title bar, Ctrl fixes
-//! the y axis while held, Enter (also outside the mode) switches perspective mode.
+//! the centre), `-` FillScreen, `.` Center, `;`/`'` move along the fixed axis (`:`/`"`/`@`
+//! farther; the keys where a US keyboard has `;` and `'` too, whatever they type), `<`/`>`
+//! observer distance, `\` angles or position in the title bar, Ctrl fixes the y axis while
+//! held, Enter (also outside the mode) switches perspective mode. `-`, `.`, `<` and `>` go by
+//! the character typed (Shift-`.` is `>` on a US keyboard, `:` on a German one).
 
 use dpx_core::perspective::{self, Axis3, Orientation, Placement, Vec3, Viewer};
 use dpx_core::{BrushImage, Command, Engine, IndexedImage, Rect};
@@ -124,7 +126,7 @@ impl PerspectiveState {
     }
 }
 
-/// What a key does in perspective mode.
+/// The keypad digit a key stands for.
 fn digit(key: egui::Key) -> Option<u8> {
     use egui::Key::*;
     Some(match key {
@@ -140,6 +142,27 @@ fn digit(key: egui::Key) -> Option<u8> {
         Num9 => 9,
         _ => return None,
     })
+}
+
+/// The step a key moves the brush along its fixed axis by its place on the keyboard: where a
+/// US (and Amiga) keyboard has `;` (towards the observer, negative) and `'` (away), with
+/// Shift (`:` and `"`) the large step (AGA p.134-135, p.295). So the steps work on layouts
+/// that type other characters there (German Ö and Ä, `@` for Shift-' on a UK keyboard), but
+/// not where that key types a letter or another key's character (French M, Dvorak S and -).
+fn step_key(key: egui::Key, physical: Option<egui::Key>, shift: bool) -> Option<f64> {
+    use egui::Key::{Colon, Quote, Semicolon};
+    let physical = physical?;
+    let towards = match physical {
+        Semicolon => true,
+        Quote => false,
+        _ => return None,
+    };
+    // egui names the key by its place when it has no name for the character typed.
+    if key != physical && !matches!(key, Semicolon | Colon | Quote) {
+        return None;
+    }
+    let step = if shift { STEP_LARGE } else { STEP };
+    Some(if towards { -step } else { step })
 }
 
 impl PainterApp {
@@ -164,10 +187,15 @@ impl PainterApp {
         })
     }
 
-    /// Replace mode paints the brush's transparent pixels in BG: the projection does that
-    /// inside the brush and the stamp is Matte, so nothing outside the brush is painted.
-    fn perspective_replace_bg(&self) -> Option<u8> {
-        (self.ui.mode == PaintMode::Replace).then_some(self.ui.bg)
+    /// Replace mode paints the brush's transparent pixels in BG (with the right button the
+    /// whole brush): the projection does that inside the brush and the stamp is Matte, so
+    /// nothing outside the brush is painted.
+    fn perspective_replace(&self, right: bool) -> Option<perspective::Replace<'_>> {
+        (self.ui.mode == PaintMode::Replace).then(|| perspective::Replace {
+            bg: self.ui.bg,
+            right,
+            page: self.engine.document().page(),
+        })
     }
 
     /// The Effect ▸ Perspective items.
@@ -310,8 +338,15 @@ impl PainterApp {
 
     /// A press while perspective has the pointer; returns whether it took it. In the mode a
     /// click on the page stamps the brush, a right-click on Grid opens the requester and a
-    /// click on a tool or built-in brush ends the mode (AGA p.278-279).
+    /// click on a tool or built-in brush ends the mode (AGA p.278-279). The toolbox's action
+    /// buttons (UNDO, CLR, Grid, Symmetry, Magnify, Zoom) do their job and keep it: they choose
+    /// no tool, and the tutorial clicks CLR in the mode and goes on turning (AGA p.131).
     pub(crate) fn perspective_press(&mut self, hit: Hit, right: bool) -> bool {
+        // An armed Brush menu gesture (Handle ▸ Place, Stretch, Rotate, Shear, Bend) takes the
+        // page click and ends as outside the mode; the mode goes on with its brush.
+        if self.xform_armed() && matches!(hit, Hit::Page { .. }) {
+            return false;
+        }
         if self.perspective.placing {
             self.perspective.placing = false;
             self.perspective.pointer = None;
@@ -336,6 +371,11 @@ impl PainterApp {
                 self.open_perspective_requester();
                 true
             }
+            Hit::Tool {
+                tool:
+                    Tool::Undo | Tool::Clear | Tool::Grid | Tool::Symmetry | Tool::Magnify | Tool::Zoom,
+                ..
+            } => false,
             Hit::Tool { .. } | Hit::Brush(_) => {
                 self.leave_perspective();
                 false
@@ -410,7 +450,8 @@ impl PainterApp {
             return;
         };
         let doc = self.engine.document();
-        let replace = self.perspective_replace_bg();
+        let replace = self.perspective_replace(right);
+        let matte = replace.is_some();
         let projected = perspective::project_brush(
             brush,
             &place,
@@ -420,7 +461,7 @@ impl PainterApp {
             replace,
         );
         if let Some((img, at)) = projected {
-            let cmd = self.brush_stamp(img, at, right, replace.is_some());
+            let cmd = self.brush_stamp(img, at, right, matte);
             self.run(cmd);
         }
     }
@@ -447,7 +488,8 @@ impl PainterApp {
         let screen = Rect::new(self.scroll.0, self.scroll.1, v.screen_w, v.screen_h)
             .intersect(doc.page().bounds());
         let [gx, gy, _] = self.perspective.settings.grid;
-        let replace = self.perspective_replace_bg();
+        let replace = self.perspective_replace(false);
+        let matte = replace.is_some();
         let plane = perspective::fill_plane(
             brush,
             &place,
@@ -458,7 +500,7 @@ impl PainterApp {
             replace,
         );
         if let Some((img, at)) = plane {
-            let cmd = self.brush_stamp(img, at, false, replace.is_some());
+            let cmd = self.brush_stamp(img, at, false, matte);
             self.run(cmd);
         }
     }
@@ -495,8 +537,15 @@ impl PainterApp {
         ]);
     }
 
-    /// One key of the keypad table (AGA p.280-281, p.295); returns whether it was used.
-    fn perspective_key(&mut self, key: egui::Key, digit_key: Option<u8>, shift: bool) -> bool {
+    /// One key of the keypad table (AGA p.280-281, p.295) or a step key ([`step_key`]);
+    /// returns whether it was used.
+    fn perspective_key(
+        &mut self,
+        key: egui::Key,
+        digit_key: Option<u8>,
+        step: Option<f64>,
+        shift: bool,
+    ) -> bool {
         if key == egui::Key::Escape && self.perspective.placing {
             self.perspective.placing = false;
             self.perspective.pointer = None;
@@ -518,19 +567,24 @@ impl PainterApp {
         if !self.perspective.active {
             return false;
         }
-        let step = if shift {
+        if let Some(step) = step {
+            self.perspective_push(step);
+            self.dirty = true;
+            return true;
+        }
+        let angle = if shift {
             self.perspective.settings.angle_step
         } else {
             1
         };
-        match (digit_key, key) {
-            (Some(7), _) => self.perspective_rotate(Axis3::X, -step),
-            (Some(8), _) => self.perspective_rotate(Axis3::X, step),
-            (Some(4), _) => self.perspective_rotate(Axis3::Y, -step),
-            (Some(5), _) => self.perspective_rotate(Axis3::Y, step),
-            (Some(1), _) => self.perspective_rotate(Axis3::Z, -step),
-            (Some(2), _) => self.perspective_rotate(Axis3::Z, step),
-            (Some(d @ (9 | 6 | 3)), _) => {
+        match digit_key {
+            Some(7) => self.perspective_rotate(Axis3::X, -angle),
+            Some(8) => self.perspective_rotate(Axis3::X, angle),
+            Some(4) => self.perspective_rotate(Axis3::Y, -angle),
+            Some(5) => self.perspective_rotate(Axis3::Y, angle),
+            Some(1) => self.perspective_rotate(Axis3::Z, -angle),
+            Some(2) => self.perspective_rotate(Axis3::Z, angle),
+            Some(d @ (9 | 6 | 3)) => {
                 let axis = match d {
                     9 => Axis3::X,
                     6 => Axis3::Y,
@@ -542,27 +596,32 @@ impl PainterApp {
                     self.perspective.orientation.reset_axis(axis);
                 }
             }
-            (Some(0), _) if shift => self.reset_perspective(),
-            (Some(0), _) => {
+            Some(0) if shift => self.reset_perspective(),
+            Some(0) => {
                 // Angles back to 0 and the z axis fixed; distances stay (AGA p.281).
                 self.perspective.orientation = Orientation::default();
                 self.perspective.fixed = Axis3::Z;
             }
-            (_, egui::Key::Minus) => self.perspective_fill_screen(),
-            (_, egui::Key::Period) => self.place_perspective_center(),
             _ => return false,
         }
         self.dirty = true;
         true
     }
 
-    /// One typed character in perspective mode; returns whether it was used.
-    fn perspective_char(&mut self, c: char) -> bool {
+    /// One typed character in perspective mode; returns whether it was used. `-` and `.` (the
+    /// keypad's FillScreen and Center) go by the character, not the key: Shift-`.` types `>`
+    /// on a US keyboard and `:` on a German one, and those are keys of their own. `held`: the
+    /// key is held down and repeats; only the steps and the distance go on then.
+    fn perspective_char(&mut self, c: char, held: bool) -> bool {
         match c {
+            '-' | '.' | '\\' if held => {}
+            '-' => self.perspective_fill_screen(),
+            '.' => self.place_perspective_center(),
             ';' => self.perspective_push(-STEP),
             ':' => self.perspective_push(-STEP_LARGE),
             '\'' => self.perspective_push(STEP),
-            '"' => self.perspective_push(STEP_LARGE),
+            // The manual calls the large step away `@` once (AGA p.135).
+            '"' | '@' => self.perspective_push(STEP_LARGE),
             '<' | '>' => {
                 let d = self.perspective_viewer().distance;
                 let d = if c == '>' { d * 1.25 } else { d * 0.8 };
@@ -594,8 +653,9 @@ impl PainterApp {
         let events = ctx.input(|i| i.events.clone());
         let mut taken = Vec::new();
         // The text a used key types (e.g. `"` for Shift-2 on a German keyboard) is no
-        // command of its own.
+        // command of its own; the text of a held, repeating key repeats only some.
         let mut its_text = false;
+        let mut held = false;
         for (n, event) in events.iter().enumerate() {
             let used = match event {
                 egui::Event::Key {
@@ -606,25 +666,29 @@ impl PainterApp {
                     modifiers,
                 } => {
                     its_text = false;
+                    held = *repeat;
                     if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
                         false
                     } else {
                         // Shift changes what the main digit keys type: go by the key's place.
                         let d = physical_key.and_then(digit).or_else(|| digit(*key));
-                        let turns = matches!(d, Some(1 | 2 | 4 | 5 | 7 | 8));
-                        let used =
-                            (!*repeat || turns) && self.perspective_key(*key, d, modifiers.shift);
+                        let step = step_key(*key, *physical_key, modifiers.shift);
+                        // Held down, the turn and step keys go on.
+                        let repeats = matches!(d, Some(1 | 2 | 4 | 5 | 7 | 8)) || step.is_some();
+                        let used = (!*repeat || repeats)
+                            && self.perspective_key(*key, d, step, modifiers.shift);
                         its_text = used && !matches!(key, egui::Key::Enter | egui::Key::Escape);
                         used
                     }
                 }
                 egui::Event::Text(t) => {
                     let mut chars = t.chars();
+                    let held = std::mem::take(&mut held);
                     if std::mem::take(&mut its_text) {
                         true
                     } else if self.perspective.active {
                         match (chars.next(), chars.next()) {
-                            (Some(c), None) => self.perspective_char(c),
+                            (Some(c), None) => self.perspective_char(c, held),
                             _ => false,
                         }
                     } else {
@@ -656,7 +720,8 @@ impl PainterApp {
     pub(crate) fn prepare_perspective_view(&mut self) {
         // Changes later in this pass (a menu item, a tool key) show at once.
         self.check_perspective();
-        if !self.perspective.busy() {
+        // A Brush menu gesture shows its own preview (the stroke) until it ends.
+        if !self.perspective.busy() || self.xform_armed() {
             self.perspective.shown = None;
             return;
         }
@@ -670,11 +735,12 @@ impl PainterApp {
             && let (Some(brush), Some(place)) = (&self.custom_brush, self.perspective_placement())
         {
             if place.on_screen_plane() {
-                let replace = self.perspective_replace_bg();
+                let replace = self.perspective_replace(false);
+                let matte = replace.is_some();
                 if let Some((img, at)) =
                     perspective::project_brush(brush, &place, &viewer, clip, palette.len(), replace)
                 {
-                    let cmd = self.brush_stamp(img, at, false, replace.is_some());
+                    let cmd = self.brush_stamp(img, at, false, matte);
                     if cmd.check_paint(page, palette).is_ok() {
                         cmd.paint(&mut shown, page, palette);
                     }
@@ -1025,6 +1091,209 @@ mod tests {
         assert_eq!(app.ui.perspective.as_deref(), Some(" 100  100    0"));
         ui_pass(&mut app, &ctx, 1.2, text("'"));
         assert_eq!(app.ui.perspective.as_deref(), Some(" 100  100    4"));
+    }
+
+    #[test]
+    fn shift_period_is_the_observer_and_the_period_alone_the_centre() {
+        let (mut app, ctx) = setup(true);
+        enter_at(&mut app, &ctx, 0.1, (100, 100));
+        // US and UK keyboards: egui has no key for `>`, so Shift-. comes as the period key
+        // with Shift, then the text `>`: the observer moves away, no Center.
+        let us = typed(egui::Key::Period, egui::Key::Period, true, ">");
+        ui_pass(&mut app, &ctx, 0.3, us);
+        assert_eq!(app.perspective.distance, Some(400.0));
+        assert!(!app.perspective.placing);
+        let us = typed(egui::Key::Comma, egui::Key::Comma, true, "<");
+        ui_pass(&mut app, &ctx, 0.4, us);
+        assert_eq!(app.perspective.distance, Some(320.0));
+        // German keyboard: Shift-. types `:`, the large step towards the observer.
+        let german = typed(egui::Key::Colon, egui::Key::Period, true, ":");
+        ui_pass(&mut app, &ctx, 0.5, german);
+        assert_eq!(app.perspective.position.unwrap()[2], -STEP_LARGE);
+        assert!(!app.perspective.placing);
+        // A held `-` fills the screen once, not with every repeat (egui marks the second
+        // press of a key that is still down as a repeat).
+        let revision = app.engine.document().revision();
+        let mut minus = typed(egui::Key::Minus, egui::Key::Minus, false, "-");
+        let release = minus.pop().unwrap();
+        ui_pass(&mut app, &ctx, 0.6, minus.clone());
+        assert_eq!(app.engine.document().revision(), revision + 1);
+        ui_pass(&mut app, &ctx, 0.65, minus);
+        ui_pass(&mut app, &ctx, 0.7, vec![release]);
+        assert_eq!(app.engine.document().revision(), revision + 1);
+        // The period itself places the centre; so does the keypad's with Shift (the keypad
+        // period has no key place in egui).
+        let period = typed(egui::Key::Period, egui::Key::Period, false, ".");
+        ui_pass(&mut app, &ctx, 0.8, period);
+        assert!(app.perspective.placing);
+        ui_pass(&mut app, &ctx, 0.9, tap(egui::Key::Escape));
+        assert!(!app.perspective.placing && app.perspective.active);
+        let keypad = vec![
+            egui::Event::Key {
+                key: egui::Key::Period,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+            egui::Event::Text(".".into()),
+        ];
+        ui_pass(&mut app, &ctx, 1.0, keypad);
+        assert!(app.perspective.placing);
+    }
+
+    #[test]
+    fn the_step_keys_go_by_their_place_on_the_keyboard_too() {
+        let (mut app, ctx) = setup(true);
+        enter_at(&mut app, &ctx, 0.1, (100, 100));
+        use egui::Key::{Colon, M, Quote, Semicolon};
+        let z = |app: &PainterApp| app.perspective.position.unwrap()[2];
+        // German keyboard: Ä and Ö sit where a US keyboard has ' and ;.
+        let steps = [
+            (Quote, Quote, false, "ä", STEP),
+            (Quote, Quote, true, "Ä", STEP + STEP_LARGE),
+            (Semicolon, Semicolon, false, "ö", STEP_LARGE),
+            (Semicolon, Semicolon, true, "Ö", 0.0),
+            // UK keyboard: Shift-' types `@`.
+            (Quote, Quote, true, "@", STEP_LARGE),
+            // US keyboard: Shift-; is `:` (egui knows that key): one large step, not two.
+            (Colon, Semicolon, true, ":", 0.0),
+            // French keyboard: M sits there; it stays M (Magnify), no step.
+            (M, Semicolon, false, "m", 0.0),
+        ];
+        for (i, (key, place, shift, text, want)) in steps.into_iter().enumerate() {
+            let t = 0.3 + 0.1 * i as f64;
+            ui_pass(&mut app, &ctx, t, typed(key, place, shift, text));
+            assert_eq!(z(&app), want, "{text}");
+        }
+        assert!(app.tools.magnify.is_some(), "M is Magnify");
+        // `@` typed another way (Option-L on a German Mac) is the large step away too.
+        ui_pass(&mut app, &ctx, 1.1, text("@"));
+        assert_eq!(z(&app), STEP_LARGE);
+    }
+
+    #[test]
+    fn undo_clr_and_the_toggle_buttons_keep_the_mode() {
+        use egui::PointerButton::Primary;
+        let (mut app, ctx) = setup(true);
+        app.engine
+            .execute(Command::SetFrameCount { count: 3 })
+            .unwrap();
+        app.engine.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        enter_at(&mut app, &ctx, 0.1, (60, 60));
+        click(&mut app, &ctx, 0.3, (80, 70), Primary);
+        assert_eq!(painted(&app, (80, 70)), brush().get(3, 2));
+        // UNDO takes the stamp back and the mode stays (as Shift-K's CLR keeps it).
+        let undo = tool_at(&app, Tool::Undo);
+        click(&mut app, &ctx, 0.4, undo, Primary);
+        assert_eq!(painted(&app, (80, 70)), Some(0));
+        assert!(app.perspective.active, "UNDO");
+        // CLR, as in the tutorial (AGA p.131), then the keypad turns on.
+        click(&mut app, &ctx, 0.5, (80, 70), Primary);
+        let clr = tool_at(&app, Tool::Clear);
+        click(&mut app, &ctx, 0.6, clr, Primary);
+        assert_eq!(painted(&app, (80, 70)), Some(0));
+        assert!(app.perspective.active, "CLR");
+        // Grid and Symmetry switch on and off.
+        let grid = tool_at(&app, Tool::Grid);
+        click(&mut app, &ctx, 0.7, grid, Primary);
+        let sym = tool_at(&app, Tool::Symmetry);
+        click(&mut app, &ctx, 0.8, sym, Primary);
+        assert!(app.tools.grid && app.tools.symmetry);
+        assert!(app.perspective.active, "Grid, Symmetry");
+        ui_pass(&mut app, &ctx, 0.9, pad(2, true));
+        assert_eq!(app.perspective.orientation.angles(), [0, 0, 90]);
+        assert_eq!(app.engine.document().current_frame(), 0, "no frame step");
+        // A drawing tool still ends it.
+        let rect = tool_at(&app, Tool::Rectangle);
+        click(&mut app, &ctx, 1.0, rect, Primary);
+        assert!(!app.perspective.active);
+    }
+
+    #[test]
+    fn brush_menu_gestures_work_in_the_mode() {
+        use egui::PointerButton::Primary;
+        let (mut app, ctx) = setup(true);
+        enter_at(&mut app, &ctx, 0.1, (100, 100));
+        let revision = app.engine.document().revision();
+        // Brush ▸ Handle ▸ Place (the tutorial changes the handle in the mode, AGA p.142).
+        menu(&mut app, &ctx, 0.3, "brush.handle_place");
+        assert!(app.xform_armed() && app.perspective.active);
+        let m = vec![moved(&app, (100, 100))];
+        ui_pass(&mut app, &ctx, 0.4, m);
+        // The gesture shows its own preview: the brush flat, its handle at the pointer.
+        app.prepare_perspective_view();
+        assert!(app.perspective.shown.is_none());
+        assert_eq!(app.compose_screen().get(101, 101), brush().get(4, 3));
+        // Press, drag two left and one up, let go: the handle moves to (1, 1); no stamp.
+        let down = vec![button(&app, (100, 100), Primary, true)];
+        ui_pass(&mut app, &ctx, 0.5, down);
+        let drag = vec![moved(&app, (98, 99))];
+        ui_pass(&mut app, &ctx, 0.6, drag);
+        let up = vec![button(&app, (98, 99), Primary, false)];
+        ui_pass(&mut app, &ctx, 0.7, up);
+        assert!(!app.xform_armed());
+        assert_eq!(app.engine.document().revision(), revision, "no stamp");
+        assert_eq!(app.custom_brush.as_ref().unwrap().handle, (1, 1));
+        assert!(app.perspective.active);
+        // The mode goes on with the new handle.
+        click(&mut app, &ctx, 0.8, (150, 120), Primary);
+        assert_eq!(app.engine.document().revision(), revision + 1);
+        assert_eq!(painted(&app, (150, 120)), brush().get(1, 1));
+        assert_eq!(painted(&app, (152, 122)), brush().get(3, 3));
+    }
+
+    #[test]
+    fn replace_on_a_four_colour_screen_paints_bg_inside_the_brush() {
+        use egui::PointerButton::{Primary, Secondary};
+        let (mut app, ctx) = setup(false);
+        let rgb = [0x000, 0xF00, 0x0F0, 0xFFF];
+        let palette = dpx_core::Palette::from_rgb4(&rgb).unwrap();
+        app.engine = Engine::new(dpx_core::Document::new(320, 256, palette));
+        app.engine.execute(Command::Clear { color: 3 }).unwrap();
+        // Every colour in the brush, 0 transparent; BG 0: no colour is free.
+        let b = BrushImage {
+            width: 4,
+            height: 2,
+            pixels: vec![0, 1, 2, 3, 3, 2, 1, 0],
+            handle: (1, 1),
+            transparent: Some(0),
+        };
+        app.custom_brush = Some(b.clone());
+        app.picked_brush = Some(b);
+        app.ui.mode = PaintMode::Replace;
+        (app.ui.fg, app.ui.bg) = (1, 0);
+        ui_pass(&mut app, &ctx, 0.05, vec![]);
+        enter_at(&mut app, &ctx, 0.1, (60, 60));
+        click(&mut app, &ctx, 0.3, (80, 70), Primary);
+        // The brush's transparent corners in BG, its colours as they are, around it nothing.
+        assert_eq!(painted(&app, (79, 69)), Some(0));
+        assert_eq!(painted(&app, (82, 70)), Some(0));
+        assert_eq!(painted(&app, (80, 69)), Some(1));
+        assert_eq!(painted(&app, (79, 70)), Some(3));
+        assert_eq!(painted(&app, (83, 70)), Some(3), "outside");
+        // The right button: the whole brush in BG.
+        click(&mut app, &ctx, 0.4, (180, 70), Secondary);
+        assert!((179..183).all(|x| (69..71).all(|y| painted(&app, (x, y)) == Some(0))));
+        assert_eq!(painted(&app, (183, 70)), Some(3), "outside");
+        // Turned by 45 degrees: only the turned brush, not the box around it.
+        app.perspective.orientation = Orientation::from_angles([0, 0, 45]);
+        click(&mut app, &ctx, 0.5, (180, 150), Secondary);
+        let bg: Vec<_> = (170..190)
+            .flat_map(|x| (140..160).map(move |y| (x, y)))
+            .filter(|&p| painted(&app, p) == Some(0))
+            .collect();
+        let (x0, x1) = (bg.iter().map(|p| p.0).min(), bg.iter().map(|p| p.0).max());
+        let (y0, y1) = (bg.iter().map(|p| p.1).min(), bg.iter().map(|p| p.1).max());
+        let (x0, x1, y0, y1) = (x0.unwrap(), x1.unwrap(), y0.unwrap(), y1.unwrap());
+        assert!(bg.len() >= 8, "{bg:?}");
+        for corner in [(x0, y0), (x1, y0), (x0, y1)] {
+            assert_eq!(
+                painted(&app, corner),
+                Some(3),
+                "a corner of the box: {corner:?}"
+            );
+        }
     }
 
     #[test]

@@ -1085,6 +1085,11 @@ impl PainterApp {
         }
     }
 
+    /// A Brush menu gesture (ADR-30) is armed or running (Effect > Perspective, ADR-37).
+    pub(crate) fn xform_armed(&self) -> bool {
+        self.tools.xform.is_some()
+    }
+
     /// A gesture is under way (not just the custom brush following the pointer), or a Brush
     /// menu gesture is armed.
     pub(crate) fn gesture_in_progress(&self) -> bool {

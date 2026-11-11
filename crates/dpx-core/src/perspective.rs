@@ -15,7 +15,7 @@
 //! (Type Brush) go through `asin` / `atan2`, rounded to whole degrees.
 
 use crate::brush_ops;
-use crate::image::Rect;
+use crate::image::{IndexedImage, Rect};
 use crate::paint::BrushImage;
 
 /// A point or direction in page space.
@@ -477,22 +477,41 @@ pub fn snap(
     out
 }
 
-/// The colour standing for "nothing" in a projected brush. With `replace_bg` (Replace mode:
-/// the brush's own transparent pixels are painted in that colour) it must differ from it too.
-fn nothing_colour(brush: &BrushImage, colors: usize, replace_bg: Option<u8>) -> u8 {
-    let Some(bg) = replace_bg else {
-        return brush_ops::fill_colour(brush, colors);
+/// Replace mode for a projected stamp, which is painted as Matte (ADR-37): inside the turned
+/// brush its transparent pixels are painted in `bg`, outside it nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Replace<'a> {
+    /// The BG colour.
+    pub bg: u8,
+    /// The right button: the stamp paints its shape in BG, so every pixel inside the brush
+    /// counts and its colours do not matter (DeluxePaint's Replace with the right button paints
+    /// the whole brush rectangle in BG).
+    pub right: bool,
+    /// The picture under the stamp. When the brush's colours and BG use the whole palette, no
+    /// colour is left to stand for "nothing" (on 2- and 4-colour screens often): the pixels
+    /// outside the brush then repeat the picture and the stamp has no transparent colour.
+    pub page: &'a IndexedImage,
+}
+
+/// The colour standing for "nothing" in a projected brush. With `replace` it must differ from
+/// every colour the stamp paints (BG and, with the left button, the brush's own colours);
+/// `None` if every palette colour is taken.
+fn nothing_colour(brush: &BrushImage, colors: usize, replace: Option<&Replace>) -> Option<u8> {
+    let Some(r) = replace else {
+        return Some(brush_ops::fill_colour(brush, colors));
     };
     let mut used = [false; 256];
-    used[usize::from(bg)] = true;
-    for &p in &brush.pixels {
-        if Some(p) != brush.transparent {
-            used[usize::from(p)] = true;
+    used[usize::from(r.bg)] = true;
+    if !r.right {
+        for &p in &brush.pixels {
+            if Some(p) != brush.transparent {
+                used[usize::from(p)] = true;
+            }
         }
     }
     (0..colors.clamp(1, 256))
         .find(|&c| !used[c])
-        .map_or(0, |c| c as u8)
+        .map(|c| c as u8)
 }
 
 /// The brush pixel seen at brush plane coordinates `(u, v)`, if the brush covers them.
@@ -521,15 +540,16 @@ fn paint_area(
     viewer: &Viewer,
     area: Rect,
     colors: usize,
-    replace_bg: Option<u8>,
+    replace: Option<&Replace>,
     tile: Option<(i64, i64)>,
     max_depth: f64,
 ) -> Option<(BrushImage, (i32, i32))> {
     if area.is_empty() {
         return None;
     }
-    let nothing = nothing_colour(brush, colors, replace_bg);
-    let mut pixels = vec![nothing; area.w as usize * area.h as usize];
+    let nothing = nothing_colour(brush, colors, replace);
+    // What each pixel paints; `None` = nothing.
+    let mut pixels = vec![None; area.w as usize * area.h as usize];
     // Bounds of the pixels that show something: x0..x1, y0..y1 (exclusive ends).
     let (mut x0, mut y0, mut x1, mut y1) = (area.w, area.h, 0, 0);
     for y in 0..area.h {
@@ -541,14 +561,16 @@ fn paint_area(
             else {
                 continue;
             };
-            let p = match replace_bg {
-                Some(bg) if Some(p) == brush.transparent => bg,
-                _ => p,
+            let p = match replace {
+                Some(r) if r.right || Some(p) == brush.transparent => r.bg,
+                Some(_) => p,
+                // The brush's own transparent pixels (or, without one, those in the colour
+                // standing for nothing, see `brush_ops::fill_colour`) paint nothing.
+                None if Some(p) == nothing => continue,
+                None => p,
             };
-            if p != nothing {
-                pixels[(y * area.w + x) as usize] = p;
-                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
-            }
+            pixels[(y * area.w + x) as usize] = Some(p);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
         }
     }
     if x0 >= x1 {
@@ -560,12 +582,20 @@ fn paint_area(
         height: shown.h as u32,
         pixels: Vec::with_capacity(shown.w as usize * shown.h as usize),
         handle: (0, 0),
-        transparent: Some(nothing),
+        transparent: nothing,
     };
     for y in shown.y..shown.y + shown.h {
-        let row = (y * area.w) as usize;
-        out.pixels
-            .extend_from_slice(&pixels[row + shown.x as usize..row + (shown.x + shown.w) as usize]);
+        for x in shown.x..shown.x + shown.w {
+            let p = pixels[(y * area.w + x) as usize]
+                .or(nothing)
+                .unwrap_or_else(|| {
+                    // No colour is free: the picture itself, painted over unchanged.
+                    replace
+                        .and_then(|r| r.page.get(area.x + x, area.y + y))
+                        .unwrap_or(0)
+                });
+            out.pixels.push(p);
+        }
     }
     Some((out, (area.x + shown.x, area.y + shown.y)))
 }
@@ -606,16 +636,16 @@ fn footprint(brush: &BrushImage, place: &Placement, viewer: &Viewer, clip: Rect)
 /// The brush turned and placed in space, as it appears on the page, cut to `clip` (the page):
 /// a brush image with its handle at the top-left and where that top-left lies. Pixels the
 /// brush does not cover are transparent (the brush's transparent colour, else an unused one,
-/// see [`brush_ops::fill_colour`]). With `replace_bg` the brush's own transparent pixels come
-/// out in that colour (Replace mode, painted as Matte). `None` if nothing shows in `clip`.
-/// Unturned on the screen plane it is exactly the brush.
+/// see [`brush_ops::fill_colour`]). With `replace` the brush's own transparent pixels come
+/// out in BG (Replace mode, painted as Matte, see [`Replace`]). `None` if nothing shows in
+/// `clip`. Unturned on the screen plane it is exactly the brush.
 pub fn project_brush(
     brush: &BrushImage,
     place: &Placement,
     viewer: &Viewer,
     clip: Rect,
     colors: usize,
-    replace_bg: Option<u8>,
+    replace: Option<Replace>,
 ) -> Option<(BrushImage, (i32, i32))> {
     let area = footprint(brush, place, viewer, clip);
     paint_area(
@@ -624,7 +654,7 @@ pub fn project_brush(
         viewer,
         area,
         colors,
-        replace_bg,
+        replace.as_ref(),
         None,
         f64::INFINITY,
     )
@@ -641,7 +671,7 @@ pub fn fill_plane(
     grid: (u32, u32),
     area: Rect,
     colors: usize,
-    replace_bg: Option<u8>,
+    replace: Option<Replace>,
 ) -> Option<(BrushImage, (i32, i32))> {
     let tile = (i64::from(grid.0.max(1)), i64::from(grid.1.max(1)));
     paint_area(
@@ -650,7 +680,7 @@ pub fn fill_plane(
         viewer,
         area,
         colors,
-        replace_bg,
+        replace.as_ref(),
         Some(tile),
         FAR * viewer.distance,
     )
@@ -719,13 +749,19 @@ pub fn wireframe(
 /// A cross hair at page pixel `at` with arms `arm` pixels long, cut to `clip` (the small one
 /// marks the perspective centre; a long one is the pointer while the centre is placed).
 pub fn cross(at: (i32, i32), arm: i32, clip: Rect) -> Vec<(i32, i32)> {
-    let mut out = Vec::new();
-    for d in -arm..=arm {
-        for p in [(at.0 + d, at.1), (at.0, at.1 + d)] {
-            if (d != 0 || p.0 == at.0) && clip.contains(p.0, p.1) && !out.contains(&p) {
-                out.push(p);
-            }
+    let arm = arm.max(0);
+    let mut out = Vec::with_capacity(4 * arm as usize + 1);
+    let mut push = |p: (i32, i32)| {
+        if clip.contains(p.0, p.1) {
+            out.push(p);
         }
+    };
+    // The centre once, then both arms: every pixel once, in time linear in `arm` (the large
+    // cross hair spans the page and is made on every redraw while the centre is placed).
+    push(at);
+    for d in (1..=arm).flat_map(|d| [-d, d]) {
+        push((at.0 + d, at.1));
+        push((at.0, at.1 + d));
     }
     out
 }
@@ -973,7 +1009,13 @@ mod tests {
         let b = brush(3, 3);
         let mut place = Placement::at_pixel((20, 20));
         place.matrix = Mat3::rotation(Axis3::Z, 45);
-        let (img, at) = project_brush(&b, &place, &viewer(), page(), 32, Some(9)).unwrap();
+        let picture = IndexedImage::new(320, 256, 0);
+        let replace = Replace {
+            bg: 9,
+            right: false,
+            page: &picture,
+        };
+        let (img, at) = project_brush(&b, &place, &viewer(), page(), 32, Some(replace)).unwrap();
         let nothing = img.transparent.unwrap();
         assert_ne!(nothing, 9);
         assert!(
@@ -988,6 +1030,156 @@ mod tests {
         );
         // Outside the turned square nothing is painted (the corners of the box).
         assert_eq!(img.get(0, 0), Some(nothing), "{at:?}");
+    }
+
+    /// A picture in every colour of a `colors`-colour palette, as a striped pattern.
+    fn picture(colors: u8) -> IndexedImage {
+        let mut p = IndexedImage::new(64, 48, 0);
+        for y in 0..48 {
+            for x in 0..64 {
+                p.set(x, y, ((x * 3 + y * 5) % i32::from(colors)) as u8);
+            }
+        }
+        p
+    }
+
+    /// `stamp` painted on `picture` the way the app stamps in Replace mode: one Matte
+    /// `Stroke` (with `right` the shape in BG) through the engine, on a palette of `rgb`.
+    fn stamped(
+        picture: &IndexedImage,
+        rgb: &[u32],
+        (img, at): (BrushImage, (i32, i32)),
+        bg: u8,
+        right: bool,
+        fx: crate::PaintFx,
+    ) -> IndexedImage {
+        let colors = rgb
+            .iter()
+            .map(|&c| crate::Rgb8::new((c >> 16) as u8, (c >> 8) as u8, c as u8))
+            .collect();
+        let palette = crate::Palette::new(colors).unwrap();
+        let (w, h) = (picture.width(), picture.height());
+        let mut engine = crate::Engine::new(crate::Document::new(w, h, palette));
+        let pixels = picture.pixels().to_vec();
+        let set = crate::Command::SetPage {
+            width: w,
+            height: h,
+            pixels,
+        };
+        engine.execute(set).unwrap();
+        let stamp = crate::Command::Stroke {
+            brush: Vec::new(),
+            color: bg,
+            points: vec![at],
+            continuous: false,
+            custom: Some(img),
+            mode: crate::DrawMode::Matte,
+            range: None,
+            stencil: None,
+            right,
+            fx,
+        };
+        engine.execute(stamp).unwrap();
+        engine.document().page().clone()
+    }
+
+    /// What Replace should leave: the reference projection (on a palette with colours to
+    /// spare, so it has a transparent colour) painted over `picture` pixel by pixel.
+    fn replaced(
+        picture: &IndexedImage,
+        b: &BrushImage,
+        place: &Placement,
+        bg: u8,
+        right: bool,
+    ) -> IndexedImage {
+        let replace = Replace {
+            bg,
+            right,
+            page: picture,
+        };
+        let (img, at) =
+            project_brush(b, place, &viewer(), picture.bounds(), 256, Some(replace)).unwrap();
+        assert!(img.transparent.is_some());
+        let mut want = picture.clone();
+        let mut outside = 0;
+        for y in 0..img.height as i32 {
+            for x in 0..img.width as i32 {
+                if img.is_opaque(x, y) {
+                    let c = if right { bg } else { img.get(x, y).unwrap() };
+                    want.set(at.0 + x, at.1 + y, c);
+                } else {
+                    outside += 1;
+                }
+            }
+        }
+        assert!(outside > 0, "the turned brush leaves corners of its box");
+        want
+    }
+
+    #[test]
+    fn replace_works_when_the_brush_and_bg_use_the_whole_palette() {
+        let mut place = Placement::at_pixel((30, 22));
+        place.matrix = Orientation::from_angles([-30, 0, 30]).matrix();
+        let rgb4 = [0x000000, 0xff2020, 0x20ff20, 0xffffff];
+        // 4 colours: a brush in all of them (0 transparent), BG 0. No colour is left to stand
+        // for nothing, so the stamp repeats the picture around the brush.
+        let b4 = BrushImage {
+            width: 8,
+            height: 6,
+            pixels: (0..48u8).map(|i| (i * 5 + i / 8) % 4).collect(),
+            handle: (4, 3),
+            transparent: Some(0),
+        };
+        let pic4 = picture(4);
+        let replace = Replace {
+            bg: 0,
+            right: false,
+            page: &pic4,
+        };
+        let stamp = project_brush(&b4, &place, &viewer(), pic4.bounds(), 4, Some(replace));
+        let stamp = stamp.unwrap();
+        assert_eq!(stamp.0.transparent, None, "no colour is free");
+        let plain = crate::PaintFx::default();
+        let got = stamped(&pic4, &rgb4, stamp.clone(), 0, false, plain);
+        assert_eq!(got, replaced(&pic4, &b4, &place, 0, false));
+        assert_ne!(got, pic4);
+        // Translucency, Process and AntiAlias leave the picture around the brush as it was.
+        let fx = crate::PaintFx {
+            translucency: Some(50),
+            process: Some(crate::ProcessMode::Tint),
+            antialias: crate::AntiAlias::High,
+        };
+        let soft = stamped(&pic4, &rgb4, stamp, 0, false, fx);
+        let want = replaced(&pic4, &b4, &place, 0, false);
+        for y in 0..48 {
+            for x in 0..64 {
+                if want.get(x, y) == pic4.get(x, y) {
+                    assert_eq!(soft.get(x, y), pic4.get(x, y), "({x}, {y})");
+                }
+            }
+        }
+        // 2 colours: any brush with BG 0 uses both.
+        let b2 = BrushImage {
+            width: 7,
+            height: 5,
+            pixels: (0..35u8).map(|i| u8::from(i % 3 != 0)).collect(),
+            handle: (3, 2),
+            transparent: Some(0),
+        };
+        let pic2 = picture(2);
+        let rgb2 = [0x000000, 0xffffff];
+        for right in [false, true] {
+            let replace = Replace {
+                bg: 0,
+                right,
+                page: &pic2,
+            };
+            let stamp = project_brush(&b2, &place, &viewer(), pic2.bounds(), 2, Some(replace));
+            let plain = crate::PaintFx::default();
+            let got = stamped(&pic2, &rgb2, stamp.unwrap(), 0, right, plain);
+            let want = replaced(&pic2, &b2, &place, 0, right);
+            assert_eq!(got, want, "right {right}");
+        }
     }
 
     #[test]
@@ -1063,6 +1255,24 @@ mod tests {
         assert!(c.contains(&(1, 1)) && c.contains(&(4, 1)) && c.contains(&(1, 4)));
         assert!(c.contains(&(0, 1)) && !c.iter().any(|&(x, y)| x < 0 || y < 0));
         assert_eq!(c.len(), 9);
+        let mut sorted = c.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), c.len(), "every pixel once");
+    }
+
+    /// The large cross hair is made on every redraw while the centre is placed: across the
+    /// largest page it takes well under a frame (the old duplicate check made it quadratic,
+    /// about 0.2 s here).
+    #[test]
+    fn the_large_cross_hair_is_quick_on_the_largest_page() {
+        let side = crate::command::MAX_PAGE_SIDE as i32;
+        let clip = Rect::new(0, 0, side, side);
+        let start = std::time::Instant::now();
+        let c = cross((side / 2, side / 2), side, clip);
+        let took = start.elapsed();
+        assert_eq!(c.len(), 2 * side as usize - 1);
+        assert!(took < std::time::Duration::from_millis(20), "{took:?}");
     }
 
     /// Pins the pixels of one turned, distant stamp and one plane, so any change of the
