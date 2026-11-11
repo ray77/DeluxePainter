@@ -184,6 +184,10 @@ impl PainterApp {
     /// Keys of the ADR-15 menu items on the paint screen, and the colour-cycling clock: `j`
     /// Spare ▸ Swap, Ctrl+`j` Copy to Spare, `k` CLR, Tab Cycle, `?` About.
     pub(crate) fn menu_keys(&mut self, ctx: &egui::Context) {
+        if self.typing() {
+            // The Text tool owns the keyboard.
+            return;
+        }
         let (now, events) = ctx.input(|i| (i.time, i.events.clone()));
         for event in events {
             match event {
@@ -200,7 +204,11 @@ impl PainterApp {
                         egui::Key::J if plain => self.swap_spare(),
                         egui::Key::J if ctrl_only => self.copy_to_spare(),
                         egui::Key::K if plain => self.run(Command::Clear { color: self.ui.bg }),
-                        egui::Key::Tab if plain => self.toggle_cycling(now),
+                        egui::Key::Tab if plain => {
+                            self.toggle_cycling(now);
+                            // This pass's clock tick has run already.
+                            ctx.request_repaint();
+                        }
                         _ => {}
                     }
                 }
@@ -208,6 +216,11 @@ impl PainterApp {
                 _ => {}
             }
         }
+    }
+
+    /// The colour-cycling clock, once per pass in every state (ADR-35): advances the shown
+    /// palette and asks for the next pass while cycling is on.
+    pub(crate) fn cycle_frame(&mut self, ctx: &egui::Context, now: f64) {
         if self.cycle_tick(now) {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -385,16 +398,16 @@ impl PainterApp {
         self.dirty = true;
     }
 
-    /// Advances colour cycling to `now`; returns whether cycling is on.
-    fn cycle_tick(&mut self, now: f64) -> bool {
+    /// Advances colour cycling to `now`; returns whether cycling is on. While the Range
+    /// requester is open, its edited ranges cycle (they are kept only on Ok). Calling it again
+    /// with the same `now` changes nothing unless the palette or the ranges changed.
+    pub(crate) fn cycle_tick(&mut self, now: f64) -> bool {
         let Some(start) = self.menu_data.cycle_start else {
             return false;
         };
-        let shown = cycled_palette(
-            self.engine.document().palette(),
-            &self.extras.ranges,
-            now - start,
-        );
+        let editing = self.ui.range_requester.as_ref().map(color_ranges);
+        let ranges = editing.as_deref().unwrap_or(&self.extras.ranges);
+        let shown = cycled_palette(self.engine.document().palette(), ranges, now - start);
         if self.menu_data.cycled.as_ref() != Some(&shown) {
             self.menu_data.cycled = Some(shown);
             self.dirty = true;
@@ -580,26 +593,33 @@ impl PainterApp {
         self.dirty = true;
         match response {
             RangeResponse::Continue => {}
-            RangeResponse::Cancel => self.ui.range_requester = None,
+            RangeResponse::Cancel => {
+                self.ui.range_requester = None;
+                // The kept ranges cycle again from the next tick.
+                self.menu_data.cycled = None;
+            }
             RangeResponse::Ok => {
                 let Some(req) = self.ui.range_requester.take() else {
                     return;
                 };
-                self.extras.ranges = req
-                    .ranges()
-                    .iter()
-                    .map(|r| ColorRange {
-                        rate: r.rate,
-                        flags: r.flags,
-                        low: r.low,
-                        high: r.high,
-                    })
-                    .collect();
-                // The cycling clock restarts from the new ranges.
+                self.extras.ranges = color_ranges(&req);
                 self.menu_data.cycled = None;
             }
         }
     }
+}
+
+/// The ranges being edited in the Range requester, as CRNG ranges.
+fn color_ranges(req: &RangeRequester) -> Vec<ColorRange> {
+    req.ranges()
+        .iter()
+        .map(|r| ColorRange {
+            rate: r.rate,
+            flags: r.flags,
+            low: r.low,
+            high: r.high,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -638,6 +658,8 @@ mod tests {
             time: Some(t),
             ..Default::default()
         });
+        // As in `ui()`: the cycling clock first, then the keys.
+        app.cycle_frame(&ctx, t);
         app.menu_keys(&ctx);
         // The pass uploads egui's font texture; nothing renders it here.
         ctx.end_pass().textures_delta.clear();

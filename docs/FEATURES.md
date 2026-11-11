@@ -66,7 +66,7 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 |---|---|---|
 | P0 | Colour mixer: RGB/HSV sliders, spread, copy, exchange, undo; AGA "Scale" RGB4→RGB8 | docked as a strip at the bottom like DPaint |
 | P1 | Arrange palette, remap picture/brush, use brush palette, default palette, load/save palette | Arrange and picture Remap done (ADR-31); Color Set Load/Save = palette files; Use Brush Palette and brush remap open |
-| P2 | Colour cycling: 8 ranges × up to 32 colours, rate 0–63, direction, live preview (display-only) | Range requester (bottom strip); CRNG/CCRT |
+| P2 | Colour cycling: 8 ranges × up to 32 colours, rate 0–63, direction, live preview (display-only) | Range requester (bottom strip); CRNG/CCRT; Tab cycles on screen, also under requesters/menus and during playback (ADR-35) |
 
 Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester (range 1–8, span by two clicks or a drag, rate 0–63, direction, active, clear) with two inactive default ranges on new pictures; the requester is not yet a bottom strip, has no colour beads/free RGB values, Random/Dither or Undo/Revert, and the ranges are not yet used by gradient fills, Shade or Cycle modes.
 

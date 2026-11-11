@@ -856,6 +856,8 @@ impl PainterApp {
     /// Replaces the document with a loaded picture (not undoable, like DeluxePaint's Load).
     fn set_picture(&mut self, doc: Document, extras: files::PictureExtras, path: PathBuf) {
         self.menu_data.loaded_palette = Some(doc.palette().clone());
+        // Cycling stays on or off; the next clock tick cycles the new palette.
+        self.menu_data.cycled = None;
         self.stroke = None;
         self.anim.playing = None;
         self.engine = Engine::new(doc);
@@ -1399,7 +1401,11 @@ impl PainterApp {
                 "spare.delete" => self.delete_page(),
                 "picture.delete" => self.open_file_requester(FileKind::DeleteFile),
                 "app.about" => self.show_about(),
-                "color.cycle" => self.toggle_cycling(ctx.input(|i| i.time)),
+                "color.cycle" => {
+                    self.toggle_cycling(ctx.input(|i| i.time));
+                    // This pass's clock tick has run already; the next one keeps it going.
+                    ctx.request_repaint();
+                }
                 "palette.restore" => self.restore_palette(),
                 "palette.load" => self.open_file_requester(FileKind::LoadPalette),
                 "palette.save" => self.open_file_requester(FileKind::SavePalette),
@@ -1493,6 +1499,8 @@ impl eframe::App for PainterApp {
         }
         self.clamp_scroll();
         self.persist_settings(&ctx, now);
+        // Colour cycling runs in every state: under requesters and menus, during playback.
+        self.cycle_frame(&ctx, now);
 
         // The screen at its pixel size (whole and half steps, ADR-13), centred; each screen
         // pixel is shown fx×fy times `scale` physical pixels (its shape in this mode). When
@@ -1664,7 +1672,9 @@ impl eframe::App for PainterApp {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
-        // Tool keys first: while typing text or magnifying they own the keyboard.
+        // Tool keys first: while typing text or magnifying they own the keyboard. Keys that
+        // arrive in the pass whose Esc ends the text are text keys too.
+        let was_typing = self.typing();
         let keys_taken = self.tool_keys(&ctx);
         if !keys_taken {
             self.page_scroll_input(&ctx, ppp, scale, view);
@@ -1702,11 +1712,13 @@ impl eframe::App for PainterApp {
             }
         });
         self.window_keys(&ctx);
-        self.menu_keys(&ctx);
-        self.anim_keys(&ctx);
+        if !was_typing {
+            self.menu_keys(&ctx);
+            self.anim_keys(&ctx);
+        }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
-        if undo_key && !self.typing() {
+        if undo_key && !was_typing && !self.typing() {
             if shift {
                 self.redo();
             } else {
@@ -2108,7 +2120,8 @@ impl PainterApp {
                     return;
                 };
                 self.ui.fg = req.selected();
-                if req.colors() != self.palette().colors() {
+                // Against the document palette: the shown one may be cycling.
+                if req.colors() != self.engine.document().palette().colors() {
                     self.run(Command::SetPalette {
                         colors: req.colors().to_vec(),
                     });
@@ -2202,6 +2215,9 @@ impl PainterApp {
         rect: egui::Rect,
         area: egui::Rect,
     ) {
+        // The shown cycling palette follows palette and range changes made earlier in this
+        // pass (the clock at the top of `ui()` ran before them).
+        self.cycle_tick(ctx.input(|i| i.time));
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
             self.prepare_anim_view();
@@ -2375,6 +2391,243 @@ mod tests {
         });
         assert!(palettes.len() >= 8, "{} palettes in 0.9 s", palettes.len());
         assert_eq!(app.engine.document().palette(), &doc, "display only");
+    }
+
+    /// A waterfall-like range: colours 8-15 at 11 steps per second.
+    fn waterfall_range(app: &mut PainterApp) {
+        app.extras.ranges = vec![dpx_iff::ilbm::ColorRange {
+            rate: 3072,
+            flags: 1,
+            low: 8,
+            high: 15,
+        }];
+    }
+
+    /// Runs a pass with `first` at `t`, then passes only when egui asks for one until
+    /// `until`; returns the distinct shown palettes of colours 8-15 seen on the way.
+    fn idle_palettes(
+        app: &mut PainterApp,
+        ctx: &egui::Context,
+        t: f64,
+        until: f64,
+        first: Vec<egui::Event>,
+    ) -> usize {
+        let mut delay = ui_pass(app, ctx, t, first);
+        let mut t = t;
+        let mut seen = std::collections::BTreeSet::new();
+        while t < until {
+            assert!(
+                delay < std::time::Duration::from_secs(1),
+                "no repaint requested at t = {t}"
+            );
+            t += delay.as_secs_f64().max(1.0 / 60.0);
+            delay = ui_pass(app, ctx, t, vec![]);
+            seen.insert(format!("{:?}", &app.palette().colors()[8..16]));
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn cycling_runs_under_requesters_and_menus() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        waterfall_range(&mut app);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 0.2, |_| {});
+        // The note after a load: Tab there does not reach the paint screen, but the colours
+        // keep moving behind it.
+        let note = ["DPPS chunk (110 bytes) not kept".to_string()];
+        app.ui.note_requester = note_requester(LOADED, &note);
+        let n = idle_palettes(&mut app, &ctx, 0.3, 1.3, vec![]);
+        assert!(n >= 8, "under the note: {n}");
+        ui_pass(&mut app, &ctx, 1.4, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.ui.note_requester.is_none());
+        // The Range requester cycles the ranges being edited: switching the range off there
+        // stops it at once; Cancel brings the kept one back.
+        app.open_ranges();
+        let n = idle_palettes(&mut app, &ctx, 1.5, 2.5, vec![]);
+        assert!(n >= 8, "under the Range requester: {n}");
+        let active = dpx_ui::RangeRequester::active_rect();
+        app.range_event(ReqEvent::Press(active.x + 2, active.y + 2));
+        app.range_event(ReqEvent::Release);
+        let n = idle_palettes(&mut app, &ctx, 2.6, 3.0, vec![]);
+        assert_eq!(n, 1, "range switched off in the requester");
+        assert_eq!(app.palette(), app.engine.document().palette());
+        app.range_event(ReqEvent::Key(ReqKey::Escape));
+        assert!(app.ui.range_requester.is_none());
+        let n = idle_palettes(&mut app, &ctx, 3.1, 4.1, vec![]);
+        assert!(n >= 8, "the kept range after Cancel: {n}");
+        // The menu strip, held open with the right button over the title bar.
+        let title = egui::pos2(640.0, 4.0);
+        let hold = vec![
+            egui::Event::PointerMoved(title),
+            egui::Event::PointerButton {
+                pos: title,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        ui_pass(&mut app, &ctx, 4.2, hold);
+        assert!(app.ui.menu.active, "the strip opened");
+        let n = idle_palettes(&mut app, &ctx, 4.3, 5.3, vec![]);
+        assert!(n >= 8, "with the menu strip: {n}");
+        assert!(app.ui.menu.active, "the strip stayed open");
+    }
+
+    #[test]
+    fn cycling_plays_along_with_the_animation_and_tab_switches_it_there() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        waterfall_range(&mut app);
+        app.engine
+            .execute(Command::SetFrameCount { count: 3 })
+            .unwrap();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 0.2, |_| {});
+        press_and_idle(&mut app, &ctx, egui::Key::Num4, 0.3, 0.4, |_| {});
+        assert!(app.anim.playing.is_some());
+        let n = idle_palettes(&mut app, &ctx, 0.5, 1.5, vec![]);
+        assert!(n >= 8, "while playing: {n}");
+        // Tab while playing: cycling off, the playback goes on.
+        ui_pass(&mut app, &ctx, 1.6, vec![key_event(egui::Key::Tab, true)]);
+        ui_pass(&mut app, &ctx, 1.62, vec![key_event(egui::Key::Tab, false)]);
+        assert!(app.menu_data.cycle_start.is_none());
+        assert!(app.anim.playing.is_some());
+        assert_eq!(app.palette(), app.engine.document().palette());
+    }
+
+    #[test]
+    fn cycle_from_the_menu_asks_for_the_next_pass() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        waterfall_range(&mut app);
+        // Settle: the first passes ask for repaints of their own (window size).
+        let mut t = 0.0;
+        while ui_pass(&mut app, &ctx, t, vec![]) != std::time::Duration::MAX {
+            t += 0.01;
+            assert!(t < 1.0, "the window does not settle");
+        }
+        // The menu runs its action after this pass's clock tick.
+        let raw = egui::RawInput {
+            time: Some(t + 0.1),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            let ctx = ui.ctx().clone();
+            app.run_action(Action::Command("color.cycle"), &ctx);
+        });
+        out.textures_delta.clear();
+        let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay < std::time::Duration::from_secs(1), "{delay:?}");
+        let from = t + 0.1 + delay.as_secs_f64();
+        let n = idle_palettes(&mut app, &ctx, from, from + 1.0, vec![]);
+        assert!(n >= 8, "{n}");
+    }
+
+    #[test]
+    fn a_palette_change_shows_cycled_in_the_same_pass() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        waterfall_range(&mut app);
+        let before = app.engine.document().palette().clone();
+        // Colours 8-15 become shades of red.
+        let mut colors = before.colors().to_vec();
+        for (i, c) in colors[8..16].iter_mut().enumerate() {
+            *c = dpx_core::Rgb8::new(100 + i as u8 * 20, 0, 0);
+        }
+        app.run(Command::SetPalette { colors });
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 0.5, |_| {});
+        // `U` undoes the red after this pass's clock tick: the screen of the same pass
+        // already shows the old colours cycling, not the red ones.
+        ui_pass(&mut app, &ctx, 0.6, vec![key_event(egui::Key::U, true)]);
+        assert_eq!(app.engine.document().palette(), &before);
+        let old = &before.colors()[8..16];
+        for c in &app.palette().colors()[8..16] {
+            assert!(old.contains(c), "{c:?} is not one of the old colours");
+        }
+    }
+
+    #[test]
+    fn a_load_while_cycling_cycles_the_new_palette() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        waterfall_range(&mut app);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 0.5, |_| {});
+        assert!(app.menu_data.cycled.is_some());
+        // A picture with another palette and no ranges: what is shown is its own palette,
+        // never the old picture's cycled one.
+        let colors: Vec<dpx_core::Rgb8> = (0..32u8)
+            .map(|i| dpx_core::Rgb8::new(i * 8, 0, 255 - i * 8))
+            .collect();
+        let palette = Palette::new(colors).unwrap();
+        let doc = Document::from_picture(
+            IndexedImage::new(320, 256, 0),
+            palette.clone(),
+            Target::default(),
+        );
+        app.set_picture(
+            doc,
+            files::PictureExtras::default(),
+            PathBuf::from("other.iff"),
+        );
+        assert_eq!(app.palette(), &palette);
+        ui_pass(&mut app, &ctx, 0.6, vec![]);
+        assert_eq!(app.palette(), &palette, "no ranges: nothing moves");
+        assert!(app.menu_data.cycle_start.is_some(), "cycling stays on");
+    }
+
+    #[test]
+    fn mixer_ok_without_edits_adds_no_undo_step_while_cycling() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        waterfall_range(&mut app);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 0.5, |_| {});
+        assert_ne!(
+            app.palette(),
+            app.engine.document().palette(),
+            "cycling shows"
+        );
+        assert!(!app.engine.can_undo());
+        app.run_action(Action::Command("palette.mixer"), &ctx);
+        app.palette_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.ui.palette_requester.is_none());
+        assert!(!app.engine.can_undo(), "Ok without edits changes nothing");
+    }
+
+    #[test]
+    fn paint_screen_keys_wait_while_typing_text() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.select_tool(Tool::Text, false);
+        app.handle_press(Hit::Page { x: 20, y: 20 }, false);
+        app.release();
+        assert!(app.typing());
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let typed = |c: &str| vec![egui::Event::Text(c.into())];
+        let mut j = vec![key_event(egui::Key::J, true)];
+        j.extend(typed("j"));
+        ui_pass(&mut app, &ctx, 0.1, j);
+        ui_pass(&mut app, &ctx, 0.12, vec![key_event(egui::Key::J, false)]);
+        ui_pass(&mut app, &ctx, 0.2, typed("?"));
+        ui_pass(&mut app, &ctx, 0.3, vec![key_event(egui::Key::Tab, true)]);
+        assert!(app.menu_data.spare.is_none(), "j is typed, not Swap Spare");
+        assert!(app.ui.note_requester.is_none(), "? is typed, not About");
+        assert!(app.menu_data.cycle_start.is_none(), "Tab does not cycle");
+        assert!(app.typing());
+        // `j` in the same pass as the Esc that ends the text is still a text key.
+        let mut end = typed("j");
+        end.push(key_event(egui::Key::J, true));
+        end.push(key_event(egui::Key::Escape, true));
+        ui_pass(&mut app, &ctx, 0.4, end);
+        assert!(!app.typing());
+        assert!(
+            app.menu_data.spare.is_none(),
+            "j with Esc is not Swap Spare"
+        );
     }
 
     /// Runs one egui pass with the `p` key pressed through the Color Mixer's input.

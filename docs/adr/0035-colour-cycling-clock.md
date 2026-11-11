@@ -1,0 +1,26 @@
+# ADR-35: The colour-cycling clock runs in every state
+
+- Status: accepted (Phase 4, 2026-11-11; decided without the owner after the report "Waterfall, Tab/Play: nothing animates")
+- Context:
+  - Color ▸ Cycle (Tab) worked only on the plain paint screen. The clock (`cycle_tick`) ran inside `menu_keys`, and every modal branch of `ui()` returns before that: the note after Load, the requesters, the menu strip, Show Page and animation playback.
+  - Loading a DeluxePaint picture such as the Waterfall example opens the note "DPPS chunk (110 bytes) not kept" (ADR-12). While it was open, the colours stood still, and Tab and `4` went to the note.
+  - If cycling had been switched on before the load (e.g. on the start picture, whose default ranges are inactive), the new picture first showed the old picture's cycled palette, then cycled by itself once the note closed, and the next Tab switched it off.
+  - Manual (AGA): Cycle is one on/off toggle with the key Tab (menu figure p.259, p.262). The spinning-ball tutorial switches cycling on and then plays the animation, and the result needs both (p.194–196). The Range requester shows cycling live while its Rate slider moves (p.261). The manual says nothing about menus, notes, the Color Mixer or Play on a single frame.
+  - Verified from the egui-winit 0.37 / winit 0.30 / eframe 0.37 sources: a real Tab press reaches `ctx.input()` as `Key::Tab` (IME is off; eframe ignores the "consumed" flag).
+- Decision:
+  - `cycle_frame` runs once per pass near the top of `ui()`, before every modal branch. While cycling is on, it advances the shown palette and asks for the next pass in 16 ms. Cycling therefore keeps going under requesters, notes and the menu strip, and during Play / Play once / Ping-pong.
+  - The shown palette is worked out again just before the screen is uploaded (same time, so the phase does not move). A palette change later in the same pass (Undo, Mixer Ok, Restore, a load) therefore never shows one frame of the old palette.
+  - While the Range requester is open, the ranges being edited cycle (Active, Clear, Rate and the span show at once); Cancel goes back to the kept ones. Deviation: the manual also shows the selected range cycling while its Rate slider is dragged when cycling is off (p.261); DeluxePainter shows cycling there only while it is on.
+  - Toggles (Tab on the paint screen, Tab during playback, Color ▸ Cycle) ask for another pass at once, because that pass's clock tick has already run.
+  - Tab also toggles cycling during playback (as in the tutorial). In requesters it keeps its requester meaning (moving between fields, or nothing), and the note still takes every key (ADR-12, owner's decision).
+  - A load keeps cycling on or off and drops the old cycled palette; the next tick cycles the new picture's ranges.
+  - The Color Mixer still shows its edited palette without cycling. Its Ok compares against the document palette, so Ok without edits adds no undo step while cycling.
+  - The paint-screen menu and animation keys (`j`, Ctrl+`j`, `k`, Tab, `?`, `1`–`6`, `l`, `U`) wait while the Text tool is typing, judged before the tool keys run, so keys in the same pass as the Esc that ends the text are still text.
+  - Color ▸ Cycle shows the key hint TAB, as in the manual's menu figure.
+  - Play / Play once / Ping-pong on a single frame stay a silent no-op (the manual is silent); a hint would be a visible change for the owner to decide.
+- Verified:
+  - App tests drive `PainterApp::ui` with real egui key events and egui's own repaint delay (no pass unless egui asks for one), as the idle window does: Tab cycles; cycling continues under a note, the Range requester (following its edits and Cancel) and the menu strip held with the right button, and during playback; Tab toggles it during playback; Color ▸ Cycle from the menu asks for the next pass (after the window has settled); Undo of a palette change shows the old colours cycling in the same pass; a load while cycling shows the new palette; Mixer Ok without edits adds no undo step; `j`, `?` and Tab are typed while the Text tool is active, also together with the ending Esc; key `4` shows every frame and the title counter follows.
+  - Each fix was reverted on its own and its test then failed (seven mutations).
+  - An adversarial review (three lenses, every finding re-checked) found six small defects in the first version; all are fixed above.
+  - A real-window run with the Waterfall example and cycling switched on from code showed about 18 palette changes per second.
+  - Not verified with a real keyboard in the window: the owner did not grant remote control.

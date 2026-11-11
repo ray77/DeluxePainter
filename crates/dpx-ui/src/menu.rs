@@ -424,7 +424,7 @@ pub static MENUS: [Menu; 7] = [
         title: "Color",
         items: &[
             cmd("Ranges..", "color.ranges"),
-            cmd("Cycle", "color.cycle"),
+            cmd_key("Cycle", plain("TAB"), "color.cycle"),
             sub(
                 "Palette",
                 &[

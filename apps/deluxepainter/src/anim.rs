@@ -263,11 +263,20 @@ impl PainterApp {
         }
         for event in events {
             if let egui::Event::Key {
-                key, pressed: true, ..
+                key,
+                pressed: true,
+                repeat,
+                modifiers,
+                ..
             } = event
             {
                 match key {
                     egui::Key::Escape | egui::Key::Space => return self.stop_playback(),
+                    // Colour cycling plays along (AGA p.194-196); Tab switches it here too.
+                    egui::Key::Tab if !repeat && !modifiers.any() => {
+                        self.toggle_cycling(now);
+                        ctx.request_repaint();
+                    }
                     egui::Key::ArrowLeft => self.change_play_rate(-1, now),
                     egui::Key::ArrowRight => self.change_play_rate(1, now),
                     _ => {}
