@@ -535,6 +535,12 @@ fn main() -> eframe::Result {
             .with_inner_size(start)
             .with_min_inner_size([320.0, 200.0])
             .with_icon(Arc::new(app_icon())),
+        // VSync with one queued frame instead of eframe's default two: the brush follows the
+        // pointer a frame sooner (ADR-40). Our GPU work is one textured quad.
+        wgpu_options: eframe::WgpuConfiguration {
+            surface: eframe::SurfaceConfig::LOW_LATENCY,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
