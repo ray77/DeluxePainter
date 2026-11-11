@@ -4,6 +4,8 @@
 //! shares the picture palette, like the classic Amiga paint programs. The host (eframe) only
 //! converts that buffer to RGBA and shows it with nearest-neighbour scaling.
 
+pub mod anim_control;
+pub mod anim_panel;
 pub mod anim_requester;
 pub mod arrange_requester;
 pub mod bitmap;
@@ -28,6 +30,11 @@ pub(crate) mod widgets;
 
 use dpx_core::{IndexedImage, Palette};
 
+pub use anim_control::{
+    AnimControlRequester, MoveRequester, MoveResponse, PlayRange, PlayRangeRequester,
+    PlayRangeResponse,
+};
+pub use anim_panel::{AnimPanel, PanelButton, PanelHit};
 pub use anim_requester::{AnimChoice, AnimReqResponse, AnimRequester};
 pub use arrange_requester::ArrangeRequester;
 pub use choice_requester::{ChoiceRequester, ChoiceResponse};

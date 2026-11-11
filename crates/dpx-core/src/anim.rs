@@ -136,7 +136,8 @@ pub fn light_table(
     IndexedImage::from_pixels(current.width(), current.height(), pixels).expect("same size")
 }
 
-/// Anim ▸ Control ▸ Play, Play once and Ping-pong (keys 4, 5, 6).
+/// Anim ▸ Control ▸ Play, Play once and Ping-pong (keys 4, 5, 6), and the reverse plays of
+/// the Control Panel and Shift-4 / Shift-5 (ADR-38).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayMode {
     /// Loops forward until stopped.
@@ -145,6 +146,10 @@ pub enum PlayMode {
     Once,
     /// Forward to the last frame, back to the first, until stopped.
     PingPong,
+    /// Loops backward until stopped (ADR-38).
+    LoopBackward,
+    /// Plays once from the last frame back to the first and stops there (ADR-38).
+    OnceBackward,
 }
 
 /// The step position after `elapsed` seconds at `fps` frames per second, counted from
@@ -158,20 +163,48 @@ pub fn play_position(start: u64, fps: u8, elapsed: f64) -> u64 {
 /// playback is over. Loop and Once count positions as frame numbers (a loop may start at any
 /// frame); Ping-pong positions run around the cycle 0, 1, …, last, last−1, …, 1.
 pub fn frame_at(mode: PlayMode, count: usize, position: u64) -> (usize, bool) {
-    if count <= 1 {
-        return (0, mode == PlayMode::Once && position >= 1);
+    frame_in(mode, 0, count.max(1) - 1, position)
+}
+
+/// [`frame_at`] for a playback of frames `first..=last` (Anim ▸ Control ▸ Set Range, ADR-38).
+/// Positions count steps from `first` (forward modes) or from `last` (backward modes):
+/// position `p` shows `first + p` (Loop wraps, Once stops on `last`), `last − p`
+/// (LoopBackward wraps, OnceBackward stops on `first`), or runs around the ping-pong cycle.
+/// The play-once modes are over one frame time after their last frame.
+pub fn frame_in(mode: PlayMode, first: usize, last: usize, position: u64) -> (usize, bool) {
+    let last = last.max(first);
+    let once = matches!(mode, PlayMode::Once | PlayMode::OnceBackward);
+    if first == last {
+        return (first, once && position >= 1);
     }
-    let n = count as u64;
+    let n = (last - first + 1) as u64;
+    let (forward, backward) = (|p: u64| first + p as usize, |p: u64| last - p as usize);
     match mode {
-        PlayMode::Loop => ((position % n) as usize, false),
-        PlayMode::Once if position >= n => (count - 1, true),
-        PlayMode::Once => (position as usize, false),
+        PlayMode::Loop => (forward(position % n), false),
+        PlayMode::LoopBackward => (backward(position % n), false),
+        PlayMode::Once if position >= n => (last, true),
+        PlayMode::Once => (forward(position), false),
+        PlayMode::OnceBackward if position >= n => (first, true),
+        PlayMode::OnceBackward => (backward(position), false),
         PlayMode::PingPong => {
             let period = 2 * (n - 1);
             let p = position % period;
-            let frame = if p < n { p } else { period - p };
-            (frame as usize, false)
+            (forward(if p < n { p } else { period - p }), false)
         }
+    }
+}
+
+/// The position at which a playback of frames `first..=last` in `mode` shows frame
+/// `current` (see [`frame_in`]): the loops and Ping-pong start there when it lies in the
+/// range, else at the range's start; the play-once modes always start at their first frame
+/// (ADR-28, ADR-38).
+pub fn start_position(mode: PlayMode, first: usize, last: usize, current: usize) -> u64 {
+    let inside = (first..=last).contains(&current);
+    match mode {
+        PlayMode::Once | PlayMode::OnceBackward => 0,
+        PlayMode::Loop | PlayMode::PingPong if inside => (current - first) as u64,
+        PlayMode::LoopBackward if inside => (last - current) as u64,
+        _ => 0,
     }
 }
 
@@ -274,5 +307,45 @@ mod tests {
         assert_eq!(frame_at(PlayMode::PingPong, 1, 9), (0, false));
         assert_eq!(frame_at(PlayMode::Once, 1, 0), (0, false));
         assert_eq!(frame_at(PlayMode::Once, 1, 1), (0, true));
+    }
+
+    #[test]
+    fn ranges_and_backward_playback() {
+        // Frames 3..=6 (from 0): Once runs 3, 4, 5, 6 and stops on 6.
+        let once: Vec<(usize, bool)> = (0..5).map(|p| frame_in(PlayMode::Once, 3, 6, p)).collect();
+        assert_eq!(
+            once,
+            [(3, false), (4, false), (5, false), (6, false), (6, true)]
+        );
+        // Backward: 6, 5, 4, 3, done on 3.
+        let back: Vec<(usize, bool)> = (0..5)
+            .map(|p| frame_in(PlayMode::OnceBackward, 3, 6, p))
+            .collect();
+        assert_eq!(
+            back,
+            [(6, false), (5, false), (4, false), (3, false), (3, true)]
+        );
+        // Loop backward wraps from the first to the last.
+        let lb: Vec<usize> = (0..6)
+            .map(|p| frame_in(PlayMode::LoopBackward, 0, 3, p).0)
+            .collect();
+        assert_eq!(lb, [3, 2, 1, 0, 3, 2]);
+        // Ping-pong inside the range.
+        let pp: Vec<usize> = (0..7)
+            .map(|p| frame_in(PlayMode::PingPong, 2, 4, p).0)
+            .collect();
+        assert_eq!(pp, [2, 3, 4, 3, 2, 3, 4]);
+        // A one-frame range.
+        assert_eq!(frame_in(PlayMode::OnceBackward, 5, 5, 0), (5, false));
+        assert_eq!(frame_in(PlayMode::OnceBackward, 5, 5, 1), (5, true));
+        assert_eq!(frame_in(PlayMode::LoopBackward, 5, 5, 9), (5, false));
+        // Start positions: the current frame for loops inside the range, else the start.
+        assert_eq!(start_position(PlayMode::Loop, 0, 9, 4), 4);
+        assert_eq!(start_position(PlayMode::LoopBackward, 0, 9, 4), 5);
+        assert_eq!(frame_in(PlayMode::LoopBackward, 0, 9, 5).0, 4);
+        assert_eq!(start_position(PlayMode::PingPong, 2, 5, 4), 2);
+        assert_eq!(start_position(PlayMode::PingPong, 2, 5, 8), 0);
+        assert_eq!(start_position(PlayMode::Once, 2, 5, 4), 0);
+        assert_eq!(start_position(PlayMode::OnceBackward, 2, 5, 4), 0);
     }
 }

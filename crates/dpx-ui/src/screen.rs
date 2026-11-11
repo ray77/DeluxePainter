@@ -115,6 +115,15 @@ pub struct UiState {
     /// Effect flags shown after the paint mode in the title bar (A/a, P, S/s, T; ADR-31); the
     /// app keeps them in sync.
     pub flags: String,
+    // Anim control (ADR-38).
+    /// The Animation Control Panel while shown (Anim ▸ Control ▸ Panel On/Off, Alt-a); the
+    /// app keeps its frame and Light Table state in sync.
+    pub anim_panel: Option<crate::anim_panel::AnimPanel>,
+    /// Set Range.. or Move.. while open.
+    pub anim_control: Option<crate::anim_control::AnimControlRequester>,
+    /// Anim ▸ Method: Expanded (else Compressed, DeluxePaint's default). Only a check mark:
+    /// it describes DeluxePaint's memory use and changes nothing here.
+    pub anim_expanded: bool,
 }
 
 impl UiState {
@@ -129,6 +138,7 @@ impl UiState {
             ham: false,
             has_brush: self.has_brush,
             can_restore: self.can_restore,
+            anim_expanded: self.anim_expanded,
         }
     }
 }
@@ -160,6 +170,9 @@ impl Default for UiState {
             anim_requester: None,
             frame_counter: None,
             flags: String::new(),
+            anim_panel: None,
+            anim_control: None,
+            anim_expanded: false,
         }
     }
 }
@@ -210,12 +223,20 @@ pub fn palette_grid(colors: usize, screen_h: i32) -> (i32, i32, i32, i32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     TitleBar,
-    Tool { tool: Tool, filled_half: bool },
+    Tool {
+        tool: Tool,
+        filled_half: bool,
+    },
     Brush(usize),
     Indicator,
     PaletteCell(u8),
     ToolboxBackground,
-    Page { x: i32, y: i32 },
+    Page {
+        x: i32,
+        y: i32,
+    },
+    /// The Animation Control Panel (ADR-38).
+    AnimPanel(crate::anim_panel::PanelHit),
 }
 
 pub struct Screen {
@@ -289,6 +310,12 @@ impl Screen {
         if ui.toolbox_visible {
             self.draw_toolbox(img, palette, ui, pens);
         }
+        // ADR-38: under the menus and requesters.
+        if let Some(panel) = &ui.anim_panel {
+            let layout =
+                crate::anim_panel::Layout::new(self.width, self.height, ui.toolbox_visible);
+            panel.draw(img, pens, &layout);
+        }
         if ui.title_visible {
             if ui.menu.active {
                 let ctx = ui.menu_context();
@@ -319,6 +346,9 @@ impl Screen {
             req.draw(img, pens, palette);
         }
         if let Some(req) = &ui.anim_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.anim_control {
             req.draw(img, pens);
         }
     }
@@ -494,6 +524,13 @@ impl Screen {
     pub fn hit_test(&self, palette_len: usize, ui: &UiState, x: i32, y: i32) -> Hit {
         if ui.title_visible && y < geom::TITLE_H {
             return Hit::TitleBar;
+        }
+        if let Some(panel) = &ui.anim_panel {
+            let layout =
+                crate::anim_panel::Layout::new(self.width, self.height, ui.toolbox_visible);
+            if let Some(hit) = panel.hit(&layout, x, y) {
+                return Hit::AnimPanel(hit);
+            }
         }
         let x0 = self.toolbox_x();
         if ui.toolbox_visible && x >= x0 && y >= geom::TITLE_H {

@@ -23,8 +23,11 @@ pub const NOTHING_TO_PLAY: &str = "Nothing to play";
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Playback {
     pub mode: PlayMode,
-    /// Step position at `since` (see [`anim::frame_at`]).
+    /// Step position at `since` (see [`anim::frame_in`]).
     pub start: u64,
+    /// The frames played (from 0): Set Range for the play-once modes and Ping-pong (ADR-38).
+    pub first: usize,
+    pub last: usize,
     /// When the clock started (egui time, seconds).
     pub since: f64,
     /// The frame on screen.
@@ -197,15 +200,16 @@ impl PainterApp {
             self.dirty = true;
             return;
         }
-        let start = match mode {
-            PlayMode::Once => 0,
-            PlayMode::Loop | PlayMode::PingPong => doc.current_frame() as u64,
-        };
+        // ADR-38: the play range and the backward modes.
+        let (first, last) = self.play_frames(mode);
+        let start = anim::start_position(mode, first, last, doc.current_frame());
         self.anim.playing = Some(Playback {
             mode,
             start,
+            first,
+            last,
             since: now,
-            shown: start as usize,
+            shown: anim::frame_in(mode, first, last, start).0,
         });
         self.dirty = true;
     }
@@ -229,7 +233,8 @@ impl PainterApp {
         };
         let doc = self.engine.document();
         let position = anim::play_position(p.start, doc.fps(), now - p.since);
-        let (frame, done) = anim::frame_at(p.mode, doc.frame_count(), position);
+        let last = p.last.min(doc.frame_count() - 1);
+        let (frame, done) = anim::frame_in(p.mode, p.first.min(last), last, position);
         if frame != p.shown {
             self.dirty = true;
         }
@@ -406,6 +411,8 @@ impl PainterApp {
             );
             self.anim.shown = Some(page);
         }
+        // ADR-38: the Control Panel and the Move preview.
+        self.sync_anim_control_view();
     }
 
     /// Pointer and keys while an Anim requester is open (it is modal).
@@ -486,7 +493,11 @@ impl PainterApp {
                 last: count - 1,
                 fill,
             },
-            AnimChoice::Goto(n) => Command::GotoFrame { frame: from1(n) },
+            AnimChoice::Goto(n) => {
+                // ADR-38: the Control Panel's Go To and Shift-3 go here again.
+                self.anim_control.last_goto = Some(from1(n) as usize);
+                Command::GotoFrame { frame: from1(n) }
+            }
             AnimChoice::Rate(fps) => Command::SetFrameRate { fps },
         };
         match self.frame_command(command) {

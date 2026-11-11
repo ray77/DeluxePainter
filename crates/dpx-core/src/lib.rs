@@ -8,6 +8,8 @@
 // Animation frames (ADR-28).
 pub mod anim;
 mod frame_ops;
+// Anim ▸ Move.. (ADR-38).
+pub mod anim_move;
 
 pub mod brush_ops;
 pub mod command;

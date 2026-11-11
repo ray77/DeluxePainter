@@ -586,6 +586,8 @@ pub struct MenuContext {
     pub has_brush: bool,
     /// There is a picked-up brush to go back to (enables Brush ▸ Restore).
     pub can_restore: bool,
+    /// Anim ▸ Method ▸ Expanded is chosen (else Compressed; ADR-38).
+    pub anim_expanded: bool,
 }
 
 impl Action {
@@ -595,6 +597,9 @@ impl Action {
             Action::Mode(m) => Some(ctx.mode == m),
             Action::Pref(p) => Some(ctx.prefs.get(p)),
             Action::PixelSize(p) => Some(ctx.pixel_size == p),
+            // Anim ▸ Method: a radio pair (ADR-38).
+            Action::Command("anim.method_compressed") => Some(!ctx.anim_expanded),
+            Action::Command("anim.method_expanded") => Some(ctx.anim_expanded),
             Action::Command(_) => None,
         }
     }
@@ -735,6 +740,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "brush.to_spare",
     "brush.swap_spare",
     "brush.remap",
+    // ADR-38: Anim > Move.., Control > Panel On/Off and Set Range.., Method.
+    "anim.move",
+    "anim.panel",
+    "anim.set_range",
+    "anim.method_compressed",
+    "anim.method_expanded",
 ];
 
 impl Item {
@@ -1149,6 +1160,7 @@ mod tests {
             pixel_size: PixelSize::default(),
             has_brush: false,
             can_restore: false,
+            anim_expanded: false,
         }
     }
 
@@ -1422,7 +1434,10 @@ mod tests {
             "Metamorph: ghosted"
         );
         assert!(menu_enabled(menu("Anim"), &c), "frames work (ADR-28)");
-        assert!(!Action::Command("anim.move").enabled(&c));
+        assert!(
+            Action::Command("anim.move").enabled(&c),
+            "Move works (ADR-38)"
+        );
         assert!(menu_enabled(menu("Picture"), &c));
         let effect = &MENUS[menu("Effect")];
         let item = |label: &str| effect.items.iter().find(|i| i.label == label).unwrap();
