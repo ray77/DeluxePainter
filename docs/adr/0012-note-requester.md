@@ -12,12 +12,12 @@
     - After Picture ▸ Load with the title "Picture loaded": notes from reading the file, from opening it on a screen, and from enlarging a small page.
     - After Picture ▸ Save with the title "Picture saved": what the chosen format cannot store, and colour ranges outside the palette.
     - At start-up after `--open` with the same notes as Load.
-    - Only when there is at least one note. Errors still appear in the file requester's message line and keep it open.
+    - Only when there is at least one note. Amended by ADR-35 (owner, 2026-11-11): notes about DeluxePaint's settings chunks (DPPS, DPPV) and the TINY thumbnail stay on stderr and open no requester. Errors still appear in the file requester's message line and keep it open.
   - The notes are still printed to stderr as `note: <path>: <text>`, and the CLI (`info`, `convert`) is unchanged.
   - Snapshot option for documentation: `--notes` shows the notes of `--open`.
 - Verified:
   - Unit tests in `dpx-ui`: size and height, wrapping (words kept, width respected, long words broken), capitalisation, the overflow line and its count, Ok press/release, keys, centring and clamping, title pixels.
-  - App test: loading an ILBM with a DPPS chunk through the file requester shows the requester and Ok closes it; a picture without notes shows none; saving PNG shows what PNG cannot store and Return closes it.
+  - App test: loading an ILBM with a chunk DeluxePainter does not keep (ANNO since ADR-35) through the file requester shows the requester and Ok closes it; a picture without notes, or with only DPPS, DPPV and TINY, shows none; saving PNG shows what PNG cannot store and Return closes it.
   - Headless snapshot `docs/design/screenshots/phase2-notes.png` of a self-made 1600×1200 JPEG opened with `--open`.
   - Not tried by hand in the window.
 - Consequences:

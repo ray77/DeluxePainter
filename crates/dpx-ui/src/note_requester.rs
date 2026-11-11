@@ -150,6 +150,11 @@ impl NoteRequester {
         }
     }
 
+    /// The title, as given.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
     /// Height in UI pixels (depends on the number of lines).
     pub fn height(&self) -> i32 {
         geom::TEXT_Y

@@ -33,7 +33,7 @@ Done (verified by tests and on real DeluxePaint-era ILBM files, see IFF_SUPPORT_
 
 - Overscan and custom screens (ADR-11): Screen Format ▸ Screen Size cycles Standard / Overscan / Custom (editable width/height, up to 368/736/1472 × 241/283, laced 482/566); the information panel shows Size and Max Size; pictures open on the screen from their ILBM page fields or their own size; ILBM saves write the screen size. Verified by tests and snapshots.
 
-- Notes after Load/Save (ADR-12): whatever was not kept, reduced, scaled or cannot be stored is listed in a "Picture loaded" / "Picture saved" requester with Ok (also after `--open`), not only on stderr. Verified by tests and a snapshot.
+- Notes after Load/Save (ADR-12): whatever was not kept, reduced, scaled or cannot be stored is listed in a "Picture loaded" / "Picture saved" requester with Ok (also after `--open`), not only on stderr; notes about DPPS, DPPV and TINY stay on stderr only (ADR-35). Verified by tests and a snapshot.
 
 - Window scaling (ADR-13, owner request): the window snaps to the picture's screen in whole and half pixel-size steps (1x–8x), so the picture fills it without bars; Prefs ▸ Pixel Size and Cmd/Ctrl +/−/0; full screen (Ctrl+Cmd+F / F11) centres the screen at the largest step. Verified by tests; dragging, keys and full screen not tried by hand.
 

@@ -619,8 +619,15 @@ fn export_name(path: &Path) -> Option<String> {
 }
 
 /// The note requester for `notes`, or `None` when there is nothing to tell (ADR-12).
+/// The note requester for `notes`, without the notes about DeluxePaint's own chunks (they
+/// stay on stderr); `None` when nothing is left to show.
 fn note_requester(title: &str, notes: &[String]) -> Option<NoteRequester> {
-    (!notes.is_empty()).then(|| NoteRequester::new(title, notes))
+    let shown: Vec<String> = notes
+        .iter()
+        .filter(|n| !files::is_quiet_note(n))
+        .cloned()
+        .collect();
+    (!shown.is_empty()).then(|| NoteRequester::new(title, &shown))
 }
 
 /// Picture ▸ Page Size for `doc`: its page size in the fields and the mode's presets.
@@ -854,6 +861,22 @@ impl PainterApp {
     }
 
     /// Replaces the document with a loaded picture (not undoable, like DeluxePaint's Load).
+    /// A requester, note, Show Page or playback is open: it takes the pointer and the keys.
+    fn modal_open(&self) -> bool {
+        let ui = &self.ui;
+        ui.choice_requester.is_some()
+            || self.requester.is_some()
+            || ui.tool_requester.is_some()
+            || self.anim.playing.is_some()
+            || ui.anim_requester.is_some()
+            || ui.palette_requester.is_some()
+            || ui.range_requester.is_some()
+            || ui.note_requester.is_some()
+            || ui.file_requester.is_some()
+            || ui.page_size_requester.is_some()
+            || self.show_page.is_some()
+    }
+
     fn set_picture(&mut self, doc: Document, extras: files::PictureExtras, path: PathBuf) {
         self.menu_data.loaded_palette = Some(doc.palette().clone());
         // Cycling stays on or off; the next clock tick cycles the new palette.
@@ -1609,8 +1632,14 @@ impl eframe::App for PainterApp {
             let menu_ctx = self.ui.menu_context();
             if press_l && let Some(a) = self.ui.menu.hovered_action(&menu_ctx) {
                 self.run_action(a, &ctx);
+                if self.modal_open() {
+                    // A requester, note or playback took over: the strip goes, so releasing
+                    // the right button later does not run the item a second time.
+                    self.ui.menu.close();
+                    self.dirty = true;
+                }
             }
-            if !down_r {
+            if self.ui.menu.active && !down_r {
                 let action = self.ui.menu.hovered_action(&menu_ctx);
                 self.ui.menu.close();
                 self.dirty = true;
@@ -1718,7 +1747,8 @@ impl eframe::App for PainterApp {
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
-        if undo_key && !was_typing && !self.typing() {
+        // A modal opened by a key of this pass (e.g. the "Nothing to play" note) takes the rest.
+        if undo_key && !was_typing && !self.typing() && !self.modal_open() {
             if shift {
                 self.redo();
             } else {
@@ -2373,6 +2403,145 @@ mod tests {
     }
 
     #[test]
+    fn play_on_a_single_frame_says_how_to_add_frames() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.run(Command::Clear { color: 3 });
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // `4`, `3` and `U` in one pass: the note takes the rest of the keys (no Go to Frame
+        // requester on top of it, no undo behind it).
+        let mut keys = vec![
+            key_event(egui::Key::Num4, true),
+            egui::Event::Text("4".into()),
+        ];
+        keys.push(key_event(egui::Key::Num3, true));
+        keys.push(key_event(egui::Key::U, true));
+        ui_pass(&mut app, &ctx, 0.1, keys);
+        assert!(app.anim.playing.is_none());
+        assert!(app.ui.anim_requester.is_none(), "no requester on the note");
+        assert_eq!(app.page().get(0, 0), Some(3), "no undo behind the note");
+        let note = app.ui.note_requester.as_ref().expect("a note");
+        assert_eq!(note.title(), anim::NOTHING_TO_PLAY);
+        ui_pass(&mut app, &ctx, 0.2, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.ui.note_requester.is_none(), "Return closes it");
+        // The menu items do the same.
+        for id in ["anim.play_once", "anim.ping_pong"] {
+            app.run_action(Action::Command(id), &ctx);
+            assert!(app.ui.note_requester.take().is_some(), "{id}");
+        }
+        assert_eq!(app.engine.document().frame_count(), 1);
+    }
+
+    /// The window point (1280×1024 test window, 1 pixel per point) over UI pixel (`x`, `y`),
+    /// after a pass has laid the screen out.
+    fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
+        let (view, scale) = app.layout();
+        let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
+        let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
+        let (ox, oy) = (((1280 - img_w) / 2) as f32, ((1024 - img_h) / 2) as f32);
+        let sx = (x * view.ux) as f32 + 0.5;
+        let sy = (y * view.uy) as f32 + 0.5;
+        egui::pos2(
+            ox + sx * scale * view.fx as f32,
+            oy + sy * scale * view.fy as f32,
+        )
+    }
+
+    /// UI pixels over the title of the menu holding `id`, over the item whose submenu holds
+    /// it, and over `id` itself (from the menu geometry, checked with the pointer tracking).
+    fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
+        let (w, h) = app.view().ui_size();
+        let wanted = Action::Command(id);
+        let (m, item, sub) = MENUS
+            .iter()
+            .enumerate()
+            .flat_map(|(m, menu)| menu.items.iter().enumerate().map(move |(i, it)| (m, i, it)))
+            .find_map(|(m, i, it)| match it.entry {
+                menu::Entry::Submenu(items) => items
+                    .iter()
+                    .position(|s| matches!(s.entry, menu::Entry::Action(a) if a == wanted))
+                    .map(|s| (m, i, s)),
+                menu::Entry::Action(_) => None,
+            })
+            .expect("in a submenu");
+        let title_x = (0..w)
+            .find(|&x| {
+                let mut state = dpx_ui::MenuState::default();
+                state.open(w, h, x, 1);
+                state.menu == Some(m)
+            })
+            .expect("menu title");
+        let mbox = menu::menu_box(m, w, h);
+        let menu::Entry::Submenu(items) = MENUS[m].items[item].entry else {
+            unreachable!()
+        };
+        let sbox = menu::submenu_box(&mbox, item, items, w, h);
+        let path = [
+            (title_x, 1),
+            (mbox.x + mbox.w / 2, mbox.item_top(item) + 1),
+            (sbox.x + sbox.w / 2, sbox.item_top(sub) + 1),
+        ];
+        // The pointer tracking agrees.
+        let mut state = dpx_ui::MenuState::default();
+        state.open(w, h, path[0].0, path[0].1);
+        for &(x, y) in &path[1..] {
+            state.pointer(w, h, x, y);
+        }
+        assert_eq!(state.hovered_action(&app.ui.menu_context()), Some(wanted));
+        path
+    }
+
+    #[test]
+    fn play_picked_with_the_left_button_in_the_menu_runs_once() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let [title, control, play] = menu_path(&app, "anim.play").map(|p| ui_point(&app, p));
+        let button = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        use egui::PointerButton::{Primary, Secondary};
+        // Right button held on the title bar, over Anim ▸ Control ▸ Play, left click on it.
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.1,
+            vec![
+                egui::Event::PointerMoved(title),
+                button(title, Secondary, true),
+            ],
+        );
+        assert!(app.ui.menu.active);
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.2,
+            vec![egui::Event::PointerMoved(control)],
+        );
+        ui_pass(&mut app, &ctx, 0.3, vec![egui::Event::PointerMoved(play)]);
+        ui_pass(&mut app, &ctx, 0.4, vec![button(play, Primary, true)]);
+        assert!(app.ui.note_requester.is_some(), "one frame: the note");
+        assert!(!app.ui.menu.active, "the note closed the strip");
+        // Both buttons go up under the note; Return closes it; nothing runs again.
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.5,
+            vec![button(play, Primary, false), button(play, Secondary, false)],
+        );
+        ui_pass(&mut app, &ctx, 0.6, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.ui.note_requester.is_none());
+        ui_pass(&mut app, &ctx, 0.7, vec![]);
+        assert!(
+            app.ui.note_requester.is_none(),
+            "Play did not run a second time"
+        );
+    }
+
+    #[test]
     fn tab_cycles_colours_through_the_real_ui_loop() {
         let ctx = egui::Context::default();
         let mut app = PainterApp::new();
@@ -2434,10 +2603,11 @@ mod tests {
         waterfall_range(&mut app);
         ui_pass(&mut app, &ctx, 0.0, vec![]);
         press_and_idle(&mut app, &ctx, egui::Key::Tab, 0.1, 0.2, |_| {});
-        // The note after a load: Tab there does not reach the paint screen, but the colours
+        // A note after a load: Tab there does not reach the paint screen, but the colours
         // keep moving behind it.
-        let note = ["DPPS chunk (110 bytes) not kept".to_string()];
+        let note = ["ANNO chunk (110 bytes) not kept".to_string()];
         app.ui.note_requester = note_requester(LOADED, &note);
+        assert!(app.ui.note_requester.is_some(), "the note is open");
         let n = idle_palettes(&mut app, &ctx, 0.3, 1.3, vec![]);
         assert!(n >= 8, "under the note: {n}");
         ui_pass(&mut app, &ctx, 1.4, vec![key_event(egui::Key::Enter, true)]);
@@ -3105,18 +3275,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
-        // An ILBM with a chunk DeluxePainter does not keep, and a plain one.
+        // An ILBM with a chunk DeluxePainter does not keep, one with only DeluxePaint's own
+        // chunks (settings, thumbnail) and a plain one.
         let img = IndexedImage::new(320, 256, 0);
         let mut src = dpx_iff::Ilbm::from_indexed(img.clone(), Palette::dpaint_default_32());
-        src.other_chunks.push(dpx_iff::ilbm::RawChunk {
-            id: *b"DPPS",
+        let chunk = |id: &[u8; 4]| dpx_iff::ilbm::RawChunk {
+            id: *id,
             data: vec![0; 10],
-        });
+        };
+        src.other_chunks.push(chunk(b"ANNO"));
         let write = |name: &str, i: &dpx_iff::Ilbm| {
             let bytes = dpx_iff::ilbm::write(i, dpx_iff::Compression::ByteRun1).unwrap();
             std::fs::write(dir.join(name), bytes).unwrap();
         };
         write("Notes.iff", &src);
+        src.other_chunks = vec![chunk(b"DPPS"), chunk(b"DPPV"), chunk(b"TINY")];
+        write("DPaint.iff", &src);
         src.other_chunks.clear();
         write("Plain.iff", &src);
 
@@ -3142,11 +3316,15 @@ mod tests {
             .compose(app.page(), app.scroll, app.palette(), &app.ui);
         assert_ne!(with, without);
 
-        // A picture without notes opens none.
-        app.run_action(Action::Command("picture.load"), &ctx);
-        type_into(&mut app, "Plain.iff");
-        app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
-        assert!(app.ui.note_requester.is_none());
+        // A picture without notes opens none, and neither does one with only DeluxePaint's
+        // own chunks (their notes go to stderr).
+        for name in ["DPaint.iff", "Plain.iff"] {
+            app.run_action(Action::Command("picture.load"), &ctx);
+            type_into(&mut app, name);
+            app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
+            assert!(app.ui.file_requester.is_none(), "{name} loaded");
+            assert!(app.ui.note_requester.is_none(), "{name}: no note");
+        }
 
         // Exporting PNG tells what PNG cannot store (the display mode); Return closes.
         app.run_action(Action::Command("picture.export"), &ctx);

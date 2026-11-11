@@ -16,6 +16,9 @@ use eframe::egui;
 
 use crate::{PainterApp, View};
 
+/// Title of the note after Play on a single frame.
+pub const NOTHING_TO_PLAY: &str = "Nothing to play";
+
 /// A playback in progress (Play, Play once, Ping-pong).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Playback {
@@ -183,11 +186,15 @@ impl PainterApp {
     }
 
     /// Play (`4`), Play once (`5`), Ping-pong (`6`): Loop and Ping-pong start at the current
-    /// frame, Play once at the first. Nothing happens with a single frame.
+    /// frame, Play once at the first. With a single frame a note says how to add frames (the
+    /// manual is silent; owner's choice, ADR-35).
     pub(crate) fn start_playback(&mut self, mode: PlayMode, now: f64) {
         self.finish_stroke();
         let doc = self.engine.document();
         if doc.frame_count() < 2 {
+            let note = ["only one frame: Anim ▸ Frames ▸ Set # adds frames".to_string()];
+            self.ui.note_requester = crate::note_requester(NOTHING_TO_PLAY, &note);
+            self.dirty = true;
             return;
         }
         let start = match mode {
@@ -335,7 +342,10 @@ impl PainterApp {
                 _ => continue,
             };
             self.anim_action(id, now);
-            if self.anim.playing.is_some() || self.ui.anim_requester.is_some() {
+            if self.anim.playing.is_some()
+                || self.ui.anim_requester.is_some()
+                || self.ui.note_requester.is_some()
+            {
                 // The rest of this frame's keys belong to the playback or the requester; the
                 // playback needs the next frame at once.
                 ctx.request_repaint();

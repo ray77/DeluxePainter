@@ -526,6 +526,20 @@ pub fn reduce_true_color(img: &RgbaImage, format: &str, current: Target) -> Redu
     }
 }
 
+/// Chunks that say nothing about the picture: DeluxePaint's settings (`DPPS`, `DPPV`) and a
+/// thumbnail (`TINY`, found next to them in DeluxePaint-era files; layout unverified, see
+/// IFF_SUPPORT_MATRIX). Dropping them loses no pixels, colours or ranges, so their notes go
+/// to stderr only, not to the note requester (owner, 2026-11-11; ADR-35).
+pub const QUIET_CHUNKS: [&str; 3] = ["DPPS", "DPPV", "TINY"];
+
+/// Whether `note` only says that one of the [`QUIET_CHUNKS`] was not kept.
+pub fn is_quiet_note(note: &str) -> bool {
+    QUIET_CHUNKS.iter().any(|id| {
+        note.strip_prefix(id)
+            .is_some_and(|rest| rest.starts_with(" chunk (") && rest.ends_with(" bytes) not kept"))
+    })
+}
+
 /// Turns a loaded picture into a document. Indexed pictures get the display mode guessed from
 /// CAMG and size; true-colour ones are reduced ([`reduce_true_color`], which scales pictures
 /// too big for any screen to `current`). Returns notes about everything that is not kept.
@@ -1730,6 +1744,19 @@ mod tests {
         let (doc, extras, notes) = open_picture(Picture::Ilbm(Box::new(src)), Target::default());
         assert_eq!(doc.target().mode, pal_hi_lace);
         assert_eq!(notes, ["DPPS chunk (10 bytes) not kept"]);
+        // DeluxePaint's own chunks are quiet (stderr only); everything else is shown.
+        assert!(is_quiet_note(&notes[0]));
+        for id in QUIET_CHUNKS {
+            assert!(is_quiet_note(&format!("{id} chunk (4133 bytes) not kept")));
+        }
+        for other in [
+            "ANNO chunk (10 bytes) not kept",
+            "DPPSX chunk (10 bytes) not kept",
+            "mask plane not kept (pages are opaque)",
+            "4 colour-cycling ranges (CRNG) not kept",
+        ] {
+            assert!(!is_quiet_note(other), "{other}");
+        }
 
         // Own drawer: the other test removes the shared one when it ends.
         let dir = std::env::temp_dir().join(format!("dpx-files-rt-{}", std::process::id()));
