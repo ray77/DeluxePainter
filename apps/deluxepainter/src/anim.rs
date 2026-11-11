@@ -165,7 +165,8 @@ impl PainterApp {
     /// Runs a frame command; returns the engine's message if it refused.
     fn frame_command(&mut self, command: Command) -> Result<(), String> {
         self.finish_stroke();
-        let result = self.engine.execute(command).map(|_| ()).map_err(|e| {
+        // ADR-39: the area stencil follows its picture.
+        let result = self.execute_frames(command).map(|_| ()).map_err(|e| {
             eprintln!("{e}");
             e.message
         });

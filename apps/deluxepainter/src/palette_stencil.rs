@@ -15,7 +15,9 @@
 use dpx_core::brush_palette::{self, Adopted};
 use dpx_core::quantize::PaletteDepth;
 use dpx_core::stencil::{self, AreaStencil};
-use dpx_core::{BrushImage, Chipset, Command, Document, Engine, Palette};
+use dpx_core::{
+    BrushImage, Chipset, Command, CommandError, Document, Engine, Outcome, Palette, anim,
+};
 use dpx_iff::ilbm::ColorRange;
 use eframe::egui;
 
@@ -88,17 +90,22 @@ fn adds(cmd: &Command, fg: u8, bg: u8) -> bool {
 }
 
 impl PainterApp {
+    /// Before every menu item: any item but Stencil ▸ Paint ends Stencil ▸ Paint first
+    /// (keeping what was painted), as DeluxePaint may (AGA p.120); Mode, Prefs and Pixel Size
+    /// items too.
+    pub(crate) fn menu_item_ends_stencil_paint(&mut self, action: dpx_ui::Action) {
+        if action != dpx_ui::Action::Command("stencil.paint") && self.ps().painting.is_some() {
+            self.leave_stencil_paint();
+        }
+    }
+
     /// Whether ADR-39 handles menu item `id`: its own four items, and the stencil items that
-    /// act on an area stencil when there is one. Any item but Stencil ▸ Paint ends Stencil ▸
-    /// Paint first (keeping what was painted), as DeluxePaint may (AGA p.120).
-    pub(crate) fn takes_adr39(&mut self, id: &str) -> bool {
+    /// act on an area stencil when there is one.
+    pub(crate) fn takes_adr39(&self, id: &str) -> bool {
         let own = matches!(
             id,
             "palette.use_brush" | "color.recompute" | "stencil.paint" | "background.lock_fg"
         );
-        if id != "stencil.paint" && self.ps().painting.is_some() {
-            self.leave_stencil_paint();
-        }
         own || (self.ps().area.is_some()
             && matches!(
                 id,
@@ -190,7 +197,7 @@ impl PainterApp {
                 Some(&l.ranges),
             ),
             // Picked up: the picture palette of the moment.
-            None => (custom.clone(), meant, None),
+            None => (custom.clone(), meant.clone(), None),
         };
         let Adopted {
             colors,
@@ -222,16 +229,39 @@ impl PainterApp {
                 self.extras.ranges = kept;
             }
         }
+        // The brush Brush ▸ Restore gives back, in the new palette's numbers too: the loaded
+        // brush in the file's numbers, a picked-up one in the pick-up palette's; their own
+        // numbers where the palette was taken as it is, else the nearest new colours.
+        let restore = self.picked_brush.as_ref().map(|picked| {
+            if *picked == custom {
+                return brush.clone();
+            }
+            let (own_restore, own_palette) = match &loaded {
+                Some(l) => (&l.brush, &l.palette),
+                None => (picked, &meant),
+            };
+            let n = n.min(own_palette.len());
+            let fits = |c: u8| usize::from(c) < n;
+            if !reduced
+                && own_restore.pixels.iter().all(|&p| fits(p))
+                && own_restore.transparent.is_none_or(fits)
+            {
+                own_restore.clone()
+            } else {
+                // The custom brush's transparent number in the new palette.
+                brush_palette::fit_brush_into(own_restore, own_palette, &colors, brush.transparent)
+            }
+        });
         if colors != current.colors() {
             self.run(Command::SetPalette { colors });
         }
-        if self.picked_brush.as_ref() == Some(&custom) {
-            self.picked_brush = Some(brush.clone());
+        if let Some(restore) = restore {
             if let Some(l) = &mut self.ps_mut().loaded
                 && loaded.is_some()
             {
-                l.fitted = brush.clone();
+                l.fitted = restore.clone();
             }
+            self.picked_brush = Some(restore);
         }
         self.custom_brush = Some(brush);
         self.tools.brush_palette = Some(self.engine.document().palette().clone());
@@ -263,6 +293,64 @@ impl PainterApp {
                     && a.stencil.fits(doc.page())
             })
             .map(|a| &a.stencil)
+    }
+
+    /// A frame command (anim.rs sends them all here): the area stencil and Stencil ▸ Paint
+    /// follow their picture when frames are inserted or deleted, and go with it (AGA p.273).
+    pub(crate) fn execute_frames(&mut self, command: Command) -> Result<Outcome, CommandError> {
+        let doc = self.engine.document();
+        let moves = anim::frame_moves(&command, doc.frame_count(), doc.current_frame());
+        let out = self.engine.execute(command)?;
+        if let Some(moves) = moves {
+            self.follow_frames(|f| moves.get(f).copied().flatten());
+        }
+        Ok(out)
+    }
+
+    /// Undo (`redo`: Redo) in the engine; a frame step moves the area stencil and Stencil ▸
+    /// Paint back (forth) with their picture. A stencil gone with its frame stays gone (it is
+    /// not part of the history).
+    pub(crate) fn history_step(&mut self, redo: bool) -> Result<Outcome, CommandError> {
+        // Where the frames of the document without the step go under it: the command waits
+        // for Redo after an undo, and runs on the frame it first ran on.
+        let moves = |e: &Engine| {
+            let count = e.document().frame_count();
+            e.next_redo()
+                .and_then(|(command, frame)| anim::frame_moves(command, count, frame))
+        };
+        if redo {
+            let moves = moves(&self.engine);
+            let out = self.engine.redo()?;
+            if let Some(moves) = moves {
+                self.follow_frames(|f| moves.get(f).copied().flatten());
+            }
+            Ok(out)
+        } else {
+            let out = self.engine.undo()?;
+            if let Some(moves) = moves(&self.engine) {
+                self.follow_frames(|f| moves.iter().position(|&to| to == Some(f)));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Moves the area stencil and Stencil ▸ Paint to the index `to` gives their frame; `None`:
+    /// the frame is gone, and so are they.
+    fn follow_frames(&mut self, to: impl Fn(usize) -> Option<usize>) {
+        let st = self.ps_mut();
+        if let Some(a) = &mut st.area {
+            match to(a.frame) {
+                Some(f) => a.frame = f,
+                None => st.area = None,
+            }
+        }
+        if let Some(p) = &mut st.painting {
+            match to(p.frame) {
+                Some(f) => p.frame = f,
+                None => st.painting = None,
+            }
+        }
+        self.dirty = true;
     }
 
     /// Stencil ▸ Paint is on.
@@ -516,8 +604,14 @@ impl PainterApp {
 
     /// Before the screen is composed: during Stencil ▸ Paint the picture dimmed with the
     /// mask (and the gesture in progress) at full brightness; during Show the same for the
-    /// area stencil. Display only.
+    /// area stencil. With the Light Table on, its picture is dimmed so; a playing animation
+    /// shows its frames as they are (the stencil belongs to one frame). Display only.
     pub(crate) fn prepare_stencil_view(&mut self) {
+        if self.anim.playing.is_some() {
+            return;
+        }
+        // `prepare_anim_view` made the Light Table picture (ADR-28).
+        let light_table = self.anim.shown.is_some();
         let doc = self.engine.document();
         let (mut base, mask) = if let Some(p) = &self.ps().painting {
             let mut mask = p.engine.document().page().clone();
@@ -546,6 +640,17 @@ impl PainterApp {
         } else {
             return;
         };
+        if light_table {
+            // Made again on the picture without the stroke preview (Stencil ▸ Paint paints
+            // the mask, not the picture).
+            let spare = self
+                .menu_data
+                .spare
+                .as_ref()
+                .map(|s| s.engine.document().page());
+            let light = self.anim.light;
+            base = crate::anim::light_table_page(doc, &base, light, spare, self.ui.bg, light.dim);
+        }
         base = stencil::view(&base, &mask, doc.palette());
         self.anim.shown = Some(base);
     }
@@ -566,6 +671,13 @@ pub fn snapshot_view(
     let [x, y, w, h] = v[..] else {
         return Err(format!("{spec}: expected X,Y,W,H"));
     };
+    // The rectangle's far edges must be numbers too (`fill_rect` adds them up).
+    if w < 0 || h < 0 || x.checked_add(w).is_none() || y.checked_add(h).is_none() {
+        return Err(format!(
+            "{spec}: W and H must be 0 or more, X+W and Y+H at most {}",
+            i32::MAX
+        ));
+    }
     let page = doc.page();
     let mut mask = stencil::AreaStencil::free(page).to_image();
     mask.fill_rect(x, y, w, h, stencil::PROTECTED);
@@ -1079,5 +1191,347 @@ mod tests {
         act(&mut app, "palette.use_brush");
         assert_eq!(app.engine.document().palette(), &old);
         assert_eq!(app.custom_brush, Some(picked));
+    }
+
+    fn key_with(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Presses and releases plain `key` through `ui()` at `t`.
+    fn tap(app: &mut PainterApp, ctx: &egui::Context, key: egui::Key, t: f64) {
+        ui_pass(app, ctx, t, vec![key_event(key, true)]);
+        ui_pass(app, ctx, t + 0.01, vec![key_event(key, false)]);
+    }
+
+    fn area_frame(app: &PainterApp) -> Option<usize> {
+        app.ps().area.as_ref().map(|a| a.frame)
+    }
+
+    fn full_stencil() -> AreaStencil {
+        AreaStencil::from_mask(320, 256, vec![true; 320 * 256]).unwrap()
+    }
+
+    /// An app with `count` frames (all colour 0) on frame `current`, painting brush 9 dots.
+    fn frames_app(count: u32, current: u32) -> PainterApp {
+        let mut app = PainterApp::new();
+        app.custom_brush = Some(square_brush(9));
+        app.ui.tool = Tool::DottedFreehand;
+        app.ui.mode = dpx_ui::PaintMode::Matte;
+        app.engine
+            .execute(Command::SetFrameCount { count })
+            .unwrap();
+        app.engine
+            .execute(Command::GotoFrame { frame: current })
+            .unwrap();
+        app
+    }
+
+    #[test]
+    fn deleting_the_stencils_frame_deletes_the_stencil() {
+        // Frame 2 of 3 gets the stencil; Delete Frames (current) makes the old third frame
+        // the current frame 2, which is painted as usual.
+        let ctx = egui::Context::default();
+        let mut app = frames_app(3, 1);
+        app.set_area(full_stencil());
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        pick_menu(&mut app, &ctx, "anim.delete_frames", 0.1);
+        assert!(app.ui.anim_requester.is_some());
+        tap(&mut app, &ctx, egui::Key::Enter, 0.2);
+        assert!(app.ui.anim_requester.is_none());
+        let doc = app.engine.document();
+        assert_eq!((doc.frame_count(), doc.current_frame()), (2, 1));
+        assert!(app.ps().area.is_none(), "gone with its frame");
+        assert_eq!(app.ui.flags, "");
+        click_page(&mut app, &ctx, (40, 40), false, 0.3);
+        assert_eq!(page_px(&app, 40, 40), 9);
+        // Undo brings the frame back, not the stencil (it is outside the history).
+        tap(&mut app, &ctx, egui::Key::U, 0.4);
+        tap(&mut app, &ctx, egui::Key::U, 0.5);
+        assert_eq!(app.engine.document().frame_count(), 3);
+        assert!(app.ps().area.is_none());
+    }
+
+    #[test]
+    fn an_area_stencil_follows_its_picture_when_frames_go_in() {
+        let ctx = egui::Context::default();
+        // The stencil on frame 3 of 3; `1` steps back to frame 2.
+        let mut app = frames_app(3, 2);
+        app.set_area(full_stencil());
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        tap(&mut app, &ctx, egui::Key::Num1, 0.1);
+        assert_eq!(app.engine.document().current_frame(), 1);
+        assert!(app.active_area().is_none());
+        // Alt+= adds a copy of frame 2 after it (the copy is current): the stencil's picture
+        // is frame 4 now.
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        ui_pass(&mut app, &ctx, 0.2, vec![key_with(egui::Key::Equals, alt)]);
+        let doc = app.engine.document();
+        assert_eq!((doc.frame_count(), doc.current_frame()), (4, 2));
+        assert_eq!(area_frame(&app), Some(3), "with its picture");
+        // The copy is painted normally, the stencil's own picture is protected.
+        click_page(&mut app, &ctx, (40, 40), false, 0.3);
+        assert_eq!(page_px(&app, 40, 40), 9);
+        tap(&mut app, &ctx, egui::Key::Num2, 0.4);
+        assert_eq!(app.engine.document().current_frame(), 3);
+        assert_eq!(app.ui.flags, "S");
+        click_page(&mut app, &ctx, (40, 40), false, 0.5);
+        assert_eq!(page_px(&app, 40, 40), 0);
+        // Undo back to three frames: the stencil goes back to frame 3; Redo moves it on.
+        let mut t = 0.6;
+        while app.engine.document().frame_count() == 4 {
+            assert!(t < 1.0, "undo reaches Add Frames");
+            tap(&mut app, &ctx, egui::Key::U, t);
+            t += 0.05;
+        }
+        assert_eq!(area_frame(&app), Some(2));
+        app.redo();
+        assert_eq!(app.engine.document().frame_count(), 4);
+        assert_eq!(area_frame(&app), Some(3));
+        // Stencil Paint follows its frame too (copies inserted before it).
+        app.engine.execute(Command::GotoFrame { frame: 3 }).unwrap();
+        app.toggle_stencil_paint();
+        let painting = |app: &PainterApp| app.ps().painting.as_ref().map(|p| p.frame);
+        assert_eq!(painting(&app), Some(3));
+        app.execute_frames(Command::InsertFrameCopies {
+            first: 0,
+            last: 1,
+            before: 0,
+        })
+        .unwrap();
+        assert_eq!(painting(&app), Some(5));
+        assert_eq!(area_frame(&app), Some(5));
+    }
+
+    #[test]
+    fn playback_and_the_light_table_show_through_stencil_paint() {
+        let ctx = egui::Context::default();
+        // Frame 1 in colour 5, frame 2 (current) empty, frame 3 in colour 6.
+        let mut app = frames_app(3, 0);
+        for (frame, color) in [(0, 5), (1, 0), (2, 6)] {
+            app.engine.execute(Command::GotoFrame { frame }).unwrap();
+            app.engine.execute(Command::Clear { color }).unwrap();
+        }
+        app.engine.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        app.anim.light.dim = false;
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        ui_pass(&mut app, &ctx, 0.1, vec![ctrl_s(true)]);
+        ui_pass(&mut app, &ctx, 0.11, vec![ctrl_s(false)]);
+        click_page(&mut app, &ctx, (40, 40), false, 0.2);
+        assert!(app.stencil_painting());
+        let pal = app.engine.document().palette().clone();
+        let half = stencil::half_bright_table(&pal);
+        let rgb = |c: u8| {
+            let c = pal.get(c).unwrap();
+            egui::Color32::from_rgb(c.r, c.g, c.b)
+        };
+        let at = |s: &egui::ColorImage, x: usize, y: usize| s.pixels[y * s.size[0] + x];
+        // `l`: the Light Table picture (frame 1 through the empty frame 2), dimmed but for the
+        // stencil.
+        tap(&mut app, &ctx, egui::Key::L, 0.3);
+        assert!(app.anim.light_on);
+        let screen = screen_pass(&mut app, &ctx, 0.35);
+        assert_eq!(at(&screen, 40, 40), rgb(5));
+        assert_eq!(at(&screen, 60, 60), rgb(half[5]));
+        tap(&mut app, &ctx, egui::Key::L, 0.4);
+        assert!(!app.anim.light_on);
+        // `4`: the frames play as they are.
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.5,
+            vec![
+                key_event(egui::Key::Num4, true),
+                egui::Event::Text("4".into()),
+            ],
+        );
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.51,
+            vec![key_event(egui::Key::Num4, false)],
+        );
+        assert!(app.anim.playing.is_some());
+        let mut seen = std::collections::BTreeSet::new();
+        let mut t = 0.52;
+        while t < 1.5 {
+            let screen = screen_pass(&mut app, &ctx, t);
+            seen.insert(at(&screen, 60, 60).to_array());
+            t += 0.02;
+        }
+        for c in [5, 0, 6] {
+            assert!(
+                seen.contains(&rgb(c).to_array()),
+                "frame colour {c}: {seen:?}"
+            );
+        }
+        ui_pass(
+            &mut app,
+            &ctx,
+            1.6,
+            vec![key_event(egui::Key::Escape, true)],
+        );
+        assert!(app.anim.playing.is_none());
+        assert!(app.stencil_painting(), "Stencil Paint goes on");
+    }
+
+    #[test]
+    fn use_brush_palette_brings_the_restorable_brush_into_the_new_palette() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[4] = Rgb8::new(10, 200, 30);
+        colors[5] = Rgb8::new(250, 120, 0);
+        let palette = Palette::new(colors.clone()).unwrap();
+        load_brush_file(&mut app, "restore", &palette, &[]);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // Brush ▸ Flip ▸ Horiz: the brush is not the one Restore gives back any more.
+        pick_menu(&mut app, &ctx, "brush.flip_horizontal", 0.1);
+        assert_ne!(app.custom_brush, app.picked_brush);
+        pick_menu(&mut app, &ctx, "palette.use_brush", 0.2);
+        assert_eq!(app.engine.document().palette().colors(), colors.as_slice());
+        // `B` (Brush ▸ Restore): the brush as loaded, in the file's own colours.
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![key_with(egui::Key::B, shift), egui::Event::Text("B".into())],
+        );
+        let b = app.custom_brush.clone().unwrap();
+        assert_eq!(b.pixels, [0, 4, 5]);
+        let pal = app.engine.document().palette();
+        assert_eq!(pal.get(b.pixels[1]), Some(colors[4]));
+        assert_eq!(pal.get(b.pixels[2]), Some(colors[5]));
+        // A second use recognises the loaded brush again.
+        let revision = app.engine.document().revision();
+        act(&mut app, "palette.use_brush");
+        assert_eq!(app.engine.document().revision(), revision);
+        assert_eq!(app.custom_brush.as_ref().unwrap().pixels, [0, 4, 5]);
+    }
+
+    #[test]
+    fn use_brush_palette_recomputes_the_restorable_brush_too() {
+        // A picked-up brush, flipped, in a 4-colour picture from a 32-colour palette.
+        let mut app = PainterApp::new();
+        app.run(Command::Clear { color: 7 });
+        app.ui.fg = 20;
+        app.handle_press(Hit::Page { x: 0, y: 0 }, false);
+        app.finish_stroke();
+        app.ui.tool = Tool::BrushSelect;
+        app.handle_press(Hit::Page { x: 0, y: 0 }, false);
+        app.handle_drag(4, 4);
+        app.release();
+        let picked = app.picked_brush.clone().expect("picked up");
+        let old = app.engine.document().palette().clone();
+        act(&mut app, "brush.flip_horizontal");
+        assert_ne!(app.custom_brush.as_ref(), Some(&picked));
+        app.engine
+            .execute(Command::SetFormat {
+                mode: dpx_core::DisplayMode::PAL_LORES,
+                colors: 4,
+                width: 320,
+                height: 256,
+                retain: false,
+                screen: None,
+            })
+            .unwrap();
+        act(&mut app, "palette.use_brush");
+        let pal = app.engine.document().palette().clone();
+        assert_eq!(pal.len(), 4);
+        let restore = app.picked_brush.clone().unwrap();
+        assert!(
+            restore.pixels.iter().all(|&p| usize::from(p) < 4),
+            "{restore:?}"
+        );
+        // Every pixel shows (nearly) the colour it had when it was picked up.
+        for (&now, &then) in restore.pixels.iter().zip(&picked.pixels) {
+            let (now, then) = (pal.get(now).unwrap(), old.get(then).unwrap());
+            assert!(now.distance_sq(then) < 3 * 40 * 40, "{now:?} for {then:?}");
+        }
+    }
+
+    #[test]
+    fn a_mode_item_ends_stencil_paint_too() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.custom_brush = Some(square_brush(9));
+        app.ui.tool = Tool::DottedFreehand;
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        ui_pass(&mut app, &ctx, 0.1, vec![ctrl_s(true)]);
+        ui_pass(&mut app, &ctx, 0.11, vec![ctrl_s(false)]);
+        click_page(&mut app, &ctx, (40, 40), false, 0.2);
+        assert!(app.stencil_painting());
+        // Mode ▸ Smear, picked from the menu strip with the right button.
+        let wanted = Action::Mode(dpx_ui::PaintMode::Smear);
+        let (w, h) = app.view().ui_size();
+        let (m, item) = dpx_ui::menu::MENUS
+            .iter()
+            .enumerate()
+            .find_map(|(m, menu)| {
+                menu.items
+                    .iter()
+                    .position(
+                        |it| matches!(it.entry, dpx_ui::menu::Entry::Action(a) if a == wanted),
+                    )
+                    .map(|i| (m, i))
+            })
+            .expect("a Mode item");
+        let title_x = (0..w)
+            .find(|&x| {
+                let mut state = dpx_ui::MenuState::default();
+                state.open(w, h, x, 1);
+                state.menu == Some(m)
+            })
+            .expect("menu title");
+        let mbox = dpx_ui::menu::menu_box(m, w, h);
+        let title = ui_point(&app, (title_x, 1));
+        let entry = ui_point(&app, (mbox.x + mbox.w / 2, mbox.item_top(item) + 1));
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![egui::Event::PointerMoved(title), button(title, true, true)],
+        );
+        assert!(app.ui.menu.active);
+        ui_pass(&mut app, &ctx, 0.31, vec![egui::Event::PointerMoved(entry)]);
+        ui_pass(&mut app, &ctx, 0.32, vec![button(entry, true, false)]);
+        assert_eq!(app.ui.mode, dpx_ui::PaintMode::Smear);
+        assert!(!app.stencil_painting(), "Stencil Paint ended");
+        assert_eq!(app.active_area().map(|a| a.count()), Some(9), "kept");
+    }
+
+    #[test]
+    fn the_stencil_paint_snapshot_refuses_rectangles_beyond_the_numbers() {
+        let doc = PainterApp::new().engine.document().clone();
+        let mut ui = dpx_ui::UiState::default();
+        for bad in [
+            "2147483647,0,1,1",
+            "0,2147483647,1,1",
+            "5,0,2147483647,1",
+            "0,0,-1,4",
+            "0,0,4,-1",
+            "1,2,3",
+            "a,b,c,d",
+        ] {
+            assert!(snapshot_view(bad, &doc, &mut ui).is_err(), "{bad}");
+        }
+        let shown = snapshot_view("-5,-5,20,20", &doc, &mut ui).unwrap();
+        assert_eq!(ui.flags, "s");
+        let pal = doc.palette();
+        let dim = stencil::half_bright_table(pal)[0];
+        assert_eq!(shown.page().get(0, 0), Some(0), "the stencil, bright");
+        assert_eq!(shown.page().get(15, 15), Some(dim));
     }
 }

@@ -1327,7 +1327,8 @@ impl PainterApp {
         if self.stencil_paint_undo(false) {
             return;
         }
-        Self::report(self.engine.undo(), ErrorCode::NothingToUndo);
+        // ADR-39: the engine's undo; the area stencil follows its picture.
+        Self::report(self.history_step(false), ErrorCode::NothingToUndo);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;
@@ -1338,7 +1339,7 @@ impl PainterApp {
         if self.stencil_paint_undo(true) {
             return;
         }
-        Self::report(self.engine.redo(), ErrorCode::NothingToRedo);
+        Self::report(self.history_step(true), ErrorCode::NothingToRedo);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;
@@ -1395,13 +1396,15 @@ impl PainterApp {
 
     /// Runs a menu action. Commands not implemented yet do nothing.
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
+        // ADR-39: any other menu item ends Stencil ▸ Paint.
+        self.menu_item_ends_stencil_paint(action);
         match action {
             Action::Mode(m) => self.ui.mode = m,
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::PixelSize(p) => self.set_pixel_size(p),
             Action::Command(id) => match id {
                 // ADR-39 (palette_stencil.rs): its own items, and the Stencil items while there
-                // is an area stencil; other items end Stencil ▸ Paint first.
+                // is an area stencil.
                 id if self.takes_adr39(id) => self.adr39_action(id),
                 "color.ranges" => self.open_ranges(),
                 "palette.mixer" => {

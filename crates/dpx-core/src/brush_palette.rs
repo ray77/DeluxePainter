@@ -103,14 +103,32 @@ pub fn use_brush_palette(
 /// brush's pixels are in its own palette `to`. Opaque pixels never land on the transparent
 /// colour; numbers `from` lacks stay as they are.
 pub fn fit_brush(brush: &BrushImage, from: &Palette, to: &[Rgb8]) -> BrushImage {
+    fit_brush_into(brush, from, to, brush.transparent)
+}
+
+/// [`fit_brush`] into a palette whose transparent colour is number `transparent` (the
+/// brush Brush ▸ Restore gives back after Use Brush Palette recomputed the palette): `brush`'s
+/// transparent pixels take that number, the others the nearest other colours of `to`. With
+/// `None`, a brush without transparent pixels becomes opaque, and one with them keeps its
+/// transparent number.
+pub fn fit_brush_into(
+    brush: &BrushImage,
+    from: &Palette,
+    to: &[Rgb8],
+    transparent: Option<u8>,
+) -> BrushImage {
     let Ok(to) = Palette::new(to.to_vec()) else {
         return brush.clone();
     };
-    let exclude: Vec<u8> = brush.transparent.into_iter().collect();
+    let shows_through = brush.transparent.is_some_and(|t| brush.pixels.contains(&t));
+    let target = transparent.or(brush.transparent.filter(|_| shows_through));
+    let exclude: Vec<u8> = target.into_iter().collect();
     let mut map: [Option<u8>; 256] = [None; 256];
     let mut out = brush.clone();
+    out.transparent = target;
     for p in &mut out.pixels {
         if Some(*p) == brush.transparent {
+            *p = target.unwrap_or(*p);
             continue;
         }
         let slot = &mut map[usize::from(*p)];
@@ -204,5 +222,34 @@ mod tests {
         assert_eq!(fitted.pixels, vec![0, 1, 1]);
         let b = brush(vec![0, 1, 2], None);
         assert_eq!(fit_brush(&b, &from, &own).pixels, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn fit_brush_into_takes_the_new_palettes_transparent_colour() {
+        let from = Palette::new(vec![rgb(0), rgb(100), rgb(250)]).unwrap();
+        let to = [rgb(250), rgb(0), rgb(100)];
+        // Transparent pixels (colour 0) take the new transparent number 1; 0 (black) is no
+        // longer free for opaque pixels then.
+        let b = brush(vec![0, 1, 2], Some(0));
+        let fitted = fit_brush_into(&b, &from, &to, Some(1));
+        assert_eq!(
+            (fitted.pixels.as_slice(), fitted.transparent),
+            (&[1, 2, 0][..], Some(1))
+        );
+        // No transparent number in the new palette: a brush that nowhere shows through becomes
+        // opaque, so every colour is free again ...
+        let b = brush(vec![1, 2, 1], Some(0));
+        let fitted = fit_brush_into(&b, &from, &[rgb(100), rgb(250)], None);
+        assert_eq!(
+            (fitted.pixels.as_slice(), fitted.transparent),
+            (&[0, 1, 0][..], None)
+        );
+        // ... one that shows through keeps its transparent number.
+        let b = brush(vec![0, 2], Some(0));
+        let fitted = fit_brush_into(&b, &from, &[rgb(250), rgb(240)], None);
+        assert_eq!(
+            (fitted.pixels.as_slice(), fitted.transparent),
+            (&[0, 1][..], Some(0))
+        );
     }
 }
