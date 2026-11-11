@@ -65,8 +65,9 @@ pub struct PerspectiveState {
     /// The page with brush, wire frame and cross hairs; made just before the screen is
     /// composed and dropped after.
     pub shown: Option<IndexedImage>,
-    /// The picked-up brush when the mode started: a new pick-up or load ends the mode.
-    picked: Option<BrushImage>,
+    /// [`crate::tools::ToolState::brush_gen`] when the mode started: a new pick-up or load
+    /// ends the mode (a change of the brush in place, such as Arrange, does not).
+    picked_gen: u64,
     /// The tool when the mode started: choosing a tool ends the mode.
     tool: (Tool, bool),
 }
@@ -87,7 +88,7 @@ impl Default for PerspectiveState {
             grid_origin: [0.5, 0.5, 0.0],
             pointer: None,
             shown: None,
-            picked: None,
+            picked_gen: 0,
             tool: (Tool::ContinuousFreehand, false),
         }
     }
@@ -166,8 +167,9 @@ fn step_key(key: egui::Key, physical: Option<egui::Key>, shift: bool) -> Option<
 }
 
 impl PainterApp {
-    /// The observer: the centre (the middle of the screen until placed) and the distance.
-    fn perspective_viewer(&self) -> Viewer {
+    /// The observer: the centre (the middle of the screen until placed) and the distance
+    /// (also Anim ▸ Move's, ADR-38).
+    pub(crate) fn perspective_viewer(&self) -> Viewer {
         let v = self.view();
         let center = self.perspective.center.unwrap_or((
             self.scroll.0 + v.screen_w / 2,
@@ -238,7 +240,7 @@ impl PainterApp {
         p.active = true;
         p.placing = false;
         p.fixed = Axis3::Z;
-        p.picked = self.picked_brush.clone();
+        p.picked_gen = self.tools.brush_gen;
         p.tool = (self.ui.tool, self.ui.filled);
         p.center.get_or_insert((
             viewer_center.0.floor() as i32,
@@ -324,7 +326,7 @@ impl PainterApp {
     fn check_perspective(&mut self) {
         if self.perspective.active
             && (self.custom_brush.is_none()
-                || self.picked_brush != self.perspective.picked
+                || self.tools.brush_gen != self.perspective.picked_gen
                 || (self.ui.tool, self.ui.filled) != self.perspective.tool)
         {
             self.leave_perspective();
@@ -441,12 +443,23 @@ impl PainterApp {
     }
 
     /// A click in perspective mode: the turned brush as one stamp (FG, BG with the right
-    /// button), in the Mode menu's mode. Stencil ▸ Show keeps painting off.
+    /// button), in the Mode menu's mode. Stencil ▸ Show keeps painting off. The next Move
+    /// starts from the stamped brush (ADR-38), and an AnimBrush goes on to its next cel
+    /// (ADR-36).
     fn perspective_stamp(&mut self, right: bool) {
         if self.menu_data.effects.stencil_show {
             return;
         }
-        let (Some(brush), Some(place)) = (&self.custom_brush, self.perspective_placement()) else {
+        let Some(place) = self.perspective_placement() else {
+            return;
+        };
+        if self.custom_brush.is_none() {
+            return;
+        }
+        // Move ▸ starts from this stamp's exact pose (ADR-38).
+        self.note_stamp(place.position, place.matrix.0);
+        let animated = self.animbrush_cels().is_some();
+        let Some(brush) = &self.custom_brush else {
             return;
         };
         let doc = self.engine.document();
@@ -462,7 +475,24 @@ impl PainterApp {
         );
         if let Some((img, at)) = projected {
             let cmd = self.brush_stamp(img, at, right, matte);
-            self.run(cmd);
+            self.run_stamp(cmd, animated);
+        }
+    }
+
+    /// Runs a perspective stamp or FillScreen; with an AnimBrush whose cels fit the palette
+    /// the next cel becomes the brush when it painted (the picture or the Stencil ▸ Paint
+    /// mask), one cel per click, as a dotted click outside the mode (ADR-36).
+    fn run_stamp(&mut self, cmd: Command, animated: bool) {
+        let revisions = |app: &Self| {
+            (
+                app.engine.document().revision(),
+                app.stencil_mask_revision(),
+            )
+        };
+        let before = revisions(self);
+        self.run(cmd);
+        if animated && revisions(self) != before {
+            self.advance_anim_brush(1);
         }
     }
 
@@ -483,6 +513,7 @@ impl PainterApp {
         let (Some(brush), Some(place)) = (&self.custom_brush, self.perspective_placement()) else {
             return;
         };
+        let animated = self.animbrush_cels().is_some();
         let v = self.view();
         let doc = self.engine.document();
         let screen = Rect::new(self.scroll.0, self.scroll.1, v.screen_w, v.screen_h)
@@ -501,7 +532,7 @@ impl PainterApp {
         );
         if let Some((img, at)) = plane {
             let cmd = self.brush_stamp(img, at, false, matte);
-            self.run(cmd);
+            self.run_stamp(cmd, animated);
         }
     }
 
@@ -717,35 +748,73 @@ impl PainterApp {
     /// Just before the screen is composed: the page with the brush (only while it lies
     /// unturned on the screen plane, AGA p.128), its wire frame, the centre's cross hair and,
     /// while the centre is placed, the large cross hair; the marks in complementary colours.
+    /// The brush goes behind the area stencil as the click paints it (ADR-39); during
+    /// Stencil ▸ Paint the stencil view shows it in the mask instead and draws the marks on
+    /// top of that view (`prepare_stencil_view`).
     pub(crate) fn prepare_perspective_view(&mut self) {
         // Changes later in this pass (a menu item, a tool key) show at once.
         self.check_perspective();
-        // A Brush menu gesture shows its own preview (the stroke) until it ends.
-        if !self.perspective.busy() || self.xform_armed() {
+        if !self.perspective_shown() {
             self.perspective.shown = None;
+            return;
+        }
+        let doc = self.engine.document();
+        let (page, palette) = (doc.page(), doc.palette());
+        let mut shown = page.clone();
+        if !self.stencil_painting()
+            && let Some(cmd) = self.perspective_preview_stamp()
+        {
+            let cmd = self.with_area_stencil(cmd);
+            if cmd.check_paint(page, palette).is_ok() {
+                cmd.paint(&mut shown, page, palette);
+            }
+        }
+        self.draw_perspective_marks(&mut shown);
+        self.perspective.shown = Some(shown);
+    }
+
+    /// Perspective shows itself on the screen: the mode is on or the centre is being placed,
+    /// and no Brush menu gesture shows its own preview (the stroke) meanwhile.
+    pub(crate) fn perspective_shown(&self) -> bool {
+        self.perspective.busy() && !self.xform_armed()
+    }
+
+    /// The stamp a click paints now while the brush lies unturned on the screen plane (only
+    /// then its image is shown, AGA p.128), without the area stencil; `None` otherwise.
+    pub(crate) fn perspective_preview_stamp(&self) -> Option<Command> {
+        if !self.perspective_shown() || !self.perspective.active {
+            return None;
+        }
+        let (Some(brush), Some(place)) = (&self.custom_brush, self.perspective_placement()) else {
+            return None;
+        };
+        if !place.on_screen_plane() {
+            return None;
+        }
+        let doc = self.engine.document();
+        let replace = self.perspective_replace(false);
+        let matte = replace.is_some();
+        let viewer = self.perspective_viewer();
+        let clip = doc.page().bounds();
+        let (img, at) =
+            perspective::project_brush(brush, &place, &viewer, clip, doc.palette().len(), replace)?;
+        Some(self.brush_stamp(img, at, false, matte))
+    }
+
+    /// Draws the wire frame, the centre's cross hair and, while the centre is placed, the
+    /// large cross hair on `img` (the page as shown), in the complementary colours of what
+    /// `img` shows there; nothing while perspective does not show itself.
+    pub(crate) fn draw_perspective_marks(&self, img: &mut IndexedImage) {
+        if !self.perspective_shown() {
             return;
         }
         let viewer = self.perspective_viewer();
         let doc = self.engine.document();
-        let (page, palette) = (doc.page(), doc.palette());
-        let clip = page.bounds();
-        let mut shown = page.clone();
+        let clip = doc.page().bounds();
         let mut marks = Vec::new();
         if self.perspective.active
             && let (Some(brush), Some(place)) = (&self.custom_brush, self.perspective_placement())
         {
-            if place.on_screen_plane() {
-                let replace = self.perspective_replace(false);
-                let matte = replace.is_some();
-                if let Some((img, at)) =
-                    perspective::project_brush(brush, &place, &viewer, clip, palette.len(), replace)
-                {
-                    let cmd = self.brush_stamp(img, at, false, matte);
-                    if cmd.check_paint(page, palette).is_ok() {
-                        cmd.paint(&mut shown, page, palette);
-                    }
-                }
-            }
             let size = (brush.width, brush.height);
             marks.extend(perspective::wireframe(
                 size,
@@ -768,13 +837,12 @@ impl PainterApp {
         }
         marks.sort_unstable();
         marks.dedup();
-        let top = (palette.len().clamp(1, 256) - 1) as u8;
+        let top = (doc.palette().len().clamp(1, 256) - 1) as u8;
         for (x, y) in marks {
-            if let Some(c) = shown.get(x, y) {
-                shown.set(x, y, top.saturating_sub(c));
+            if let Some(c) = img.get(x, y) {
+                img.set(x, y, top.saturating_sub(c));
             }
         }
-        self.perspective.shown = Some(shown);
     }
 }
 
@@ -1485,6 +1553,154 @@ mod tests {
         assert!(app.perspective.shown.is_none());
     }
 
+    // ---- Interactions with area stencils, Stencil ▸ Paint, Arrange, Use Brush Palette and
+    // Move (review of the wave-7 merge).
+
+    /// An area stencil protecting page pixel (`x`, `y`) on frame 1.
+    fn protect(app: &mut PainterApp, x: usize, y: usize) {
+        let mut bits = vec![false; 320 * 256];
+        bits[y * 320 + x] = true;
+        app.menu_data.palette_stencil.area = Some(crate::palette_stencil::Area {
+            stencil: dpx_core::AreaStencil::from_mask(320, 256, bits).unwrap(),
+            frame: 0,
+            on: true,
+        });
+    }
+
+    #[test]
+    fn the_brush_preview_goes_behind_an_area_stencil_as_the_click_does() {
+        use egui::PointerButton::Primary;
+        let (mut app, ctx) = setup(true);
+        protect(&mut app, 101, 101);
+        enter_at(&mut app, &ctx, 0.1, (100, 100));
+        app.prepare_perspective_view();
+        let shown = app.compose_screen();
+        let b = brush();
+        assert_eq!(
+            shown.get(101, 101),
+            Some(0),
+            "spared, as the click spares it"
+        );
+        assert_eq!(shown.get(102, 101), b.get(5, 3));
+        click(&mut app, &ctx, 0.2, (100, 100), Primary);
+        // Inside the brush (off the cross through its handle) the click paints exactly what
+        // was shown.
+        for y in [98, 99, 101] {
+            for x in [97, 98, 99, 101, 102] {
+                assert_eq!(painted(&app, (x, y)), shown.get(x, y), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn stencil_paint_in_the_mode_shows_the_brush_in_the_mask_and_the_marks_on_top() {
+        use egui::PointerButton::Primary;
+        let (mut app, ctx) = setup(true);
+        app.run(Command::Clear { color: 3 });
+        enter_at(&mut app, &ctx, 0.1, (100, 100));
+        let ctrl_s = |pressed| egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: Some(egui::Key::S),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        ui_pass(&mut app, &ctx, 0.2, vec![ctrl_s(true), ctrl_s(false)]);
+        assert!(app.stencil_painting() && app.perspective.active);
+        let dim = dpx_core::stencil::half_bright_table(app.palette())[3];
+        assert_ne!(dim, 3);
+        app.prepare_perspective_view();
+        app.prepare_anim_view();
+        app.prepare_stencil_view();
+        let shown = app.compose_screen();
+        // The dimmed picture, the brush where a click stamps it into the mask (bright), and
+        // the wire frame and the centre's cross hair on top (complementary colours).
+        assert_eq!(shown.get(120, 120), Some(dim));
+        assert_eq!(
+            shown.get(101, 101),
+            Some(3),
+            "the brush's shape in the mask"
+        );
+        assert_eq!(shown.get(100 - 4, 100), Some(31 - dim), "frame");
+        assert_eq!(shown.get(160 + 4, 128), Some(31 - dim), "centre");
+        // The click stamps into the mask; the picture stays.
+        let revision = app.engine.document().revision();
+        click(&mut app, &ctx, 0.3, (100, 100), Primary);
+        assert_eq!(app.engine.document().revision(), revision);
+        let p = app.menu_data.palette_stencil.painting.as_ref().unwrap();
+        let mask = dpx_core::AreaStencil::from_image(p.engine.document().page());
+        assert!(
+            mask.protects(101, 101) && !mask.protects(97, 98),
+            "its shape"
+        );
+    }
+
+    #[test]
+    fn arrange_and_use_brush_palette_keep_perspective_mode() {
+        let (mut app, ctx) = setup(true);
+        enter_at(&mut app, &ctx, 0.1, (100, 100));
+        // Arrange renumbers the brushes in place: no brush was picked up or loaded.
+        let order: Vec<u8> = (0..32u8).rev().collect();
+        app.apply_arrange(&order);
+        ui_pass(&mut app, &ctx, 0.2, vec![]);
+        assert!(app.perspective.active, "after Arrange");
+        // Use Brush Palette gives a loaded brush the file's colour numbers in place.
+        let custom = app.custom_brush.clone().unwrap();
+        let mut own = custom.clone();
+        for p in &mut own.pixels {
+            if Some(*p) != own.transparent {
+                *p = 1;
+            }
+        }
+        app.menu_data.palette_stencil.loaded = Some(crate::palette_stencil::LoadedBrush {
+            brush: own.clone(),
+            palette: app.palette().clone(),
+            ranges: Vec::new(),
+            fitted: custom,
+        });
+        app.run_action(dpx_ui::Action::Command("palette.use_brush"), &ctx);
+        assert_eq!(app.custom_brush.as_ref(), Some(&own));
+        assert_eq!(app.picked_brush.as_ref(), Some(&own));
+        ui_pass(&mut app, &ctx, 0.3, vec![]);
+        assert!(app.perspective.active, "after Use Brush Palette");
+    }
+
+    #[test]
+    fn a_move_after_a_perspective_stamp_starts_from_the_turned_brush() {
+        use egui::PointerButton::Primary;
+        let (mut app, ctx) = setup(true);
+        enter_at(&mut app, &ctx, 0.1, (100, 60));
+        // Turned a quarter about Z and a degree about X, and pushed 8 pixels away: the
+        // Moving Ground recipe (AGA p.192) turns, stamps, undoes and moves.
+        ui_pass(&mut app, &ctx, 0.2, pad(2, true));
+        ui_pass(&mut app, &ctx, 0.3, pad(7, false));
+        ui_pass(&mut app, &ctx, 0.4, text("'"));
+        ui_pass(&mut app, &ctx, 0.45, text("'"));
+        assert_eq!(app.perspective.orientation.angles(), [-1, 0, 90]);
+        click(&mut app, &ctx, 0.5, (100, 60), Primary);
+        let stamped = app.engine.document().page().clone();
+        assert!(stamped.pixels().iter().any(|&c| c != 0));
+        ui_pass(&mut app, &ctx, 0.6, tap(egui::Key::U));
+        assert!(painted(&app, (100, 60)) == Some(0));
+        // A move of no distance, one stamp: exactly the stamp again.
+        app.anim_control.settings = Some(dpx_core::anim_move::MovePath {
+            count: 1,
+            ..Default::default()
+        });
+        let shift_m = |pressed| egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: Some(egui::Key::M),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        };
+        ui_pass(&mut app, &ctx, 0.7, vec![shift_m(true), shift_m(false)]);
+        assert!(app.ui.anim_control.is_some(), "the Move requester");
+        ui_pass(&mut app, &ctx, 0.8, tap(egui::Key::Enter));
+        assert!(app.ui.anim_control.is_none(), "drawn");
+        assert_eq!(app.engine.document().page(), &stamped);
+    }
+
     #[test]
     fn the_mouse_slides_the_brush_on_its_plane_and_ctrl_fixes_y() {
         let (mut app, ctx) = setup(true);
@@ -1551,6 +1767,7 @@ mod tests {
         let mut other = brush();
         other.pixels[5] = 9;
         app.picked_brush = Some(other);
+        app.tools.brush_gen += 1;
         ui_pass(&mut app, &ctx, 0.4, vec![]);
         assert!(!app.perspective.active);
         ui_pass(&mut app, &ctx, 0.5, tap(egui::Key::Enter));

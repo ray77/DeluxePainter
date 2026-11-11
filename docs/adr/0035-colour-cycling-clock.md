@@ -15,7 +15,7 @@
   - Tab also toggles cycling during playback (as in the tutorial). In requesters it keeps its requester meaning (moving between fields, or nothing), and the note still takes every key (ADR-12, owner's decision).
   - A load keeps cycling on or off and drops the old cycled palette; the next tick cycles the new picture's ranges.
   - The Color Mixer still shows its edited palette without cycling. Its Ok compares against the document palette, so Ok without edits adds no undo step while cycling.
-  - The paint-screen menu and animation keys (`j`, Ctrl+`j`, `k`, Tab, `?`, `1`–`6`, `l`, `U`) wait while the Text tool is typing, judged before the tool keys run, so keys in the same pass as the Esc that ends the text are still text.
+  - The paint-screen menu and animation keys (`j`, Ctrl+`j`, `k`, Tab, `?`, `1`–`6`, `l`, `U`, and `p` for the Color Mixer) wait while the Text tool is typing, judged before the tool keys run, so keys in the same pass as the Esc that ends the text are still text. (`p` was added after the wave-7 review: it opened the Mixer, which ended the text.)
   - Color ▸ Cycle shows the key hint TAB, as in the manual's menu figure.
   - Owner's decisions (2026-11-11), asked because both are visible:
     - **DeluxePaint's own chunks are quiet:** `DPPS` and `DPPV` (DeluxePaint's settings) and `TINY` (a thumbnail chunk found next to them in DeluxePaint-era files) say nothing about the picture, so "… chunk not kept" for them goes to stderr only and opens no note (`files::QUIET_CHUNKS`, filtered in `note_requester`). Every other loss (other chunks, the mask, ranges, scaling) still shows the note. A DeluxePaint picture like the Waterfall example now opens without a note, so Tab works at once. `TINY` was added to the owner's DPPS/DPPV example because it is only a thumbnail (IFF_SUPPORT_MATRIX: exists, layout unverified), seen with DPPS in the AH_Celtic example, and dropping it loses nothing from the picture. The CLI (`info`, `convert`) is unchanged.
@@ -28,4 +28,5 @@
   - Each fix was reverted on its own and its test then failed (seven mutations).
   - An adversarial review (three lenses, every finding re-checked) found six small defects in the first version; all are fixed above.
   - A real-window run with the Waterfall example and cycling switched on from code showed about 18 palette changes per second.
+  - Wave-7 review: the app test `paint_screen_keys_wait_while_typing_text` also types `p`, alone and in the pass of the ending Esc, and no Mixer opens; it failed with `typing()` taken out of the Mixer key's guard.
   - Not verified with a real keyboard in the window: the owner did not grant remote control.

@@ -165,8 +165,9 @@ impl PainterApp {
         self.dirty = true;
     }
 
-    /// Runs a frame command; returns the engine's message if it refused.
-    fn frame_command(&mut self, command: Command) -> Result<(), String> {
+    /// Runs a frame command (the menus, the keys and the Control Panel all come here);
+    /// returns the engine's message if it refused.
+    pub(crate) fn frame_command(&mut self, command: Command) -> Result<(), String> {
         self.finish_stroke();
         // ADR-39: the area stencil follows its picture.
         let result = self.execute_frames(command).map(|_| ()).map_err(|e| {

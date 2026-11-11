@@ -1465,10 +1465,17 @@ impl PainterApp {
         }
     }
 
-    /// Runs a menu action. Commands not implemented yet do nothing.
+    /// Runs a menu action (also a key that stands for a menu item and ends Stencil ▸ Paint as
+    /// the item does: `p`, `M`). Commands not implemented yet do nothing.
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
         // ADR-39: any other menu item ends Stencil ▸ Paint.
         self.menu_item_ends_stencil_paint(action);
+        self.dispatch_action(action, ctx);
+    }
+
+    /// Runs a menu action without ending Stencil ▸ Paint: for the shortcut keys that keep it
+    /// (Alt-m, Alt-n, Alt-b; ADR-39).
+    fn dispatch_action(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Mode(m) => self.ui.mode = m,
             Action::Pref(p) => self.ui.prefs.toggle(p),
@@ -2226,7 +2233,8 @@ impl PainterApp {
     }
 
     /// The Color Mixer (Color ▸ Palette ▸ Mixer, ADR-16). While it is closed, the `p` key
-    /// opens it when no other requester, view or menu is open; while it is open, it gets the
+    /// opens it when no other requester, view or menu is open and the Text tool is not
+    /// typing; while it is open, it gets the
     /// pointer and keys (it is modal). Returns whether it is or was open this frame, so the
     /// caller only paints.
     fn palette_input(
@@ -2238,11 +2246,14 @@ impl PainterApp {
         view: View,
     ) -> bool {
         if self.ui.palette_requester.is_none() {
+            // `p` typed by the Text tool is a letter (judged before the tool keys run, so a
+            // `p` in the pass of the Esc that ends the text is still text, ADR-35).
             let busy = self.ui.note_requester.is_some()
                 || self.ui.file_requester.is_some()
                 || self.ui.page_size_requester.is_some()
                 || self.show_page.is_some()
-                || self.ui.menu.active;
+                || self.ui.menu.active
+                || self.typing();
             let p = ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.is_none());
             if busy || !p {
                 return false;
@@ -2932,6 +2943,23 @@ mod tests {
             app.menu_data.spare.is_none(),
             "j with Esc is not Swap Spare"
         );
+        // `p` is a letter while typing, not the Color Mixer (which would end the text).
+        app.handle_press(Hit::Page { x: 20, y: 40 }, false);
+        app.release();
+        assert!(app.typing());
+        let mut p = vec![key_event(egui::Key::P, true)];
+        p.extend(typed("p"));
+        ui_pass(&mut app, &ctx, 0.5, p);
+        ui_pass(&mut app, &ctx, 0.52, vec![key_event(egui::Key::P, false)]);
+        assert!(app.ui.palette_requester.is_none(), "p is typed");
+        assert!(app.typing());
+        // Also in the pass of the Esc that ends the text.
+        let mut end = vec![key_event(egui::Key::P, true)];
+        end.extend(typed("p"));
+        end.push(key_event(egui::Key::Escape, true));
+        ui_pass(&mut app, &ctx, 0.6, end);
+        assert!(!app.typing());
+        assert!(app.ui.palette_requester.is_none(), "p with Esc is typed");
     }
 
     /// Runs one egui pass with the `p` key pressed through the Color Mixer's input.

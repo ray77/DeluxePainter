@@ -35,41 +35,88 @@ pub fn use_brush_palette(
     current: &Palette,
     depth: PaletteDepth,
 ) -> Adopted {
+    let AdoptedCels {
+        colors,
+        mut cels,
+        reduced,
+    } = use_cels_palette(std::slice::from_ref(brush), own, current, depth);
+    Adopted {
+        colors,
+        brush: cels.pop().expect("one cel"),
+        reduced,
+    }
+}
+
+/// The result of [`use_cels_palette`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptedCels {
+    /// The picture's new palette, with the picture's number of colours.
+    pub colors: Vec<Rgb8>,
+    /// The cels in the new palette's colour numbers.
+    pub cels: Vec<BrushImage>,
+    /// See [`Adopted::reduced`].
+    pub reduced: bool,
+}
+
+/// [`use_brush_palette`] for the cels of an AnimBrush (ADR-36): one palette for all of them.
+/// When every cel fits the picture's colour count the palette is taken as it is and the
+/// cels keep their numbers; otherwise it is recomputed from the pixels of every cel together
+/// and every cel is repainted in it (a cel's transparent pixels stay transparent).
+pub fn use_cels_palette(
+    cels: &[BrushImage],
+    own: &[Rgb8],
+    current: &Palette,
+    depth: PaletteDepth,
+) -> AdoptedCels {
     let n = current.len();
     let fits = |c: u8| usize::from(c) < n;
-    if brush.pixels.iter().all(|&p| fits(p)) && brush.transparent.is_none_or(fits) {
+    if cels
+        .iter()
+        .all(|b| b.pixels.iter().all(|&p| fits(p)) && b.transparent.is_none_or(fits))
+    {
         let colors = current
             .colors()
             .iter()
             .enumerate()
             .map(|(i, &c)| own.get(i).copied().unwrap_or(c))
             .collect();
-        return Adopted {
+        return AdoptedCels {
             colors,
-            brush: brush.clone(),
+            cels: cels.to_vec(),
             reduced: false,
         };
     }
-    // The brush's pixels (transparent ones with alpha 0, which the reduction keeps in colour
-    // 0) decide the colours; the brush palette's other colours fill the entries left.
+    // The cels' pixels (transparent ones with alpha 0, which the reduction keeps in colour
+    // 0) decide the colours; the brush palette's other colours fill the entries left. The
+    // cels lie one below the other on a canvas as wide as the widest; the space beside a
+    // narrower one is transparent.
     let color = |c: u8| own.get(usize::from(c)).copied().unwrap_or(Rgb8::BLACK);
-    let pixels: Vec<Rgba8> = brush
-        .pixels
+    let width = cels.iter().map(|b| b.width).max().unwrap_or(0).max(1);
+    let height = cels.iter().map(|b| b.height).sum::<u32>().max(1);
+    let mut pixels = vec![Rgba8::new(0, 0, 0, 0); width as usize * height as usize];
+    let mut top = 0usize;
+    for b in cels {
+        for (y, row) in b.pixels.chunks(b.width.max(1) as usize).enumerate() {
+            for (x, &p) in row.iter().enumerate() {
+                let c = color(p);
+                let alpha = if Some(p) == b.transparent { 0 } else { 255 };
+                pixels[(top + y) * width as usize + x] = Rgba8::new(c.r, c.g, c.b, alpha);
+            }
+        }
+        top += b.height as usize;
+    }
+    let image = RgbaImage::from_pixels(width, height, pixels).expect("canvas size");
+    let transparent = cels
         .iter()
-        .map(|&p| {
-            let c = color(p);
-            let alpha = if Some(p) == brush.transparent { 0 } else { 255 };
-            Rgba8::new(c.r, c.g, c.b, alpha)
-        })
-        .collect();
-    let image = RgbaImage::from_pixels(brush.width, brush.height, pixels).expect("brush size");
+        .find_map(|b| b.transparent)
+        .map_or(Rgb8::BLACK, color);
     let reduced = quantize::reduce(
         &image,
         &ReduceOptions {
             max_colors: n as u16,
             depth,
             dither: Dither::None,
-            transparent: brush.transparent.map_or(Rgb8::BLACK, color),
+            transparent,
         },
     );
     let used = reduced.colors + usize::from(reduced.transparent_index.is_some());
@@ -88,13 +135,29 @@ pub fn use_brush_palette(
         }
     }
     colors.resize(n, Rgb8::BLACK);
-    Adopted {
+    let out = reduced.image.pixels();
+    let mut top = 0usize;
+    let cels = cels
+        .iter()
+        .map(|b| {
+            let w = b.width as usize;
+            let pixels = (0..b.height as usize)
+                .flat_map(|y| {
+                    let start = (top + y) * width as usize;
+                    out[start..start + w].iter().copied()
+                })
+                .collect();
+            top += b.height as usize;
+            BrushImage {
+                pixels,
+                transparent: b.transparent.and(reduced.transparent_index),
+                ..b.clone()
+            }
+        })
+        .collect();
+    AdoptedCels {
         colors,
-        brush: BrushImage {
-            pixels: reduced.image.pixels().to_vec(),
-            transparent: reduced.transparent_index,
-            ..brush.clone()
-        },
+        cels,
         reduced: true,
     }
 }
@@ -222,6 +285,42 @@ mod tests {
         assert_eq!(fitted.pixels, vec![0, 1, 1]);
         let b = brush(vec![0, 1, 2], None);
         assert_eq!(fit_brush(&b, &from, &own).pixels, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn animbrush_cels_share_one_palette() {
+        let current = Palette::new((0..4).map(rgb).collect()).unwrap();
+        let own: Vec<Rgb8> = (0..16)
+            .map(|i| Rgb8::new(i * 16, 0, 255 - i * 16))
+            .collect();
+        // Every cel fits: the palette as it is, the numbers kept.
+        let small = [brush(vec![1, 2], Some(0)), brush(vec![3, 0, 3], Some(0))];
+        let a = use_cels_palette(&small, &own, &current, PaletteDepth::Rgb8);
+        assert!(!a.reduced);
+        assert_eq!(a.cels, small.to_vec());
+        assert_eq!(a.colors, own[..4].to_vec());
+        // One cel does not fit: one palette from the colours of both, both repainted in it.
+        let cels = [
+            brush(vec![9, 15, 9], Some(15)),
+            brush(vec![12, 12], Some(15)),
+        ];
+        let a = use_cels_palette(&cels, &own, &current, PaletteDepth::Rgb8);
+        assert!(a.reduced);
+        assert_eq!(a.colors.len(), 4);
+        assert_eq!(a.cels.len(), 2);
+        let shown = |b: &BrushImage| -> Vec<Option<Rgb8>> {
+            b.pixels
+                .iter()
+                .map(|&p| (Some(p) != b.transparent).then(|| a.colors[usize::from(p)]))
+                .collect()
+        };
+        assert_eq!(shown(&a.cels[0]), vec![Some(own[9]), None, Some(own[9])]);
+        assert_eq!(shown(&a.cels[1]), vec![Some(own[12]), Some(own[12])]);
+        assert_eq!((a.cels[1].width, a.cels[1].height), (2, 1));
+        // A single brush gets what Use Brush Palette gives it.
+        let one = use_brush_palette(&cels[0], &own, &current, PaletteDepth::Rgb8);
+        let alone = use_cels_palette(&cels[..1], &own, &current, PaletteDepth::Rgb8);
+        assert_eq!((one.colors, vec![one.brush]), (alone.colors, alone.cels));
     }
 
     #[test]

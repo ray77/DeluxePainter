@@ -111,6 +111,17 @@ fn command_bytes(command: &Command) -> u64 {
         Command::SetPalette { colors } => 3 * colors.len() as u64,
         Command::ArrangePalette { order } => order.len() as u64,
         Command::AnimBrushPaint { brush, paint } => brush.bytes() + command_bytes(paint),
+        Command::MoveBrush {
+            brush,
+            custom: c,
+            area,
+            ..
+        } => {
+            let mask = area.as_ref().map_or(0, |a| {
+                u64::from(a.area.width()) * u64::from(a.area.height())
+            });
+            points(brush.len()) + custom(c) + mask
+        }
         // ADR-39: the mask (shared between commands, counted for each).
         Command::Stenciled { area, command } => {
             u64::from(area.width()) * u64::from(area.height()) + command_bytes(command)

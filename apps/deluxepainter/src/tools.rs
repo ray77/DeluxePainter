@@ -81,6 +81,9 @@ pub struct ToolState {
     /// The page palette when the custom brush was picked up or loaded: what its colour
     /// indices meant then. Brush > Remap fits them to the current palette (ADR-30).
     pub brush_palette: Option<Palette>,
+    /// Counts the brushes picked up or loaded (a new one ends perspective mode, ADR-37);
+    /// changes to the brush itself (Arrange, Use Brush Palette, transforms) do not count.
+    pub brush_gen: u64,
 }
 
 impl Default for ToolState {
@@ -112,6 +115,7 @@ impl Default for ToolState {
             rotate_base: None,
             spare_brush: None,
             brush_palette: None,
+            brush_gen: 0,
         }
     }
 }
@@ -1311,6 +1315,7 @@ impl PainterApp {
         }
         self.custom_brush = Some(brush.clone());
         self.picked_brush = Some(brush);
+        self.tools.brush_gen += 1;
         self.leave_anim_brush(); // ADR-36
         self.tools.brush_palette = Some(self.engine.document().palette().clone());
         self.ui.mode = PaintMode::Matte;

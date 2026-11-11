@@ -293,8 +293,10 @@ fn silhouette(b: &BrushImage, value: u8) -> BrushImage {
 /// protected, otherwise free. Strokes and shapes keep their path, brush shape, filled flag
 /// and symmetry and paint plain (no mode, range, stencil or effect); a custom brush paints
 /// its shape. A fill fills the mask's own region at its point, CLR the whole mask (with
-/// `add` = false: everything free). A [`Command::Stenciled`] paints its command. `None` for
-/// commands that do not paint (they do not belong to the stencil).
+/// `add` = false: everything free). A [`Command::Stenciled`] paints its command. An
+/// [`Command::AnimBrushPaint`] stays one: every cel becomes its shape, so the mask gets the
+/// shapes the picture would have got, stamp by stamp. `None` for commands that do not paint
+/// (they do not belong to the stencil).
 pub fn mask_command(cmd: &Command, add: bool) -> Option<Command> {
     let value = if add { PROTECTED } else { FREE };
     Some(match cmd {
@@ -344,6 +346,10 @@ pub fn mask_command(cmd: &Command, add: bool) -> Option<Command> {
         },
         Command::Clear { .. } => Command::Clear { color: value },
         Command::Stenciled { command, .. } => return mask_command(command, add),
+        Command::AnimBrushPaint { brush, paint } => Command::AnimBrushPaint {
+            brush: brush.map(|cel| silhouette(cel, value)),
+            paint: Box::new(mask_command(paint, add)?),
+        },
         _ => return None,
     })
 }
@@ -571,6 +577,106 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// An AnimBrush of two cels (a dot of colour 3, then a two-pixel bar of colour 4) over a
+    /// Dotted Freehand stroke of two points that stamps its first cel.
+    fn anim_brush_stroke() -> Command {
+        let dot = BrushImage {
+            width: 1,
+            height: 1,
+            pixels: vec![3],
+            handle: (0, 0),
+            transparent: None,
+        };
+        let bar = BrushImage {
+            width: 2,
+            height: 1,
+            pixels: vec![4, 4],
+            handle: (0, 0),
+            transparent: None,
+        };
+        Command::AnimBrushPaint {
+            brush: crate::AnimBrush::new(vec![dot.clone(), bar]),
+            paint: Box::new(Command::Stroke {
+                brush: Vec::new(),
+                color: 1,
+                points: vec![(0, 0), (0, 2)],
+                continuous: false,
+                custom: Some(dot),
+                mode: DrawMode::Matte,
+                range: None,
+                stencil: None,
+                right: false,
+                fx: PaintFx::default(),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_animbrush_stroke_paints_its_cels_shapes_on_the_mask() {
+        // Stencil ▸ Paint with an AnimBrush in use: the mask gets the cels' shapes stamp by
+        // stamp (the dot, then the bar), never the picture's colours.
+        let cmd = anim_brush_stroke();
+        let pal = mask_palette();
+        let mut page = IndexedImage::new(3, 3, FREE);
+        let add = mask_command(&cmd, true).expect("an AnimBrush stroke paints the mask");
+        assert!(matches!(add, Command::AnimBrushPaint { .. }));
+        assert!(add.check_paint(&page, &pal).is_ok());
+        let before = page.clone();
+        add.paint(&mut page, &before, &pal);
+        assert_eq!(rows(&page), ["100", "000", "110"]);
+        // The right button frees in the same shapes; under an area stencil as well.
+        let wrapped = stenciled(&AreaStencil::free(&page), cmd.clone());
+        let free = mask_command(&wrapped, false).unwrap();
+        let before = page.clone();
+        free.paint(&mut page, &before, &pal);
+        assert_eq!(rows(&page), ["000", "000", "000"]);
+        // It runs in a mask engine too (two colours).
+        let mut e = Engine::new(Document::from_picture(
+            IndexedImage::new(3, 3, FREE),
+            pal,
+            Target::default(),
+        ));
+        e.execute(add).unwrap();
+        assert_eq!(rows(e.document().page()), ["100", "000", "110"]);
+    }
+
+    #[test]
+    fn an_animbrush_stroke_under_an_area_stencil_previews_and_counts_its_stamps() {
+        // The tools wrap an AnimBrush stroke in the area stencil: the preview check must
+        // accept what the engine accepts, and the stamps must count for the AnimBrush clock.
+        let area = mask(&["#..", "...", "..."]);
+        let pal = Palette::dpaint_default_32();
+        let inner = anim_brush_stroke();
+        let cmd = stenciled(&area, inner.clone());
+        let mut e = engine(3, 3, 0);
+        let page = e.document().page().clone();
+        assert!(cmd.check_paint(&page, &pal).is_ok());
+        assert_eq!(cmd.stamps(), inner.stamps());
+        assert_eq!(cmd.stamps(), 2);
+        let mut preview = page.clone();
+        cmd.paint(&mut preview, &page, &pal);
+        e.execute(cmd.clone()).unwrap();
+        assert_eq!(e.document().page(), &preview, "the preview is the commit");
+        assert_eq!(rows(e.document().page()), ["000", "000", "440"]);
+        // Every kind the engine accepts under an area stencil, the preview check accepts.
+        let fill = Command::FloodFill {
+            x: 1,
+            y: 1,
+            color: 5,
+            fill: FillType::Solid,
+        };
+        for inner in [plain(5), fill, inner] {
+            let cmd = stenciled(&area, inner);
+            let mut e = engine(3, 3, 0);
+            let page = e.document().page().clone();
+            assert_eq!(
+                cmd.check_paint(&page, &pal).is_ok(),
+                e.execute(cmd.clone()).is_ok(),
+                "{cmd:?}"
+            );
+        }
     }
 
     fn engine(w: u32, h: u32, fill: u8) -> Engine {
