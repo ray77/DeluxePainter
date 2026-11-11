@@ -31,12 +31,14 @@
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
 mod anim;
+mod autosave;
 mod browse;
 mod brush_menu;
 mod config;
 mod effects;
 mod files;
 mod menu_actions;
+mod recovery;
 mod settings;
 mod tools;
 
@@ -455,6 +457,12 @@ fn main() -> eframe::Result {
         {
             ui.note_requester = note_requester(LOADED, notes);
         }
+        if args.iter().any(|a| a == "--recover-requester") {
+            ui.choice_requester = Some(autosave::recover_requester(
+                "Castle",
+                recovery::format_utc(recovery::unix_now()),
+            ));
+        }
         if args.iter().any(|a| a == "--show-page") {
             let sp = ShowPage::new(
                 (doc.page().width(), doc.page().height()),
@@ -541,6 +549,9 @@ fn main() -> eframe::Result {
             if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
                 app.ui.note_requester = note_requester(LOADED, &notes);
+            }
+            if let Some(store) = recovery::Store::platform() {
+                app.attach_recovery(store);
             }
             Ok(Box::new(app))
         }),
@@ -802,6 +813,8 @@ struct PainterApp {
     anim: anim::AnimState,
     /// The settings file (ADR-33); `None` in tests, snapshots and with `--no-settings`.
     config: Option<config::ConfigStore>,
+    /// Autosave, recovery and the quit question (ADR-34).
+    autosave: autosave::State,
 }
 
 impl PainterApp {
@@ -836,6 +849,7 @@ impl PainterApp {
             stencil: None,
             anim: anim::AnimState::default(),
             config: None,
+            autosave: autosave::State::default(),
         }
     }
 
@@ -851,6 +865,7 @@ impl PainterApp {
         self.clamp_colors();
         self.scroll = (0, 0);
         self.dirty = true;
+        self.mark_clean();
     }
 
     /// Keeps the shown part inside the page (after loads, page and format changes, undo).
@@ -1094,6 +1109,9 @@ impl PainterApp {
                     &notes,
                 );
                 if !export {
+                    if matches!(files::save_format(&path), Ok(files::SaveFormat::Project)) {
+                        self.mark_clean();
+                    }
                     self.picture_path = Some(path);
                 }
             }
@@ -1372,7 +1390,7 @@ impl PainterApp {
                 "picture.load" => self.open_file_requester(FileKind::LoadPicture),
                 "picture.save" => self.open_file_requester(FileKind::SavePicture),
                 "picture.export" => self.open_file_requester(FileKind::ExportPicture),
-                "app.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                "app.quit" => self.request_quit(ctx),
                 // ADR-15 (menu_actions.rs).
                 "spare.swap" => self.swap_spare(),
                 "spare.copy" => self.copy_to_spare(),
@@ -1443,6 +1461,9 @@ impl eframe::App for PainterApp {
         self.ui.has_brush = self.custom_brush.is_some();
         self.ui.can_restore = self.picked_brush.is_some();
         self.refresh_effects();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.close_requested(&ctx);
+        }
         let ppp = ctx.pixels_per_point();
         let area = ctx.content_rect();
         let window = Window {
@@ -1486,6 +1507,14 @@ impl eframe::App for PainterApp {
         let origin = area.min + origin_px / ppp;
         let rect = egui::Rect::from_min_size(origin, egui::vec2(img_w as f32, img_h as f32) / ppp);
 
+        if let Some(wait) = self.autosave_tick(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.5)));
+        }
+        if self.ui.choice_requester.is_some() {
+            self.choice_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
         if self.requester.is_some() {
             self.requester_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);

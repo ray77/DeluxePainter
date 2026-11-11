@@ -69,7 +69,7 @@ fn capitalise(s: &str) -> String {
 
 /// Word-wraps `text` at spaces to at most `width` pixels per line; a word wider than a line is
 /// broken by characters.
-fn wrap(text: &str, width: i32) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: i32) -> Vec<String> {
     let font = Font::builtin();
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();

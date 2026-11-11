@@ -77,7 +77,7 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 | P0 | `.dpxproj` save/open — lossless, atomic writes | Picture ▸ Save.. writes the project, Load.. opens it, Export.. writes IFF ILBM / PNG (ADR-23, ADR-27, [PROJECT_FORMAT.md](PROJECT_FORMAT.md)); animation frames saved as format version 2 (ADR-28); one layer, no undo history or spare page yet |
 | P1 | Layers: add/delete/rename/reorder, visibility, lock, opacity, Normal blend | |
 | P1 | Layer groups | |
-| P1 | Autosave & crash recovery | |
+| P1 | Autosave & crash recovery | Recovery project after 30 s idle and on quit; "Recover Picture" on start; Quit asks when unsaved (ADR-34) |
 | P3 | Masks, more blend modes, adjustment layers | |
 
 ## 6. Files
