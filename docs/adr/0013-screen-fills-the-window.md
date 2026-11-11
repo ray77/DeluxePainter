@@ -24,7 +24,7 @@
     - 1x to 8x in half steps; the current step is checked.
     - Cmd/Ctrl + `+` (or `=`) and `−` go half a step up or down; Cmd/Ctrl + `0` = Largest. egui's own keyboard zoom is switched off.
     - The start window, 960×768 points, is 3x for the default 320×256 screen.
-    - The choice is not saved yet (no settings file exists).
+    - The choice is saved in the settings file (ADR-33).
   - **The Screen Format requester** keeps its own screen. It is shown at the same pixel size (or the largest that fits) and centred; the window does not snap while it is open.
   - **Left from the earlier attempts:**
     - `dpx_ui::Screen::render` draws a dark dotted pattern where the page image does not cover the screen. With the screen equal to `Target.screen` and pages never smaller than it (ADR-10), this is not visible in normal use.
@@ -36,4 +36,4 @@
   - Not tried by hand: dragging the window and the snap, the keys, full screen, how the system reacts to sizes in half points, and Windows/Linux. Windows has no live-resize snapping guarantee from winit; untested.
 - Consequences:
   - The picture always fills a windowed DeluxePainter without bars. Pictures bigger than the screen scroll as before (ADR-10).
-  - Saving the pixel size waits for a settings file.
+  - The pixel size is saved in the settings file (ADR-33).
