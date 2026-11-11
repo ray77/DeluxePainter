@@ -2375,7 +2375,7 @@ impl PainterApp {
         area: egui::Rect,
     ) {
         // ADR-41: no tooltip over (or under) a menu, requester or playback opened this pass.
-        self.tooltip_guard();
+        self.tooltip_guard(ctx);
         // The shown cycling palette follows palette and range changes made earlier in this
         // pass (the clock at the top of `ui()` ran before them).
         self.cycle_tick(ctx.input(|i| i.time));

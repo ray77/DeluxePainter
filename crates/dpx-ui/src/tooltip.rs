@@ -5,7 +5,8 @@
 //!
 //! This module holds the texts, where the box goes and how it looks. When it shows is the
 //! app's business (`apps/deluxepainter/src/tooltip.rs`), which also checks every key named
-//! here against its key handlers, so the texts cannot drift from what the keys do.
+//! here against its key handlers, so the texts cannot drift from what the keys do. Modes that
+//! take keys for themselves (perspective, typing text: [`KeyMode`]) leave those keys out.
 
 use dpx_core::{IndexedImage, Rect};
 
@@ -25,6 +26,42 @@ pub mod geom {
     pub const BOX_H: i32 = super::font::GLYPH_H + 4;
     /// Free pixels between the box and the toolbox (tools) or the panel (panel buttons).
     pub const GAP: i32 = 2;
+}
+
+/// Which keys do their paint-screen job at the moment. A tooltip names a key only when it
+/// does what a click on the button does; modes that take keys for themselves leave them out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyMode {
+    /// The paint screen: every key of the table.
+    #[default]
+    Paint,
+    /// Effect ▸ Perspective (ADR-37) takes the main-row digits with and without Shift (they
+    /// turn the brush, fix or reset its axes) and the characters of its keypad table, `<` and
+    /// `>` among them (the observer's distance); the tool and frame keys do not see them.
+    Perspective,
+    /// The Text tool is typing: every key goes into the text (or ends it).
+    Typing,
+}
+
+/// The characters perspective mode takes when typed (`perspective_char` in the app).
+const PERSPECTIVE_CHARS: [char; 10] = ['-', '.', '\\', ';', ':', '\'', '"', '@', '<', '>'];
+
+impl KeyMode {
+    /// Whether `key`, as the tooltips write it, does its paint-screen job in this mode.
+    pub fn keeps(self, key: &str) -> bool {
+        match self {
+            Self::Paint => true,
+            Self::Typing => false,
+            Self::Perspective => {
+                let bare = key.strip_prefix("Shift+").unwrap_or(key);
+                let mut chars = bare.chars();
+                !matches!(
+                    (chars.next(), chars.next()),
+                    (Some(c), None) if c.is_ascii_digit() || PERSPECTIVE_CHARS.contains(&c)
+                )
+            }
+        }
+    }
 }
 
 /// What a tooltip names.
@@ -51,20 +88,39 @@ impl TooltipTarget {
         }
     }
 
-    /// The tooltip text: the name, then two spaces and the key, if there is one.
+    /// The tooltip text on the paint screen: the name, then two spaces and the key, if there
+    /// is one.
     pub fn text(self) -> String {
-        let (name, key) = match self {
-            Self::Tool { tool, filled } => (tool_name(tool, filled), tool_key(tool, filled)),
-            Self::Panel(b) => (panel_name(b), panel_key(b)),
-        };
-        match key {
+        self.text_in(KeyMode::Paint)
+    }
+
+    /// The tooltip text in `keys` mode: the key only when it does the button's job there.
+    pub fn text_in(self, keys: KeyMode) -> String {
+        let name = self.name();
+        match self.key().filter(|k| keys.keeps(k)) {
             Some(key) => format!("{name}  {key}"),
             None => name.to_string(),
         }
     }
+
+    /// The name of the button (half).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tool { tool, filled } => tool_name(tool, filled),
+            Self::Panel(b) => panel_name(b),
+        }
+    }
+
+    /// The paint-screen key of the button (half), if any ([`tool_key`], [`panel_key`]).
+    pub fn key(self) -> Option<&'static str> {
+        match self {
+            Self::Tool { tool, filled } => tool_key(tool, filled),
+            Self::Panel(b) => panel_key(b),
+        }
+    }
 }
 
-/// The text naming a toolbox button (half), e.g. "Filled Rectangle  R".
+/// The text naming a toolbox button (half) on the paint screen, e.g. "Filled Rectangle  R".
 pub fn for_tool(tool: Tool, filled_half: bool) -> String {
     TooltipTarget::Tool {
         tool,
@@ -73,7 +129,7 @@ pub fn for_tool(tool: Tool, filled_half: bool) -> String {
     .text()
 }
 
-/// The text naming a Control Panel button, e.g. "Next Frame  2".
+/// The text naming a Control Panel button on the paint screen, e.g. "Next Frame  2".
 pub fn for_panel_button(button: PanelButton) -> String {
     TooltipTarget::Panel(button).text()
 }
@@ -173,14 +229,18 @@ pub fn panel_key(button: PanelButton) -> Option<&'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tooltip {
     pub target: TooltipTarget,
+    /// The keys its text names ([`TooltipTarget::text_in`]).
+    pub keys: KeyMode,
     pub text: String,
 }
 
 impl Tooltip {
-    pub fn new(target: TooltipTarget) -> Self {
+    /// The tooltip of `target` while `keys` say which keys work.
+    pub fn new(target: TooltipTarget, keys: KeyMode) -> Self {
         Self {
             target,
-            text: target.text(),
+            keys,
+            text: target.text_in(keys),
         }
     }
 
@@ -378,6 +438,65 @@ mod tests {
     }
 
     #[test]
+    fn modes_that_take_keys_leave_them_out() {
+        // Perspective mode: the digits with and without Shift and `>` go; Ctrl- and Alt-keys
+        // and the letters stay.
+        let perspective = [
+            (Tool::Zoom, "Zoom"),
+            (Tool::Line, "Straight Line  v"),
+            (Tool::Symmetry, "Symmetry  /"),
+            (Tool::Clear, "Clear  K"),
+        ];
+        for (tool, text) in perspective {
+            let target = TooltipTarget::Tool {
+                tool,
+                filled: false,
+            };
+            assert_eq!(target.text_in(KeyMode::Perspective), text);
+        }
+        let rect = TooltipTarget::Tool {
+            tool: Tool::Rectangle,
+            filled: true,
+        };
+        assert_eq!(rect.text_in(KeyMode::Perspective), "Filled Rectangle  R");
+        let panel = [
+            (PanelButton::First, "First Frame"),
+            (PanelButton::Last, "Last Frame"),
+            (PanelButton::LoopBackward, "Loop Backward"),
+            (PanelButton::OnceBackward, "Play Once Backward"),
+            (PanelButton::Previous, "Previous Frame"),
+            (PanelButton::Next, "Next Frame"),
+            (PanelButton::OnceForward, "Play Once"),
+            (PanelButton::LoopForward, "Loop"),
+            (PanelButton::PingPong, "Ping-Pong"),
+            (PanelButton::Add, "Add Frame  Alt+="),
+            (PanelButton::Delete, "Delete Frame"),
+            (PanelButton::GoTo, "Repeat Go To"),
+            (PanelButton::LightTable, "Light Table  l"),
+            (PanelButton::TwoBack, "Light Table: Two Back  Ctrl+1"),
+            (PanelButton::LightPrevious, "Light Table: Previous  Ctrl+2"),
+            (PanelButton::LightNext, "Light Table: Next  Ctrl+3"),
+            (PanelButton::Spare, "Light Table: Spare  Ctrl+4"),
+        ];
+        for (b, text) in panel {
+            assert_eq!(TooltipTarget::Panel(b).text_in(KeyMode::Perspective), text);
+        }
+        for key in ["1", "Shift+5", "0", ">", "<", ";", "Shift+9"] {
+            assert!(!KeyMode::Perspective.keeps(key), "{key}");
+        }
+        for key in ["Ctrl+1", "Alt+=", "v", "R", "/", "K"] {
+            assert!(KeyMode::Perspective.keeps(key), "{key}");
+        }
+        // Typing text: every key types, so every tooltip is the name alone.
+        for t in all_targets() {
+            assert_eq!(t.text_in(KeyMode::Typing), t.name(), "{t:?}");
+            assert_eq!(t.text_in(KeyMode::Paint), t.text());
+            let tip = Tooltip::new(t, KeyMode::Typing);
+            assert_eq!((tip.keys, tip.text.as_str()), (KeyMode::Typing, t.name()));
+        }
+    }
+
+    #[test]
     fn targets_come_from_tool_buttons_halves_and_panel_buttons_only() {
         let screen = Screen::new(320, 256);
         let ui = panel_ui(true);
@@ -437,7 +556,7 @@ mod tests {
                 let screen = Screen::new(w, h);
                 let panel = anim_panel::Layout::new(w, h, toolbox).panel;
                 for target in all_targets() {
-                    let tip = Tooltip::new(target);
+                    let tip = Tooltip::new(target, KeyMode::Paint);
                     let at = format!("{target:?} on {w}x{h}, toolbox {toolbox}");
                     let Some(r) = tip.layout(w, h, &ui) else {
                         assert!(
@@ -473,6 +592,7 @@ mod tests {
             for target in all_targets() {
                 let tip = Tooltip {
                     target,
+                    keys: KeyMode::Paint,
                     text: "M".repeat(n),
                 };
                 let (w, h) = (320, 200);
@@ -504,10 +624,13 @@ mod tests {
     fn the_box_has_a_dark_border_square_corners_and_dark_text() {
         let pens = Pens::from_palette(&Palette::dpaint_default_32());
         let ui = UiState::default();
-        let tip = Tooltip::new(TooltipTarget::Tool {
-            tool: Tool::Line,
-            filled: false,
-        });
+        let tip = Tooltip::new(
+            TooltipTarget::Tool {
+                tool: Tool::Line,
+                filled: false,
+            },
+            KeyMode::Paint,
+        );
         let paper = 9;
         let mut img = IndexedImage::new(320, 256, paper);
         tip.draw(&mut img, &pens, 320, 256, &ui);
@@ -566,12 +689,13 @@ mod tests {
                 tool: Tool::Line,
                 filled: false,
             },
+            keys: KeyMode::Paint,
             text: "M".repeat(60),
         };
         for tip in [
-            Tooltip::new(rect),
-            Tooltip::new(TooltipTarget::Panel(PanelButton::Spare)),
-            Tooltip::new(TooltipTarget::Panel(PanelButton::First)),
+            Tooltip::new(rect, KeyMode::Paint),
+            Tooltip::new(TooltipTarget::Panel(PanelButton::Spare), KeyMode::Paint),
+            Tooltip::new(TooltipTarget::Panel(PanelButton::First), KeyMode::Paint),
             wide,
         ] {
             let target = tip.target;
@@ -611,7 +735,7 @@ mod tests {
         let pens = Pens::from_palette(&Palette::dpaint_default_32());
         let blank = IndexedImage::new(320, 256, 9);
         let check = |target, ui: &UiState| {
-            let tip = Tooltip::new(target);
+            let tip = Tooltip::new(target, KeyMode::Paint);
             let mut img = blank.clone();
             tip.draw(&mut img, &pens, 320, 256, ui);
             assert_eq!(tip.layout(320, 256, ui), None);

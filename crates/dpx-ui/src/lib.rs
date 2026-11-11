@@ -60,7 +60,7 @@ pub use tool_requesters::{
     TranslucencyRequester,
 };
 pub use toolbox::Tool;
-pub use tooltip::{Tooltip, TooltipTarget};
+pub use tooltip::{KeyMode, Tooltip, TooltipTarget};
 
 /// Converts an indexed screen to RGBA8, scaling each pixel by `sx`×`sy` (integer factors).
 pub fn to_rgba(img: &IndexedImage, palette: &Palette, sx: usize, sy: usize) -> Vec<u8> {

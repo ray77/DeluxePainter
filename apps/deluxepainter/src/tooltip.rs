@@ -8,11 +8,12 @@
 //! a requester, note, Show Page or playback, and a button that is not shown (toolbox hidden
 //! with F10, panel off) hide it, and the delay starts again afterwards. egui only runs a pass
 //! on input, so while the pointer rests the pass asks for one when the delay is over; once the
-//! tooltip shows, it asks for nothing more.
+//! tooltip shows, it asks for nothing more. The key in the text follows the keyboard's mode:
+//! perspective mode and typing text take keys for themselves ([`KeyMode`]).
 
 use std::time::Duration;
 
-use dpx_ui::{Hit, Screen, Tooltip, TooltipTarget, UiState};
+use dpx_ui::{Hit, KeyMode, Screen, Tooltip, TooltipTarget, UiState};
 use eframe::egui;
 
 use crate::PainterApp;
@@ -32,6 +33,16 @@ pub struct State {
     /// The tooltip shows. While the pointer goes straight from one target to the next, the
     /// next one shows at once.
     shown: bool,
+    /// The last upload had the menu strip or a modal open.
+    blocked: bool,
+}
+
+impl State {
+    /// Hidden; the next target waits the whole delay.
+    fn hide(&mut self) {
+        self.target = None;
+        self.shown = false;
+    }
 }
 
 impl PainterApp {
@@ -46,9 +57,9 @@ impl PainterApp {
         let tip = &mut self.tooltip;
         match target {
             // A press or a held button hides it; the delay starts again after the release.
-            _ if buttons => *tip = State::default(),
+            _ if buttons => tip.hide(),
             // Page, palette, gaps, outside the window: hidden, the next one waits again.
-            None => *tip = State::default(),
+            None => tip.hide(),
             // Moving on the same button (and half) keeps the time it came.
             Some(t) if tip.target.is_some_and(|(old, _)| old == t) => {}
             Some(t) => tip.target = Some((t, now)),
@@ -56,6 +67,7 @@ impl PainterApp {
         if let State {
             target: Some((_, since)),
             shown: false,
+            ..
         } = *tip
         {
             let left = DELAY - (now - since);
@@ -73,25 +85,45 @@ impl PainterApp {
     /// (the pass's keys may have opened one) or the menu strip is shown (it opens with a
     /// press, which hides the tooltip already). A button that is no longer shown (toolbox
     /// hidden with F10, panel off) needs nothing here: it is not hit any more, and
-    /// `Tooltip::layout` draws no box for it meanwhile.
-    pub(crate) fn tooltip_guard(&mut self) {
+    /// `Tooltip::layout` draws no box for it meanwhile. The text follows a key mode changed
+    /// in this pass (Return into perspective mode, Esc ending the text).
+    pub(crate) fn tooltip_guard(&mut self, ctx: &egui::Context) {
         if self.ui.menu.active || self.modal_open() {
-            self.tooltip = State::default();
-            self.sync_tooltip();
+            self.tooltip.hide();
+            self.tooltip.blocked = true;
+        } else if std::mem::take(&mut self.tooltip.blocked) {
+            // It closed in this pass. Play Once ends by itself, with no input that brings the
+            // next pass: one more, so the hover branch starts the delay under a resting pointer.
+            ctx.request_repaint();
+        }
+        self.sync_tooltip();
+    }
+
+    /// The keys that do their paint-screen job now: perspective mode takes the digits and
+    /// `<` / `>` (`perspective_keys` runs first), typing text takes every key.
+    fn tooltip_keys(&self) -> KeyMode {
+        if self.typing() {
+            KeyMode::Typing
+        } else if self.perspective.active {
+            KeyMode::Perspective
+        } else {
+            KeyMode::Paint
         }
     }
 
     /// `UiState::tooltip` follows the state; the screen is redrawn only when it changes.
     fn sync_tooltip(&mut self) {
+        let keys = self.tooltip_keys();
         let shown = match self.tooltip {
             State {
                 target: Some((t, _)),
                 shown: true,
-            } => Some(t),
+                ..
+            } => Some((t, keys)),
             _ => None,
         };
-        if self.ui.tooltip.as_ref().map(|t| t.target) != shown {
-            self.ui.tooltip = shown.map(Tooltip::new);
+        if self.ui.tooltip.as_ref().map(|t| (t.target, t.keys)) != shown {
+            self.ui.tooltip = shown.map(|(t, keys)| Tooltip::new(t, keys));
             self.dirty = true;
         }
     }
@@ -123,7 +155,10 @@ pub fn snapshot_hover(
         || ui.anim_requester.is_some()
         || ui.anim_control.is_some();
     let target = TooltipTarget::of_hit(screen.hit_test(palette_len, ui, x, y));
-    ui.tooltip = target.filter(|_| !open).map(Tooltip::new);
+    // Snapshots start on the paint screen: every key works.
+    ui.tooltip = target
+        .filter(|_| !open)
+        .map(|t| Tooltip::new(t, KeyMode::Paint));
     if ui.tooltip.is_none() {
         eprintln!("note: --hover {x},{y}: no tooltip there");
     }
@@ -571,31 +606,53 @@ mod tests {
         }
     }
 
-    /// What a tool button or its key may change.
+    /// What a button or its key may change.
     #[derive(Debug, PartialEq)]
-    struct ToolEffect {
+    struct Effect {
         tool: Tool,
         filled: bool,
         grid: bool,
         symmetry: bool,
         magnify: bool,
         zoom: usize,
+        /// The document's page (not the perspective or text preview).
         pixel: Option<u8>,
         can_undo: bool,
         can_redo: bool,
+        frame: usize,
+        count: usize,
+        playing: Option<dpx_core::anim::PlayMode>,
+        goto_requester: bool,
+        note: bool,
+        light: (bool, bool, bool, bool, bool),
+        /// The frame of the area stencil (ADR-39).
+        stencil_frame: Option<usize>,
+        perspective: bool,
+        typing: bool,
     }
 
-    fn tool_effect(app: &PainterApp) -> ToolEffect {
-        ToolEffect {
+    fn effect(app: &PainterApp) -> Effect {
+        let doc = app.engine.document();
+        let l = app.anim.light;
+        Effect {
             tool: app.ui.tool,
             filled: app.ui.filled,
             grid: app.tools.grid,
             symmetry: app.tools.symmetry,
             magnify: app.tools.magnify.is_some(),
             zoom: app.tools.zoom,
-            pixel: app.page().get(0, 0),
+            pixel: doc.page().get(0, 0),
             can_undo: app.engine.can_undo(),
             can_redo: app.engine.can_redo(),
+            frame: doc.current_frame(),
+            count: doc.frame_count(),
+            playing: app.anim.playing.map(|p| p.mode),
+            goto_requester: app.ui.anim_requester.is_some(),
+            note: app.ui.note_requester.is_some(),
+            light: (app.anim.light_on, l.two_back, l.previous, l.next, l.spare),
+            stencil_frame: app.menu_data.palette_stencil.area.as_ref().map(|a| a.frame),
+            perspective: app.perspective.active,
+            typing: app.typing(),
         }
     }
 
@@ -610,62 +667,8 @@ mod tests {
         (app, ctx)
     }
 
-    #[test]
-    fn every_tool_key_a_tooltip_names_does_what_the_button_does() {
-        let mut checked = 0;
-        for tool in TOOL_ROWS.iter().flatten().copied() {
-            for filled in [false, true].into_iter().filter(|&f| !f || tool.is_split()) {
-                let Some(key) = dpx_ui::tooltip::tool_key(tool, filled) else {
-                    continue;
-                };
-                // A click on the button (half).
-                let (mut clicked, ctx) = tool_app();
-                let before = tool_effect(&clicked);
-                let at = tool_at(tool, filled);
-                click_ui(&mut clicked, &ctx, 1.0, at, Primary);
-                let by_click = tool_effect(&clicked);
-                assert_ne!(
-                    by_click, before,
-                    "{tool:?} {filled}: the click does something"
-                );
-                // The key, pressed while the tooltip naming it shows.
-                let (mut keyed, ctx) = tool_app();
-                let t = rest_on(&mut keyed, &ctx, 1.0, at);
-                let text = dpx_ui::tooltip::for_tool(tool, filled);
-                assert_eq!(shown(&keyed), Some(text.as_str()));
-                input(&mut keyed, &ctx, t + 0.1, key_events(key));
-                assert_eq!(tool_effect(&keyed), by_click, "'{text}'");
-                checked += 1;
-            }
-        }
-        assert_eq!(checked, 20, "every key shown");
-    }
-
-    /// What a panel button or its key may change.
-    #[derive(Debug, PartialEq)]
-    struct PanelEffect {
-        frame: usize,
-        count: usize,
-        playing: Option<dpx_core::anim::PlayMode>,
-        goto_requester: bool,
-        note: bool,
-        light: (bool, bool, bool, bool, bool),
-    }
-
-    fn panel_effect(app: &PainterApp) -> PanelEffect {
-        let doc = app.engine.document();
-        let l = app.anim.light;
-        PanelEffect {
-            frame: doc.current_frame(),
-            count: doc.frame_count(),
-            playing: app.anim.playing.map(|p| p.mode),
-            goto_requester: app.ui.anim_requester.is_some(),
-            note: app.ui.note_requester.is_some(),
-            light: (app.anim.light_on, l.two_back, l.previous, l.next, l.spare),
-        }
-    }
-
-    /// Five frames at frame 3 with the panel on; `last_goto`: the frame of the last Go To.
+    /// Five frames at frame 3 with the panel on and an area stencil on frame 4;
+    /// `last_goto`: the frame of the last Go To.
     fn panel_app(last_goto: Option<usize>) -> (PainterApp, egui::Context) {
         let (mut app, ctx) = started();
         app.engine
@@ -674,43 +677,303 @@ mod tests {
         app.engine.execute(Command::GotoFrame { frame: 2 }).unwrap();
         app.anim_control.panel = true;
         app.anim_control.last_goto = last_goto;
+        app.menu_data.palette_stencil.area = Some(area_on(&app, 3));
         app.dirty = true;
         input(&mut app, &ctx, 0.1, vec![]);
         (app, ctx)
     }
 
-    #[test]
-    fn every_panel_key_a_tooltip_names_does_what_the_button_does() {
-        let mut checked = 0;
-        for last_goto in [None, Some(4)] {
-            for b in [PanelButton::First, PanelButton::Last]
-                .into_iter()
-                .chain(CONTROLS)
-                .chain(TOGGLES)
-            {
-                let Some(key) = dpx_ui::tooltip::panel_key(b) else {
-                    continue;
-                };
-                let (mut clicked, ctx) = panel_app(last_goto);
-                let before = panel_effect(&clicked);
-                let at = panel_at(b, true);
-                click_ui(&mut clicked, &ctx, 1.0, at, Primary);
-                let by_click = panel_effect(&clicked);
-                assert_ne!(by_click, before, "{b:?}: the click does something");
-                let (mut keyed, ctx) = panel_app(last_goto);
-                let t = rest_on(&mut keyed, &ctx, 1.0, at);
-                let text = dpx_ui::tooltip::for_panel_button(b);
-                assert_eq!(shown(&keyed), Some(text.as_str()));
-                input(&mut keyed, &ctx, t + 0.1, key_events(key));
-                assert_eq!(
-                    panel_effect(&keyed),
+    /// An area stencil protecting page pixel (0, 0) of frame `frame`.
+    fn area_on(app: &PainterApp, frame: usize) -> crate::palette_stencil::Area {
+        let page = app.engine.document().page();
+        let (w, h) = (page.width(), page.height());
+        let mut mask = vec![false; (w * h) as usize];
+        mask[0] = true;
+        crate::palette_stencil::Area {
+            stencil: dpx_core::stencil::AreaStencil::from_mask(w, h, mask).unwrap(),
+            frame,
+            on: true,
+        }
+    }
+
+    /// Effect ▸ Perspective on with a 6×4 brush (Return, as in the window).
+    fn in_perspective((mut app, ctx): (PainterApp, egui::Context)) -> (PainterApp, egui::Context) {
+        let brush = dpx_core::BrushImage {
+            width: 6,
+            height: 4,
+            pixels: (0..24u8).map(|i| 5 + i % 3).collect(),
+            handle: (3, 2),
+            transparent: Some(0),
+        };
+        app.custom_brush = Some(brush.clone());
+        app.picked_brush = Some(brush);
+        input(&mut app, &ctx, 0.2, tap(egui::Key::Enter));
+        assert!(app.perspective.active);
+        (app, ctx)
+    }
+
+    /// The page pixel where text is typed: left of the toolbox at the height of the Line
+    /// button, under the place of its tooltip.
+    fn text_at() -> (i32, i32) {
+        let b = Screen::new(SCREEN.0, SCREEN.1).tool_button(Tool::Line);
+        (b.x - 100, b.y + 1)
+    }
+
+    /// The Text tool typing: picked and a click on the page.
+    fn typing((mut app, ctx): (PainterApp, egui::Context)) -> (PainterApp, egui::Context) {
+        app.select_tool(Tool::Text, false);
+        click_ui(&mut app, &ctx, 0.2, text_at(), Primary);
+        input(&mut app, &ctx, 0.3, vec![]);
+        assert!(app.typing());
+        (app, ctx)
+    }
+
+    fn tool_targets() -> Vec<TooltipTarget> {
+        TOOL_ROWS
+            .iter()
+            .flatten()
+            .flat_map(|&tool| {
+                [false, true]
+                    .into_iter()
+                    .filter(move |&f| !f || tool.is_split())
+                    .map(move |filled| TooltipTarget::Tool { tool, filled })
+            })
+            .collect()
+    }
+
+    fn panel_targets() -> Vec<TooltipTarget> {
+        [PanelButton::First, PanelButton::Last]
+            .into_iter()
+            .chain(CONTROLS)
+            .chain(TOGGLES)
+            .map(TooltipTarget::Panel)
+            .collect()
+    }
+
+    fn target_at(target: TooltipTarget) -> (i32, i32) {
+        match target {
+            TooltipTarget::Tool { tool, filled } => tool_at(tool, filled),
+            TooltipTarget::Panel(b) => panel_at(b, true),
+        }
+    }
+
+    /// For every target with a key, in the state `setup` makes (whose keys are `keys`): the
+    /// pointer rests on the button until its tooltip shows, then the key is pressed (as
+    /// egui-winit sends it); a second app in the same state gets a click on the button (half).
+    /// A key the tooltip names does exactly what the click does; a key it leaves out does
+    /// something else (the mode takes it). Returns how many keys were named and left out.
+    fn check_keys(
+        setup: impl Fn() -> (PainterApp, egui::Context),
+        keys: KeyMode,
+        targets: &[TooltipTarget],
+    ) -> (usize, usize) {
+        let (mut named, mut left_out) = (0, 0);
+        for &target in targets {
+            let Some(key) = target.key() else {
+                continue;
+            };
+            let at = target_at(target);
+            let (mut clicked, ctx) = setup();
+            let before = effect(&clicked);
+            click_ui(&mut clicked, &ctx, 1.0, at, Primary);
+            input(&mut clicked, &ctx, 1.1, vec![]);
+            let by_click = effect(&clicked);
+            assert_ne!(by_click, before, "{target:?}: the click does something");
+            let (mut keyed, ctx) = setup();
+            assert_eq!(keyed.tooltip_keys(), keys);
+            let t = rest_on(&mut keyed, &ctx, 1.0, at);
+            let text = target.text_in(keys);
+            assert_eq!(shown(&keyed), Some(text.as_str()), "{target:?}");
+            input(&mut keyed, &ctx, t + 0.1, key_events(key));
+            if keys.keeps(key) {
+                assert!(text.ends_with(&format!("  {key}")), "'{text}'");
+                assert_eq!(effect(&keyed), by_click, "'{text}' in {keys:?}");
+                named += 1;
+            } else {
+                assert_eq!(text, target.name());
+                assert_ne!(
+                    effect(&keyed),
                     by_click,
-                    "'{text}', Go To {last_goto:?}"
+                    "{key} in {keys:?}: taken by the mode"
                 );
-                checked += 1;
+                left_out += 1;
             }
         }
-        assert_eq!(checked, 2 * 16, "every key shown");
+        (named, left_out)
+    }
+
+    #[test]
+    fn every_tool_key_a_tooltip_names_does_what_the_button_does() {
+        let targets = tool_targets();
+        assert_eq!(check_keys(tool_app, KeyMode::Paint, &targets), (20, 0));
+    }
+
+    #[test]
+    fn every_panel_key_a_tooltip_names_does_what_the_button_does() {
+        let targets = panel_targets();
+        for last_goto in [None, Some(4)] {
+            let setup = || panel_app(last_goto);
+            assert_eq!(check_keys(setup, KeyMode::Paint, &targets), (16, 0));
+        }
+    }
+
+    #[test]
+    fn in_perspective_mode_the_tooltips_leave_out_the_keys_it_takes() {
+        // The digits (with and without Shift) turn the brush and `>` moves the observer: Zoom
+        // and the frame and playback buttons show no key; the letters, Ctrl- and Alt-keys stay.
+        let tools = tool_targets();
+        let setup = || in_perspective(tool_app());
+        assert_eq!(check_keys(setup, KeyMode::Perspective, &tools), (19, 1));
+        let panel = panel_targets();
+        for last_goto in [None, Some(4)] {
+            let setup = || in_perspective(panel_app(last_goto));
+            assert_eq!(check_keys(setup, KeyMode::Perspective, &panel), (6, 10));
+        }
+    }
+
+    #[test]
+    fn while_typing_text_the_tooltips_show_no_keys() {
+        // Every key types into the text.
+        let tools = tool_targets();
+        let setup = || typing(tool_app());
+        assert_eq!(check_keys(setup, KeyMode::Typing, &tools), (0, 20));
+        let panel = panel_targets();
+        let setup = || typing(panel_app(Some(4)));
+        assert_eq!(check_keys(setup, KeyMode::Typing, &panel), (0, 16));
+    }
+
+    #[test]
+    fn the_text_follows_the_key_mode_in_the_pass_that_changes_it() {
+        let (mut app, ctx) = tool_app();
+        app.custom_brush = Some(dpx_core::BrushImage {
+            width: 2,
+            height: 2,
+            pixels: vec![5; 4],
+            handle: (1, 1),
+            transparent: None,
+        });
+        app.picked_brush = app.custom_brush.clone();
+        let t = rest_on(&mut app, &ctx, 1.0, tool_at(Tool::Zoom, false));
+        assert_eq!(shown(&app), Some("Zoom  >"));
+        // Return into perspective mode and out again, the pointer resting: in that same pass.
+        ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::Enter));
+        assert!(app.perspective.active);
+        assert_eq!(shown(&app), Some("Zoom"));
+        input(&mut app, &ctx, t + 0.2, vec![]);
+        ui_pass(&mut app, &ctx, t + 0.3, tap(egui::Key::Enter));
+        assert!(!app.perspective.active);
+        assert_eq!(shown(&app), Some("Zoom  >"));
+        // Esc ends the text: the key is back in that pass.
+        let (mut app, ctx) = typing(tool_app());
+        let t = rest_on(&mut app, &ctx, 1.0, tool_at(Tool::Line, false));
+        assert_eq!(shown(&app), Some("Straight Line"));
+        ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::Escape));
+        assert!(!app.typing());
+        assert_eq!(shown(&app), Some("Straight Line  v"));
+    }
+
+    #[test]
+    fn the_text_cursor_lies_under_the_tooltip() {
+        let (mut app, ctx) = tool_app();
+        app.ui.fg = 5;
+        let (mut app, ctx) = typing((app, ctx));
+        let pens = dpx_ui::Pens::from_palette(app.palette());
+        assert!(![pens.face, pens.dark].contains(&5));
+        // The cursor: one column right of the typing point, the font's height.
+        let (cx, cy) = (text_at().0 + 1, text_at().1);
+        let cursor = |app: &PainterApp| {
+            let screen = app.compose_screen();
+            (cy..cy + 8).all(|y| screen.get(cx, y) == Some(5))
+        };
+        assert!(cursor(&app), "the cursor shows on the page");
+        let line = tool_at(Tool::Line, false);
+        let t = rest_on(&mut app, &ctx, 1.0, line);
+        assert!(app.typing());
+        let tip = app.ui.tooltip.clone().unwrap();
+        let s = app.view().ui_screen();
+        let r = tip.layout(s.width, s.height, &app.ui).unwrap();
+        assert!(r.contains(cx, cy) && r.contains(cx, cy + 7), "{r:?}");
+        // The box on the shown screen is exactly the box as drawn alone: no cursor in it.
+        let screen = app.compose_screen();
+        let mut alone = dpx_core::IndexedImage::new(s.width as u32, s.height as u32, 99);
+        tip.draw(&mut alone, &pens, s.width, s.height, &app.ui);
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
+                assert_eq!(screen.get(x, y), alone.get(x, y), "({x}, {y})");
+            }
+        }
+        // Back on the page, the cursor shows again.
+        move_to(&mut app, &ctx, t + 0.1, (100, 120));
+        assert_eq!(shown(&app), None);
+        assert!(cursor(&app));
+    }
+
+    #[test]
+    fn after_play_once_ends_by_itself_the_resting_pointer_waits_and_shows_it_again() {
+        let (mut app, ctx) = panel_app(None);
+        let at = panel_at(PanelButton::OnceForward, true);
+        let t = rest_on(&mut app, &ctx, 1.0, at);
+        assert_eq!(shown(&app), Some("Play Once  5"));
+        let mut delay = click_ui(&mut app, &ctx, t + 0.1, at, Primary);
+        assert!(app.anim.playing.is_some());
+        // The idle window: a pass only when egui asks for one, the pointer on the button.
+        let mut t = t + 0.12;
+        let mut ended = None;
+        while delay < std::time::Duration::from_secs(10) && t < 60.0 && shown(&app).is_none() {
+            t += delay.as_secs_f64();
+            delay = ui_pass(&mut app, &ctx, t, vec![]);
+            if app.anim.playing.is_none() {
+                ended.get_or_insert(t);
+            }
+        }
+        let ended = ended.expect("Play Once ends by itself");
+        assert_eq!(
+            shown(&app),
+            Some("Play Once  5"),
+            "at {t}, ended at {ended}"
+        );
+        assert!(
+            (t - ended - DELAY).abs() < 0.01,
+            "the whole delay after the end: {ended} -> {t}"
+        );
+        assert_eq!(delay, std::time::Duration::MAX, "then nothing more");
+    }
+
+    #[test]
+    fn the_delete_frame_button_takes_the_area_stencil_with_its_frames() {
+        // The stencil on frame 4 (index 3) follows its picture to index 2 when frame 3 goes;
+        // the stencil of the deleted frame goes with it (ADR-39).
+        let (mut app, ctx) = panel_app(None);
+        click_ui(
+            &mut app,
+            &ctx,
+            1.0,
+            panel_at(PanelButton::Delete, true),
+            Primary,
+        );
+        assert_eq!(app.engine.document().frame_count(), 4);
+        assert_eq!(effect(&app).stencil_frame, Some(2));
+        let (mut app, ctx) = panel_app(None);
+        app.menu_data.palette_stencil.area = Some(area_on(&app, 2));
+        click_ui(
+            &mut app,
+            &ctx,
+            1.0,
+            panel_at(PanelButton::Delete, true),
+            Primary,
+        );
+        assert_eq!(effect(&app).stencil_frame, None);
+        // Add Frame (and Alt-=, checked above) inserts after the current frame.
+        let (mut app, ctx) = panel_app(None);
+        click_ui(
+            &mut app,
+            &ctx,
+            1.0,
+            panel_at(PanelButton::Add, true),
+            Primary,
+        );
+        assert_eq!(app.engine.document().frame_count(), 6);
+        assert_eq!(effect(&app).stencil_frame, Some(4));
     }
 
     #[test]

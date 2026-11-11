@@ -375,10 +375,11 @@ impl PainterApp {
         }
     }
 
-    /// A frame command from the panel or a key (as `anim::frame_command`).
+    /// A frame command from the panel or a key (as `anim::frame_command`): the area stencil
+    /// and Stencil ▸ Paint follow their picture when frames are added or deleted (ADR-39).
     fn control_command(&mut self, command: Command) {
         self.finish_stroke();
-        if let Err(e) = self.engine.execute(command) {
+        if let Err(e) = self.execute_frames(command) {
             eprintln!("{e}");
         }
         self.clamp_scroll();
