@@ -111,6 +111,10 @@ fn command_bytes(command: &Command) -> u64 {
         Command::SetPalette { colors } => 3 * colors.len() as u64,
         Command::ArrangePalette { order } => order.len() as u64,
         Command::AnimBrushPaint { brush, paint } => brush.bytes() + command_bytes(paint),
+        // ADR-39: the mask (shared between commands, counted for each).
+        Command::Stenciled { area, command } => {
+            u64::from(area.width()) * u64::from(area.height()) + command_bytes(command)
+        }
         _ => 0,
     }
 }
@@ -180,6 +184,12 @@ impl Engine {
 
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
+    }
+
+    /// The command the next [`Self::redo`] replays, with the frame it runs on (after an undo:
+    /// the command just undone).
+    pub fn next_redo(&self) -> Option<(&Command, usize)> {
+        self.redo.last().map(|(command, frame)| (command, *frame))
     }
 
     /// Validates and executes a command as one undo step. A new command clears the redo list.
@@ -436,6 +446,24 @@ mod tests {
         e.execute(Command::Clear { color: 2 }).unwrap();
         assert!(!e.can_redo());
         assert_eq!(e.redo().unwrap_err().code, ErrorCode::NothingToRedo);
+    }
+
+    #[test]
+    fn next_redo_names_the_command_just_undone_and_its_frame() {
+        let mut e = engine();
+        assert_eq!(e.next_redo(), None);
+        e.execute(Command::SetFrameCount { count: 3 }).unwrap();
+        e.execute(Command::GotoFrame { frame: 2 }).unwrap();
+        e.execute(Command::Clear { color: 4 }).unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.next_redo(), Some((&Command::Clear { color: 4 }, 2)));
+        e.undo().unwrap();
+        assert_eq!(
+            e.next_redo(),
+            Some((&Command::SetFrameCount { count: 3 }, 0))
+        );
+        e.redo().unwrap();
+        assert_eq!(e.next_redo(), Some((&Command::Clear { color: 4 }, 2)));
     }
 
     #[test]

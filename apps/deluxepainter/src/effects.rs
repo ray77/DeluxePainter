@@ -296,10 +296,13 @@ impl PainterApp {
     /// Brings the title-bar flags and the Show view up to date; called every frame.
     pub(crate) fn refresh_effects(&mut self) {
         self.track_palette();
-        let e = &mut self.menu_data.effects;
-        if self.stencil.is_none() {
-            e.stencil_show = false;
+        // ADR-39: the area stencil counts as a stencil for Show and the flag.
+        self.refresh_area();
+        if self.stencil.is_none() && self.active_area().is_none() {
+            self.menu_data.effects.stencil_show = false;
         }
+        let stencil_flag = self.stencil_flag();
+        let e = &mut self.menu_data.effects;
         let doc_palette = self.engine.document().palette();
         let view = match (&self.stencil, e.stencil_show) {
             (Some(s), true) => Some(stencil_view(doc_palette, s)),
@@ -317,9 +320,7 @@ impl PainterApp {
         if e.process_on {
             flags.push("P");
         }
-        if self.stencil.is_some() {
-            flags.push(if e.stencil_show { "s" } else { "S" });
-        }
+        flags.extend(stencil_flag);
         if e.translucency_on {
             flags.push("T");
         }
@@ -811,11 +812,8 @@ mod tests {
     }
 
     #[test]
-    fn use_brush_palette_and_lock_fg_stay_ghosted() {
+    fn effect_items_are_enabled() {
         let ctx = PainterApp::new().ui.menu_context();
-        for id in ["palette.use_brush", "background.lock_fg"] {
-            assert!(!Action::Command(id).enabled(&ctx), "{id}");
-        }
         for id in [
             "palette.arrange",
             "color.remap",

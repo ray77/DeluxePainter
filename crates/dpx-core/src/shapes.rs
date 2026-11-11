@@ -414,6 +414,13 @@ impl Command {
                 ..pen
             });
         }
+        if let Command::Stenciled { area, command } = self {
+            // ADR-39: the area stencil joins the colour stencil in every pixel's test.
+            return command.pen(before, palette).map(|mut pen| {
+                pen.ctx.area = Some(area);
+                pen
+            });
+        }
         let (brush, color, custom, mode, range, stencil, right, fx) = match self {
             Command::Stroke {
                 brush,
@@ -448,6 +455,7 @@ impl Command {
                 palette,
                 range: *range,
                 stencil: stencil.as_deref(),
+                area: None,
                 before,
                 motion: (0, 0),
                 right: *right,
@@ -540,19 +548,11 @@ impl Command {
     /// parts passes the page before the gesture. `palette` is the document's. The command
     /// should be valid for the document (see [`crate::Engine::execute`]).
     pub fn paint(&self, img: &mut IndexedImage, before: &IndexedImage, palette: &Palette) -> bool {
+        if let Command::Stenciled { area, command } = self {
+            return paint_stenciled(area, command, img, before, palette);
+        }
         if let Some(pen) = self.pen(before, palette) {
-            match self.painting() {
-                Command::Stroke {
-                    points, continuous, ..
-                } => raster::stroke_pen(img, &pen, points, *continuous),
-                Command::Shape {
-                    shape,
-                    filled,
-                    symmetry,
-                    ..
-                } => shape.draw(img, &pen, *filled, symmetry.as_ref()),
-                _ => unreachable!("only strokes and shapes have a pen"),
-            }
+            self.draw_pen(img, &pen);
             return true;
         }
         match self {
@@ -564,27 +564,88 @@ impl Command {
         true
     }
 
-    /// The pixels of `page` that [`Self::paint`] can change, clipped to the page (empty if
-    /// none); `None` for commands that are not page-pixel commands.
-    pub fn paint_bounds(&self, page: &IndexedImage) -> Option<Rect> {
-        let r = match self.painting() {
-            Command::Stroke { points, .. } => self
-                .brush_extent()
-                .and_then(|e| raster::extent_bounds(e, points))
-                .unwrap_or_default(),
+    /// Draws a Stroke or Shape with `pen` (its own pen, perhaps with an area stencil).
+    fn draw_pen(&self, img: &mut IndexedImage, pen: &Pen) {
+        match self.painting() {
+            Command::Stroke {
+                points, continuous, ..
+            } => raster::stroke_pen(img, pen, points, *continuous),
             Command::Shape {
                 shape,
                 filled,
                 symmetry,
                 ..
-            } => shape.bounds(self.brush_extent(), *filled, symmetry.as_ref()),
-            Command::FloodFill { x, y, color, fill } => {
-                gradient::flood_fill(&mut page.clone(), *x, *y, *color, fill).unwrap_or_default()
+            } => shape.draw(img, pen, *filled, symmetry.as_ref()),
+            _ => unreachable!("only strokes and shapes have a pen"),
+        }
+    }
+
+    /// The pixels of `page` that [`Self::paint`] can change, clipped to the page (empty if
+    /// none); `None` for commands that are not page-pixel commands.
+    pub fn paint_bounds(&self, page: &IndexedImage) -> Option<Rect> {
+        let r = match self {
+            // ADR-39: CLR and a whole page under an area stencil may change every pixel.
+            Command::Stenciled { command, .. } => {
+                return command.paint_bounds(page).or(Some(page.bounds()));
             }
-            _ => return None,
+            _ => match self.painting() {
+                Command::Stroke { points, .. } => self
+                    .brush_extent()
+                    .and_then(|e| raster::extent_bounds(e, points))
+                    .unwrap_or_default(),
+                Command::Shape {
+                    shape,
+                    filled,
+                    symmetry,
+                    ..
+                } => shape.bounds(self.brush_extent(), *filled, symmetry.as_ref()),
+                Command::FloodFill { x, y, color, fill } => {
+                    gradient::flood_fill(&mut page.clone(), *x, *y, *color, fill)
+                        .unwrap_or_default()
+                }
+                _ => return None,
+            },
         };
         Some(r.intersect(page.bounds()))
     }
+}
+
+/// [`Command::paint`] of a [`Command::Stenciled`] (ADR-39): strokes and shapes test every
+/// pixel against the area as they paint; fills, CLR and a page of the same size paint first,
+/// then the protected pixels get their colour from `before` back. `false` for other commands.
+fn paint_stenciled(
+    area: &crate::stencil::AreaStencil,
+    command: &Command,
+    img: &mut IndexedImage,
+    before: &IndexedImage,
+    palette: &Palette,
+) -> bool {
+    if let Some(mut pen) = command.pen(before, palette) {
+        pen.ctx.area = Some(area);
+        command.draw_pen(img, &pen);
+        return true;
+    }
+    match command {
+        Command::FloodFill { .. } => {
+            command.paint(img, before, palette);
+        }
+        Command::Clear { color } => {
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            img.fill_rect(0, 0, w, h, *color);
+        }
+        Command::SetPage {
+            width,
+            height,
+            pixels,
+        } if (*width, *height) == (img.width(), img.height()) => {
+            if let Some(page) = IndexedImage::from_pixels(*width, *height, pixels.clone()) {
+                *img = page;
+            }
+        }
+        _ => return false,
+    }
+    area.restore(img, before);
+    true
 }
 
 #[cfg(test)]

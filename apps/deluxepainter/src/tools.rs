@@ -145,9 +145,23 @@ struct Ink {
     cels: Option<AnimBrush>,
     /// Stamps already painted in parts (freehand, airbrush) since the gesture started.
     parts: u64,
+    /// The area stencil (ADR-39): every command of the gesture is wrapped in it, so the
+    /// preview spares the same pixels as the engine.
+    area: Option<dpx_core::AreaStencil>,
 }
 
 impl Ink {
+    /// `cmd` under the area stencil, if there is one.
+    fn stenciled(&self, cmd: Command) -> Command {
+        match &self.area {
+            Some(area) => Command::Stenciled {
+                area: area.clone(),
+                command: Box::new(cmd),
+            },
+            None => cmd,
+        }
+    }
+
     /// `cmd` stamping the AnimBrush's cels from `offset` stamps after the gesture's start,
     /// when the gesture paints with an AnimBrush and `cmd` stamps the custom brush (ADR-36).
     fn with_cels(&self, cmd: Command, offset: u64) -> Command {
@@ -605,8 +619,19 @@ impl Stroke {
     /// The command this gesture stands for: as shown while drawing, or (`commit`) as
     /// committed. They differ only for filled freehand and polygons (outline, then filled)
     /// and the polygon's rubber band (dropped). With an AnimBrush the stamps go through its
-    /// cels (ADR-36).
+    /// cels (ADR-36); under the area stencil (ADR-39).
     fn candidate(&self, commit: bool) -> Option<Command> {
+        self.bare_candidate(commit).map(|c| self.ink.stenciled(c))
+    }
+
+    /// The command the gesture shows now (ADR-39: Stencil ▸ Paint paints it into the mask
+    /// view); `None` for the Brush Selector's frame.
+    pub(crate) fn preview_command(&self) -> Option<Command> {
+        self.candidate(false)
+    }
+
+    /// [`Self::candidate`] without the area stencil.
+    fn bare_candidate(&self, commit: bool) -> Option<Command> {
         self.plain_candidate(commit)
             .map(|c| self.ink.with_cels(c, 0))
     }
@@ -734,6 +759,7 @@ impl Stroke {
     /// document page (the page before the gesture). A part the engine would refuse is not
     /// shown, so nothing appears that vanishes on release.
     fn paint_more(&mut self, cmd: &Command, page: &IndexedImage, palette: &Palette) {
+        let cmd = &self.ink.stenciled(cmd.clone());
         if cmd.check_paint(page, palette).is_err() {
             return;
         }
@@ -971,6 +997,7 @@ impl PainterApp {
         ink.mode = DrawMode::Matte;
         ink.range = None;
         ink.stencil = None;
+        ink.area = None;
         let mut s = Stroke {
             preview: doc.page().clone(),
             drawn: Rect::default(),
@@ -1121,6 +1148,7 @@ impl PainterApp {
             fx: self.menu_data.effects.fx(),
             cels: None,
             parts: 0,
+            area: self.active_area().cloned(),
         }
     }
 

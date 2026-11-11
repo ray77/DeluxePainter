@@ -30,6 +30,9 @@ pub mod remap;
 pub mod resample;
 pub mod rgba;
 pub mod shapes;
+// Area stencils and Use Brush Palette (ADR-39).
+pub mod brush_palette;
+pub mod stencil;
 
 pub use anim::{LightTable, PlayMode};
 pub use anim_brush::{AnimBrush, CelDirection};
@@ -43,3 +46,4 @@ pub use paint::{AntiAlias, BrushImage, DrawMode, PaintContext, PaintFx, ProcessM
 pub use palette::{Palette, PaletteError, Rgb8};
 pub use rgba::{Rgba8, RgbaImage};
 pub use shapes::{Shape, Symmetry};
+pub use stencil::AreaStencil;

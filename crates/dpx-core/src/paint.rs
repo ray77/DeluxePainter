@@ -162,6 +162,8 @@ pub struct PaintContext<'a> {
     pub range: Option<(u8, u8)>,
     /// Stencil: `stencil[c]` is true when colour `c` on the page is protected.
     pub stencil: Option<&'a [bool]>,
+    /// Area stencil (ADR-39): the page pixels it protects are left alone too.
+    pub area: Option<&'a crate::stencil::AreaStencil>,
     /// The page before the gesture; Smear and Smooth read from it.
     pub before: &'a IndexedImage,
     /// Brush movement since the previous stamp (Smear).
@@ -239,7 +241,8 @@ fn unprotected(page: &IndexedImage, x: i32, y: i32, ctx: &PaintContext) -> Optio
     let under = page.get(x, y)?;
     let protected = ctx
         .stencil
-        .is_some_and(|s| s.get(usize::from(under)).copied().unwrap_or(false));
+        .is_some_and(|s| s.get(usize::from(under)).copied().unwrap_or(false))
+        || ctx.area.is_some_and(|a| a.protects(x, y));
     (!protected).then_some(under)
 }
 
@@ -466,6 +469,7 @@ mod tests {
             palette: &pal,
             range: None,
             stencil: Some(&stencil),
+            area: None,
             before: &before,
             motion: (0, 0),
             right: false,
@@ -486,6 +490,7 @@ mod tests {
             palette: pal,
             range: None,
             stencil: None,
+            area: None,
             before,
             motion: (0, 0),
             right: false,

@@ -7,6 +7,9 @@
 use crate::image::IndexedImage;
 use crate::palette::{Palette, Rgb8};
 
+// ADR-39: where the pictures go when frames are inserted or deleted.
+pub use crate::frame_ops::frame_moves;
+
 /// Most frames a document may have. DeluxePaint names a saved frame series with three digits
 /// (AGA p.231); its own limit was the Amiga's memory.
 pub const MAX_FRAMES: usize = 999;

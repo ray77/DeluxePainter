@@ -86,6 +86,53 @@ pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError
     }
 }
 
+/// Where the pictures go under frame command `cmd` (what [`apply`] does to the frame list;
+/// ADR-39: an area stencil follows its picture): for every frame of a document of `count`
+/// frames whose current frame is `current`, its index afterwards, `None` if it is deleted.
+/// Copies are new pictures. `None` for every command that keeps all frames where they are
+/// (CopyFrame repaints frames in place). `cmd` must be valid for such a document.
+pub fn frame_moves(cmd: &Command, count: usize, current: usize) -> Option<Vec<Option<usize>>> {
+    // `n` new frames go in at `at`.
+    let insert = |at: usize, n: usize| {
+        (0..count)
+            .map(|i| Some(if i < at { i } else { i + n }))
+            .collect()
+    };
+    // `n` frames from `at` on go.
+    let delete = |at: usize, n: usize| {
+        (0..count)
+            .map(|i| match i {
+                _ if i < at => Some(i),
+                _ if i < at + n => None,
+                _ => Some(i - n),
+            })
+            .collect()
+    };
+    let span = |first: u32, last: u32| last.saturating_sub(first) as usize + 1;
+    match *cmd {
+        Command::SetFrameCount { count: to } => {
+            let to = to as usize;
+            if to > count {
+                Some(insert(current + 1, to - count))
+            } else if to < count {
+                Some(delete(current.min(to), count - to))
+            } else {
+                None
+            }
+        }
+        Command::AddFrames { count: n } => Some(insert(current + 1, n as usize)),
+        Command::InsertFrameCopies {
+            first,
+            last,
+            before,
+        } => Some(insert(before as usize, span(first, last))),
+        Command::DeleteFrames { first, last, .. } => {
+            Some(delete(first as usize, span(first, last)))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
     let total = doc.frame_count();
     let current = doc.current;
@@ -295,6 +342,107 @@ mod tests {
         assert_eq!(
             validate(&bad, &d).unwrap_err().code,
             ErrorCode::PaletteRangeInvalid
+        );
+    }
+
+    #[test]
+    fn frame_moves_follow_every_picture_as_apply_moves_it() {
+        let commands = [
+            Command::SetFrameCount { count: 8 },
+            Command::SetFrameCount { count: 2 },
+            Command::SetFrameCount { count: 5 },
+            Command::AddFrames { count: 2 },
+            Command::InsertFrameCopies {
+                first: 0,
+                last: 1,
+                before: 0,
+            },
+            Command::InsertFrameCopies {
+                first: 3,
+                last: 3,
+                before: 2,
+            },
+            Command::InsertFrameCopies {
+                first: 1,
+                last: 4,
+                before: 5,
+            },
+            Command::DeleteFrames {
+                first: 1,
+                last: 1,
+                fill: 0,
+            },
+            Command::DeleteFrames {
+                first: 0,
+                last: 2,
+                fill: 0,
+            },
+            Command::DeleteFrames {
+                first: 0,
+                last: 4,
+                fill: 9,
+            },
+            Command::CopyFrame { first: 0, last: 4 },
+            Command::GotoFrame { frame: 3 },
+        ];
+        for cmd in &commands {
+            for current in 0..5 {
+                let mut d = doc(current);
+                run(&mut d, cmd.clone());
+                let after: Vec<u8> = state(&d).0;
+                let Some(moves) = frame_moves(cmd, 5, current) else {
+                    // In place: as many frames as before.
+                    assert_eq!(after.len(), 5, "{cmd:?}");
+                    continue;
+                };
+                assert_eq!(moves.len(), 5);
+                // Every kept picture is where the map says; the others are copies.
+                for (old, to) in moves.iter().enumerate() {
+                    if let Some(to) = *to {
+                        assert_eq!(after[to], old as u8 + 1, "{cmd:?} at {current}");
+                    }
+                }
+                let targets: Vec<usize> = moves.iter().flatten().copied().collect();
+                assert!(
+                    targets.windows(2).all(|w| w[0] < w[1]),
+                    "in order, one place each: {cmd:?}"
+                );
+                assert!(targets.len() <= after.len());
+            }
+        }
+        // A copy goes in before the originals or after them, as the commands say.
+        let delete_one = Command::DeleteFrames {
+            first: 1,
+            last: 1,
+            fill: 0,
+        };
+        assert_eq!(
+            frame_moves(&delete_one, 3, 1),
+            Some(vec![Some(0), None, Some(1)])
+        );
+        let insert_first = Command::InsertFrameCopies {
+            first: 0,
+            last: 0,
+            before: 0,
+        };
+        assert_eq!(
+            frame_moves(&insert_first, 3, 1),
+            Some(vec![Some(1), Some(2), Some(3)])
+        );
+        assert_eq!(
+            frame_moves(&Command::AddFrames { count: 2 }, 3, 1),
+            Some(vec![Some(0), Some(1), Some(4)])
+        );
+        // The single frame left after deleting all is a new picture.
+        let all = Command::DeleteFrames {
+            first: 0,
+            last: 4,
+            fill: 9,
+        };
+        assert_eq!(frame_moves(&all, 5, 2), Some(vec![None; 5]));
+        assert_eq!(
+            frame_moves(&Command::SetFrameCount { count: 5 }, 5, 0),
+            None
         );
     }
 

@@ -44,6 +44,8 @@ pub struct MenuData {
     pub cycled: Option<Palette>,
     /// Effect menu settings, the Remap base and the stencil view (ADR-31).
     pub effects: crate::effects::Effects,
+    /// The area stencil, Stencil ▸ Paint and the loaded brush's palette (ADR-39).
+    pub palette_stencil: crate::palette_stencil::State,
 }
 
 impl MenuData {

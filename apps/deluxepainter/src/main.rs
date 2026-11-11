@@ -28,6 +28,7 @@
 //!                                       (ADR-36)
 //!     [--anim-panel]                    show the Animation Control Panel (ADR-38)
 //!     [--anim-control range|move]       show the Set Range or Move requester (ADR-38)
+//!     [--stencil-paint X,Y,W,H]         Stencil ▸ Paint with that rectangle painted (ADR-39)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -35,8 +36,8 @@
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
 mod anim;
-mod animbrush;
 mod anim_control;
+mod animbrush;
 mod autosave;
 mod browse;
 mod brush_menu;
@@ -44,6 +45,7 @@ mod config;
 mod effects;
 mod files;
 mod menu_actions;
+mod palette_stencil;
 mod perspective;
 mod recovery;
 mod settings;
@@ -479,6 +481,16 @@ fn main() -> eframe::Result {
             Document::from_picture(page, doc.palette().clone(), doc.target())
         } else {
             doc
+        };
+        // ADR-39: the Stencil ▸ Paint view.
+        let doc = match arg_value(&args, "--stencil-paint") {
+            Some(spec) => {
+                palette_stencil::snapshot_view(&spec, &doc, &mut ui).unwrap_or_else(|e| {
+                    eprintln!("--stencil-paint: {e}");
+                    std::process::exit(2);
+                })
+            }
+            None => doc,
         };
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
@@ -1343,11 +1355,16 @@ impl PainterApp {
     /// Executes a command; a pending stroke is committed first so the order stays intact.
     fn run(&mut self, command: Command) {
         self.finish_stroke();
-        let command = self.with_fixed_background(command);
+        // ADR-15 CLR on a fixed background, under the area stencil of ADR-39.
+        let command = self.with_background_and_area(command);
         self.execute(command);
     }
 
     fn execute(&mut self, command: Command) {
+        // ADR-39: Stencil ▸ Paint takes painting commands; the area stencil joins the rest.
+        let Some(command) = self.area_route(command) else {
+            return;
+        };
         if let Err(e) = self.engine.execute(command) {
             eprintln!("command rejected: {e}");
         }
@@ -1356,7 +1373,11 @@ impl PainterApp {
 
     fn undo(&mut self) {
         self.finish_stroke();
-        Self::report(self.engine.undo(), ErrorCode::NothingToUndo);
+        if self.stencil_paint_undo(false) {
+            return;
+        }
+        // ADR-39: the engine's undo; the area stencil follows its picture.
+        Self::report(self.history_step(false), ErrorCode::NothingToUndo);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;
@@ -1364,7 +1385,10 @@ impl PainterApp {
 
     fn redo(&mut self) {
         self.finish_stroke();
-        Self::report(self.engine.redo(), ErrorCode::NothingToRedo);
+        if self.stencil_paint_undo(true) {
+            return;
+        }
+        Self::report(self.history_step(true), ErrorCode::NothingToRedo);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;
@@ -1430,11 +1454,16 @@ impl PainterApp {
 
     /// Runs a menu action. Commands not implemented yet do nothing.
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
+        // ADR-39: any other menu item ends Stencil ▸ Paint.
+        self.menu_item_ends_stencil_paint(action);
         match action {
             Action::Mode(m) => self.ui.mode = m,
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::PixelSize(p) => self.set_pixel_size(p),
             Action::Command(id) => match id {
+                // ADR-39 (palette_stencil.rs): its own items, and the Stencil items while there
+                // is an area stencil.
+                id if self.takes_adr39(id) => self.adr39_action(id),
                 "color.ranges" => self.open_ranges(),
                 "palette.mixer" => {
                     self.finish_stroke();
@@ -1827,6 +1856,7 @@ impl eframe::App for PainterApp {
             self.anim_keys(&ctx);
             self.animbrush_keys(&ctx);
             self.anim_control_keys(&ctx);
+            self.palette_stencil_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
@@ -2335,6 +2365,7 @@ impl PainterApp {
         if self.dirty || self.texture.is_none() {
             self.prepare_perspective_view();
             self.prepare_anim_view();
+            self.prepare_stencil_view();
             let (screen, rgba) = match (&self.requester, &self.show_page) {
                 (Some(req), _) => {
                     let screen = req.render();
@@ -2426,7 +2457,7 @@ mod tests {
 
     /// Presses and releases `key` at `t`, then runs passes only when egui asks for them
     /// (as the idle real window does) until `until`; `seen` is called after every pass.
-    fn press_and_idle(
+    pub(crate) fn press_and_idle(
         app: &mut PainterApp,
         ctx: &egui::Context,
         key: egui::Key,

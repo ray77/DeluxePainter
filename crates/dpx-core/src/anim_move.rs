@@ -828,6 +828,8 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
                     palette: &palette,
                     range: f.range,
                     stencil: f.stencil,
+                    // No area stencil yet (ADR-38/39 integration).
+                    area: None,
                     before: &before,
                     motion: (0, 0),
                     right: f.right,

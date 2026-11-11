@@ -240,9 +240,59 @@ pub fn convert_to_ham(kind: HamKind, img: &RgbaImage, threshold: f64) -> (HamEnc
     (encode_ham(kind, img, &pal, threshold), pal)
 }
 
+/// Color ▸ Recompute (ADR-39, manual AGA p.270): the HAM picture data `raw` worked out again
+/// for the base palette `new_base`, so that it shows the colours it showed with `old_base` as
+/// closely as the encoder can ([`encode_ham`]). With `old_base == new_base` it re-encodes the
+/// picture as it looks, which reduces the fringing of data written by another program's
+/// encoder. Not wired into the app yet: documents are never HAM (ADR-26 reduces HAM pictures
+/// on load), so the menu item stays ghosted.
+pub fn recompute(
+    kind: HamKind,
+    raw: &IndexedImage,
+    old_base: &[Rgb8],
+    new_base: &[Rgb8],
+    threshold: f64,
+) -> HamEncoded {
+    encode_ham(kind, &decode_ham(kind, raw, old_base), new_base, threshold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recompute_keeps_the_look_under_a_new_base_palette() {
+        let img = gradient(48, 8);
+        let (encoded, old) = convert_to_ham(HamKind::Ham6, &img, 10.0);
+        let shown = decode_ham(HamKind::Ham6, &encoded.indices, &old);
+        // Same palette: the picture looks the same afterwards (the encoder is deterministic,
+        // so recomputing its own data changes nothing).
+        let same = recompute(HamKind::Ham6, &encoded.indices, &old, &old, 0.0);
+        assert_eq!(same.indices, encoded.indices);
+        // Another base palette: the plain decode of the old data with it differs, the
+        // recomputed data shows the old colours again (HAM can hold any 12-bit colour after
+        // at most three modify steps, so the error stays small).
+        let mut new = old.clone();
+        new.reverse();
+        let stale = decode_ham(HamKind::Ham6, &encoded.indices, &new);
+        assert_ne!(rgb(&stale), rgb(&shown));
+        let fixed = recompute(HamKind::Ham6, &encoded.indices, &old, &new, 0.0);
+        let back = decode_ham(HamKind::Ham6, &fixed.indices, &new);
+        let err = |a: &RgbaImage| -> u64 {
+            a.pixels()
+                .iter()
+                .zip(shown.pixels())
+                .map(|(p, q)| u64::from(sq(Rgb8::new(p.r, p.g, p.b), Rgb8::new(q.r, q.g, q.b))))
+                .sum()
+        };
+        assert!(
+            err(&back) * 4 < err(&stale),
+            "{} vs {}",
+            err(&back),
+            err(&stale)
+        );
+        assert_eq!(fixed.report.pixels, 48 * 8);
+    }
 
     fn rgb(img: &RgbaImage) -> Vec<(u8, u8, u8)> {
         img.pixels().iter().map(|p| (p.r, p.g, p.b)).collect()
