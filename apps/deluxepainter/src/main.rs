@@ -24,6 +24,8 @@
 //!     [--light-table [LIST]]            Light Table on (previous,next,two_back,spare,dim)
 //!     [--anim-requester KIND]           show an Anim requester: count, add, copy, delete,
 //!                                       goto or rate
+//!     [--animbrush-requester KIND]      show an AnimBrush requester: pick, make or settings
+//!                                       (ADR-36)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -31,6 +33,7 @@
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 
 mod anim;
+mod animbrush;
 mod autosave;
 mod browse;
 mod brush_menu;
@@ -424,6 +427,9 @@ fn main() -> eframe::Result {
             ui.range_requester = Some(menu_actions::range_requester(doc.palette(), &ranges));
         }
         if let Some(req) = settings::snapshot_requester(&args, &doc) {
+            ui.tool_requester = Some(req);
+        }
+        if let Some(req) = animbrush::snapshot_requester(&args, &doc) {
             ui.tool_requester = Some(req);
         }
         if args.iter().any(|a| a == "--page-size-requester") {
@@ -828,6 +834,8 @@ struct PainterApp {
     config: Option<config::ConfigStore>,
     /// Autosave, recovery and the quit question (ADR-34).
     autosave: autosave::State,
+    /// AnimBrush and Metamorph (ADR-36, animbrush.rs).
+    animbrush: animbrush::AnimBrushState,
 }
 
 impl PainterApp {
@@ -863,6 +871,7 @@ impl PainterApp {
             anim: anim::AnimState::default(),
             config: None,
             autosave: autosave::State::default(),
+            animbrush: animbrush::AnimBrushState::default(),
         }
     }
 
@@ -1440,6 +1449,8 @@ impl PainterApp {
                 "palette.save" => self.open_file_requester(FileKind::SavePalette),
                 "background.fix" => self.fix_background(),
                 "background.free" => self.free_background(),
+                // ADR-36 (animbrush.rs).
+                id if self.animbrush_takes(id) => self.animbrush_action(id),
                 // ADR-28 (anim.rs).
                 id if id.starts_with("anim.") || id.starts_with("light_table.") => {
                     self.anim_action(id, ctx.input(|i| i.time));
@@ -1495,6 +1506,7 @@ impl eframe::App for PainterApp {
         let ctx = ui.ctx().clone();
         self.ui.has_brush = self.custom_brush.is_some();
         self.ui.can_restore = self.picked_brush.is_some();
+        self.animbrush_sync(&ctx);
         self.refresh_effects();
         if ctx.input(|i| i.viewport().close_requested()) {
             self.close_requested(&ctx);
@@ -1750,6 +1762,7 @@ impl eframe::App for PainterApp {
         if !was_typing {
             self.menu_keys(&ctx);
             self.anim_keys(&ctx);
+            self.animbrush_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
@@ -2313,7 +2326,7 @@ mod tests {
 
     /// One full `ui()` pass at time `t` with `events`; returns when egui wants the next
     /// pass (the real window repaints only then, unless the pointer moves).
-    fn ui_pass(
+    pub(crate) fn ui_pass(
         app: &mut PainterApp,
         ctx: &egui::Context,
         t: f64,
@@ -2335,7 +2348,7 @@ mod tests {
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
     }
 
-    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+    pub(crate) fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
         egui::Event::Key {
             key,
             physical_key: None,
@@ -2440,7 +2453,7 @@ mod tests {
 
     /// The window point (1280×1024 test window, 1 pixel per point) over UI pixel (`x`, `y`),
     /// after a pass has laid the screen out.
-    fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
+    pub(crate) fn ui_point(app: &PainterApp, (x, y): (i32, i32)) -> egui::Pos2 {
         let (view, scale) = app.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
@@ -2455,7 +2468,7 @@ mod tests {
 
     /// UI pixels over the title of the menu holding `id`, over the item whose submenu holds
     /// it, and over `id` itself (from the menu geometry, checked with the pointer tracking).
-    fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
+    pub(crate) fn menu_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 3] {
         let (w, h) = app.view().ui_size();
         let wanted = Action::Command(id);
         let (m, item, sub) = MENUS

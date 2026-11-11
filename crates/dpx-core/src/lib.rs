@@ -8,6 +8,8 @@
 // Animation frames (ADR-28).
 pub mod anim;
 mod frame_ops;
+// AnimBrush and Metamorph (ADR-36).
+pub mod anim_brush;
 
 pub mod brush_ops;
 pub mod command;
@@ -26,6 +28,7 @@ pub mod rgba;
 pub mod shapes;
 
 pub use anim::{LightTable, PlayMode};
+pub use anim_brush::{AnimBrush, CelDirection};
 pub use command::{Axis, Command, CommandError, ErrorCode};
 pub use document::Document;
 pub use engine::{Engine, Outcome, Request};

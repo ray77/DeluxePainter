@@ -4,6 +4,7 @@
 //! The drawing commands stamp their brush with a [`Pen`], which sends every pixel through
 //! [`paint::plot`] so the drawing mode and the stencil apply (ADR-18).
 
+use crate::anim_brush::AnimBrush;
 use crate::image::{IndexedImage, Rect};
 use crate::paint::{self, BrushImage, DrawMode, PaintContext};
 
@@ -214,14 +215,19 @@ pub struct Pen<'a> {
     /// The Effect menu: Translucency, Process and the AntiAlias of custom brush edges
     /// (ADR-31).
     pub fx: paint::PaintFx,
+    /// AnimBrush (ADR-36): stamp `k` of a path paints the cel `cels.cel_at(k)` in place of
+    /// `custom` ([`Stamper`] counts the stamps).
+    pub cels: Option<&'a AnimBrush>,
 }
 
 impl Pen<'_> {
-    /// The brush's pixels relative to its hotspot; `None` for an empty brush.
+    /// The brush's pixels relative to its hotspot (for an AnimBrush: of all its cels); `None`
+    /// for an empty brush.
     pub fn extent(&self) -> Option<Rect> {
-        match self.custom {
-            Some(b) => brush_extent(b),
-            None => Rect::from_points(self.offsets),
+        match (self.cels, self.custom) {
+            (Some(c), _) => c.extent(),
+            (None, Some(b)) => brush_extent(b),
+            (None, None) => Rect::from_points(self.offsets),
         }
     }
 
@@ -328,6 +334,9 @@ pub struct Stamper<'a> {
     last: Option<(i32, i32)>,
     /// The pen's extent; `None` for an empty brush, which paints nothing.
     extent: Option<Rect>,
+    /// Stamps so far, those skipped off the image included: the AnimBrush cel of the next
+    /// stamp (ADR-36).
+    count: u64,
 }
 
 impl<'a> Stamper<'a> {
@@ -336,7 +345,14 @@ impl<'a> Stamper<'a> {
             pen,
             last: None,
             extent: pen.extent(),
+            count: 0,
         }
+    }
+
+    /// Makes the next stamp stamp number `count` of the path (symmetric copies keep the
+    /// AnimBrush cel of the original's stamp at the start of every line, ADR-36).
+    pub fn set_count(&mut self, count: u64) {
+        self.count = count;
     }
 
     /// Hotspot positions whose stamp can touch `img`.
@@ -349,8 +365,17 @@ impl<'a> Stamper<'a> {
     pub fn at(&mut self, img: &mut IndexedImage, p: (i32, i32)) {
         let motion = self.last.map_or((0, 0), |l| (p.0 - l.0, p.1 - l.1));
         self.last = Some(p);
+        let k = self.count;
+        self.count += 1;
         if self.reach(img).contains(p.0, p.1) {
-            self.pen.stamp(img, p.0, p.1, motion);
+            match self.pen.cels {
+                Some(c) => Pen {
+                    custom: Some(c.cel_at(k)),
+                    ..self.pen
+                }
+                .stamp(img, p.0, p.1, motion),
+                None => self.pen.stamp(img, p.0, p.1, motion),
+            }
         }
     }
 
@@ -358,14 +383,18 @@ impl<'a> Stamper<'a> {
     /// the part of the line near the image is walked; the stamps keep the motion they have on
     /// the whole line.
     pub fn line(&mut self, img: &mut IndexedImage, a: (i32, i32), b: (i32, i32)) {
+        // Every stamp of the line counts, also those clipped away (ADR-36).
+        let end = self.count + u64::from(line_steps(a, b)) + 1;
         if let Some((i0, i1)) = clip_steps(a, b, self.reach(img)) {
             if i0 > 0 {
                 self.last = Some(line_point(a, b, i0 - 1));
             }
+            self.count += u64::from(i0);
             for i in i0..=i1 {
                 self.at(img, line_point(a, b, i));
             }
         }
+        self.count = end;
         self.last = Some(b);
     }
 }
@@ -931,6 +960,7 @@ mod tests {
                             right: false,
                         },
                         fx: Default::default(),
+                        cels: None,
                     };
                     let mut clipped = page.clone();
                     stroke_pen(&mut clipped, &pen, points, true);
@@ -986,6 +1016,60 @@ mod tests {
             }
         }
         *img = out;
+    }
+
+    /// AnimBrush (ADR-36): stamp k of a clipped stroke paints cel k, counting the stamps that
+    /// were clipped away, exactly as stamping every line pixel would.
+    #[test]
+    fn anim_brush_cels_follow_every_stamp_also_when_clipped() {
+        use crate::palette::Palette;
+        let pal = Palette::dpaint_default_32();
+        let page = IndexedImage::new(20, 12, 0);
+        let cel = |c: u8| BrushImage {
+            width: 2,
+            height: 2,
+            pixels: vec![c, c, c, 0],
+            handle: (0, 0),
+            transparent: Some(0),
+        };
+        let mut cels = AnimBrush::new(vec![cel(1), cel(2), cel(3)]);
+        cels.set_duration(4);
+        cels.set_current(1);
+        let points = [(-40, 3), (30, 8), (5, -20), (7, 7)];
+        let pen = Pen {
+            offsets: &[],
+            custom: Some(&cels.cels[0]),
+            color: 9,
+            mode: DrawMode::Matte,
+            ctx: PaintContext {
+                palette: &pal,
+                range: None,
+                stencil: None,
+                before: &page,
+                motion: (0, 0),
+                right: false,
+            },
+            fx: Default::default(),
+            cels: Some(&cels),
+        };
+        let mut clipped = page.clone();
+        stroke_pen(&mut clipped, &pen, &points, true);
+        let mut naive = page.clone();
+        let mut k = 0;
+        for pair in points.windows(2) {
+            for p in line_points(pair[0], pair[1]) {
+                let one = Pen {
+                    custom: Some(cels.cel_at(k)),
+                    cels: None,
+                    ..pen
+                };
+                one.stamp(&mut naive, p.0, p.1, (0, 0));
+                k += 1;
+            }
+        }
+        assert_eq!(clipped, naive);
+        let used: std::collections::BTreeSet<u8> = clipped.pixels().iter().copied().collect();
+        assert_eq!(used, [0, 1, 2, 3].into(), "every cel shows");
     }
 
     #[test]

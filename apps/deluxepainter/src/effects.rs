@@ -216,6 +216,7 @@ impl PainterApp {
             }
             b.transparent = b.transparent.map(|t| lut[usize::from(t)]);
         }
+        self.animbrush_arrange(&lut); // ADR-36: the AnimBrush's cels too.
         if let Some(bg) = &mut self.menu_data.background {
             let pixels = remap::reindex(bg.pixels(), order);
             *bg = dpx_core::IndexedImage::from_pixels(bg.width(), bg.height(), pixels)

@@ -321,6 +321,8 @@ pub enum ToolRequester {
     Arrange(ArrangeRequester),
     /// Effect ▸ Translucency ▸ Settings.. (ADR-31).
     Translucency(TranslucencyRequester),
+    /// Pick up AnimBrush, Make AnimBrush, AnimBrush Settings (ADR-36).
+    AnimBrush(crate::animbrush_requester::AnimBrushRequester),
 }
 
 impl ToolRequester {
@@ -331,7 +333,9 @@ impl ToolRequester {
             ToolRequester::Spacing(r) => Some(&r.form),
             ToolRequester::Fill(r) => Some(&r.form),
             ToolRequester::Translucency(r) => Some(&r.form),
-            ToolRequester::Stencil(_) | ToolRequester::Arrange(_) => None,
+            ToolRequester::Stencil(_) | ToolRequester::Arrange(_) | ToolRequester::AnimBrush(_) => {
+                None
+            }
         }
     }
 
@@ -340,7 +344,8 @@ impl ToolRequester {
             (Some(f), _) => f.size(),
             (None, ToolRequester::Stencil(r)) => r.size(),
             (None, ToolRequester::Arrange(r)) => r.size(),
-            _ => unreachable!("every requester but Stencil and Arrange is a form"),
+            (None, ToolRequester::AnimBrush(r)) => r.size(),
+            _ => unreachable!("every requester but Stencil, Arrange and AnimBrush is a form"),
         }
     }
 
@@ -360,6 +365,7 @@ impl ToolRequester {
             ToolRequester::Stencil(r) => r.handle(event),
             ToolRequester::Arrange(r) => r.handle(event),
             ToolRequester::Translucency(r) => r.form.handle(event).into(),
+            ToolRequester::AnimBrush(r) => r.handle(event),
         }
     }
 
@@ -368,6 +374,7 @@ impl ToolRequester {
         match self {
             ToolRequester::Stencil(r) => r.render(pens, palette),
             ToolRequester::Arrange(r) => r.render(pens, palette),
+            ToolRequester::AnimBrush(r) => r.render(pens),
             _ => self.form().expect("a form requester").render(pens),
         }
     }

@@ -7,6 +7,7 @@
 //! Custom brushes (ADR-18): the Brush Selector picks up part of the page; every drawing tool
 //! then stamps it, in the Mode menu's drawing mode, and it follows the pointer as a preview.
 
+use dpx_core::AnimBrush;
 use dpx_core::brush_ops;
 use dpx_core::gradient::range_for;
 use dpx_core::shapes::MAX_SHAPE_POINTS;
@@ -140,9 +141,40 @@ struct Ink {
     right: bool,
     /// Effect menu: Translucency, Process, AntiAlias (ADR-31).
     fx: dpx_core::PaintFx,
+    /// AnimBrush (ADR-36): its cels, clock at the start of the gesture.
+    cels: Option<AnimBrush>,
+    /// Stamps already painted in parts (freehand, airbrush) since the gesture started.
+    parts: u64,
 }
 
 impl Ink {
+    /// `cmd` stamping the AnimBrush's cels from `offset` stamps after the gesture's start,
+    /// when the gesture paints with an AnimBrush and `cmd` stamps the custom brush (ADR-36).
+    fn with_cels(&self, cmd: Command, offset: u64) -> Command {
+        match &self.cels {
+            Some(b)
+                if matches!(
+                    cmd,
+                    Command::Stroke {
+                        custom: Some(_),
+                        ..
+                    } | Command::Shape {
+                        custom: Some(_),
+                        ..
+                    }
+                ) =>
+            {
+                let mut brush = b.clone();
+                brush.advance(offset);
+                Command::AnimBrushPaint {
+                    brush,
+                    paint: Box::new(cmd),
+                }
+            }
+            _ => cmd,
+        }
+    }
+
     /// Whether parts of a stroke may be painted on top of each other: the modes that only set
     /// colours. The others depend on the order and motion of every stamp, so the preview is
     /// painted again as a whole.
@@ -435,7 +467,7 @@ fn draw_frame(img: &mut IndexedImage, page: &IndexedImage, r: Rect, colors: usiz
 
 /// The transparent colour of a brush picked up as `img`: the BG colour, or with Prefs ▸
 /// AutoTransp the colour all four corners share (manual: "else BG").
-fn pick_transparent(img: &IndexedImage, prefs: Prefs, bg: u8) -> u8 {
+pub(crate) fn pick_transparent(img: &IndexedImage, prefs: Prefs, bg: u8) -> u8 {
     let (w, h) = (img.width() as i32, img.height() as i32);
     let corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].map(|(x, y)| img.get(x, y));
     match corners[0] {
@@ -572,8 +604,14 @@ impl Stroke {
 
     /// The command this gesture stands for: as shown while drawing, or (`commit`) as
     /// committed. They differ only for filled freehand and polygons (outline, then filled)
-    /// and the polygon's rubber band (dropped).
+    /// and the polygon's rubber band (dropped). With an AnimBrush the stamps go through its
+    /// cels (ADR-36).
     fn candidate(&self, commit: bool) -> Option<Command> {
+        self.plain_candidate(commit)
+            .map(|c| self.ink.with_cels(c, 0))
+    }
+
+    fn plain_candidate(&self, commit: bool) -> Option<Command> {
         if self.spaced()
             && let Some((path, closed)) = self.outline_path(commit)
         {
@@ -708,7 +746,12 @@ impl Stroke {
     /// A new part of a freehand stroke or spray: painted on top, or in the modes that need the
     /// whole stroke ([`Ink::paints_in_parts`]) the whole preview again.
     fn add_part(&mut self, part: &Command, page: &IndexedImage, palette: &Palette) {
-        if self.ink.paints_in_parts() {
+        if self.ink.paints_in_parts() && self.ink.cels.is_some() {
+            // ADR-36: an AnimBrush part goes on from the stamps painted so far.
+            let part = self.ink.with_cels(part.clone(), self.ink.parts);
+            self.ink.parts += part.stamps();
+            self.paint_more(&part, page, palette);
+        } else if self.ink.paints_in_parts() {
             self.paint_more(part, page, palette);
         } else {
             self.redraw(page, palette);
@@ -763,6 +806,20 @@ pub struct Xform {
 }
 
 impl Xform {
+    pub(crate) fn kind(&self) -> XformKind {
+        self.kind
+    }
+
+    /// The same gesture done on brush `b` (another AnimBrush cel, ADR-36).
+    pub(crate) fn apply_to(&self, b: &BrushImage, colors: usize) -> BrushImage {
+        Xform {
+            base: b.clone(),
+            ..self.clone()
+        }
+        .result(colors)
+        .0
+    }
+
     /// The new brush and where the top-left of its image lies on the page, for the pointer
     /// at `self.cur` and the button down at `origin`.
     fn result(&self, colors: usize) -> (BrushImage, (i32, i32)) {
@@ -887,7 +944,12 @@ impl PainterApp {
         if g.origin == Some(g.cur) && g.kind != XformKind::Place {
             return;
         }
-        let (brush, _) = g.result(self.engine.document().palette().len());
+        let colors = self.engine.document().palette().len();
+        // ADR-36: on an AnimBrush the gesture changes every cel.
+        if self.animbrush_xform(&g, colors) {
+            return;
+        }
+        let (brush, _) = g.result(colors);
         if g.kind == XformKind::Rotate {
             self.tools.rotate_base = Some((brush.clone(), g.base));
         }
@@ -1057,6 +1119,8 @@ impl PainterApp {
             stencil: self.stencil.clone(),
             right,
             fx: self.menu_data.effects.fx(),
+            cels: None,
+            parts: 0,
         }
     }
 
@@ -1149,7 +1213,14 @@ impl PainterApp {
         if r.is_empty() {
             return;
         }
-        let img = page.crop(r);
+        // ADR-36: Alt, or Anim ▸ AnimBrush ▸ Pick up.., takes the frame for an AnimBrush.
+        if self.animbrush_take_pick(r) {
+            let back = self.tools.pick_return.take();
+            let (tool, filled) = back.unwrap_or((UiState::default().tool, false));
+            self.select_tool(tool, filled);
+            return;
+        }
+        let img = self.engine.document().page().crop(r);
         let transparent = pick_transparent(&img, self.ui.prefs, self.ui.bg);
         let brush = BrushImage::from_image(&img, Some(transparent));
         if ink.right {
@@ -1172,6 +1243,7 @@ impl PainterApp {
         }
         self.custom_brush = Some(brush.clone());
         self.picked_brush = Some(brush);
+        self.leave_anim_brush(); // ADR-36
         self.tools.brush_palette = Some(self.engine.document().palette().clone());
         self.ui.mode = PaintMode::Matte;
         let (tool, filled) = self
@@ -1184,8 +1256,13 @@ impl PainterApp {
 
     /// `B` (Brush ▸ Restore): the brush last picked up becomes the brush again.
     pub(crate) fn restore_custom_brush(&mut self) {
+        // ADR-36: B brings back the AnimBrush when it was made after the last brush.
+        if self.animbrush_restore() {
+            return;
+        }
         if let Some(b) = &self.picked_brush {
             self.custom_brush = Some(b.clone());
+            self.leave_anim_brush();
             self.dirty = true;
         }
     }
@@ -1193,6 +1270,10 @@ impl PainterApp {
     /// Right-click on the Brush Selector: back to the last custom brush, or (while it is the
     /// brush) to the built-in brush.
     pub(crate) fn toggle_custom_brush(&mut self) {
+        // ADR-36: with an AnimBrush it toggles between the AnimBrush and the custom brush.
+        if self.animbrush_toggle() {
+            return;
+        }
         if self.custom_brush.take().is_none() {
             self.restore_custom_brush();
         }
@@ -1203,6 +1284,7 @@ impl PainterApp {
     pub(crate) fn select_builtin_brush(&mut self, i: usize) {
         self.ui.brush = i.min(toolbox::BUILTIN_BRUSHES.len() - 1);
         self.custom_brush = None;
+        self.leave_anim_brush(); // ADR-36
         self.dirty = true;
     }
 
@@ -1306,10 +1388,16 @@ impl PainterApp {
             held: true,
             kind,
         };
+        s.ink.cels = self.animbrush_cels();
         match &s.kind {
             Kind::Freehand { continuous, .. } if !s.spaced() => {
-                let first = s.freehand(vec![p], *continuous);
+                let continuous = *continuous;
+                let first = s.freehand(vec![p], continuous);
                 s.add_part(&first, page, palette);
+                if continuous {
+                    // ADR-36: the first line stamps this point again, from the same cel.
+                    s.ink.parts = 0;
+                }
             }
             Kind::Lasso { .. } => {
                 let first = s.outline(vec![p]);
@@ -1487,7 +1575,7 @@ impl PainterApp {
         self.drop_xform();
         if let Some(s) = self.stroke.take() {
             if let Some(cmd) = s.candidate(true) {
-                self.execute(cmd);
+                self.execute_painted(cmd);
             }
             self.dirty = true;
         }

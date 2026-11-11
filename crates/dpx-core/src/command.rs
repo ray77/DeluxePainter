@@ -7,6 +7,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::anim_brush::{self, AnimBrush};
 use crate::document::{Document, check_frame_count};
 use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
@@ -198,6 +199,14 @@ pub enum Command {
     /// Color ▸ Palette ▸ Arrange (ADR-31): reorders the palette, `order[new] = old` (a
     /// permutation of all entries), and renumbers the pixels so the picture looks the same.
     ArrangePalette { order: Vec<u8> },
+    /// Painting with an AnimBrush (ADR-36): `paint`, a Stroke or Shape, stamps the cels of
+    /// `brush` in turn instead of its own custom brush. Stamp `k` along the path (and of
+    /// every symmetric copy) paints the cel the brush reaches `k` stamps after its clock;
+    /// [`Command::stamps`] tells how far the clock moves.
+    AnimBrushPaint {
+        brush: AnimBrush,
+        paint: Box<Command>,
+    },
 }
 
 impl Command {
@@ -295,6 +304,15 @@ impl Command {
                 validate_paint(colors, custom.as_ref(), *range, stencil.as_deref())?;
                 shape.validate(brush, custom.is_some(), *filled, symmetry.as_ref())
             }
+            Command::AnimBrushPaint { brush, paint } => {
+                if !matches!(**paint, Command::Stroke { .. } | Command::Shape { .. }) {
+                    return Err(CommandError::invalid(
+                        "an AnimBrush paints with a stroke or a shape".into(),
+                    ));
+                }
+                validate_anim_brush(colors, brush)?;
+                paint.check_paint(page, palette)
+            }
             Command::FloodFill {
                 x,
                 y,
@@ -342,9 +360,10 @@ impl Command {
         let colors = doc.palette.len();
         let color = |c: u8| check_color(c, colors);
         match self {
-            Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
-                self.check_paint(&doc.page, &doc.palette)
-            }
+            Command::Stroke { .. }
+            | Command::Shape { .. }
+            | Command::FloodFill { .. }
+            | Command::AnimBrushPaint { .. } => self.check_paint(&doc.page, &doc.palette),
             Command::Clear { color: c } => color(*c),
             Command::Flip { .. } => Ok(()),
             Command::ReplaceColor { from, to } => color(*from).and(color(*to)),
@@ -504,7 +523,7 @@ impl Command {
             Command::Stroke { .. } => {
                 Footprint::Pixels(self.paint_bounds(&doc.page).unwrap_or_default())
             }
-            Command::Shape { .. } | Command::FloodFill { .. } => {
+            Command::Shape { .. } | Command::FloodFill { .. } | Command::AnimBrushPaint { .. } => {
                 Footprint::Pixels(self.paint_bounds(&doc.page).unwrap_or_default())
             }
             Command::Clear { .. }
@@ -540,7 +559,10 @@ impl Command {
         }
         let page = &mut doc.page;
         match self {
-            Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
+            Command::Stroke { .. }
+            | Command::Shape { .. }
+            | Command::FloodFill { .. }
+            | Command::AnimBrushPaint { .. } => {
                 let before = page.clone();
                 self.paint(page, &before, &doc.palette);
             }
@@ -660,6 +682,37 @@ fn check_color(c: u8, colors: usize) -> Result<(), CommandError> {
             format!("colour {c} is outside the palette (0..{colors})"),
         ))
     }
+}
+
+/// Checks an AnimBrush (ADR-36): 1 to [`anim_brush::MAX_CELS`] cels, each a valid custom
+/// brush for a palette of `colors` entries, at most [`anim_brush::MAX_CEL_BYTES`] of pixels,
+/// a Duration of 1 to [`anim_brush::MAX_DURATION`].
+fn validate_anim_brush(colors: usize, brush: &AnimBrush) -> Result<(), CommandError> {
+    let n = brush.cels.len();
+    if !(1..=anim_brush::MAX_CELS).contains(&n) {
+        return Err(CommandError::invalid(format!(
+            "an AnimBrush has 1..={} cels, got {n}",
+            anim_brush::MAX_CELS
+        )));
+    }
+    if !(1..=anim_brush::MAX_DURATION).contains(&brush.duration) {
+        return Err(CommandError::invalid(format!(
+            "AnimBrush duration must be 1..={}, got {}",
+            anim_brush::MAX_DURATION,
+            brush.duration
+        )));
+    }
+    if brush.bytes() > anim_brush::MAX_CEL_BYTES {
+        return Err(CommandError::invalid(format!(
+            "AnimBrush cels hold {} bytes, at most {}",
+            brush.bytes(),
+            anim_brush::MAX_CEL_BYTES
+        )));
+    }
+    for cel in &brush.cels {
+        validate_paint(colors, Some(cel), None, None)?;
+    }
+    Ok(())
 }
 
 /// Checks the paint fields of a Stroke or Shape (ADR-18): a custom brush whose pixel count

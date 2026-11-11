@@ -93,6 +93,9 @@ pub enum FileKind {
     /// Effect ▸ Stencil ▸ Load.. / Save.. (ADR-31).
     LoadStencil,
     SaveStencil,
+    /// Anim ▸ AnimBrush ▸ Load.. / Save.. (IFF ANIM, ADR-36).
+    LoadAnimBrush,
+    SaveAnimBrush,
 }
 
 impl FileKind {
@@ -110,6 +113,8 @@ impl FileKind {
             FileKind::SaveBrush => "Save Brush",
             FileKind::LoadStencil => "Load Stencil",
             FileKind::SaveStencil => "Save Stencil",
+            FileKind::LoadAnimBrush => "Load AnimBrush",
+            FileKind::SaveAnimBrush => "Save AnimBrush",
         }
     }
 
@@ -119,12 +124,14 @@ impl FileKind {
             | FileKind::LoadAnim
             | FileKind::LoadPalette
             | FileKind::LoadBrush
-            | FileKind::LoadStencil => "Load",
+            | FileKind::LoadStencil
+            | FileKind::LoadAnimBrush => "Load",
             FileKind::SavePicture
             | FileKind::SaveAnim
             | FileKind::SavePalette
             | FileKind::SaveBrush
-            | FileKind::SaveStencil => "Save",
+            | FileKind::SaveStencil
+            | FileKind::SaveAnimBrush => "Save",
             FileKind::DeleteFile => "Delete",
             FileKind::ExportPicture => "Export",
         }

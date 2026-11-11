@@ -222,6 +222,7 @@ impl PainterApp {
                         self.tools.stencil_off = None;
                         self.stencil = (r.count() > 0).then(|| r.protected());
                     }
+                    ToolRequester::AnimBrush(r) => self.animbrush_requester_ok(r),
                 }
             }
         }

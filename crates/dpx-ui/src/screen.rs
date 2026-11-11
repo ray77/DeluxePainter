@@ -104,6 +104,10 @@ pub struct UiState {
     pub has_brush: bool,
     /// A picked-up brush exists (Brush ▸ Restore).
     pub can_restore: bool,
+    /// An AnimBrush exists; the app keeps it in sync (ghosts AnimBrush items, ADR-36).
+    pub has_anim_brush: bool,
+    /// A spare brush exists (Brush ▸ Spare ▸ Metamorph.., ADR-36).
+    pub has_spare_brush: bool,
     /// Gridding, Symmetry, Spacing, Fill Type or Make Stencil while open (ADR-20).
     pub tool_requester: Option<crate::tool_requesters::ToolRequester>,
     // Animation (ADR-28).
@@ -129,6 +133,8 @@ impl UiState {
             ham: false,
             has_brush: self.has_brush,
             can_restore: self.can_restore,
+            anim_brush: self.has_anim_brush,
+            spare_brush: self.has_spare_brush,
         }
     }
 }
@@ -156,6 +162,8 @@ impl Default for UiState {
             range_requester: None,
             has_brush: false,
             can_restore: false,
+            has_anim_brush: false,
+            has_spare_brush: false,
             tool_requester: None,
             anim_requester: None,
             frame_counter: None,

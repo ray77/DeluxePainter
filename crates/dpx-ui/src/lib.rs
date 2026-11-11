@@ -5,6 +5,7 @@
 //! converts that buffer to RGBA and shows it with nearest-neighbour scaling.
 
 pub mod anim_requester;
+pub mod animbrush_requester;
 pub mod arrange_requester;
 pub mod bitmap;
 pub mod choice_requester;
@@ -29,6 +30,7 @@ pub(crate) mod widgets;
 use dpx_core::{IndexedImage, Palette};
 
 pub use anim_requester::{AnimChoice, AnimReqResponse, AnimRequester};
+pub use animbrush_requester::{AnimBrushReq, AnimBrushRequester};
 pub use arrange_requester::ArrangeRequester;
 pub use choice_requester::{ChoiceRequester, ChoiceResponse};
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};

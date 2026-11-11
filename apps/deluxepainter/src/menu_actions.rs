@@ -458,6 +458,9 @@ impl PainterApp {
             FileKind::LoadBrush | FileKind::SaveBrush => {
                 self.brush_file_accept(kind, path, overwrite)
             }
+            FileKind::LoadAnimBrush | FileKind::SaveAnimBrush => {
+                self.animbrush_file_accept(kind, path, overwrite)
+            }
         }
     }
 
