@@ -16,6 +16,7 @@ use dpx_ui::{PixelSize, Pref, Prefs};
 use serde_json::{Map, Value, json};
 
 use crate::PainterApp;
+use crate::import::{self, ImportSettings};
 
 /// Version written to the file. Newer files are read as far as their fields are known.
 pub const VERSION: u64 = 1;
@@ -43,6 +44,8 @@ pub struct Config {
     pub translucency_percent: u8,
     pub light_on: bool,
     pub light: LightTable,
+    /// The Import requester's last choices (ADR-42).
+    pub import: ImportSettings,
 }
 
 impl Default for Config {
@@ -65,6 +68,7 @@ impl Default for Config {
             translucency_percent: effects.percent,
             light_on: anim.light_on,
             light: anim.light,
+            import: ImportSettings::default(),
         }
     }
 }
@@ -176,6 +180,25 @@ impl Config {
             spare: get_bool(&l, "spare", d.light.spare),
             dim: get_bool(&l, "dim", d.light.dim),
         };
+        let im = section(o, "import");
+        let text = |key: &str| im.get(key).and_then(Value::as_str);
+        c.import = ImportSettings {
+            position: text("position")
+                .and_then(import::parse_position)
+                .unwrap_or(d.import.position),
+            palette: text("palette")
+                .and_then(import::parse_palette)
+                .unwrap_or(d.import.palette),
+            // Whole bitplanes, 2-256; the screen's maximum applies when the requester opens.
+            colors: im
+                .get("colors")
+                .and_then(Value::as_i64)
+                .map(|n| dpx_core::import::color_count(n.clamp(2, 256) as u16, 256))
+                .or(d.import.colors),
+            dither: text("dither")
+                .and_then(import::parse_dither)
+                .unwrap_or(d.import.dither),
+        };
         Some(c)
     }
 
@@ -214,6 +237,12 @@ impl Config {
                 },
             },
             "translucency": { "on": self.translucency_on, "percent": self.translucency_percent },
+            "import": {
+                "position": import::position_name(self.import.position),
+                "palette": import::palette_name(self.import.palette),
+                "colors": self.import.colors,
+                "dither": import::dither_name(self.import.dither),
+            },
             "light_table": {
                 "on": self.light_on,
                 "two_back": self.light.two_back,
@@ -245,6 +274,7 @@ impl Config {
             translucency_percent: app.menu_data.effects.percent,
             light_on: app.anim.light_on,
             light: app.anim.light,
+            import: app.import.settings,
         }
     }
 
@@ -268,6 +298,7 @@ impl Config {
         app.menu_data.effects.percent = self.translucency_percent;
         app.anim.light_on = self.light_on;
         app.anim.light = self.light;
+        app.import.settings = self.import;
     }
 }
 
@@ -443,7 +474,39 @@ mod tests {
             spare: true,
             dim: false,
         };
+        c.import = ImportSettings {
+            position: dpx_core::import::Position::TopLeft,
+            palette: dpx_core::import::PaletteChoice::Current,
+            colors: Some(8),
+            dither: dpx_core::quantize::Dither::Ordered,
+        };
         c
+    }
+
+    #[test]
+    fn import_settings_load_from_old_files_and_clamp_colours() {
+        let d = dir("import");
+        // A file from before ADR-42: the defaults (colours: the document's).
+        std::fs::write(d.join(FILE), r#"{"version": 1, "pixel_size": 6}"#).unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert_eq!(c.import, ImportSettings::default());
+        assert_eq!(c.import.colors, None);
+        // Odd counts become whole bitplanes, out of range is clamped, bad names fall back.
+        std::fs::write(
+            d.join(FILE),
+            r#"{"import": {"position": "top_left", "palette": "sideways",
+                          "colors": 100, "dither": "none"}}"#,
+        )
+        .unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert_eq!(c.import.position, dpx_core::import::Position::TopLeft);
+        assert_eq!(c.import.palette, dpx_core::import::PaletteChoice::New);
+        assert_eq!(c.import.colors, Some(64));
+        assert_eq!(c.import.dither, dpx_core::quantize::Dither::None);
+        std::fs::write(d.join(FILE), r#"{"import": {"colors": 100000}}"#).unwrap();
+        assert_eq!(ConfigStore::open(&d).1.import.colors, Some(256));
+        std::fs::write(d.join(FILE), r#"{"import": {"colors": -3}}"#).unwrap();
+        assert_eq!(ConfigStore::open(&d).1.import.colors, Some(2));
     }
 
     #[test]

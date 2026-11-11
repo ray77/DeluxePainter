@@ -29,6 +29,9 @@
 //!     [--anim-panel]                    show the Animation Control Panel (ADR-38)
 //!     [--anim-control range|move]       show the Set Range or Move requester (ADR-38)
 //!     [--stencil-paint X,Y,W,H]         Stencil ▸ Paint with that rectangle painted (ADR-39)
+//!     [--import-requester FILE]         the Import requester for a PNG or JPEG (ADR-42)
+//!     [--import SPEC] [--import-apply]  … with position=centre|top_left;palette=new|current;
+//!                                       colors=N;dither=none|fs|ordered, or the page after Ok
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -44,6 +47,7 @@ mod brush_menu;
 mod config;
 mod effects;
 mod files;
+mod import;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -492,6 +496,11 @@ fn main() -> eframe::Result {
             }
             None => doc,
         };
+        // ADR-42: the Import requester for a PNG or JPEG, or its result after Ok.
+        let doc = import::snapshot(&args, &doc, &mut ui).unwrap_or_else(|(code, e)| {
+            eprintln!("{e}");
+            std::process::exit(code);
+        });
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
@@ -759,7 +768,17 @@ fn snapshot(
         dpx_ui::toolbox::draw_brush_unselected(&mut screen, x0, ui.brush, &pens, view.ux, view.uy);
     }
     let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
-    let rgba = to_rgba(&screen, doc.palette(), sx, sy);
+    let mut rgba = to_rgba(&screen, doc.palette(), sx, sy);
+    // ADR-42: the Import thumbnail in true colour over the indexed screen.
+    if let Some(req) = &ui.import_requester {
+        let frame_w = screen.width() as usize * sx;
+        req.overlay(
+            &mut rgba,
+            frame_w,
+            view.ux as usize * sx,
+            view.uy as usize * sy,
+        );
+    }
     write_png(
         path,
         screen.width() * sx as u32,
@@ -874,6 +893,8 @@ struct PainterApp {
     animbrush: animbrush::AnimBrushState,
     /// Effect > Perspective (ADR-37, perspective.rs).
     perspective: perspective::PerspectiveState,
+    /// Picture ▸ Load's Import requester for PNG and JPEG (ADR-42, import.rs).
+    import: import::ImportState,
 }
 
 impl PainterApp {
@@ -912,6 +933,7 @@ impl PainterApp {
             autosave: autosave::State::default(),
             animbrush: animbrush::AnimBrushState::default(),
             perspective: perspective::PerspectiveState::default(),
+            import: import::ImportState::default(),
         }
     }
 
@@ -929,6 +951,7 @@ impl PainterApp {
             || ui.note_requester.is_some()
             || ui.file_requester.is_some()
             || ui.page_size_requester.is_some()
+            || ui.import_requester.is_some()
             || self.show_page.is_some()
             || ui.anim_control.is_some()
             || self.anim_control.preview.is_some()
@@ -1111,7 +1134,10 @@ impl PainterApp {
             } => {
                 let path = browse::expand_home(&drawer).join(file);
                 match kind {
-                    FileKind::LoadPicture | FileKind::LoadAnim => self.load_picture(path),
+                    // ADR-42: only Picture ▸ Load.. asks how to import PNG and JPEG.
+                    FileKind::LoadPicture | FileKind::LoadAnim => {
+                        self.load_picture(path, kind == FileKind::LoadPicture)
+                    }
                     FileKind::SaveAnim => self.save_picture(anim_path(&path), overwrite, true),
                     FileKind::SavePicture => {
                         self.save_picture(project_path(&path), overwrite, false)
@@ -1133,8 +1159,13 @@ impl PainterApp {
         }
     }
 
-    fn load_picture(&mut self, path: PathBuf) {
+    /// Loads a picture file; with `ask`, PNG and JPEG pictures open the Import requester
+    /// instead (ADR-42).
+    fn load_picture(&mut self, path: PathBuf, ask: bool) {
         match files::load(&path) {
+            Ok(loaded) if ask && import::asks(&loaded.picture) => {
+                self.open_import(path, loaded.picture, loaded.notes);
+            }
             Ok(loaded) => {
                 let current = self.engine.document().target();
                 let (doc, extras, notes) = files::open_picture(loaded.picture, current);
@@ -1648,6 +1679,12 @@ impl eframe::App for PainterApp {
         }
         if self.ui.choice_requester.is_some() {
             self.choice_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-42: the Import requester after Picture ▸ Load.. of a PNG or JPEG.
+        if self.ui.import_requester.is_some() {
+            self.import_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -2379,7 +2416,9 @@ impl PainterApp {
                 }
                 (None, None) => {
                     let screen = self.compose_screen();
-                    let rgba = to_rgba(&screen, self.palette(), 1, 1);
+                    let mut rgba = to_rgba(&screen, self.palette(), 1, 1);
+                    // ADR-42: the Import thumbnail in true colour over the indexed screen.
+                    self.import_overlay(&mut rgba, screen.width() as usize);
                     (screen, rgba)
                 }
             };
@@ -3489,7 +3528,13 @@ mod tests {
         app.run_action(Action::Command("picture.load"), &ctx);
         type_into(&mut app, "Photo.png");
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
-        assert!(app.ui.file_requester.is_none(), "loaded and closed");
+        assert!(app.ui.file_requester.is_none(), "closed");
+        // ADR-42: the Import requester asks first; Top left (Tab, Down), then Return.
+        assert!(app.ui.import_requester.is_some());
+        app.import_event(ReqEvent::Key(ReqKey::Tab));
+        app.import_event(ReqEvent::Key(ReqKey::Down));
+        app.import_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.ui.import_requester.is_none(), "loaded");
         assert_eq!(app.engine.document().target(), before, "kept the screen");
         // 320x256 LoRes: 7:6 shown on square pixels → 299x256, on a screen-sized page.
         assert_eq!((app.page().width(), app.page().height()), (320, 256));
@@ -3497,9 +3542,9 @@ mod tests {
         assert_eq!(at(10), dpx_core::Rgb8::new(200, 40, 40));
         assert_eq!(at(290), dpx_core::Rgb8::new(40, 40, 200));
         assert_eq!(
-            app.page().get(310, 100),
-            Some(0),
-            "rest of the page: colour 0"
+            at(310),
+            Palette::dpaint_default_32().get(0).unwrap(),
+            "rest of the page: the BG colour"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

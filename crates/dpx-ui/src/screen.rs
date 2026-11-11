@@ -92,6 +92,8 @@ pub struct UiState {
     pub file_requester: Option<FileRequester>,
     /// Picture ▸ Page Size while it is open.
     pub page_size_requester: Option<PageSizeRequester>,
+    /// Picture ▸ Load's Import Picture requester for PNG and JPEG files (ADR-42).
+    pub import_requester: Option<crate::import_requester::ImportRequester>,
     /// Notes after Load/Save while shown (drawn over everything else).
     pub note_requester: Option<NoteRequester>,
     /// Recover Picture and Quit without saving? (ADR-34).
@@ -169,6 +171,7 @@ impl Default for UiState {
             menu: MenuState::default(),
             file_requester: None,
             page_size_requester: None,
+            import_requester: None,
             note_requester: None,
             choice_requester: None,
             palette_requester: None,
@@ -340,6 +343,9 @@ impl Screen {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.page_size_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.import_requester {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.note_requester {

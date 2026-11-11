@@ -433,7 +433,7 @@ impl Form {
 }
 
 /// A 7×7 box: frame, and when `on` a filled centre (radio) or a cross (check box).
-fn draw_box(img: &mut IndexedImage, at: (i32, i32), on: bool, check: bool, pens: &Pens) {
+pub(crate) fn draw_box(img: &mut IndexedImage, at: (i32, i32), on: bool, check: bool, pens: &Pens) {
     let r = Rect::new(at.0, at.1 + 1, BOX, BOX);
     button_face(img, r, false, pens);
     if !on {

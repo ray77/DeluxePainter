@@ -12,6 +12,11 @@
 //!   never used by pixels.
 //!
 //! Distances are weighted RGB (2·ΔR² + 4·ΔG² + 3·ΔB²), the same for clustering and mapping.
+//!
+//! The GUI's Import requester (ADR-42) adds an ordered (4×4 Bayer) dither next to
+//! Floyd–Steinberg and none, extra colours that count for the palette without being pixels
+//! ([`reduce_with`]: the page around an imported picture), and [`reduce_to_palette`], which
+//! maps a picture onto a fixed palette (the current document's) instead of building one.
 
 use std::collections::HashMap;
 
@@ -49,7 +54,14 @@ pub enum Dither {
     None,
     /// Floyd–Steinberg error diffusion.
     FloydSteinberg,
+    /// Ordered dither with the 4×4 Bayer matrix (the pattern of the gradient fills' dither,
+    /// ADR-20): every pixel is moved by its matrix threshold, scaled to the palette's colour
+    /// spacing, before the nearest colour is taken (ADR-42).
+    Ordered,
 }
+
+/// 4×4 Bayer thresholds, 0..16 (the same matrix as the gradient fills' dither).
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReduceOptions {
@@ -122,12 +134,26 @@ fn nearest(pal: &[[f64; 3]], c: [f64; 3]) -> usize {
 
 /// Reduces `img` to an indexed picture as described in the module documentation.
 pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
+    reduce_with(img, opts, &[]).0
+}
+
+/// Like [`reduce`], with `extra` colours and pixel counts that are not pixels of `img` but
+/// belong to the picture all the same (the page around an imported picture, ADR-42): they
+/// count for the exact-colour test, the histogram and the palette order. Also returns the
+/// palette index of each extra colour (exact when the colours are kept, else the nearest
+/// entry).
+pub fn reduce_with(
+    img: &RgbaImage,
+    opts: &ReduceOptions,
+    extra: &[(Rgb8, u64)],
+) -> (Reduced, Vec<u8>) {
     let max = usize::from(opts.max_colors.clamp(2, 256));
     let transparent = img.pixels().iter().any(|&p| is_transparent(p));
     let offset = usize::from(transparent);
     let avail = max - offset;
+    let counted: Vec<(Rgb8, u64)> = extra.iter().copied().filter(|&(_, n)| n > 0).collect();
 
-    let (entries, reduction) = match unique_colors(img, avail) {
+    let (entries, reduction) = match unique_colors(img, avail, &counted) {
         Some(counts) => {
             let mut merged: HashMap<Rgb8, u64> = HashMap::new();
             let mut rounded = false;
@@ -143,7 +169,10 @@ pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
             };
             (merged.into_iter().collect::<Vec<_>>(), r)
         }
-        None => (palette_for(img, avail, opts.depth), Reduction::Quantized),
+        None => (
+            palette_for(img, avail, opts.depth, &counted),
+            Reduction::Quantized,
+        ),
     };
     let entries = order(entries);
     let colors = entries.len();
@@ -157,14 +186,16 @@ pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
     pal.resize(padded, Rgb8::BLACK);
 
     let real: Vec<[f64; 3]> = entries.iter().map(|&(c, _)| to_f(c)).collect();
-    let pixels = match reduction {
+    let ids: Vec<u8> = (0..real.len()).map(|i| (i + offset) as u8).collect();
+    let (pixels, extra_ids) = match reduction {
         Reduction::Exact | Reduction::Rounded => {
             let index: HashMap<Rgb8, u8> = entries
                 .iter()
                 .enumerate()
                 .map(|(i, &(c, _))| (c, (i + offset) as u8))
                 .collect();
-            img.pixels()
+            let pixels = img
+                .pixels()
                 .iter()
                 .map(|&p| {
                     if is_transparent(p) {
@@ -173,26 +204,112 @@ pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
                         index[&opts.depth.snap(rgb(p))]
                     }
                 })
-                .collect()
+                .collect();
+            let lookup = |c: Rgb8| {
+                index
+                    .get(&opts.depth.snap(c))
+                    .copied()
+                    .unwrap_or_else(|| ids.get(nearest(&real, to_f(c))).copied().unwrap_or(0))
+            };
+            (pixels, extra.iter().map(|&(c, _)| lookup(c)).collect())
         }
-        Reduction::Quantized => match opts.dither {
-            Dither::None => map_nearest(img, &real, offset),
-            Dither::FloydSteinberg => map_floyd_steinberg(img, &real, offset),
-        },
+        Reduction::Quantized => {
+            let pixels = map_pixels(img, &real, &ids, opts.dither);
+            let extra_ids = extra
+                .iter()
+                .map(|&(c, _)| ids[nearest(&real, to_f(c))])
+                .collect();
+            (pixels, extra_ids)
+        }
     };
-    Reduced {
+    let reduced = Reduced {
         image: IndexedImage::from_pixels(img.width(), img.height(), pixels)
             .expect("one index per pixel"),
         palette: Palette::new(pal).expect("2..=256 entries"),
         transparent_index: transparent.then_some(0),
         reduction,
         colors,
+    };
+    (reduced, extra_ids)
+}
+
+/// A picture mapped onto a fixed palette ([`reduce_to_palette`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mapped {
+    pub image: IndexedImage,
+    /// The picture had transparent pixels: they are colour 0, which opaque pixels avoid.
+    pub transparent: bool,
+    /// Every opaque pixel was a palette colour already and keeps it exactly (no dithering).
+    pub exact: bool,
+}
+
+/// Maps `img` onto `palette` as it is (the Import requester's "Current" palette, ADR-42):
+/// every opaque pixel becomes the nearest palette colour by the weighted distance above
+/// (ties: the lowest index, so of duplicate entries the first is used), with `dither`. A
+/// picture made only of palette colours is mapped exactly, without dithering (as [`reduce`]
+/// keeps few colours exactly). Transparent pixels become colour 0; while the picture has
+/// any, opaque pixels do not use colour 0 (it marks transparency, as in [`reduce`]), unless
+/// the palette has no other colour.
+pub fn reduce_to_palette(img: &RgbaImage, palette: &Palette, dither: Dither) -> Mapped {
+    let transparent = img.pixels().iter().any(|&p| is_transparent(p));
+    let first = usize::from(transparent && palette.len() > 1);
+    let ids: Vec<u8> = (first..palette.len()).map(|i| i as u8).collect();
+    let colours: Vec<Rgb8> = ids
+        .iter()
+        .map(|&i| palette.get(i).unwrap_or(Rgb8::BLACK))
+        .collect();
+    // Exact colours: the lowest index of each.
+    let mut exact_index: HashMap<Rgb8, u8> = HashMap::new();
+    for (&i, &c) in ids.iter().zip(&colours) {
+        exact_index.entry(c).or_insert(i);
+    }
+    let exact = img
+        .pixels()
+        .iter()
+        .all(|&p| is_transparent(p) || exact_index.contains_key(&rgb(p)));
+    let pixels = if exact {
+        img.pixels()
+            .iter()
+            .map(|&p| {
+                if is_transparent(p) {
+                    0
+                } else {
+                    exact_index[&rgb(p)]
+                }
+            })
+            .collect()
+    } else {
+        let pal: Vec<[f64; 3]> = colours.iter().map(|&c| to_f(c)).collect();
+        map_pixels(img, &pal, &ids, dither)
+    };
+    Mapped {
+        image: IndexedImage::from_pixels(img.width(), img.height(), pixels)
+            .expect("one index per pixel"),
+        transparent,
+        exact,
     }
 }
 
-/// The opaque colours with their pixel counts, or `None` if there are more than `limit`.
-fn unique_colors(img: &RgbaImage, limit: usize) -> Option<Vec<(Rgb8, u64)>> {
+/// Maps the opaque pixels to `ids[nearest entry of pal]` with `dither`; transparent pixels
+/// become 0.
+fn map_pixels(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8], dither: Dither) -> Vec<u8> {
+    match dither {
+        Dither::None => map_nearest(img, pal, ids),
+        Dither::FloydSteinberg => map_floyd_steinberg(img, pal, ids),
+        Dither::Ordered => map_ordered(img, pal, ids),
+    }
+}
+
+/// The opaque colours (and `extra`) with their pixel counts, or `None` if there are more
+/// than `limit`.
+fn unique_colors(img: &RgbaImage, limit: usize, extra: &[(Rgb8, u64)]) -> Option<Vec<(Rgb8, u64)>> {
     let mut counts: HashMap<Rgb8, u64> = HashMap::new();
+    for &(c, n) in extra {
+        *counts.entry(c).or_default() += n;
+    }
+    if counts.len() > limit {
+        return None;
+    }
     for &p in img.pixels() {
         if is_transparent(p) {
             continue;
@@ -222,20 +339,31 @@ struct Item {
     w: f64,
 }
 
-/// A new palette of at most `n` colours (with pixel weights) for the opaque pixels.
-fn palette_for(img: &RgbaImage, n: usize, depth: PaletteDepth) -> Vec<(Rgb8, u64)> {
+/// A new palette of at most `n` colours (with pixel weights) for the opaque pixels and the
+/// `extra` colours.
+fn palette_for(
+    img: &RgbaImage,
+    n: usize,
+    depth: PaletteDepth,
+    extra: &[(Rgb8, u64)],
+) -> Vec<(Rgb8, u64)> {
     // 6-bit-per-channel histogram; each bin keeps the exact mean of its pixels.
     let mut bins: HashMap<u32, (u64, [u64; 3])> = HashMap::new();
-    for &p in img.pixels() {
-        if is_transparent(p) {
-            continue;
-        }
-        let key = (u32::from(p.r >> 2) << 12) | (u32::from(p.g >> 2) << 6) | u32::from(p.b >> 2);
+    let mut add = |c: Rgb8, count: u64| {
+        let key = (u32::from(c.r >> 2) << 12) | (u32::from(c.g >> 2) << 6) | u32::from(c.b >> 2);
         let bin = bins.entry(key).or_default();
-        bin.0 += 1;
-        bin.1[0] += u64::from(p.r);
-        bin.1[1] += u64::from(p.g);
-        bin.1[2] += u64::from(p.b);
+        bin.0 += count;
+        bin.1[0] += count * u64::from(c.r);
+        bin.1[1] += count * u64::from(c.g);
+        bin.1[2] += count * u64::from(c.b);
+    };
+    for &(c, count) in extra {
+        add(c, count);
+    }
+    for &p in img.pixels() {
+        if !is_transparent(p) {
+            add(rgb(p), 1);
+        }
     }
     let mut keys: Vec<u32> = bins.keys().copied().collect();
     keys.sort_unstable();
@@ -390,7 +518,7 @@ fn kmeans(items: &[Item], mut centres: Vec<[f64; 3]>) -> (Vec<[f64; 3]>, Vec<f64
     (centres, weights)
 }
 
-fn map_nearest(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<u8> {
+fn map_nearest(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8]) -> Vec<u8> {
     let mut cache: HashMap<Rgb8, u8> = HashMap::new();
     img.pixels()
         .iter()
@@ -400,13 +528,72 @@ fn map_nearest(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<u8> {
             }
             *cache
                 .entry(rgb(p))
-                .or_insert_with(|| (nearest(pal, to_f(rgb(p))) + offset) as u8)
+                .or_insert_with(|| ids[nearest(pal, to_f(rgb(p)))])
+        })
+        .collect()
+}
+
+/// How far the ordered dither moves a pixel: the mean distance (plain RGB) from each palette
+/// colour to its nearest different one, so the pattern spans about one step between
+/// neighbouring colours whatever the palette (0 for a palette of one colour).
+fn ordered_spread(pal: &[[f64; 3]]) -> f64 {
+    let mut distinct: Vec<[f64; 3]> = Vec::new();
+    for &c in pal {
+        if !distinct.contains(&c) {
+            distinct.push(c);
+        }
+    }
+    if distinct.len() < 2 {
+        return 0.0;
+    }
+    let plain = |a: [f64; 3], b: [f64; 3]| -> f64 {
+        (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
+    };
+    let total: f64 = distinct
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            distinct
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, &b)| plain(a, b))
+                .fold(f64::INFINITY, f64::min)
+        })
+        .sum();
+    total / distinct.len() as f64
+}
+
+/// Ordered dither with the 4×4 Bayer matrix: each opaque pixel is moved by
+/// `((threshold + ½) / 16 − ½) · spread` on all three channels ([`ordered_spread`]), then
+/// mapped to the nearest colour. The pattern depends on the pixel position only, so it is
+/// deterministic and flat areas get a regular texture. Transparent pixels become 0.
+fn map_ordered(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8]) -> Vec<u8> {
+    let spread = ordered_spread(pal);
+    let w = (img.width() as usize).max(1);
+    // The same colour on the same matrix cell always gives the same colour.
+    let mut cache: HashMap<(Rgb8, u8), u8> = HashMap::new();
+    img.pixels()
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            if is_transparent(p) {
+                return 0;
+            }
+            let (x, y) = (i % w, i / w);
+            let t = BAYER4[y % 4][x % 4];
+            *cache.entry((rgb(p), t)).or_insert_with(|| {
+                let shift = ((f64::from(t) + 0.5) / 16.0 - 0.5) * spread;
+                let src = to_f(rgb(p));
+                let want = src.map(|v| (v + shift).clamp(0.0, 255.0));
+                ids[nearest(pal, want)]
+            })
         })
         .collect()
 }
 
 /// Serpentine Floyd–Steinberg. Transparent pixels neither take nor pass on error.
-fn map_floyd_steinberg(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<u8> {
+fn map_floyd_steinberg(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8]) -> Vec<u8> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = vec![0u8; w * h];
     // One spare column on each side, so neighbours never need bounds checks.
@@ -428,7 +615,7 @@ fn map_floyd_steinberg(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<
                 (src[2] + e[2]).clamp(0.0, 255.0),
             ];
             let k = nearest(pal, want);
-            out[y * w + x] = (k + offset) as u8;
+            out[y * w + x] = ids[k];
             let err = [
                 want[0] - pal[k][0],
                 want[1] - pal[k][1],
