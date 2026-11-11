@@ -1817,16 +1817,19 @@ impl PainterApp {
         }
     }
 
-    /// The screen as shown: the page (normal or split for Magnify), the interface, the
-    /// toolbox toggles that are on and the text cursor.
+    /// The screen as shown: the page (normal or split for Magnify) with the text cursor, the
+    /// interface over them (the tooltip last, ADR-41) and the toolbox toggles that are on.
     pub(crate) fn compose_screen(&self) -> IndexedImage {
         let view = self.view();
         let palette = self.palette();
         let pens = Pens::from_palette(palette);
-        let mut screen = match self.magnify_layout(view) {
-            None => view.compose(self.page(), self.scroll, palette, &self.ui),
+        let (w, h) = (view.screen_w, view.screen_h);
+        let magnify = self.magnify_layout(view);
+        let mut shown = match magnify {
+            None => self
+                .page()
+                .crop(Rect::new(self.scroll.0, self.scroll.1, w, h)),
             Some(m) => {
-                let (w, h) = (view.screen_w, view.screen_h);
                 let mut shown = IndexedImage::new(w as u32, h as u32, pens.dark);
                 shown.blit(
                     &self
@@ -1840,10 +1843,30 @@ impl PainterApp {
                 shown.fill_rect(m.start - view.ux, 0, view.ux, h, pens.dark);
                 let big = raster::magnified(self.page(), m.source, m.zoom, pens.dark);
                 shown.blit(&big.crop(Rect::new(0, 0, m.end - m.start, h)), m.start, 0);
-                view.ui_screen()
-                    .render_scaled(&shown, palette, &self.ui, view.ux, view.uy)
+                shown
             }
         };
+        // The text cursor belongs to the page, like the text it follows: the interface lies
+        // over it (toolbox, menus, requesters and the tooltip, ADR-41).
+        if let Some(Stroke {
+            kind: Kind::Text { at, lines },
+            ink: Ink { color, .. },
+            ..
+        }) = &self.stroke
+        {
+            let last = lines.last().map_or("", String::as_str);
+            let x = at.0 + Font::builtin().text_width(last) + 1;
+            let y = at.1 + (lines.len() as i32 - 1) * TEXT_LINE;
+            // Normal view only; in the magnified half the typed text itself shows.
+            let (sx, sy) = (x - self.scroll.0, y - self.scroll.1);
+            let limit = magnify.map_or(w, |m| m.split);
+            if (0..limit).contains(&sx) {
+                shown.fill_rect(sx, sy, 1, font::GLYPH_H, *color);
+            }
+        }
+        let mut screen = view
+            .ui_screen()
+            .render_scaled(&shown, palette, &self.ui, view.ux, view.uy);
         if self.ui.toolbox_visible {
             let x0 = view.ui_screen().toolbox_x();
             let on = [
@@ -1864,22 +1887,6 @@ impl PainterApp {
                     view.ux,
                     view.uy,
                 );
-            }
-        }
-        if let Some(Stroke {
-            kind: Kind::Text { at, lines },
-            ink: Ink { color, .. },
-            ..
-        }) = &self.stroke
-        {
-            let last = lines.last().map_or("", String::as_str);
-            let x = at.0 + Font::builtin().text_width(last) + 1;
-            let y = at.1 + (lines.len() as i32 - 1) * TEXT_LINE;
-            // Normal view only; in the magnified half the typed text itself shows.
-            let (sx, sy) = (x - self.scroll.0, y - self.scroll.1);
-            let limit = self.magnify_layout(view).map_or(view.screen_w, |m| m.split);
-            if (0..limit).contains(&sx) {
-                screen.fill_rect(sx, sy, 1, font::GLYPH_H, *color);
             }
         }
         screen

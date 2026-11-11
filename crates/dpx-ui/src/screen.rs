@@ -2,7 +2,7 @@
 //! buffer in Amiga screen pixels. Geometry is measured from LoRes reference screenshots;
 //! see `docs/design/AMIGA_GUI_FIDELITY.md`.
 
-use dpx_core::{IndexedImage, Palette};
+use dpx_core::{IndexedImage, Palette, Rect};
 
 use crate::choice_requester::ChoiceRequester;
 use crate::file_requester::FileRequester;
@@ -131,6 +131,9 @@ pub struct UiState {
     /// Anim ▸ Method: Expanded (else Compressed, DeluxePaint's default). Only a check mark:
     /// it describes DeluxePaint's memory use and changes nothing here.
     pub anim_expanded: bool,
+    /// The tooltip naming the toolbox button or Control Panel button under the resting
+    /// pointer (ADR-41, a DeluxePainter addition); drawn over everything else.
+    pub tooltip: Option<crate::tooltip::Tooltip>,
 }
 
 impl UiState {
@@ -185,6 +188,7 @@ impl Default for UiState {
             anim_panel: None,
             anim_control: None,
             anim_expanded: false,
+            tooltip: None,
         }
     }
 }
@@ -263,6 +267,21 @@ impl Screen {
 
     pub fn toolbox_x(&self) -> i32 {
         self.width - geom::TOOLBOX_W
+    }
+
+    /// The button of `tool` in the toolbox (where `draw_toolbox` draws it).
+    pub fn tool_button(&self, tool: Tool) -> Rect {
+        let (row, col) = TOOL_ROWS
+            .iter()
+            .enumerate()
+            .find_map(|(r, pair)| pair.iter().position(|&t| t == tool).map(|c| (r, c)))
+            .expect("every tool has a button");
+        Rect::new(
+            self.toolbox_x() + col as i32 * geom::PITCH,
+            geom::TOOLS_Y + row as i32 * geom::PITCH,
+            geom::BUTTON,
+            geom::BUTTON,
+        )
     }
 
     /// Composes the full screen. `page` is the visible part of the page, at the screen's
@@ -362,6 +381,10 @@ impl Screen {
         }
         if let Some(req) = &ui.anim_control {
             req.draw(img, pens);
+        }
+        // ADR-41: last, over everything (the app shows none while a requester is open).
+        if let Some(tip) = &ui.tooltip {
+            tip.draw(img, pens, self.width, self.height, ui);
         }
     }
 

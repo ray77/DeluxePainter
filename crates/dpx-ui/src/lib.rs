@@ -28,6 +28,7 @@ pub mod show_page;
 pub mod stencil_requester;
 pub mod tool_requesters;
 pub mod toolbox;
+pub mod tooltip;
 pub(crate) mod widgets;
 
 use dpx_core::{IndexedImage, Palette};
@@ -59,6 +60,7 @@ pub use tool_requesters::{
     TranslucencyRequester,
 };
 pub use toolbox::Tool;
+pub use tooltip::{KeyMode, Tooltip, TooltipTarget};
 
 /// Converts an indexed screen to RGBA8, scaling each pixel by `sx`×`sy` (integer factors).
 pub fn to_rgba(img: &IndexedImage, palette: &Palette, sx: usize, sy: usize) -> Vec<u8> {
