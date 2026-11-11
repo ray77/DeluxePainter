@@ -217,13 +217,10 @@ impl PainterApp {
     }
 
     /// Move ▸ Draw or Trails: one undoable command; the requester closes and keeps the
-    /// settings, or stays open with the reason when the document refuses it.
+    /// settings, or stays open with the reason when the document refuses it (the settings
+    /// from before stay, so Cancel still restores them, AGA p.255).
     fn draw_move(&mut self, path: MovePath) {
         self.finish_stroke();
-        self.anim_control.settings = Some(MovePath {
-            trails: false,
-            ..path
-        });
         let doc = self.engine.document();
         let start = self.move_start();
         let end = anim_move::plan(&path, start, doc.frame_count(), doc.current_frame()).end;
@@ -231,6 +228,10 @@ impl PainterApp {
             Ok(_) => {
                 self.ui.anim_control = None;
                 self.anim_control.moved_to = Some(end.pixel());
+                self.anim_control.settings = Some(MovePath {
+                    trails: false,
+                    ..path
+                });
             }
             Err(e) => {
                 eprintln!("{e}");

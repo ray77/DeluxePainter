@@ -14,6 +14,8 @@
 //! positive Y angle turns its right side away. The projection looks from [`EYE`] pixels in
 //! front of the screen at the centre of the page.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::brush_ops;
@@ -466,15 +468,17 @@ fn invert(m: &Matrix) -> Option<Matrix> {
 
 /// The brush `b` as it shows in `pose` (perspective, nearest neighbour), cut to the page
 /// rectangle `clip`: a brush whose handle is its top-left pixel, to be stamped at the
-/// returned page position. Pixels outside the brush get the brush's transparent colour (or
-/// an unused one, [`brush_ops::fill_colour`]). `None` when nothing of it shows (off the
-/// page, behind the viewer or seen edge-on).
+/// returned page position. Pixels outside the brush get `fill`, which becomes the result's
+/// transparent colour: the brush's own transparent colour, or one it does not use
+/// ([`brush_ops::fill_colour`]; the caller works it out once per move, as it reads the whole
+/// brush). `None` when nothing of it shows (off the page, behind the viewer or seen
+/// edge-on).
 pub fn project(
     b: &BrushImage,
     pose: &Pose,
     centre: (f64, f64),
     clip: Rect,
-    colors: usize,
+    fill: u8,
 ) -> Option<(BrushImage, (i32, i32))> {
     let area = cover((b.width, b.height), b.handle, pose, centre, clip);
     if area.is_empty() {
@@ -499,7 +503,6 @@ pub fn project(
         [a[2], bv[2], EYE + p[2]],
     ];
     let inv = invert(&h)?;
-    let fill = brush_ops::fill_colour(b, colors);
     let (w, hgt) = (area.w as u32, area.h as u32);
     let mut pixels = vec![fill; w as usize * hgt as usize];
     let (hx, hy) = (f64::from(b.handle.0), f64::from(b.handle.1));
@@ -568,11 +571,38 @@ pub fn draw_outline(img: &mut IndexedImage, corners: &[(f64, f64); 4], color: u8
 
 /// The brush a MoveBrush command paints, as a custom brush: its `custom` brush, else its
 /// built-in `brush` in `color`.
-fn source(custom: Option<&BrushImage>, brush: &[(i32, i32)], color: u8) -> Option<BrushImage> {
+fn source<'a>(
+    custom: Option<&'a BrushImage>,
+    brush: &[(i32, i32)],
+    color: u8,
+) -> Option<Cow<'a, BrushImage>> {
     match custom {
-        Some(b) => Some(b.clone()),
-        None => brush_of_offsets(brush, color),
+        Some(b) => Some(Cow::Borrowed(b)),
+        None => brush_of_offsets(brush, color).map(Cow::Owned),
     }
+}
+
+/// Whether painting in `mode` with `fx` reads the page as it was before the stamp
+/// (`PaintContext::before`): every mode but plain Matte, Color and Replace, and Smear, which
+/// reads the page itself ([`raster::Pen::stamp`]). [`paint::plot_fx`] reads it at the
+/// painted pixel only, Smooth also at the eight around it.
+fn reads_before(mode: DrawMode, fx: &PaintFx) -> bool {
+    match mode {
+        DrawMode::Matte | DrawMode::Color | DrawMode::Replace => !fx.is_off(),
+        DrawMode::Smear => false,
+        DrawMode::Shade
+        | DrawMode::Cycle
+        | DrawMode::Blend
+        | DrawMode::Mix
+        | DrawMode::Smooth
+        | DrawMode::HBrite => true,
+    }
+}
+
+/// The page pixels a stamp at `at` of a `w`×`h` projected brush may read in `before`: its
+/// rectangle and one pixel around it (Smooth's neighbourhood).
+fn reach(at: (i32, i32), (w, h): (u32, u32)) -> Rect {
+    Rect::new(at.0 - 1, at.1 - 1, w as i32 + 2, h as i32 + 2)
 }
 
 /// The page centre the projection looks at.
@@ -688,8 +718,12 @@ pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError
     Ok(())
 }
 
-/// Work units of a move (see [`MAX_PAINT_WORK`]): per painted stamp (Trails repeat them) the
-/// page pixels its projection covers, once to project and once per pixel painted.
+/// Work units of a move (see [`MAX_PAINT_WORK`]): one per brush pixel (the brush is read
+/// once for the colour around the projected brush), then per painted stamp (Trails repeat
+/// them) one, plus the page pixels its projection covers, once to project and
+/// [`paint::pixel_work`] per pixel painted, plus in the modes that read the page before the
+/// stamp the pixels of its [`reach`] (copied for it). Nothing per stamp depends on the page
+/// or brush size beyond what the stamp covers.
 fn work(f: &Fields, doc: &Document) -> u64 {
     let page = doc.page();
     let Some(b) = source(f.custom, f.brush, f.color) else {
@@ -698,6 +732,7 @@ fn work(f: &Fields, doc: &Document) -> u64 {
     let plan = plan(f.path, f.start, doc.frame_count(), doc.current_frame());
     let centre = centre_of(page);
     let per_pixel = 1 + paint::pixel_work(f.mode, &f.fx, doc.palette().len());
+    let reads = reads_before(f.mode, &f.fx);
     let areas: Vec<u64> = plan
         .stamps
         .iter()
@@ -709,10 +744,20 @@ fn work(f: &Fields, doc: &Document) -> u64 {
                 centre,
                 page.bounds(),
             );
-            (r.w.max(0) as u64) * (r.h.max(0) as u64) * per_pixel + 1
+            if r.is_empty() {
+                return 1;
+            }
+            let (w, h) = (r.w as u32, r.h as u32);
+            let snapshot = if reads {
+                let s = reach((r.x, r.y), (w, h)).intersect(page.bounds());
+                s.w as u64 * s.h as u64
+            } else {
+                0
+            };
+            u64::from(w) * u64::from(h) * per_pixel + snapshot + 1
         })
         .collect();
-    let mut total: u64 = 0;
+    let mut total = b.pixels.len() as u64;
     for i in 0..areas.len() {
         let layers = plan.layers(f.path, i);
         let sum: u64 = areas[layers].iter().sum();
@@ -733,21 +778,26 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
     };
     let plan = plan(f.path, f.start, doc.frame_count(), doc.current_frame());
     let palette: Palette = doc.palette().clone();
-    let colors = palette.len();
+    // The colour around the projected brush, once: finding it reads the whole brush.
+    let fill = brush_ops::fill_colour(&b, palette.len());
     let centre = centre_of(doc.page());
     let clip = doc.page().bounds();
-    // Modes that read the page before the stamp get a copy of it.
-    let reads_before = !(matches!(
-        f.mode,
-        DrawMode::Matte | DrawMode::Color | DrawMode::Replace
-    ) && f.fx.is_off());
-    let empty = IndexedImage::new(0, 0, 0);
+    // Modes that read the page before the stamp get it in `before`, one page-sized buffer
+    // refreshed for every stamp only where that stamp reads (its reach): the rest of it is
+    // stale and never read. With Trails a move paints about count² / 2 stamps, so a stamp
+    // must not cost the whole page.
+    let reads = reads_before(f.mode, &f.fx);
+    let mut before = if reads {
+        IndexedImage::new(clip.w as u32, clip.h as u32, 0)
+    } else {
+        IndexedImage::new(0, 0, 0)
+    };
     let mut last_handle: Option<(i32, i32)> = None;
     for (i, stamp) in plan.stamps.iter().enumerate() {
         doc.go_to(stamp.frame);
         for layer in plan.layers(f.path, i) {
             let pose = plan.stamps[layer].pose;
-            let Some((img, at)) = project(&b, &pose, centre, clip, colors) else {
+            let Some((img, at)) = project(&b, &pose, centre, clip, fill) else {
                 continue;
             };
             let handle = outline((1, 1), (0, 0), &pose, centre)
@@ -759,11 +809,9 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
             if layer == i {
                 last_handle = handle;
             }
-            let before = if reads_before {
-                doc.page.clone()
-            } else {
-                empty.clone()
-            };
+            if reads {
+                before.copy_rect_from(&doc.page, reach(at, (img.width, img.height)));
+            }
             let owned: Vec<(i32, i32)>;
             let (custom, offsets) = if f.custom.is_some() {
                 (Some(&img), &[][..])
@@ -981,7 +1029,7 @@ mod tests {
     fn projection_of_the_unmoved_brush_is_the_brush() {
         let b = brush();
         let pose = Pose::at((10, 20, 0));
-        let (img, at) = project(&b, &pose, (160.0, 128.0), Rect::new(0, 0, 320, 256), 32).unwrap();
+        let (img, at) = project(&b, &pose, (160.0, 128.0), Rect::new(0, 0, 320, 256), 0).unwrap();
         assert_eq!(at, (9, 20));
         assert_eq!((img.width, img.height), (3, 2));
         assert_eq!(img.pixels, b.pixels);
@@ -992,7 +1040,7 @@ mod tests {
             &Pose::at((0, 0, 0)),
             (160.0, 128.0),
             Rect::new(0, 0, 320, 256),
-            32,
+            0,
         )
         .unwrap();
         assert_eq!((at, img.width), ((0, 0), 2));
@@ -1004,7 +1052,7 @@ mod tests {
                 &Pose::at((-50, 0, 0)),
                 (160.0, 128.0),
                 Rect::new(0, 0, 320, 256),
-                32
+                0
             )
             .is_none()
         );
@@ -1014,7 +1062,7 @@ mod tests {
                 &Pose::at((10, 10, -400)),
                 (160.0, 128.0),
                 Rect::new(0, 0, 320, 256),
-                32
+                0
             )
             .is_none()
         );
@@ -1026,7 +1074,7 @@ mod tests {
         let clip = Rect::new(0, 0, 320, 256);
         // EYE pixels away: half size, halfway to the centre.
         let far = Pose::at((100, 128, EYE as i32));
-        let (img, at) = project(&b, &far, (160.0, 128.0), clip, 32).unwrap();
+        let (img, at) = project(&b, &far, (160.0, 128.0), clip, 0).unwrap();
         assert_eq!((img.width, img.height), (20, 20));
         assert_eq!(at, (120, 118));
         assert!(img.pixels.iter().all(|&p| p == 7));
@@ -1042,7 +1090,7 @@ mod tests {
             rot: rotation([0.0, 0.0, 90.0]),
             ..Pose::at((50, 50, 0))
         };
-        let (img, at) = project(&bar, &pose, (160.0, 128.0), clip, 32).unwrap();
+        let (img, at) = project(&bar, &pose, (160.0, 128.0), clip, 0).unwrap();
         assert_eq!((img.width, img.height, at), (1, 3, (50, 49)));
         assert_eq!(img.pixels, vec![1, 2, 3], "clockwise: left end on top");
         // Seen edge-on (its plane runs through the eye): nothing.
@@ -1050,11 +1098,124 @@ mod tests {
             rot: rotation([0.0, 90.0, 0.0]),
             ..Pose::at((50, 50, 0))
         };
-        assert!(project(&bar, &edge, (50.5, 50.5), clip, 32).is_none());
+        assert!(project(&bar, &edge, (50.5, 50.5), clip, 0).is_none());
         assert!(
-            project(&bar, &edge, (160.0, 128.0), clip, 32).is_some(),
+            project(&bar, &edge, (160.0, 128.0), clip, 0).is_some(),
             "seen at an angle"
         );
+        // Turned 45 degrees, the corners of the bounding box get the fill colour given,
+        // which is the projection's transparent colour.
+        let turned = Pose {
+            rot: rotation([0.0, 0.0, 45.0]),
+            ..Pose::at((100, 100, 0))
+        };
+        let (img, _) = project(&b, &turned, (160.0, 128.0), clip, 9).unwrap();
+        assert_eq!(img.transparent, Some(9));
+        assert_eq!(img.pixels[0], 9, "top-left corner");
+        let middle = (img.height / 2 * img.width + img.width / 2) as usize;
+        assert_eq!(img.pixels[middle], 7, "the middle");
+    }
+
+    /// One stamp of `cmd`'s brush and paint fields at `start` on the current frame, as its own
+    /// command (Count 1): it reads the whole page as it is before it.
+    fn single_stamp(cmd: &Command, start: (i32, i32, i32)) -> Command {
+        let mut one = cmd.clone();
+        if let Command::MoveBrush {
+            start: s, path: p, ..
+        } = &mut one
+        {
+            *s = start;
+            *p = MovePath {
+                record: Record::InPlace,
+                ..path(1)
+            };
+        }
+        one
+    }
+
+    /// The modes that read the page before a stamp only get the part of it each stamp of a
+    /// move can read refreshed: the result is the same as stamping every layer as a command
+    /// of its own, which reads the whole page.
+    #[test]
+    fn reading_modes_see_the_page_as_before_each_stamp() {
+        let pal = Palette::dpaint_default_32();
+        let brush = BrushImage {
+            width: 3,
+            height: 2,
+            pixels: vec![4, 0, 6, 7, 8, 9],
+            handle: (1, 1),
+            transparent: Some(0),
+        };
+        let translucent = PaintFx {
+            translucency: Some(50),
+            ..PaintFx::default()
+        };
+        let cases = [
+            (DrawMode::Smooth, PaintFx::default()),
+            (DrawMode::Shade, PaintFx::default()),
+            (DrawMode::Blend, PaintFx::default()),
+            (DrawMode::Cycle, PaintFx::default()),
+            (DrawMode::Matte, translucent),
+        ];
+        for (mode, fx) in cases {
+            // A picture to read: stripes of colours 1..=7 over 3 frames.
+            let mut e = Engine::new(Document::new(24, 12, pal.clone()));
+            e.execute(Command::SetFrameCount { count: 3 }).unwrap();
+            for f in 0..3u32 {
+                e.execute(Command::GotoFrame { frame: f }).unwrap();
+                let pixels = (0..24 * 12).map(|i| ((i % 24 + f) % 7 + 1) as u8).collect();
+                e.execute(Command::SetPage {
+                    width: 24,
+                    height: 12,
+                    pixels,
+                })
+                .unwrap();
+            }
+            e.execute(Command::GotoFrame { frame: 0 }).unwrap();
+            let original = e.document().clone();
+            let mut reference = Engine::new(original.clone());
+            // Two pixels a stamp over three frames with Trails: the stamps overlap and the
+            // later ones read what the earlier ones painted (and the page edge at x 0).
+            let mut p = path(3);
+            p.cyclic = false;
+            p.dist = [4, 0, 0];
+            p.trails = true;
+            let mut cmd = move_cmd(p, (0, 5, 0));
+            if let Command::MoveBrush {
+                custom,
+                mode: m,
+                range,
+                fx: x,
+                ..
+            } = &mut cmd
+            {
+                *custom = Some(brush.clone());
+                *m = mode;
+                *range = Some((1, 7));
+                *x = fx;
+            }
+            let plan = plan(&p, (0, 5, 0), 3, 0);
+            e.execute(cmd.clone()).unwrap();
+            for (i, stamp) in plan.stamps.iter().enumerate() {
+                if reference.document().current_frame() != stamp.frame {
+                    let frame = stamp.frame as u32;
+                    reference.execute(Command::GotoFrame { frame }).unwrap();
+                }
+                for layer in plan.layers(&p, i) {
+                    let at = plan.stamps[layer].pose.pixel();
+                    reference.execute(single_stamp(&cmd, at)).unwrap();
+                }
+            }
+            for f in 0..3 {
+                let painted = e.document().frame(f).unwrap();
+                assert_eq!(
+                    painted,
+                    reference.document().frame(f).unwrap(),
+                    "{mode:?} frame {f}"
+                );
+                assert_ne!(painted, original.frame(f).unwrap(), "{mode:?} painted");
+            }
+        }
     }
 
     #[test]
@@ -1208,5 +1369,56 @@ mod tests {
         let err = e.execute(cmd).unwrap_err();
         assert!(err.message.contains("too much work"), "{}", err.message);
         assert_eq!(e.document().revision(), 1, "nothing changed");
+    }
+
+    /// Runs `cmd` on `e` and returns how long it took.
+    fn timed(e: &mut Engine, cmd: Command) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        e.execute(cmd).unwrap();
+        t.elapsed()
+    }
+
+    /// With Trails a move paints about count² / 2 layers, so a layer may only cost what it
+    /// covers. Shade reads the page before every layer: copying the whole 4096×4096 page
+    /// for each of these 20 100 layers took about 19 s in a debug build (review of ADR-38).
+    #[test]
+    fn trails_in_a_reading_mode_do_not_copy_the_page_per_layer() {
+        let mut e = Engine::new(Document::new(4096, 4096, Palette::dpaint_default_32()));
+        e.execute(Command::SetFrameCount { count: 2 }).unwrap();
+        let mut p = path(200);
+        p.trails = true;
+        p.dist = [200, 0, 0];
+        let mut cmd = move_cmd(p, (100, 100, 0));
+        if let Command::MoveBrush { mode, range, .. } = &mut cmd {
+            *mode = DrawMode::Shade;
+            *range = Some((0, 7));
+        }
+        let took = timed(&mut e, cmd);
+        eprintln!("shade trails on 4096x4096: {took:?}");
+        // Stamp 199 (x 299) went on frame 2 (199 is odd), one Shade step above colour 0.
+        assert_eq!(e.document().frame(1).unwrap().get(299, 100), Some(1));
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// A custom brush without a transparent colour is scanned for a colour it does not use
+    /// (the one around the projected brush). Doing that for every layer of a 2048×2048 brush
+    /// that shows a few pixels wide took about 15 s for these 820 layers in a debug build.
+    #[test]
+    fn trails_with_an_opaque_brush_do_not_scan_the_brush_per_layer() {
+        let mut e = Engine::new(Document::new(320, 256, Palette::dpaint_default_32()));
+        e.execute(Command::SetFrameCount { count: 2 }).unwrap();
+        let big = BrushImage::from_image(&IndexedImage::new(2048, 2048, 3), None);
+        let mut p = path(40);
+        p.trails = true;
+        p.dist = [80, 0, 0];
+        let mut cmd = move_cmd(p, (100, 100, 200_000));
+        if let Command::MoveBrush { custom, .. } = &mut cmd {
+            *custom = Some(big);
+        }
+        let took = timed(&mut e, cmd);
+        eprintln!("opaque 2048x2048 brush trails: {took:?}");
+        let page = e.document().frame(0).unwrap();
+        assert!(page.pixels().contains(&3), "the brush shows");
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 }

@@ -3881,6 +3881,81 @@ mod tests {
     }
 
     #[test]
+    fn cancel_after_a_refused_move_brings_back_the_settings_from_before() {
+        use dpx_core::anim_move::MovePath;
+        use egui::Key::{Backspace, Enter, Escape, M, Tab};
+        let ctx = egui::Context::default();
+        let mut app = adr38_app(4);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let shift_m = || chord(M, M, egui::Modifiers::SHIFT, "M");
+        let shown = |app: &PainterApp| match &app.ui.anim_control {
+            Some(dpx_ui::AnimControlRequester::Move(r)) => r.as_ref().clone(),
+            _ => panic!("the Move requester"),
+        };
+        // A move that is drawn (Dist X 12 over the 4 frames) keeps its settings.
+        ui_pass(&mut app, &ctx, 0.1, shift_m());
+        let mut keys = tap(Backspace);
+        keys.push(egui::Event::Text("12".into()));
+        keys.extend(tap(Enter));
+        ui_pass(&mut app, &ctx, 0.2, keys);
+        assert!(app.ui.anim_control.is_none(), "drawn");
+        let kept = MovePath {
+            dist: [12, 0, 0],
+            count: 4,
+            ..MovePath::default()
+        };
+        ui_pass(&mut app, &ctx, 0.3, shift_m());
+        assert_eq!(shown(&app), dpx_ui::MoveRequester::new(&kept, 4));
+        // With a 100×100 brush, Dist Z -310 and Count 999 with Trails is refused.
+        app.custom_brush = Some(dpx_core::BrushImage::from_image(
+            &IndexedImage::new(100, 100, 3),
+            None,
+        ));
+        let mut keys = [tap(Tab), tap(Tab), tap(Backspace)].concat();
+        keys.push(egui::Event::Text("-310".into()));
+        for _ in 0..6 {
+            keys.extend(tap(Tab));
+        }
+        keys.extend(tap(Backspace));
+        keys.push(egui::Event::Text("999".into()));
+        ui_pass(&mut app, &ctx, 0.4, keys);
+        let typed = MovePath {
+            dist: [12, 0, -310],
+            count: 999,
+            ..MovePath::default()
+        };
+        let mut expected = dpx_ui::MoveRequester::new(&typed, 4);
+        for _ in 0..8 {
+            expected.handle(ReqEvent::Key(ReqKey::Tab));
+        }
+        assert_eq!(shown(&app), expected, "typed in");
+        let revision = app.engine.document().revision();
+        let screen = app.view().ui_screen();
+        let Some(req) = &app.ui.anim_control else {
+            panic!("the Move requester");
+        };
+        let (ox, oy) = req.origin(screen.width, screen.height);
+        click_ui(
+            &mut app,
+            &ctx,
+            0.5,
+            (ox + 68, oy + 114),
+            egui::PointerButton::Primary,
+        );
+        assert!(app.ui.anim_control.is_some(), "Trails refused: still open");
+        assert_eq!(app.engine.document().revision(), revision, "nothing drawn");
+        let pens = dpx_ui::Pens::from_palette(app.engine.document().palette());
+        let mut quiet = shown(&app);
+        quiet.set_message("");
+        assert_ne!(shown(&app).render(&pens), quiet.render(&pens), "the reason");
+        // Esc = Cancel. Move again shows the settings from before (AGA p.255).
+        ui_pass(&mut app, &ctx, 0.7, tap(Escape));
+        assert!(app.ui.anim_control.is_none());
+        ui_pass(&mut app, &ctx, 0.8, shift_m());
+        assert_eq!(shown(&app), dpx_ui::MoveRequester::new(&kept, 4));
+    }
+
+    #[test]
     fn the_control_panel_works_with_the_pointer_through_the_ui_loop() {
         use dpx_core::anim::PlayMode;
         use dpx_ui::PanelButton as B;
