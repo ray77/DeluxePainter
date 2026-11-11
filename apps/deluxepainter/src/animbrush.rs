@@ -16,6 +16,7 @@ use std::path::Path;
 use dpx_core::anim_brush::{self, AnimBrush};
 use dpx_core::{BrushImage, Command, Document, IndexedImage, Palette, Rect, brush_ops};
 use dpx_iff::anim::{self as iff_anim, EncodeOptions};
+use dpx_iff::ilbm::ColorRange;
 use dpx_ui::{Action, AnimBrushReq, AnimBrushRequester, FileKind, PaintMode, Tool, ToolRequester};
 use eframe::egui;
 
@@ -75,6 +76,34 @@ pub struct AnimBrushState {
     /// from, so that a second use starts from the original orientation (as ADR-30 does for
     /// one brush).
     rotate_base: Option<(Vec<BrushImage>, Vec<BrushImage>)>,
+    /// The AnimBrush file it was loaded from (Anim ▸ AnimBrush ▸ Load..): what Use Brush
+    /// Palette takes (ADR-39); `None` for a picked-up or morphed AnimBrush.
+    pub loaded: Option<LoadedAnimBrush>,
+}
+
+/// An AnimBrush as its file has it: the cels in the file's colour numbers, its palette (CMAP)
+/// and colour ranges (CRNG), and the cels made from them for the picture (fitted to its
+/// palette, AGA p.249). While the AnimBrush's cels are `fitted`, they come from the file
+/// unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedAnimBrush {
+    pub cels: Vec<BrushImage>,
+    pub palette: Palette,
+    pub ranges: Vec<ColorRange>,
+    pub fitted: Vec<BrushImage>,
+}
+
+/// An AnimBrush file read for a picture ([`decode_anim_brush`]).
+#[derive(Clone, Debug)]
+pub struct DecodedAnimBrush {
+    /// The AnimBrush for the picture (its colours fitted to the picture palette).
+    pub brush: AnimBrush,
+    /// How many colours fitting changed.
+    pub changed: usize,
+    /// The reader's notes.
+    pub notes: Vec<String>,
+    /// The file's own cels, palette and ranges.
+    pub file: LoadedAnimBrush,
 }
 
 /// An AnimBrush as an IFF ANIM (the AnimBrush files of DeluxePaint are ANIMs, sample
@@ -98,11 +127,9 @@ pub fn encode_anim_brush(brush: &AnimBrush, palette: &Palette) -> Result<Vec<u8>
 /// An AnimBrush from an IFF ANIM: one cel per frame (closing loop frames left out), handle
 /// from GRAB (else the centre), transparent colour from BMHD masking 2 or 3. Its colours are
 /// fitted to `page_palette` where the palettes differ (the picture palette stays, AGA
-/// p.249); returns how many colours changed and the reader's notes.
-pub fn decode_anim_brush(
-    bytes: &[u8],
-    page_palette: &Palette,
-) -> Result<(AnimBrush, usize, Vec<String>), String> {
+/// p.249); also how many colours changed, the reader's notes and the file's own cels,
+/// palette and ranges (for Use Brush Palette).
+pub fn decode_anim_brush(bytes: &[u8], page_palette: &Palette) -> Result<DecodedAnimBrush, String> {
     let (anim, notes) = iff_anim::read_with_notes(bytes).map_err(|e| e.summary)?;
     let frames = anim.logical_frames();
     if frames.len() < anim_brush::MIN_CELS {
@@ -133,8 +160,19 @@ pub fn decode_anim_brush(
     if brush.bytes() > anim_brush::MAX_CEL_BYTES {
         return Err("AnimBrush too big".into());
     }
-    let (brush, changed) = brush.remap(&anim.palette, page_palette);
-    Ok((brush, changed, notes))
+    let (fitted, changed) = brush.remap(&anim.palette, page_palette);
+    let file = LoadedAnimBrush {
+        cels: brush.cels,
+        palette: anim.palette,
+        ranges: anim.ranges,
+        fitted: fitted.cels.clone(),
+    };
+    Ok(DecodedAnimBrush {
+        brush: fitted,
+        changed,
+        notes,
+        file,
+    })
 }
 
 /// `--animbrush-requester KIND` for snapshots: `pick` (Pick up AnimBrush for the frames from
@@ -285,17 +323,37 @@ impl PainterApp {
         self.animbrush.in_use = true;
         self.animbrush.made_after = Some(self.picked_brush.clone());
         self.animbrush.rotate_base = None;
+        // A load sets it again after this.
+        self.animbrush.loaded = None;
         self.tools.brush_palette = Some(self.engine.document().palette().clone());
         self.ui.mode = PaintMode::Matte;
         self.dirty = true;
     }
 
     /// The changed AnimBrush stays the brush (it was in use).
-    fn replace_anim_brush(&mut self, brush: AnimBrush) {
+    pub(crate) fn replace_anim_brush(&mut self, brush: AnimBrush) {
         self.custom_brush = Some(brush.current_cel().clone());
         self.animbrush.brush = Some(brush);
         self.animbrush.in_use = true;
         self.dirty = true;
+    }
+
+    /// Use Brush Palette gave the AnimBrush's cels new colour numbers (ADR-39): they replace
+    /// its cels, it stays in use with its settings and clock, and the file it came from
+    /// counts it as unchanged (a second Use Brush Palette starts from the file again).
+    pub(crate) fn adopt_anim_brush_cels(&mut self, cels: Vec<BrushImage>) {
+        let Some(b) = &self.animbrush.brush else {
+            return;
+        };
+        let new = AnimBrush {
+            cels: cels.clone(),
+            ..b.clone()
+        };
+        if let Some(l) = &mut self.animbrush.loaded {
+            l.fitted = cels;
+        }
+        self.animbrush.rotate_base = None;
+        self.replace_anim_brush(new);
     }
 
     /// Anim ▸ AnimBrush ▸ Use (also `B` and the Brush Selector's right-click).
@@ -461,21 +519,41 @@ impl PainterApp {
 
     /// Commits a gesture's command; after an AnimBrush stroke the AnimBrush's clock moves on by
     /// its stamps and the next cel becomes the brush (the next stroke, on this frame or
-    /// another, goes on from there).
+    /// another, goes on from there). The stroke may lie under an area stencil, and it may
+    /// have gone to the Stencil ▸ Paint mask (ADR-39): it moves the AnimBrush on all the same.
     pub(crate) fn execute_painted(&mut self, cmd: Command) {
-        let stamps = match &cmd {
-            Command::AnimBrushPaint { .. } => cmd.stamps(),
+        let inner = match &cmd {
+            Command::Stenciled { command, .. } => &**command,
+            c => c,
+        };
+        let stamps = match inner {
+            Command::AnimBrushPaint { .. } => inner.stamps(),
             _ => 0,
         };
         let in_use = self.anim_brush_in_use();
-        let revision = self.engine.document().revision();
+        let revisions = |app: &Self| {
+            (
+                app.engine.document().revision(),
+                app.stencil_mask_revision(),
+            )
+        };
+        let before = revisions(self);
         self.execute(cmd);
-        if stamps > 0 && in_use && self.engine.document().revision() != revision {
-            if let Some(b) = &mut self.animbrush.brush {
-                b.advance(stamps);
-            }
-            self.use_anim_brush();
+        if stamps > 0 && in_use && revisions(self) != before {
+            self.advance_anim_brush(stamps);
         }
+    }
+
+    /// The AnimBrush in use moves on by `stamps` stamps: its next cel becomes the brush (also
+    /// after a perspective stamp, ADR-37).
+    pub(crate) fn advance_anim_brush(&mut self, stamps: u64) {
+        if !self.anim_brush_in_use() {
+            return;
+        }
+        if let Some(b) = &mut self.animbrush.brush {
+            b.advance(stamps);
+        }
+        self.use_anim_brush();
     }
 
     /// Anim ▸ AnimBrush ▸ Pick up..: the Brush Selector picks up an AnimBrush next. One
@@ -646,8 +724,10 @@ impl PainterApp {
                     // Keep the menu flags current for the check (Alt+n may come first).
                     self.ui.has_brush = self.custom_brush.is_some();
                     self.ui.has_spare_brush = self.tools.spare_brush.is_some();
+                    // Shortcut keys keep Stencil ▸ Paint on (ADR-39): the brush changes, the
+                    // mask stays.
                     if Action::Command(id).enabled(&self.ui.menu_context()) {
-                        self.run_action(Action::Command(id), ctx);
+                        self.dispatch_action(Action::Command(id), ctx);
                     }
                     if self.modal_open() {
                         break;
@@ -673,9 +753,15 @@ impl PainterApp {
             .map_err(|e| e.to_string())
             .and_then(|b| decode_anim_brush(&b, &palette));
         match result {
-            Ok((brush, changed, mut notes)) => {
+            Ok(DecodedAnimBrush {
+                brush,
+                changed,
+                mut notes,
+                file,
+            }) => {
                 self.ui.file_requester = None;
                 self.set_new_anim_brush(brush);
+                self.animbrush.loaded = Some(file);
                 notes
                     .iter()
                     .for_each(|n| eprintln!("{}: {n}", path.display()));
@@ -1398,15 +1484,19 @@ mod tests {
         };
         let b = AnimBrush::new(vec![cel(1), cel(2), cel(3)]);
         let bytes = encode_anim_brush(&b, &pal).unwrap();
-        let (same, changed, _) = decode_anim_brush(&bytes, &pal).unwrap();
-        assert_eq!((same.cels, changed), (b.cels.clone(), 0));
+        let same = decode_anim_brush(&bytes, &pal).unwrap();
+        assert_eq!((same.brush.cels, same.changed), (b.cels.clone(), 0));
         // The page palette has colour 1 at index 7 instead: the cels follow.
         let mut colors = pal.colors().to_vec();
         colors.swap(1, 7);
         let page = Palette::new(colors).unwrap();
-        let (fitted, changed, _) = decode_anim_brush(&bytes, &page).unwrap();
-        assert!(changed > 0);
-        assert_eq!(fitted.cels[0].pixels, vec![7, 0, 0, 7]);
+        let fitted = decode_anim_brush(&bytes, &page).unwrap();
+        assert!(fitted.changed > 0);
+        assert_eq!(fitted.brush.cels[0].pixels, vec![7, 0, 0, 7]);
+        // The file's own numbers and palette stay for Use Brush Palette (ADR-39).
+        assert_eq!(fitted.file.cels, b.cels);
+        assert_eq!(fitted.file.palette, pal);
+        assert_eq!(fitted.file.fitted, fitted.brush.cels);
     }
 
     /// A morphed AnimBrush stamped click by click along two rows of the page, through the real
@@ -1812,5 +1902,398 @@ mod tests {
         assert_eq!(suggested_cels(20, 19), 20, "on the last frame: all");
         assert_eq!(morph_cels(1), DEFAULT_MORPH_CELS);
         assert_eq!(morph_cels(12), 12);
+    }
+
+    // ---- Interactions with Stencil ▸ Paint, area stencils and Perspective (review of the
+    // wave-7 merge).
+
+    const CTRL: egui::Modifiers = egui::Modifiers::CTRL;
+
+    /// The screen as the next upload composes it (the views of ADR-28, -37 and -39).
+    fn composed(app: &mut PainterApp) -> IndexedImage {
+        app.prepare_perspective_view();
+        app.prepare_anim_view();
+        app.prepare_stencil_view();
+        let screen = app.compose_screen();
+        app.anim.shown = None;
+        app.perspective.shown = None;
+        screen
+    }
+
+    /// The Stencil ▸ Paint mask.
+    fn mask(app: &PainterApp) -> dpx_core::AreaStencil {
+        let p = app.menu_data.palette_stencil.painting.as_ref();
+        dpx_core::AreaStencil::from_image(p.expect("Stencil Paint").engine.document().page())
+    }
+
+    /// Three cels: a dot, a bar three pixels wide (handle in its middle), a dot.
+    fn dot_bar_dot() -> AnimBrush {
+        let bar = BrushImage {
+            width: 3,
+            height: 1,
+            pixels: vec![5; 3],
+            handle: (1, 0),
+            transparent: Some(0),
+        };
+        AnimBrush::new(vec![solid(1, 1, 4), bar, solid(1, 1, 6)])
+    }
+
+    #[test]
+    fn stencil_paint_with_an_animbrush_paints_the_mask_in_its_cels_shapes() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.run(Command::Clear { color: 3 });
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        pass(&mut app, &ctx, 0.1, vec![text("s")], NONE);
+        app.set_new_anim_brush(dot_bar_dot());
+        let revision = app.engine.document().revision();
+        pass(&mut app, &ctx, 0.2, key(egui::Key::S, CTRL), CTRL);
+        assert!(app.stencil_painting());
+        // A dotted stroke of two stamps: the dot at (40, 40), the bar at (49..=51, 40).
+        let (a, b) = (page_pos(&app, (40, 40)), page_pos(&app, (50, 40)));
+        pass(
+            &mut app,
+            &ctx,
+            0.3,
+            vec![egui::Event::PointerMoved(a)],
+            NONE,
+        );
+        pass(
+            &mut app,
+            &ctx,
+            0.32,
+            vec![button(a, Primary, true, NONE)],
+            NONE,
+        );
+        pass(
+            &mut app,
+            &ctx,
+            0.34,
+            vec![egui::Event::PointerMoved(b)],
+            NONE,
+        );
+        // While dragging, the stencil view shows the stroke in the mask at full brightness.
+        let dim = dpx_core::stencil::half_bright_table(app.palette())[3];
+        assert_ne!(dim, 3);
+        let shown = composed(&mut app);
+        let row =
+            |img: &IndexedImage| -> Vec<u8> { (38..54).map(|x| img.get(x, 40).unwrap()).collect() };
+        let (d, f) = (dim, 3);
+        assert_eq!(
+            row(&shown),
+            [d, d, f, d, d, d, d, d, d, d, d, f, f, f, d, d],
+            "the cels' shapes, previewed in the mask"
+        );
+        pass(
+            &mut app,
+            &ctx,
+            0.36,
+            vec![button(b, Primary, false, NONE)],
+            NONE,
+        );
+        // The picture never changed; the mask holds the dot and the bar.
+        assert_eq!(app.engine.document().revision(), revision);
+        assert_eq!(app.engine.document().page().get(50, 40), Some(3));
+        let m = mask(&app);
+        assert!(m.protects(40, 40) && m.protects(49, 40) && m.protects(51, 40));
+        assert!(!m.protects(41, 40) && !m.protects(52, 40));
+        // The AnimBrush went on by its two stamps, as after any stroke.
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().current(), 2);
+        assert!(app.anim_brush_in_use());
+        // The right button frees in the shape of the cel it stamps (the third, a dot).
+        let c = page_pos(&app, (50, 40));
+        pass(
+            &mut app,
+            &ctx,
+            0.4,
+            vec![button(c, Secondary, true, NONE)],
+            NONE,
+        );
+        pass(
+            &mut app,
+            &ctx,
+            0.42,
+            vec![button(c, Secondary, false, NONE)],
+            NONE,
+        );
+        let m = mask(&app);
+        assert!(!m.protects(50, 40) && m.protects(49, 40) && m.protects(51, 40));
+        // `u` takes back that mask stroke, not anything in the picture.
+        pass(&mut app, &ctx, 0.5, key(egui::Key::U, NONE), NONE);
+        assert!(mask(&app).protects(50, 40));
+        assert_eq!(app.engine.document().revision(), revision);
+    }
+
+    #[test]
+    fn an_animbrush_under_an_area_stencil_previews_and_goes_on_cel_by_cel() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        pass(&mut app, &ctx, 0.1, vec![text("s")], NONE);
+        app.set_new_anim_brush(dots(3));
+        // An area stencil on this frame, away from the strokes (as Lock FG makes one).
+        let mut bits = vec![false; 320 * 256];
+        bits[10 * 320 + 10] = true;
+        app.menu_data.palette_stencil.area = Some(crate::palette_stencil::Area {
+            stencil: dpx_core::AreaStencil::from_mask(320, 256, bits).unwrap(),
+            frame: 0,
+            on: true,
+        });
+        let mut t = 0.2;
+        for (i, x) in [40, 50, 60, 70].into_iter().enumerate() {
+            let p = page_pos(&app, (x, 40));
+            pass(&mut app, &ctx, t, vec![egui::Event::PointerMoved(p)], NONE);
+            pass(
+                &mut app,
+                &ctx,
+                t + 0.02,
+                vec![button(p, Primary, true, NONE)],
+                NONE,
+            );
+            let want = i as u8 % 3 + 1;
+            assert_eq!(app.page().get(x, 40), Some(want), "previewed, click {i}");
+            pass(
+                &mut app,
+                &ctx,
+                t + 0.04,
+                vec![button(p, Primary, false, NONE)],
+                NONE,
+            );
+            let page = app.engine.document().page();
+            assert_eq!(page.get(x, 40), Some(want), "painted, click {i}");
+            t += 0.1;
+        }
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().current(), 1);
+        // A Line's rubber band shows while it is dragged.
+        app.select_tool(Tool::Line, false);
+        let (a, b) = (page_pos(&app, (100, 100)), page_pos(&app, (110, 100)));
+        pass(&mut app, &ctx, t, vec![egui::Event::PointerMoved(a)], NONE);
+        pass(
+            &mut app,
+            &ctx,
+            t + 0.02,
+            vec![button(a, Primary, true, NONE)],
+            NONE,
+        );
+        pass(
+            &mut app,
+            &ctx,
+            t + 0.04,
+            vec![egui::Event::PointerMoved(b)],
+            NONE,
+        );
+        let band = (100..=110).filter(|&x| app.page().get(x, 100) != Some(0));
+        assert_eq!(band.count(), 11, "the rubber band");
+        pass(
+            &mut app,
+            &ctx,
+            t + 0.06,
+            vec![button(b, Primary, false, NONE)],
+            NONE,
+        );
+        // Cel 2 first (the clock went on), then 3, 1, 2, ... along the eleven stamps.
+        let page = app.engine.document().page();
+        assert_eq!((page.get(100, 100), page.get(110, 100)), (Some(2), Some(3)));
+    }
+
+    #[test]
+    fn perspective_clicks_with_an_animbrush_go_on_cel_by_cel() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        app.set_new_anim_brush(dots(3));
+        let p = page_pos(&app, (100, 100));
+        pass(
+            &mut app,
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(p)],
+            NONE,
+        );
+        pass(&mut app, &ctx, 0.12, key(egui::Key::Enter, NONE), NONE);
+        assert!(app.perspective.active);
+        let mut t = 0.2;
+        for (i, x) in [100, 110, 120].into_iter().enumerate() {
+            let p = page_pos(&app, (x, 100));
+            pass(&mut app, &ctx, t, vec![egui::Event::PointerMoved(p)], NONE);
+            pass(
+                &mut app,
+                &ctx,
+                t + 0.02,
+                vec![button(p, Primary, true, NONE)],
+                NONE,
+            );
+            pass(
+                &mut app,
+                &ctx,
+                t + 0.04,
+                vec![button(p, Primary, false, NONE)],
+                NONE,
+            );
+            let page = app.engine.document().page();
+            assert_eq!(page.get(x, 100), Some(i as u8 + 1), "stamp {i}");
+            t += 0.1;
+        }
+        assert!(app.perspective.active, "the cels change, the mode stays");
+        assert!(app.anim_brush_in_use());
+        // FillScreen (`-`) paints one cel and goes on by one too.
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().current(), 0);
+        pass(
+            &mut app,
+            &ctx,
+            t,
+            with(key(egui::Key::Minus, NONE), text("-")),
+            NONE,
+        );
+        assert_eq!(app.engine.document().page().get(0, 0), Some(1));
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().current(), 1);
+    }
+
+    #[test]
+    fn alt_n_alt_b_and_alt_m_keep_stencil_paint_on() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        app.custom_brush = Some(solid(3, 3, 1));
+        app.picked_brush = app.custom_brush.clone();
+        pass(&mut app, &ctx, 0.1, key(egui::Key::S, CTRL), CTRL);
+        assert!(app.stencil_painting());
+        // Brush->Spare and Brush<->Spare change brushes only: the mask stays being painted.
+        pass(
+            &mut app,
+            &ctx,
+            0.2,
+            with(key(egui::Key::N, ALT), text("~")),
+            ALT,
+        );
+        assert!(app.tools.spare_brush.is_some());
+        app.custom_brush = Some(solid(5, 5, 2));
+        pass(
+            &mut app,
+            &ctx,
+            0.3,
+            with(key(egui::Key::B, ALT), text("∫")),
+            ALT,
+        );
+        assert_eq!(app.custom_brush, Some(solid(3, 3, 1)), "swapped");
+        assert!(app.stencil_painting());
+        // The swapped brush paints the mask.
+        let p = page_pos(&app, (40, 40));
+        pass(
+            &mut app,
+            &ctx,
+            0.4,
+            vec![egui::Event::PointerMoved(p)],
+            NONE,
+        );
+        pass(
+            &mut app,
+            &ctx,
+            0.42,
+            vec![button(p, Primary, true, NONE)],
+            NONE,
+        );
+        pass(
+            &mut app,
+            &ctx,
+            0.44,
+            vec![button(p, Primary, false, NONE)],
+            NONE,
+        );
+        assert!(mask(&app).protects(41, 41));
+        // Metamorph's requester opens over it, and Stencil Paint is still on after Cancel.
+        pass(
+            &mut app,
+            &ctx,
+            0.5,
+            with(key(egui::Key::M, ALT), text("µ")),
+            ALT,
+        );
+        assert!(app.ui.tool_requester.is_some());
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.6,
+            vec![key_event(egui::Key::Escape, true)],
+        );
+        assert!(app.ui.tool_requester.is_none());
+        assert!(app.stencil_painting());
+    }
+
+    #[test]
+    fn use_brush_palette_takes_a_loaded_animbrushs_own_palette() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // An AnimBrush file with its own 32 colours (not the picture's) and a colour range.
+        let own = Palette::new(
+            (0..32u8)
+                .map(|i| dpx_core::Rgb8::new(i * 8, 255 - i * 8, 100))
+                .collect(),
+        )
+        .unwrap();
+        let cel = |c: u8| BrushImage {
+            width: 2,
+            height: 2,
+            pixels: vec![c, 0, 0, c + 10],
+            handle: (0, 0),
+            transparent: Some(0),
+        };
+        let file = AnimBrush::new(vec![cel(1), cel(2), cel(3)]);
+        let range = ColorRange {
+            rate: 4000,
+            flags: 1,
+            low: 11,
+            high: 13,
+        };
+        let opts = EncodeOptions {
+            loop_frames: false,
+            transparent: Some(0),
+            grab: Some((0, 0)),
+            ranges: vec![range],
+            ..EncodeOptions::default()
+        };
+        let frames: Vec<IndexedImage> = file.cels.iter().map(BrushImage::to_image).collect();
+        let bytes = iff_anim::encode(&frames, &own, &opts).unwrap();
+        let dir = temp_dir("own-palette");
+        let path = dir.join("sweep.anbr");
+        std::fs::write(&path, bytes).unwrap();
+        // A plain brush loaded before it (Brush ▸ Load..) must not get in the way.
+        let plain = solid(2, 2, 7);
+        app.menu_data.palette_stencil.loaded = Some(crate::palette_stencil::LoadedBrush {
+            brush: plain.clone(),
+            palette: Palette::dpaint_default_32(),
+            ranges: Vec::new(),
+            fitted: plain.clone(),
+        });
+        app.picked_brush = Some(plain);
+        app.menu_file_accept(FileKind::LoadAnimBrush, &path, false);
+        app.ui.note_requester = None;
+        assert!(app.anim_brush_in_use());
+        app.animbrush.brush.as_mut().unwrap().set_current(1);
+        app.use_anim_brush();
+        ui_pass(&mut app, &ctx, 0.05, vec![]);
+        // Use Brush Palette (tutorial p.165): the file's palette and range, the file's
+        // numbers in every cel, the AnimBrush still in use on the same cel.
+        let t = menu_pick(&mut app, &ctx, 0.1, "palette.use_brush");
+        ui_pass(&mut app, &ctx, t, vec![]);
+        assert_eq!(app.engine.document().palette(), &own);
+        assert_eq!(app.extras.ranges, vec![range]);
+        assert!(app.anim_brush_in_use());
+        let b = app.animbrush.brush.clone().unwrap();
+        assert_eq!(b.cels, file.cels);
+        assert_eq!(b.current(), 1);
+        assert_eq!(app.custom_brush.as_ref(), Some(&file.cels[1]));
+        // Once more changes nothing; Undo brings the picture palette back.
+        let t = menu_pick(&mut app, &ctx, t + 0.1, "palette.use_brush");
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().cels, file.cels);
+        assert_eq!(app.engine.document().palette(), &own);
+        app.undo();
+        ui_pass(&mut app, &ctx, t, vec![]);
+        assert_eq!(
+            app.engine.document().palette(),
+            &Palette::dpaint_default_32()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

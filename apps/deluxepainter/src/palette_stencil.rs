@@ -12,7 +12,7 @@
 //! the stencil strokes. Everything that changes pixels lives in `dpx_core`; this module keeps
 //! the state and wires the menu, the key and the view.
 
-use dpx_core::brush_palette::{self, Adopted};
+use dpx_core::brush_palette::{self, Adopted, AdoptedCels};
 use dpx_core::quantize::PaletteDepth;
 use dpx_core::stencil::{self, AreaStencil};
 use dpx_core::{
@@ -84,9 +84,31 @@ fn adds(cmd: &Command, fg: u8, bg: u8) -> bool {
     match cmd {
         Command::Stroke { right, .. } | Command::Shape { right, .. } => !right,
         Command::FloodFill { color, .. } => *color == fg || *color != bg,
-        Command::Stenciled { command, .. } => adds(command, fg, bg),
+        Command::Stenciled { command, .. } | Command::AnimBrushPaint { paint: command, .. } => {
+            adds(command, fg, bg)
+        }
         _ => false,
     }
+}
+
+/// Whether `cmd` changes page pixels: while Stencil ▸ Paint is on such a command never
+/// reaches the picture (the mask takes it, or nothing does).
+fn paints_page(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Stroke { .. }
+            | Command::Shape { .. }
+            | Command::AnimBrushPaint { .. }
+            | Command::FloodFill { .. }
+            | Command::Clear { .. }
+            | Command::Stenciled { .. }
+            | Command::SetPage { .. }
+            | Command::MergePage { .. }
+            | Command::Flip { .. }
+            | Command::ReplaceColor { .. }
+            | Command::SwapColors { .. }
+            | Command::MoveBrush { .. }
+    )
 }
 
 impl PainterApp {
@@ -169,6 +191,10 @@ impl PainterApp {
     /// more colours than the picture is recomputed with the picture's number. One undoable
     /// palette change (the picture keeps its colour numbers, so Color ▸ Remap can fit it).
     fn use_brush_palette(&mut self) {
+        // ADR-36: an AnimBrush in use takes its palette for all its cels.
+        if self.anim_brush_in_use() {
+            return self.use_anim_brush_palette();
+        }
         let Some(custom) = self.custom_brush.clone() else {
             return;
         };
@@ -204,31 +230,7 @@ impl PainterApp {
             brush,
             reduced,
         } = brush_palette::use_brush_palette(&own_brush, own.colors(), &current, depth);
-        let mut notes = Vec::new();
-        if reduced {
-            notes.push(format!(
-                "the brush palette has {} colours; it was recomputed with the picture's {n}",
-                own.len()
-            ));
-        }
-        if let Some(ranges) = ranges.filter(|r| !r.is_empty()) {
-            if reduced {
-                notes.push("the brush's colour ranges were not used".into());
-            } else {
-                let kept: Vec<ColorRange> = ranges
-                    .iter()
-                    .filter(|r| usize::from(r.high) < n)
-                    .copied()
-                    .collect();
-                if kept.len() < ranges.len() {
-                    notes.push(format!(
-                        "{} brush colour ranges lie beyond the picture's {n} colours",
-                        ranges.len() - kept.len()
-                    ));
-                }
-                self.extras.ranges = kept;
-            }
-        }
+        let notes = self.adopt_brush_ranges(reduced, own.len(), ranges.map(Vec::as_slice), n);
         // The brush Brush ▸ Restore gives back, in the new palette's numbers too: the loaded
         // brush in the file's numbers, a picked-up one in the pick-up palette's; their own
         // numbers where the palette was taken as it is, else the nearest new colours.
@@ -268,6 +270,93 @@ impl PainterApp {
         self.ui.note_requester = note_requester(USE_BRUSH_PALETTE, &notes);
     }
 
+    /// The notes of Use Brush Palette for a brush palette of `own_len` colours, `reduced` or
+    /// not; a brush file's `ranges` replace the picture's (inside its `n` colours) unless the
+    /// palette was recomputed.
+    fn adopt_brush_ranges(
+        &mut self,
+        reduced: bool,
+        own_len: usize,
+        ranges: Option<&[ColorRange]>,
+        n: usize,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        if reduced {
+            notes.push(format!(
+                "the brush palette has {own_len} colours; it was recomputed with the picture's {n}"
+            ));
+        }
+        if let Some(ranges) = ranges.filter(|r| !r.is_empty()) {
+            if reduced {
+                notes.push("the brush's colour ranges were not used".into());
+            } else {
+                let kept: Vec<ColorRange> = ranges
+                    .iter()
+                    .filter(|r| usize::from(r.high) < n)
+                    .copied()
+                    .collect();
+                if kept.len() < ranges.len() {
+                    notes.push(format!(
+                        "{} brush colour ranges lie beyond the picture's {n} colours",
+                        ranges.len() - kept.len()
+                    ));
+                }
+                self.extras.ranges = kept;
+            }
+        }
+        notes
+    }
+
+    /// Use Brush Palette while the AnimBrush is in use (AGA p.249; the tutorial loads an
+    /// AnimBrush and chooses it, p.165): the palette of the AnimBrush file it was loaded from,
+    /// with the file's ranges, else the picture palette of the moment it was picked up or
+    /// morphed. One palette for every cel: the file's numbers where it is taken as it is,
+    /// else recomputed from all the cels, which are repainted in it. The AnimBrush stays in
+    /// use with its settings and current cel.
+    fn use_anim_brush_palette(&mut self) {
+        let Some(b) = self.animbrush.brush.clone() else {
+            return;
+        };
+        let doc = self.engine.document();
+        let current = doc.palette().clone();
+        let n = current.len();
+        let depth = depth(doc.target().chipset);
+        let meant = self
+            .tools
+            .brush_palette
+            .clone()
+            .unwrap_or_else(|| current.clone());
+        let (own_cels, own, ranges) = match &self.animbrush.loaded {
+            // As loaded: exactly the file's colour numbers.
+            Some(l) if b.cels == l.fitted => {
+                (l.cels.clone(), l.palette.clone(), Some(l.ranges.clone()))
+            }
+            // Changed since: its colours, in the file palette's nearest numbers.
+            Some(l) => (
+                b.cels
+                    .iter()
+                    .map(|c| brush_palette::fit_brush(c, &meant, l.palette.colors()))
+                    .collect(),
+                l.palette.clone(),
+                Some(l.ranges.clone()),
+            ),
+            // Picked up or morphed: the picture palette of the moment.
+            None => (b.cels.clone(), meant.clone(), None),
+        };
+        let AdoptedCels {
+            colors,
+            cels,
+            reduced,
+        } = brush_palette::use_cels_palette(&own_cels, own.colors(), &current, depth);
+        let notes = self.adopt_brush_ranges(reduced, own.len(), ranges.as_deref(), n);
+        if colors != current.colors() {
+            self.run(Command::SetPalette { colors });
+        }
+        self.adopt_anim_brush_cels(cels);
+        self.tools.brush_palette = Some(self.engine.document().palette().clone());
+        self.ui.note_requester = note_requester(USE_BRUSH_PALETTE, &notes);
+    }
+
     // ---- Recompute ------------------------------------------------------------------------
 
     /// Color ▸ Recompute: HAM pictures only (AGA p.270). Documents are never HAM yet (HAM
@@ -293,6 +382,20 @@ impl PainterApp {
                     && a.stencil.fits(doc.page())
             })
             .map(|a| &a.stencil)
+    }
+
+    /// The area stencil a move paints under, with its frame: on, of the page's size and not
+    /// being painted, on whatever frame (the move spares it on that frame only, AGA p.273).
+    pub(crate) fn move_area(&self) -> Option<dpx_core::anim_move::FrameArea> {
+        let st = self.ps();
+        let page = self.engine.document().page();
+        st.area
+            .as_ref()
+            .filter(|a| st.painting.is_none() && a.on && a.stencil.fits(page))
+            .map(|a| dpx_core::anim_move::FrameArea {
+                frame: a.frame as u32,
+                area: a.stencil.clone(),
+            })
     }
 
     /// A frame command (anim.rs sends them all here): the area stencil and Stencil ▸ Paint
@@ -477,8 +580,10 @@ impl PainterApp {
     }
 
     /// Every command on its way to the engine: while Stencil ▸ Paint is on, a painting
-    /// command paints the mask instead (`None`: nothing left for the picture); otherwise the
-    /// area stencil joins strokes, shapes, fills and CLR.
+    /// command paints the mask instead (`None`: nothing left for the picture), and one the
+    /// mask cannot take is dropped, so the picture never changes under the stencil view (its
+    /// Undo belongs to the mask meanwhile); otherwise the area stencil joins strokes, shapes,
+    /// fills and CLR.
     pub(crate) fn area_route(&mut self, command: Command) -> Option<Command> {
         let (fg, bg) = (self.ui.fg, self.ui.bg);
         if let Some(p) = &mut self.menu_data.palette_stencil.painting {
@@ -489,9 +594,28 @@ impl PainterApp {
                 self.dirty = true;
                 return None;
             }
+            if paints_page(&command) {
+                eprintln!("stencil paint: a command the stencil cannot take was not painted");
+                return None;
+            }
             return Some(command);
         }
         Some(self.with_area(command, false))
+    }
+
+    /// The revision of the Stencil ▸ Paint mask, while it is on: a stroke that went to the
+    /// mask changes it (the AnimBrush moves on after it, ADR-36).
+    pub(crate) fn stencil_mask_revision(&self) -> Option<u64> {
+        self.ps()
+            .painting
+            .as_ref()
+            .map(|p| p.engine.document().revision())
+    }
+
+    /// `command` under the active area stencil, as a gesture's command is: a preview drawn
+    /// outside the tools (the perspective brush) spares what the click will spare.
+    pub(crate) fn with_area_stencil(&self, command: Command) -> Command {
+        self.with_area(command, false)
     }
 
     /// For `run`: CLR on a fixed background (ADR-15) restores it, sparing the area stencil
@@ -603,33 +727,40 @@ impl PainterApp {
     }
 
     /// Before the screen is composed: during Stencil ▸ Paint the picture dimmed with the
-    /// mask (and the gesture in progress) at full brightness; during Show the same for the
-    /// area stencil. With the Light Table on, its picture is dimmed so; a playing animation
-    /// shows its frames as they are (the stencil belongs to one frame). Display only.
+    /// mask (and the gesture in progress, or the perspective brush where a click stamps it)
+    /// at full brightness; during Show the same for the area stencil. With the Light Table
+    /// on, its picture is dimmed so; a playing animation and the Move preview show their
+    /// frames as they are (the stencil belongs to one frame; the preview's wire frame stays).
+    /// The perspective wire frame and cross hairs are drawn on top (ADR-37). Display only.
     pub(crate) fn prepare_stencil_view(&mut self) {
-        if self.anim.playing.is_some() {
+        if self.anim.playing.is_some() || self.anim_control.preview.is_some() {
             return;
         }
-        // `prepare_anim_view` made the Light Table picture (ADR-28).
-        let light_table = self.anim.shown.is_some();
         let doc = self.engine.document();
+        // The Light Table picture, as `prepare_anim_view` decides it (ADR-28).
+        let light_table = self.anim.light_on && (doc.frame_count() > 1 || self.anim.light.spare);
         let (mut base, mask) = if let Some(p) = &self.ps().painting {
             let mut mask = p.engine.document().page().clone();
             let pal = p.engine.document().palette();
             let mut base = doc.page();
-            if let Some(s) = &self.stroke {
-                match s.preview_command() {
-                    Some(cmd) => {
-                        let add = adds(&cmd, self.ui.fg, self.ui.bg);
-                        if let Some(m) = stencil::mask_command(&cmd, add)
-                            && m.check_paint(&mask, pal).is_ok()
-                        {
-                            let before = mask.clone();
-                            m.paint(&mut mask, &before, pal);
-                        }
+            let preview = match &self.stroke {
+                Some(s) => {
+                    let cmd = s.preview_command();
+                    if cmd.is_none() {
+                        // The Brush Selector's frame: shown as the tools draw it.
+                        base = &s.preview;
                     }
-                    // The Brush Selector's frame: shown as the tools draw it.
-                    None => base = &s.preview,
+                    cmd
+                }
+                None => self.perspective_preview_stamp(),
+            };
+            if let Some(cmd) = preview {
+                let add = adds(&cmd, self.ui.fg, self.ui.bg);
+                if let Some(m) = stencil::mask_command(&cmd, add)
+                    && m.check_paint(&mask, pal).is_ok()
+                {
+                    let before = mask.clone();
+                    m.paint(&mut mask, &before, pal);
                 }
             }
             (base.clone(), AreaStencil::from_image(&mask))
@@ -652,6 +783,7 @@ impl PainterApp {
             base = crate::anim::light_table_page(doc, &base, light, spare, self.ui.bg, light.dim);
         }
         base = stencil::view(&base, &mask, doc.palette());
+        self.draw_perspective_marks(&mut base);
         self.anim.shown = Some(base);
     }
 }
@@ -1510,6 +1642,159 @@ mod tests {
         assert_eq!(app.ui.mode, dpx_ui::PaintMode::Smear);
         assert!(!app.stencil_painting(), "Stencil Paint ended");
         assert_eq!(app.active_area().map(|a| a.count()), Some(9), "kept");
+    }
+
+    // ---- Interactions with the Control Panel, Move and Stencil Paint (review of the wave-7
+    // merge).
+
+    /// One pixel protected at (`x`, `y`).
+    fn dot_stencil(x: usize, y: usize) -> AreaStencil {
+        let mut bits = vec![false; 320 * 256];
+        bits[y * 320 + x] = true;
+        AreaStencil::from_mask(320, 256, bits).unwrap()
+    }
+
+    fn panel(app: &mut PainterApp, b: dpx_ui::PanelButton) {
+        app.handle_press(Hit::AnimPanel(dpx_ui::PanelHit::Button(b)), false);
+    }
+
+    #[test]
+    fn the_control_panels_add_and_delete_move_the_stencils_with_their_picture() {
+        let ctx = egui::Context::default();
+        // The stencil on frame 2 of 3; Add on frame 1 puts a new frame 2 before its picture.
+        let mut app = frames_app(3, 1);
+        app.set_area(full_stencil());
+        app.engine.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        panel(&mut app, dpx_ui::PanelButton::Add);
+        assert_eq!(app.engine.document().frame_count(), 4);
+        assert_eq!(area_frame(&app), Some(2), "with its picture");
+        tap(&mut app, &ctx, egui::Key::U, 0.1);
+        assert_eq!(app.engine.document().frame_count(), 3);
+        assert_eq!(area_frame(&app), Some(1), "and back with Undo");
+        // Delete on the stencil's own frame: it goes with its frame and stays gone.
+        app.engine.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        panel(&mut app, dpx_ui::PanelButton::Delete);
+        assert_eq!(app.engine.document().frame_count(), 2);
+        assert!(app.ps().area.is_none());
+        tap(&mut app, &ctx, egui::Key::U, 0.2);
+        assert_eq!(app.engine.document().frame_count(), 3);
+        assert!(app.ps().area.is_none(), "not part of the history");
+        // Stencil ▸ Paint follows its frame the same way.
+        app.engine.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        app.toggle_stencil_paint();
+        app.engine.execute(Command::GotoFrame { frame: 0 }).unwrap();
+        panel(&mut app, dpx_ui::PanelButton::Add);
+        assert_eq!(app.ps().painting.as_ref().map(|p| p.frame), Some(2));
+    }
+
+    fn shift_m(pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: Some(egui::Key::M),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        }
+    }
+
+    #[test]
+    fn shift_m_ends_stencil_paint_and_the_move_spares_the_area_stencil() {
+        let ctx = egui::Context::default();
+        let mut app = frames_app(4, 0);
+        // The one-pixel built-in brush in colour 5.
+        app.custom_brush = None;
+        app.ui.fg = 5;
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        ui_pass(&mut app, &ctx, 0.1, vec![ctrl_s(true)]);
+        ui_pass(&mut app, &ctx, 0.11, vec![ctrl_s(false)]);
+        click_page(&mut app, &ctx, (40, 30), false, 0.2);
+        assert_eq!(page_px(&app, 40, 30), 0, "the click painted the stencil");
+        app.anim_control.settings = Some(dpx_core::anim_move::MovePath {
+            dist: [12, 0, 0],
+            count: 4,
+            ..Default::default()
+        });
+        // `M` opens Move as its menu item does: Stencil Paint ends, its mask is the stencil.
+        ui_pass(&mut app, &ctx, 0.3, vec![shift_m(true)]);
+        ui_pass(&mut app, &ctx, 0.31, vec![shift_m(false)]);
+        assert!(app.ui.anim_control.is_some(), "the Move requester");
+        assert!(!app.stencil_painting());
+        assert!(app.active_area().is_some_and(|a| a.protects(40, 30)));
+        // Return draws from the click, one stamp per frame; the stamp on the stencil's own
+        // frame is spared, the others are not (the stencil belongs to frame 1).
+        tap(&mut app, &ctx, egui::Key::Enter, 0.4);
+        assert!(app.ui.anim_control.is_none(), "drawn");
+        let at = |app: &PainterApp, f: usize, x: i32| app.engine.document().frame(f)?.get(x, 30);
+        assert_eq!(at(&app, 0, 40), Some(0), "spared");
+        for (f, x) in [(1, 43), (2, 46), (3, 49)] {
+            assert_eq!(at(&app, f, x), Some(5), "frame {}", f + 1);
+        }
+        // `u` takes the whole move back (the history belongs to the picture again).
+        tap(&mut app, &ctx, egui::Key::U, 0.5);
+        for (f, x) in [(1, 43), (2, 46), (3, 49)] {
+            assert_eq!(at(&app, f, x), Some(0), "frame {}", f + 1);
+        }
+    }
+
+    #[test]
+    fn move_paints_nothing_while_stencil_show_is_on() {
+        let ctx = egui::Context::default();
+        let mut app = frames_app(2, 0);
+        app.custom_brush = None;
+        app.set_area(dot_stencil(5, 5));
+        act(&mut app, "stencil.show");
+        assert!(app.menu_data.effects.stencil_show);
+        app.note_click(40, 30);
+        let revision = app.engine.document().revision();
+        app.run_action(Action::Command("anim.move"), &ctx);
+        app.anim_control_event(ReqEvent::Key(ReqKey::Enter), 0.0);
+        assert!(app.ui.anim_control.is_some(), "open, with the reason");
+        assert_eq!(app.engine.document().revision(), revision);
+    }
+
+    #[test]
+    fn the_move_preview_keeps_its_wire_frame_under_stencil_show() {
+        let ctx = egui::Context::default();
+        let mut app = frames_app(3, 0);
+        app.custom_brush = None;
+        app.ui.fg = 2;
+        app.set_area(dot_stencil(5, 5));
+        act(&mut app, "stencil.show");
+        app.note_click(100, 100);
+        app.run_action(Action::Command("anim.move"), &ctx);
+        // Preview at (6, 112) plays the wire frame of the one-pixel brush at (100, 100).
+        app.anim_control_event(ReqEvent::Press(8, 114), 5.0);
+        app.anim_control_event(ReqEvent::Release, 5.0);
+        assert!(app.anim_control.preview.is_some());
+        app.prepare_anim_view();
+        app.prepare_stencil_view();
+        let shown = app.anim.shown.take().expect("the preview frame");
+        assert_eq!(shown.get(100, 100), Some(2), "the wire frame stays");
+        assert_eq!(app.ui.frame_counter, Some((1, 3)));
+    }
+
+    #[test]
+    fn nothing_the_mask_cannot_take_reaches_the_picture_during_stencil_paint() {
+        let mut app = PainterApp::new();
+        act(&mut app, "stencil.paint");
+        let revision = app.engine.document().revision();
+        // A painting command the mask has no form for (here a page under an area stencil)
+        // is dropped: the picture's Undo is not reachable meanwhile.
+        let page = app.engine.document().page().clone();
+        app.execute(Command::Stenciled {
+            area: AreaStencil::free(&page),
+            command: Box::new(Command::SetPage {
+                width: 320,
+                height: 256,
+                pixels: vec![7; 320 * 256],
+            }),
+        });
+        assert_eq!(app.engine.document().revision(), revision);
+        assert_eq!(page_px(&app, 0, 0), 0);
+        // Commands that do not paint still reach the document.
+        app.execute(Command::SetFrameRate { fps: 10 });
+        assert_eq!(app.engine.document().fps(), 10);
     }
 
     #[test]

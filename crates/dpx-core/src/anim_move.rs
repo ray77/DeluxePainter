@@ -12,7 +12,9 @@
 //! upwards, as in DeluxePaint, so it is negated here. Rotations are in degrees: a positive Z
 //! angle turns the brush clockwise on screen, a positive X angle tilts its top away, a
 //! positive Y angle turns its right side away. The projection looks from [`EYE`] pixels in
-//! front of the screen at the centre of the page.
+//! front of the screen at the centre of the page, unless the command brings a [`MoveView`]:
+//! then the move starts turned as the brush was stamped in Effect ▸ Perspective and is seen
+//! from Perspective's centre and observer distance (ADR-37), the same projection as there.
 
 use std::borrow::Cow;
 
@@ -26,7 +28,9 @@ use crate::document::Document;
 use crate::image::{IndexedImage, Rect};
 use crate::paint::{self, BrushImage, DrawMode, PaintContext, PaintFx};
 use crate::palette::Palette;
+use crate::perspective::{Mat3, Placement, Viewer};
 use crate::raster::{self, Pen};
+use crate::stencil::AreaStencil;
 
 /// Most stamps one move may paint (the Count field).
 pub const MAX_COUNT: u32 = 999;
@@ -117,10 +121,116 @@ impl Default for MovePath {
     }
 }
 
-/// A 3×3 rotation matrix, row-major; it turns brush axes into page axes.
+/// A 3×3 rotation matrix, row-major; it turns brush axes into page axes (its columns are
+/// where the brush's own x, y and z axes point, as in [`crate::perspective::Mat3`]).
 pub type Matrix = [[f64; 3]; 3];
 
-const IDENTITY: Matrix = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+/// Not turned.
+pub const IDENTITY: Matrix = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// The area stencil a move paints under (ADR-39): stamps on `frame` (from 0) spare the
+/// pixels `area` protects; stamps on other frames do not see it, as an area stencil belongs
+/// to the picture it was made on (AGA p.273).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameArea {
+    pub frame: u32,
+    pub area: AreaStencil,
+}
+
+/// How a move starts and is seen when Effect ▸ Perspective placed the brush (ADR-37): the
+/// brush's exact position and orientation at the start, and the observer.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct MoveView {
+    /// Where the handle's centre is at the start (page x, y and depth z; Perspective places
+    /// it between pixel centres). The command's `start` must be its pixel ([`Pose::pixel`]).
+    pub at: [f64; 3],
+    /// The orientation at the start (see [`Matrix`]).
+    pub rot: Matrix,
+    /// The point on the page the observer looks at.
+    pub center: (f64, f64),
+    /// The observer's distance in front of the screen, in pixels.
+    pub distance: f64,
+}
+
+impl PartialEq for MoveView {
+    /// Bit for bit (the numbers are never NaN once validated), so commands compare exactly.
+    fn eq(&self, o: &Self) -> bool {
+        let rows = |m: &Matrix| m.map(|r| r.map(f64::to_bits));
+        self.at.map(f64::to_bits) == o.at.map(f64::to_bits)
+            && rows(&self.rot) == rows(&o.rot)
+            && self.center.0.to_bits() == o.center.0.to_bits()
+            && self.center.1.to_bits() == o.center.1.to_bits()
+            && self.distance.to_bits() == o.distance.to_bits()
+    }
+}
+
+impl Eq for MoveView {}
+
+/// Nearest and farthest observer distance a [`MoveView`] may have, in pixels.
+pub const DISTANCE_RANGE: (f64, f64) = (1.0, 1_000_000.0);
+
+/// The observer of a move: the view's, else [`EYE`] pixels in front of the page centre.
+pub fn viewer(view: Option<&MoveView>, page: &IndexedImage) -> Viewer {
+    match view {
+        Some(v) => Viewer {
+            center: v.center,
+            distance: v.distance,
+        },
+        None => Viewer {
+            center: centre_of(page),
+            distance: EYE,
+        },
+    }
+}
+
+/// Checks a [`MoveView`] of a move from `start`: finite numbers, `at` in the `start` pixel,
+/// the centre within ±[`MAX_COORD`], the distance in [`DISTANCE_RANGE`] and a rotation
+/// (orthonormal, not mirrored).
+fn check_view(v: &MoveView, start: (i32, i32, i32)) -> Result<(), CommandError> {
+    let finite = v.rot.iter().flatten().all(|c| c.is_finite())
+        && v.at.iter().all(|c| c.is_finite())
+        && v.center.0.is_finite()
+        && v.center.1.is_finite()
+        && v.distance.is_finite();
+    if !finite {
+        return Err(CommandError::invalid("view numbers must be finite".into()));
+    }
+    let max = f64::from(MAX_COORD);
+    let pixel = Pose {
+        pos: v.at,
+        rot: IDENTITY,
+    }
+    .pixel();
+    if v.at.iter().any(|c| c.abs() > max) || pixel != start {
+        return Err(CommandError::invalid(format!(
+            "view position must lie in the start pixel {start:?}"
+        )));
+    }
+    if v.center.0.abs() > max || v.center.1.abs() > max {
+        return Err(CommandError::invalid(format!(
+            "view centre must lie within ±{MAX_COORD}"
+        )));
+    }
+    let (near, far) = DISTANCE_RANGE;
+    if !(near..=far).contains(&v.distance) {
+        return Err(CommandError::invalid(format!(
+            "view distance must be {near} to {far} pixels"
+        )));
+    }
+    let m = &v.rot;
+    let t = [0, 1, 2].map(|i| [0, 1, 2].map(|j| m[j][i]));
+    let square = mul(m, &t);
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let orthonormal = (0..3).all(|i| (0..3).all(|j| (square[i][j] - IDENTITY[i][j]).abs() < 1e-6));
+    if !orthonormal || (det - 1.0).abs() > 1e-6 {
+        return Err(CommandError::invalid(
+            "view rotation must be a rotation matrix".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Where the brush is at one step of a move: the page position of the centre of its handle
 /// pixel (x, y; z = depth) and its orientation.
@@ -132,10 +242,15 @@ pub struct Pose {
 
 impl Pose {
     /// The brush as stamped at page pixel (`x`, `y`) and depth `z`, not rotated.
-    pub fn at((x, y, z): (i32, i32, i32)) -> Self {
+    pub fn at(at: (i32, i32, i32)) -> Self {
+        Self::turned(at, IDENTITY)
+    }
+
+    /// The brush as stamped at page pixel (`x`, `y`) and depth `z`, turned by `rot`.
+    pub fn turned((x, y, z): (i32, i32, i32), rot: Matrix) -> Self {
         Self {
             pos: [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z)],
-            rot: IDENTITY,
+            rot,
         }
     }
 
@@ -308,11 +423,15 @@ fn walk(
 /// - Afterwards the frame of the last stamp painted is current; Forward Go From with Cyclic
 ///   moves on to the frame after it (AGA p.140 of the tutorial).
 pub fn plan(path: &MovePath, start: (i32, i32, i32), frames: usize, current: usize) -> Plan {
+    plan_from(path, Pose::at(start), frames, current)
+}
+
+/// [`plan`] for a brush stamped in pose `origin` (turned, as Effect ▸ Perspective left it).
+pub fn plan_from(path: &MovePath, origin: Pose, frames: usize, current: usize) -> Plan {
     let count = path.count.clamp(1, MAX_COUNT);
     let n = if path.cyclic { count } else { count - 1 };
     let dist = path.dist.map(f64::from);
     let angle = path.angle.map(f64::from);
-    let origin = Pose::at(start);
     let poses = if path.come_to {
         // Walk back from the stamped brush with the move reversed, then turn the walk round.
         let neg = |v: [f64; 3]| v.map(|c| -c);
@@ -377,33 +496,33 @@ pub fn plan(path: &MovePath, start: (i32, i32, i32), frames: usize, current: usi
 }
 
 /// The page position of brush point (`u`, `v`) (pixels from the centre of the handle pixel)
-/// in `pose`, and its homogeneous weight (`EYE` + depth); `centre` = the point the viewer
-/// looks at.
-fn corner(pose: &Pose, centre: (f64, f64), u: f64, v: f64) -> ((f64, f64), f64) {
+/// in `pose`, and its homogeneous weight (observer distance + depth) as `eye` sees it.
+fn corner(pose: &Pose, eye: &Viewer, u: f64, v: f64) -> ((f64, f64), f64) {
     let q = [0, 1, 2].map(|i| pose.pos[i] + pose.rot[i][0] * u + pose.rot[i][1] * v);
-    let w = EYE + q[2];
+    let (d, centre) = (eye.distance, eye.center);
+    let w = d + q[2];
     let s = (
-        centre.0 + EYE * (q[0] - centre.0) / w,
-        centre.1 + EYE * (q[1] - centre.1) / w,
+        centre.0 + d * (q[0] - centre.0) / w,
+        centre.1 + d * (q[1] - centre.1) / w,
     );
     (s, w)
 }
 
 /// The four page corners of a `width`×`height` brush with its handle at `handle` in `pose`
 /// (top-left, top-right, bottom-right, bottom-left), or `None` when a corner is at or
-/// behind the viewer. `centre`: where the viewer looks (the page centre).
+/// behind the viewer. `eye`: the observer ([`viewer`]).
 pub fn outline(
     (width, height): (u32, u32),
     handle: (i32, i32),
     pose: &Pose,
-    centre: (f64, f64),
+    eye: &Viewer,
 ) -> Option<[(f64, f64); 4]> {
     let (hx, hy) = (f64::from(handle.0), f64::from(handle.1));
     let (u0, v0) = (-hx - 0.5, -hy - 0.5);
     let (u1, v1) = (f64::from(width) - hx - 0.5, f64::from(height) - hy - 0.5);
     let mut out = [(0.0, 0.0); 4];
     for (o, (u, v)) in out.iter_mut().zip([(u0, v0), (u1, v0), (u1, v1), (u0, v1)]) {
-        let (s, w) = corner(pose, centre, u, v);
+        let (s, w) = corner(pose, eye, u, v);
         if w < NEAR {
             return None;
         }
@@ -414,14 +533,8 @@ pub fn outline(
 
 /// The page pixels the brush covers in `pose` (bounding box of [`outline`], clipped to
 /// `clip`); empty when nothing shows.
-fn cover(
-    size: (u32, u32),
-    handle: (i32, i32),
-    pose: &Pose,
-    centre: (f64, f64),
-    clip: Rect,
-) -> Rect {
-    let Some(c) = outline(size, handle, pose, centre) else {
+fn cover(size: (u32, u32), handle: (i32, i32), pose: &Pose, eye: &Viewer, clip: Rect) -> Rect {
+    let Some(c) = outline(size, handle, pose, eye) else {
         return Rect::default();
     };
     let lim = |v: f64| v.clamp(-1e9, 1e9);
@@ -438,34 +551,6 @@ fn cover(
     Rect::new(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32)
 }
 
-fn invert(m: &Matrix) -> Option<Matrix> {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if det.abs() < 1e-9 {
-        return None;
-    }
-    let c =
-        |r0: usize, c0: usize, r1: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
-    Some([
-        [
-            c(1, 1, 2, 2) / det,
-            -c(0, 1, 2, 2) / det,
-            c(0, 1, 1, 2) / det,
-        ],
-        [
-            -c(1, 0, 2, 2) / det,
-            c(0, 0, 2, 2) / det,
-            -c(0, 0, 1, 2) / det,
-        ],
-        [
-            c(1, 0, 2, 1) / det,
-            -c(0, 0, 2, 1) / det,
-            c(0, 0, 1, 1) / det,
-        ],
-    ])
-}
-
 /// The brush `b` as it shows in `pose` (perspective, nearest neighbour), cut to the page
 /// rectangle `clip`: a brush whose handle is its top-left pixel, to be stamped at the
 /// returned page position. Pixels outside the brush get `fill`, which becomes the result's
@@ -476,52 +561,40 @@ fn invert(m: &Matrix) -> Option<Matrix> {
 pub fn project(
     b: &BrushImage,
     pose: &Pose,
-    centre: (f64, f64),
+    eye: &Viewer,
     clip: Rect,
     fill: u8,
 ) -> Option<(BrushImage, (i32, i32))> {
-    let area = cover((b.width, b.height), b.handle, pose, centre, clip);
+    let area = cover((b.width, b.height), b.handle, pose, eye, clip);
     if area.is_empty() {
         return None;
     }
-    // Brush plane point (u, v) → homogeneous page point: a projective map H.
-    let (a, bv, p) = (
-        [pose.rot[0][0], pose.rot[1][0], pose.rot[2][0]],
-        [pose.rot[0][1], pose.rot[1][1], pose.rot[2][1]],
-        pose.pos,
-    );
-    let row = |i: usize, c: f64| {
-        [
-            EYE * a[i] + c * a[2],
-            EYE * bv[i] + c * bv[2],
-            EYE * p[i] + c * p[2],
-        ]
+    // Each page pixel's line of sight meets the brush plane as Effect ▸ Perspective casts it
+    // (ADR-37), so a move and a perspective stamp of the same pose paint the same pixels.
+    let place = Placement {
+        matrix: Mat3(pose.rot),
+        position: pose.pos,
     };
-    let h = [
-        row(0, centre.0),
-        row(1, centre.1),
-        [a[2], bv[2], EYE + p[2]],
-    ];
-    let inv = invert(&h)?;
     let (w, hgt) = (area.w as u32, area.h as u32);
     let mut pixels = vec![fill; w as usize * hgt as usize];
     let (hx, hy) = (f64::from(b.handle.0), f64::from(b.handle.1));
+    let mut shows = false;
     for y in 0..area.h {
-        let sy = f64::from(area.y + y) + 0.5;
         for x in 0..area.w {
-            let sx = f64::from(area.x + x) + 0.5;
-            let r = apply_m(&inv, [sx, sy, 1.0]);
-            if r[2].abs() < 1e-12 {
+            let Some((u, v)) = place.local(eye, (area.x + x, area.y + y), f64::INFINITY) else {
                 continue;
-            }
-            let (u, v) = (r[0] / r[2], r[1] / r[2]);
+            };
             let (bx, by) = ((u + hx + 0.5).floor(), (v + hy + 0.5).floor());
             if bx < 0.0 || by < 0.0 || bx >= f64::from(b.width) || by >= f64::from(b.height) {
                 continue;
             }
             pixels[(y * area.w + x) as usize] =
                 b.pixels[by as usize * b.width as usize + bx as usize];
+            shows = true;
         }
+    }
+    if !shows {
+        return None;
     }
     let out = BrushImage {
         width: w,
@@ -625,6 +698,21 @@ struct Fields<'a> {
     stencil: Option<&'a [bool]>,
     right: bool,
     fx: PaintFx,
+    area: Option<&'a FrameArea>,
+    view: Option<&'a MoveView>,
+}
+
+impl Fields<'_> {
+    /// Where the move starts: as its view says, else unturned on the `start` pixel.
+    fn origin(&self) -> Pose {
+        match self.view {
+            Some(v) => Pose {
+                pos: v.at,
+                rot: v.rot,
+            },
+            None => Pose::at(self.start),
+        }
+    }
 }
 
 fn fields(cmd: &Command) -> Option<Fields<'_>> {
@@ -640,6 +728,8 @@ fn fields(cmd: &Command) -> Option<Fields<'_>> {
             stencil,
             right,
             fx,
+            area,
+            view,
         } => Some(Fields {
             start: *start,
             path,
@@ -651,6 +741,8 @@ fn fields(cmd: &Command) -> Option<Fields<'_>> {
             stencil: stencil.as_deref(),
             right: *right,
             fx: *fx,
+            area: area.as_ref(),
+            view: view.as_deref(),
         }),
         _ => None,
     }
@@ -706,6 +798,19 @@ pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError
             "start must lie within ±{MAX_COORD}"
         )));
     }
+    if let Some(v) = f.view {
+        check_view(v, f.start)?;
+    }
+    if let Some(a) = f.area {
+        if a.frame as usize >= doc.frame_count() {
+            return Err(CommandError::invalid(format!(
+                "area stencil frame {} is not among the {} frames",
+                a.frame,
+                doc.frame_count()
+            )));
+        }
+        crate::command::check_area(&a.area, doc.page())?;
+    }
     let work = work(&f, doc);
     if work > MAX_PAINT_WORK {
         return Err(CommandError::invalid(format!(
@@ -729,21 +834,15 @@ fn work(f: &Fields, doc: &Document) -> u64 {
     let Some(b) = source(f.custom, f.brush, f.color) else {
         return 0;
     };
-    let plan = plan(f.path, f.start, doc.frame_count(), doc.current_frame());
-    let centre = centre_of(page);
+    let plan = plan_from(f.path, f.origin(), doc.frame_count(), doc.current_frame());
+    let eye = viewer(f.view, page);
     let per_pixel = 1 + paint::pixel_work(f.mode, &f.fx, doc.palette().len());
     let reads = reads_before(f.mode, &f.fx);
     let areas: Vec<u64> = plan
         .stamps
         .iter()
         .map(|s| {
-            let r = cover(
-                (b.width, b.height),
-                b.handle,
-                &s.pose,
-                centre,
-                page.bounds(),
-            );
+            let r = cover((b.width, b.height), b.handle, &s.pose, &eye, page.bounds());
             if r.is_empty() {
                 return 1;
             }
@@ -776,11 +875,11 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
     let Some(b) = source(f.custom, f.brush, f.color) else {
         return;
     };
-    let plan = plan(f.path, f.start, doc.frame_count(), doc.current_frame());
+    let plan = plan_from(f.path, f.origin(), doc.frame_count(), doc.current_frame());
     let palette: Palette = doc.palette().clone();
     // The colour around the projected brush, once: finding it reads the whole brush.
     let fill = brush_ops::fill_colour(&b, palette.len());
-    let centre = centre_of(doc.page());
+    let eye = viewer(f.view, doc.page());
     let clip = doc.page().bounds();
     // Modes that read the page before the stamp get it in `before`, one page-sized buffer
     // refreshed for every stamp only where that stamp reads (its reach): the rest of it is
@@ -795,12 +894,17 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
     let mut last_handle: Option<(i32, i32)> = None;
     for (i, stamp) in plan.stamps.iter().enumerate() {
         doc.go_to(stamp.frame);
+        // The area stencil spares its own picture only.
+        let area = f
+            .area
+            .filter(|a| a.frame as usize == stamp.frame)
+            .map(|a| &a.area);
         for layer in plan.layers(f.path, i) {
             let pose = plan.stamps[layer].pose;
-            let Some((img, at)) = project(&b, &pose, centre, clip, fill) else {
+            let Some((img, at)) = project(&b, &pose, &eye, clip, fill) else {
                 continue;
             };
-            let handle = outline((1, 1), (0, 0), &pose, centre)
+            let handle = outline((1, 1), (0, 0), &pose, &eye)
                 .map(|c| (c[0].0.floor() as i32, c[0].1.floor() as i32));
             let motion = match (last_handle, handle) {
                 (Some(l), Some(h)) if layer == i => (h.0 - l.0, h.1 - l.1),
@@ -828,8 +932,7 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
                     palette: &palette,
                     range: f.range,
                     stencil: f.stencil,
-                    // No area stencil yet (ADR-38/39 integration).
-                    area: None,
+                    area,
                     before: &before,
                     motion: (0, 0),
                     right: f.right,
@@ -1018,6 +1121,14 @@ mod tests {
         assert!(brush.end.pixel().0 < 200);
     }
 
+    /// The observer [`EYE`] pixels in front of `centre`.
+    fn eye(centre: (f64, f64)) -> Viewer {
+        Viewer {
+            center: centre,
+            distance: EYE,
+        }
+    }
+
     fn brush() -> BrushImage {
         // 3×2: 1 2 3 / 4 5 0 (0 transparent), handle at (1, 0).
         BrushImage {
@@ -1033,7 +1144,14 @@ mod tests {
     fn projection_of_the_unmoved_brush_is_the_brush() {
         let b = brush();
         let pose = Pose::at((10, 20, 0));
-        let (img, at) = project(&b, &pose, (160.0, 128.0), Rect::new(0, 0, 320, 256), 0).unwrap();
+        let (img, at) = project(
+            &b,
+            &pose,
+            &eye((160.0, 128.0)),
+            Rect::new(0, 0, 320, 256),
+            0,
+        )
+        .unwrap();
         assert_eq!(at, (9, 20));
         assert_eq!((img.width, img.height), (3, 2));
         assert_eq!(img.pixels, b.pixels);
@@ -1042,7 +1160,7 @@ mod tests {
         let (img, at) = project(
             &b,
             &Pose::at((0, 0, 0)),
-            (160.0, 128.0),
+            &eye((160.0, 128.0)),
             Rect::new(0, 0, 320, 256),
             0,
         )
@@ -1054,7 +1172,7 @@ mod tests {
             project(
                 &b,
                 &Pose::at((-50, 0, 0)),
-                (160.0, 128.0),
+                &eye((160.0, 128.0)),
                 Rect::new(0, 0, 320, 256),
                 0
             )
@@ -1064,7 +1182,7 @@ mod tests {
             project(
                 &b,
                 &Pose::at((10, 10, -400)),
-                (160.0, 128.0),
+                &eye((160.0, 128.0)),
                 Rect::new(0, 0, 320, 256),
                 0
             )
@@ -1078,7 +1196,7 @@ mod tests {
         let clip = Rect::new(0, 0, 320, 256);
         // EYE pixels away: half size, halfway to the centre.
         let far = Pose::at((100, 128, EYE as i32));
-        let (img, at) = project(&b, &far, (160.0, 128.0), clip, 0).unwrap();
+        let (img, at) = project(&b, &far, &eye((160.0, 128.0)), clip, 0).unwrap();
         assert_eq!((img.width, img.height), (20, 20));
         assert_eq!(at, (120, 118));
         assert!(img.pixels.iter().all(|&p| p == 7));
@@ -1094,7 +1212,7 @@ mod tests {
             rot: rotation([0.0, 0.0, 90.0]),
             ..Pose::at((50, 50, 0))
         };
-        let (img, at) = project(&bar, &pose, (160.0, 128.0), clip, 0).unwrap();
+        let (img, at) = project(&bar, &pose, &eye((160.0, 128.0)), clip, 0).unwrap();
         assert_eq!((img.width, img.height, at), (1, 3, (50, 49)));
         assert_eq!(img.pixels, vec![1, 2, 3], "clockwise: left end on top");
         // Seen edge-on (its plane runs through the eye): nothing.
@@ -1102,9 +1220,9 @@ mod tests {
             rot: rotation([0.0, 90.0, 0.0]),
             ..Pose::at((50, 50, 0))
         };
-        assert!(project(&bar, &edge, (50.5, 50.5), clip, 0).is_none());
+        assert!(project(&bar, &edge, &eye((50.5, 50.5)), clip, 0).is_none());
         assert!(
-            project(&bar, &edge, (160.0, 128.0), clip, 0).is_some(),
+            project(&bar, &edge, &eye((160.0, 128.0)), clip, 0).is_some(),
             "seen at an angle"
         );
         // Turned 45 degrees, the corners of the bounding box get the fill colour given,
@@ -1113,7 +1231,7 @@ mod tests {
             rot: rotation([0.0, 0.0, 45.0]),
             ..Pose::at((100, 100, 0))
         };
-        let (img, _) = project(&b, &turned, (160.0, 128.0), clip, 9).unwrap();
+        let (img, _) = project(&b, &turned, &eye((160.0, 128.0)), clip, 9).unwrap();
         assert_eq!(img.transparent, Some(9));
         assert_eq!(img.pixels[0], 9, "top-left corner");
         let middle = (img.height / 2 * img.width + img.width / 2) as usize;
@@ -1229,7 +1347,7 @@ mod tests {
         assert_eq!(b.opaque_offsets(), vec![(0, 0), (1, 0), (0, 1)]);
         assert_eq!(brush_of_offsets(&[(0, 0)], 0).unwrap().transparent, Some(1));
         assert!(brush_of_offsets(&[], 1).is_none());
-        let c = outline((4, 2), (0, 0), &Pose::at((10, 10, 0)), (0.0, 0.0)).unwrap();
+        let c = outline((4, 2), (0, 0), &Pose::at((10, 10, 0)), &eye((0.0, 0.0))).unwrap();
         assert_eq!(c, [(10.0, 10.0), (14.0, 10.0), (14.0, 12.0), (10.0, 12.0)]);
         let mut img = IndexedImage::new(20, 20, 0);
         draw_outline(&mut img, &c, 3);
@@ -1250,6 +1368,8 @@ mod tests {
             stencil: None,
             right: false,
             fx: PaintFx::default(),
+            area: None,
+            view: None,
         }
     }
 
@@ -1373,6 +1493,146 @@ mod tests {
         let err = e.execute(cmd).unwrap_err();
         assert!(err.message.contains("too much work"), "{}", err.message);
         assert_eq!(e.document().revision(), 1, "nothing changed");
+    }
+
+    #[test]
+    fn an_area_stencil_spares_its_own_frame_only() {
+        // ADR-39: a move under an area stencil made on frame 2 spares its pixels there and
+        // nowhere else (an area stencil belongs to one picture).
+        let mut e = engine(3);
+        let mut p = path(3);
+        p.dist = [12, 0, 0];
+        let mut bits = vec![false; 64 * 32];
+        for x in [10, 14] {
+            bits[5 * 64 + x] = true;
+        }
+        let area = AreaStencil::from_mask(64, 32, bits).unwrap();
+        let mut cmd = move_cmd(p, (10, 5, 0));
+        if let Command::MoveBrush { area: a, .. } = &mut cmd {
+            *a = Some(FrameArea {
+                frame: 1,
+                area: area.clone(),
+            });
+        }
+        // The command keeps its stencil through JSON (CLI and MCP send the same).
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        e.execute(cmd.clone()).unwrap();
+        let doc = e.document();
+        // Cyclic: x 10, 14, 18 on frames 1-3.
+        assert_eq!(doc.frame(0).unwrap().get(10, 5), Some(1), "not its frame");
+        assert_eq!(doc.frame(1).unwrap().get(14, 5), Some(0), "spared");
+        assert_eq!(doc.frame(2).unwrap().get(18, 5), Some(1));
+        // A stencil for a frame the animation lacks, or of another size, is refused.
+        for bad in [
+            FrameArea {
+                frame: 3,
+                area: area.clone(),
+            },
+            FrameArea {
+                frame: 0,
+                area: AreaStencil::from_mask(2, 1, vec![true, false]).unwrap(),
+            },
+        ] {
+            let mut cmd = cmd.clone();
+            if let Command::MoveBrush { area: a, .. } = &mut cmd {
+                *a = Some(bad);
+            }
+            assert!(e.execute(cmd).is_err());
+        }
+    }
+
+    #[test]
+    fn a_view_starts_turned_and_projects_as_perspective_does() {
+        use crate::perspective::{self, Axis3, Mat3, Placement};
+        // ADR-37: a move from a brush that Effect ▸ Perspective turned and placed starts in
+        // that pose and is seen from Perspective's observer: a move of no distance paints
+        // exactly the perspective stamp.
+        let b = BrushImage {
+            width: 5,
+            height: 3,
+            pixels: (0..15u8).map(|i| 1 + i % 6).collect(),
+            handle: (2, 1),
+            transparent: Some(6),
+        };
+        let pal = Palette::dpaint_default_32();
+        let viewer = Viewer::at_pixel((100, 60), 200.0);
+        let turns = [
+            (Mat3::rotation(Axis3::Z, 90), 0),
+            (Mat3::IDENTITY, 50),
+            (Mat3::euler([20, -30, 10]), 30),
+        ];
+        for (turn, depth) in turns {
+            let start = (40, 20, depth);
+            let place = Placement {
+                matrix: turn,
+                position: Pose::turned(start, turn.0).pos,
+            };
+            let mut stamp = Engine::new(Document::new(64, 32, pal.clone()));
+            let page = stamp.document().page().bounds();
+            let (img, at) =
+                perspective::project_brush(&b, &place, &viewer, page, pal.len(), None).unwrap();
+            stamp
+                .execute(Command::Stroke {
+                    brush: Vec::new(),
+                    color: 1,
+                    points: vec![at],
+                    continuous: false,
+                    custom: Some(img),
+                    mode: DrawMode::Matte,
+                    range: None,
+                    stencil: None,
+                    right: false,
+                    fx: PaintFx::default(),
+                })
+                .unwrap();
+            let mut moved = Engine::new(Document::new(64, 32, pal.clone()));
+            let mut cmd = move_cmd(path(1), start);
+            if let Command::MoveBrush { custom, view, .. } = &mut cmd {
+                *custom = Some(b.clone());
+                *view = Some(Box::new(MoveView {
+                    at: place.position,
+                    rot: turn.0,
+                    center: viewer.center,
+                    distance: viewer.distance,
+                }));
+            }
+            moved.execute(cmd).unwrap();
+            assert_eq!(
+                moved.document().page(),
+                stamp.document().page(),
+                "{turn:?} at depth {depth}"
+            );
+            assert!(moved.document().page().pixels().iter().any(|&c| c != 0));
+        }
+        // Without a view: unturned, from EYE in front of the page centre (ADR-38).
+        let flat = move_cmd(path(1), (40, 30, 0));
+        assert!(!serde_json::to_string(&flat).unwrap().contains("view"));
+        // Views that are no rotation or no observer are refused.
+        let mut e = engine(1);
+        let mirrored = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let stretched = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.5]];
+        let inside = [10.25, 10.75, 0.0];
+        for (at, rot, distance) in [
+            (inside, IDENTITY, 320.0),
+            (inside, mirrored, 320.0),
+            (inside, stretched, 320.0),
+            (inside, IDENTITY, 0.0),
+            (inside, IDENTITY, f64::NAN),
+            ([11.5, 10.5, 0.0], IDENTITY, 320.0),
+        ] {
+            let mut cmd = move_cmd(path(1), (10, 10, 0));
+            if let Command::MoveBrush { view, .. } = &mut cmd {
+                *view = Some(Box::new(MoveView {
+                    at,
+                    rot,
+                    center: (32.0, 16.0),
+                    distance,
+                }));
+            }
+            let ok = (at, rot, distance) == (inside, IDENTITY, 320.0);
+            assert_eq!(e.execute(cmd).is_ok(), ok, "{at:?} {rot:?} {distance}");
+        }
     }
 
     /// Runs `cmd` on `e` and returns how long it took.

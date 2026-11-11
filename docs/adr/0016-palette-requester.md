@@ -14,7 +14,7 @@
     - Undo reverts the last edit inside the requester; we keep up to 64 steps (DeluxePaint: last change only). A whole slider drag is one step. `u` = Undo.
     - The requester edits a copy of the palette. While it is open the app uploads the screen in that copy, so the whole screen (picture, toolbox palette, interface pens) shows the edit live; the document is untouched.
     - Ok, Return or `p` (Mixer Off) close it and commit the copy as **one** undoable `Command::SetPalette` (none if nothing changed); the selected colour becomes the FG colour. Cancel or Esc drop the copy, which restores the shown palette.
-    - `p` opens it only on the paint screen (no other requester, Show Page or menu open); the menu item does the same.
+    - `p` opens it only on the paint screen (no other requester, Show Page or menu open, and not while the Text tool is typing, ADR-35); the menu item does the same.
   - Snapshot option `--palette-requester` (selected colour = `--fg`); `docs/design/screenshots/phase3-palette.png`.
 - Deviations from DeluxePaint IV AGA (documented, to revisit):
   - A centred modal requester with Cancel/Ok instead of the non-modal bottom strip in which painting stays possible.

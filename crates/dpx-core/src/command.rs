@@ -231,11 +231,20 @@ pub enum Command {
         right: bool,
         #[serde(default, skip_serializing_if = "is_default")]
         fx: PaintFx,
+        /// The area stencil and the frame it belongs to (ADR-39): only the stamps on that
+        /// frame spare its pixels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        area: Option<crate::anim_move::FrameArea>,
+        /// The brush's orientation at `start` and the observer (Effect ▸ Perspective,
+        /// ADR-37); `None`: unturned, seen from [`crate::anim_move::EYE`] pixels in front of
+        /// the page centre.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<Box<crate::anim_move::MoveView>>,
     },
     /// An area stencil over a painting command (ADR-39; Effect ▸ Stencil ▸ Paint, Background ▸
-    /// Lock FG): `command` (Stroke, Shape, FloodFill, Clear, or a SetPage of the page's size,
-    /// such as CLR on a fixed background) paints as usual, but the pixels `area` protects
-    /// keep their colour. `area` has the page's size.
+    /// Lock FG): `command` (Stroke, Shape, AnimBrushPaint, FloodFill, Clear, or a SetPage of
+    /// the page's size, such as CLR on a fixed background) paints as usual, but the pixels
+    /// `area` protects keep their colour. `area` has the page's size.
     Stenciled {
         area: crate::stencil::AreaStencil,
         command: Box<Command>,
@@ -367,9 +376,10 @@ impl Command {
             Command::Stenciled { area, command } => {
                 check_area(area, page)?;
                 return match **command {
-                    Command::Stroke { .. } | Command::Shape { .. } | Command::FloodFill { .. } => {
-                        command.check_paint(page, palette)
-                    }
+                    Command::Stroke { .. }
+                    | Command::Shape { .. }
+                    | Command::FloodFill { .. }
+                    | Command::AnimBrushPaint { .. } => command.check_paint(page, palette),
                     _ => Err(CommandError::invalid(
                         "only strokes, shapes and fills paint page pixels".into(),
                     )),
@@ -862,7 +872,10 @@ pub(crate) fn validate_paint(
 }
 
 /// An area stencil (ADR-39) must have the page's size.
-fn check_area(area: &crate::stencil::AreaStencil, page: &IndexedImage) -> Result<(), CommandError> {
+pub(crate) fn check_area(
+    area: &crate::stencil::AreaStencil,
+    page: &IndexedImage,
+) -> Result<(), CommandError> {
     if area.fits(page) {
         Ok(())
     } else {

@@ -11,7 +11,9 @@
 use std::time::Duration;
 
 use dpx_core::anim::PlayMode;
-use dpx_core::anim_move::{self, MAX_COUNT, MovePath, Plan};
+use dpx_core::anim_move::{self, IDENTITY, MAX_COUNT, Matrix, MovePath, MoveView, Plan, Pose};
+use dpx_core::perspective::Vec3;
+use dpx_core::perspective::Viewer;
 use dpx_core::{BrushImage, Command, Document, IndexedImage};
 use dpx_ui::anim_panel::Layout;
 use dpx_ui::{
@@ -29,12 +31,36 @@ pub struct Preview {
     /// Size and handle of the brush shown.
     size: (u32, u32),
     handle: (i32, i32),
+    /// The observer the wire frame is seen from (as Draw sees the move).
+    eye: Viewer,
     /// When it started (egui time, seconds).
     since: f64,
     /// The stamp shown (painting order).
     step: usize,
     /// The requester, shown again when the preview ends.
     requester: MoveRequester,
+}
+
+/// Where a move starts: the handle's centre (page x, y and depth z) and the brush's
+/// orientation (both as Effect ▸ Perspective stamped it, ADR-37).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Start {
+    pub pos: Vec3,
+    pub rot: Matrix,
+}
+
+impl Start {
+    fn pose(&self) -> Pose {
+        Pose {
+            pos: self.pos,
+            rot: self.rot,
+        }
+    }
+
+    /// The page pixel and depth of the handle.
+    pub fn at(&self) -> (i32, i32, i32) {
+        self.pose().pixel()
+    }
 }
 
 /// App state of the animation controls.
@@ -51,10 +77,12 @@ pub struct State {
     /// The frame (from 0) the Go to Frame requester went to last: the panel's Go To button
     /// and Shift-3 go there again.
     pub last_goto: Option<usize>,
-    /// Where the brush was last clicked down on the page; Go Back starts the next move here.
-    pub clicked: Option<(i32, i32)>,
-    /// Where the last move ended (page x, y and depth z); the next move starts there.
-    pub moved_to: Option<(i32, i32, i32)>,
+    /// Where the brush was last clicked down on the page (or stamped by Effect ▸
+    /// Perspective, turned and at its depth); Go Back starts the next move here.
+    pub clicked: Option<Start>,
+    /// Where the last move ended (page x, y, depth z and orientation); the next move starts
+    /// there.
+    pub moved_to: Option<Start>,
     /// The Move requester's settings after Exit, Draw or Trails.
     pub settings: Option<MovePath>,
     pub preview: Option<Preview>,
@@ -158,19 +186,37 @@ impl PainterApp {
 
     /// Notes where the brush was clicked down on the page: the next move starts there.
     pub(crate) fn note_click(&mut self, x: i32, y: i32) {
-        self.anim_control.clicked = Some(self.snap((x, y)));
+        let (x, y) = self.snap((x, y));
+        self.note_stamp(Pose::at((x, y, 0)).pos, IDENTITY);
+    }
+
+    /// Notes a brush stamped with its handle's centre at `pos`, turned by `rot` (Effect ▸
+    /// Perspective, ADR-37): the next move starts there, so (as in the manual's Moving Ground
+    /// and Rolling Horizon, AGA p.192-193) a stamp, Undo and Move go on from the turned brush.
+    pub(crate) fn note_stamp(&mut self, pos: Vec3, rot: Matrix) {
+        self.anim_control.clicked = Some(Start { pos, rot });
         self.anim_control.moved_to = None;
     }
 
-    /// Where the next move starts: the end of the last move, else the last click, else the
-    /// page centre.
-    fn move_start(&self) -> (i32, i32, i32) {
+    /// Where the next move starts: the end of the last move, else the last click or
+    /// perspective stamp, else the page centre (unturned).
+    fn move_start(&self) -> Start {
         let page = self.engine.document().page();
-        let centre = (page.width() as i32 / 2, page.height() as i32 / 2, 0);
+        let centre = Start {
+            pos: Pose::at((page.width() as i32 / 2, page.height() as i32 / 2, 0)).pos,
+            rot: IDENTITY,
+        };
         self.anim_control
             .moved_to
-            .or(self.anim_control.clicked.map(|(x, y)| (x, y, 0)))
+            .or(self.anim_control.clicked)
             .unwrap_or(centre)
+    }
+
+    /// The observer of a move: Effect ▸ Perspective's centre and distance (the middle of the
+    /// screen and the screen width until they are set), so moves turn and shrink towards the
+    /// perspective centre as there (AGA p.193).
+    fn move_eye(&self) -> Viewer {
+        self.perspective_viewer()
     }
 
     /// The brush Move paints with (as a gesture would, ADR-18): the custom brush if its
@@ -202,8 +248,10 @@ impl PainterApp {
             .find(|r| r.low <= fg && fg <= r.high && usize::from(r.high) < colors)
             .map(|r| (r.low, r.high));
         let (custom, brush) = self.move_brush();
+        let start = self.move_start();
+        let eye = self.move_eye();
         Command::MoveBrush {
-            start: self.move_start(),
+            start: start.at(),
             path,
             brush,
             color: fg,
@@ -213,6 +261,14 @@ impl PainterApp {
             stencil: self.stencil.clone(),
             right: false,
             fx: self.menu_data.effects.fx(),
+            // ADR-39: the area stencil, on its own frame.
+            area: self.move_area(),
+            view: Some(Box::new(MoveView {
+                at: start.pos,
+                rot: start.rot,
+                center: eye.center,
+                distance: eye.distance,
+            })),
         }
     }
 
@@ -221,13 +277,26 @@ impl PainterApp {
     /// from before stay, so Cancel still restores them, AGA p.255).
     fn draw_move(&mut self, path: MovePath) {
         self.finish_stroke();
+        // Stencil ▸ Show keeps painting off (ADR-31), for Move too; Stencil ▸ Paint (ended by
+        // the menu item and `M`) would own Undo meanwhile.
+        if self.menu_data.effects.stencil_show || self.stencil_painting() {
+            if let Some(AnimControlRequester::Move(req)) = &mut self.ui.anim_control {
+                req.set_message("Stencil Show is on: nothing is painted");
+            }
+            self.dirty = true;
+            return;
+        }
         let doc = self.engine.document();
         let start = self.move_start();
-        let end = anim_move::plan(&path, start, doc.frame_count(), doc.current_frame()).end;
+        let end =
+            anim_move::plan_from(&path, start.pose(), doc.frame_count(), doc.current_frame()).end;
         match self.engine.execute(self.move_command(path)) {
             Ok(_) => {
                 self.ui.anim_control = None;
-                self.anim_control.moved_to = Some(end.pixel());
+                self.anim_control.moved_to = Some(Start {
+                    pos: end.pos,
+                    rot: end.rot,
+                });
                 self.anim_control.settings = Some(MovePath {
                     trails: false,
                     ..path
@@ -250,12 +319,13 @@ impl PainterApp {
             return;
         };
         let doc = self.engine.document();
-        let plan = anim_move::plan(
+        let plan = anim_move::plan_from(
             &path,
-            self.move_start(),
+            self.move_start().pose(),
             doc.frame_count(),
             doc.current_frame(),
         );
+        let eye = self.move_eye();
         let (custom, builtin) = self.move_brush();
         let shape = custom.or_else(|| anim_move::brush_of_offsets(&builtin, self.ui.fg));
         let (size, handle) = shape.map_or(((1, 1), (0, 0)), |b| ((b.width, b.height), b.handle));
@@ -263,6 +333,7 @@ impl PainterApp {
             plan,
             size,
             handle,
+            eye,
             since: now,
             step: 0,
             requester: *req,
@@ -375,14 +446,11 @@ impl PainterApp {
         }
     }
 
-    /// A frame command from the panel or a key (as `anim::frame_command`).
+    /// A frame command from the panel or a key: through `anim::frame_command`, so the area
+    /// stencil and Stencil ▸ Paint follow their picture as for the menus (ADR-39).
     fn control_command(&mut self, command: Command) {
-        self.finish_stroke();
-        if let Err(e) = self.engine.execute(command) {
-            eprintln!("{e}");
-        }
-        self.clamp_scroll();
-        self.dirty = true;
+        // A refusal is logged there; the panel has no place to show it.
+        let _ = self.frame_command(command);
     }
 
     fn go_to_frame(&mut self, frame: usize) {
@@ -506,7 +574,11 @@ impl PainterApp {
                 egui::Key::Num3 if shift => self.repeat_goto(),
                 egui::Key::Num4 if shift => self.start_playback(PlayMode::LoopBackward, now),
                 egui::Key::Num5 if shift => self.start_playback(PlayMode::OnceBackward, now),
-                _ if key == egui::Key::M && shift => self.open_move(),
+                // As its menu item: it ends Stencil ▸ Paint, as Move paints the picture.
+                _ if key == egui::Key::M && shift => {
+                    self.run_action(dpx_ui::Action::Command("anim.move"), ctx);
+                    self.refresh_effects();
+                }
                 _ if (key == egui::Key::A || digit == egui::Key::A) && alt => {
                     self.anim_control_action("anim.panel")
                 }
@@ -540,8 +612,7 @@ impl PainterApp {
             && let Some(frame) = doc.frame(stamp.frame)
         {
             let mut page: IndexedImage = frame.clone();
-            let centre = anim_move::centre_of(&page);
-            if let Some(c) = anim_move::outline(p.size, p.handle, &stamp.pose, centre) {
+            if let Some(c) = anim_move::outline(p.size, p.handle, &stamp.pose, &p.eye) {
                 anim_move::draw_outline(&mut page, &c, self.ui.fg);
             }
             self.ui.frame_counter =
@@ -684,7 +755,7 @@ mod tests {
             assert_eq!(doc.frame(f).unwrap().get(x, 30), Some(5), "frame {}", f + 1);
         }
         assert_eq!(doc.current_frame(), 0, "cyclic: the frame after the last");
-        assert_eq!(app.anim_control.moved_to, Some((52, 30, 0)));
+        assert_eq!(app.anim_control.moved_to.map(|s| s.at()), Some((52, 30, 0)));
         // One undo step takes the move away from every frame.
         app.undo();
         let doc = app.engine.document();

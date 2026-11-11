@@ -429,8 +429,8 @@ impl Placement {
     }
 
     /// The brush plane coordinates of the line of sight through `pixel`: pixels along the
-    /// brush's x and y axes from the handle centre.
-    fn local(&self, viewer: &Viewer, pixel: (i32, i32), max_depth: f64) -> Option<(f64, f64)> {
+    /// brush's x and y axes from the handle centre (also Anim ▸ Move's projection, ADR-38).
+    pub fn local(&self, viewer: &Viewer, pixel: (i32, i32), max_depth: f64) -> Option<(f64, f64)> {
         let normal = self.matrix.axis(Axis3::Z);
         let q = viewer.hit_plane(self.position, normal, pixel, max_depth)?;
         let d = sub(q, self.position);

@@ -221,6 +221,7 @@ impl PainterApp {
                 self.remember_loaded_brush(own, palette, ranges, brush.clone());
                 self.custom_brush = Some(brush.clone());
                 self.picked_brush = Some(brush);
+                self.tools.brush_gen += 1;
                 self.leave_anim_brush(); // ADR-36
                 self.tools.brush_palette = Some(self.engine.document().palette().clone());
                 self.ui.file_requester = None;

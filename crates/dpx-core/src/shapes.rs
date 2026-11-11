@@ -382,9 +382,13 @@ impl Command {
 
     /// Brush stamps a Stroke or Shape makes along its path (not counting symmetric copies),
     /// those off the page included; for an [`Command::AnimBrushPaint`] those of the command
-    /// it wraps. A front-end moves its AnimBrush on by this many stamps after the command
-    /// (ADR-36). 0 for other commands and filled shapes.
+    /// it wraps, also under an area stencil ([`Command::Stenciled`], ADR-39). A front-end
+    /// moves its AnimBrush on by this many stamps after the command (ADR-36). 0 for other
+    /// commands and filled shapes.
     pub fn stamps(&self) -> u64 {
+        if let Command::Stenciled { command, .. } = self {
+            return command.stamps();
+        }
         match self.painting() {
             Command::Stroke {
                 points, continuous, ..
