@@ -207,6 +207,31 @@ pub enum Command {
         brush: AnimBrush,
         paint: Box<Command>,
     },
+    // ---- ADR-38: Anim ▸ Move.. Draw and Trails.
+    /// The brush (`custom`, else the built-in `brush` in `color`) moved and rotated along
+    /// `path` from `start` (page x, y and depth z), one stamp per frame, frames from the
+    /// current one ([`crate::anim_move::plan`]); the frame where the move ends becomes
+    /// current. One undo step for every frame it paints. The paint fields are those of
+    /// [`Command::Stroke`].
+    MoveBrush {
+        start: (i32, i32, i32),
+        path: crate::anim_move::MovePath,
+        #[serde(default)]
+        brush: Vec<(i32, i32)>,
+        color: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom: Option<BrushImage>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        mode: DrawMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        range: Option<(u8, u8)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stencil: Option<Vec<bool>>,
+        #[serde(default, skip_serializing_if = "is_default")]
+        right: bool,
+        #[serde(default, skip_serializing_if = "is_default")]
+        fx: PaintFx,
+    },
 }
 
 impl Command {
@@ -357,6 +382,9 @@ impl Command {
         if self.is_frame_command() {
             return crate::frame_ops::validate(self, doc);
         }
+        if let Command::MoveBrush { .. } = self {
+            return crate::anim_move::validate(self, doc);
+        }
         let colors = doc.palette.len();
         let color = |c: u8| check_color(c, colors);
         match self {
@@ -502,7 +530,8 @@ impl Command {
             | Command::InsertFrameCopies { .. }
             | Command::DeleteFrames { .. }
             | Command::GotoFrame { .. }
-            | Command::SetFrameRate { .. } => unreachable!("frame commands are checked above"),
+            | Command::SetFrameRate { .. }
+            | Command::MoveBrush { .. } => unreachable!("frame commands are checked above"),
             Command::ArrangePalette { order } => {
                 if crate::remap::is_permutation(order, colors) {
                     Ok(())
@@ -549,6 +578,8 @@ impl Command {
             | Command::DeleteFrames { .. } => Footprint::Frames,
             Command::GotoFrame { .. } | Command::SetFrameRate { .. } => Footprint::Setting,
             Command::ArrangePalette { .. } => Footprint::Document,
+            // Several frames and the current one change (ADR-38).
+            Command::MoveBrush { .. } => Footprint::Frames,
         }
     }
 
@@ -556,6 +587,9 @@ impl Command {
     pub(crate) fn apply(&self, doc: &mut Document) {
         if self.is_frame_command() {
             return crate::frame_ops::apply(self, doc);
+        }
+        if let Command::MoveBrush { .. } = self {
+            return crate::anim_move::apply(self, doc);
         }
         let page = &mut doc.page;
         match self {
@@ -648,7 +682,8 @@ impl Command {
             | Command::InsertFrameCopies { .. }
             | Command::DeleteFrames { .. }
             | Command::GotoFrame { .. }
-            | Command::SetFrameRate { .. } => unreachable!("frame commands are applied above"),
+            | Command::SetFrameRate { .. }
+            | Command::MoveBrush { .. } => unreachable!("frame commands are applied above"),
             Command::ArrangePalette { order } => {
                 // Every animation frame shares the palette (ADR-28), so all are renumbered.
                 doc.for_each_frame(|frame| {
@@ -719,7 +754,7 @@ fn validate_anim_brush(colors: usize, brush: &AnimBrush) -> Result<(), CommandEr
 /// matches its size, each side at most [`MAX_BRUSH_SIDE`], colours inside the palette of
 /// `colors` entries; a colour range inside the palette; a stencil with one entry per possible
 /// colour (256).
-fn validate_paint(
+pub(crate) fn validate_paint(
     colors: usize,
     custom: Option<&BrushImage>,
     range: Option<(u8, u8)>,

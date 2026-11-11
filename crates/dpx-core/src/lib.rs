@@ -10,6 +10,8 @@ pub mod anim;
 mod frame_ops;
 // AnimBrush and Metamorph (ADR-36).
 pub mod anim_brush;
+// Anim ▸ Move.. (ADR-38).
+pub mod anim_move;
 
 pub mod brush_ops;
 pub mod command;

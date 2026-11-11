@@ -221,6 +221,17 @@ impl IndexedImage {
             }
         }
     }
+
+    /// Copies the pixels of `r` from `src` to the same place here, clipped to both images.
+    pub fn copy_rect_from(&mut self, src: &IndexedImage, r: Rect) {
+        let c = r.intersect(self.bounds()).intersect(src.bounds());
+        let w = c.w.max(0) as usize;
+        for y in c.y..c.y + c.h {
+            let from = y as usize * src.width as usize + c.x as usize;
+            let to = y as usize * self.width as usize + c.x as usize;
+            self.pixels[to..to + w].copy_from_slice(&src.pixels[from..from + w]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +334,21 @@ mod tests {
         let outside = img.crop(Rect::new(7, 7, 3, 3));
         assert_eq!((outside.width(), outside.height()), (0, 0));
         assert_eq!(img.crop(img.bounds()), img);
+    }
+
+    #[test]
+    fn copy_rect_from_copies_in_place_clipped_to_both() {
+        let src = numbered(5, 4);
+        let mut dst = IndexedImage::new(4, 5, 99);
+        dst.copy_rect_from(&src, Rect::new(-1, 2, 3, 9));
+        // Rows 2..4 of src (it has 4 rows), columns 0..2.
+        assert_eq!(dst.get(0, 2), Some(10));
+        assert_eq!(dst.get(1, 3), Some(16));
+        assert_eq!(dst.get(2, 2), Some(99), "right of the rectangle");
+        assert_eq!(dst.get(0, 4), Some(99), "below src");
+        assert_eq!(dst.get(0, 1), Some(99), "above the rectangle");
+        dst.copy_rect_from(&src, Rect::new(9, 9, 2, 2));
+        dst.copy_rect_from(&src, Rect::new(1, 1, 0, 3));
+        assert_eq!(dst.pixels().iter().filter(|&&p| p != 99).count(), 4);
     }
 }

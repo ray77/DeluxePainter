@@ -590,6 +590,8 @@ pub struct MenuContext {
     pub anim_brush: bool,
     /// A spare brush exists (with a custom brush it enables Brush ▸ Spare ▸ Metamorph..).
     pub spare_brush: bool,
+    /// Anim ▸ Method ▸ Expanded is chosen (else Compressed; ADR-38).
+    pub anim_expanded: bool,
 }
 
 impl Action {
@@ -599,6 +601,9 @@ impl Action {
             Action::Mode(m) => Some(ctx.mode == m),
             Action::Pref(p) => Some(ctx.prefs.get(p)),
             Action::PixelSize(p) => Some(ctx.pixel_size == p),
+            // Anim ▸ Method: a radio pair (ADR-38).
+            Action::Command("anim.method_compressed") => Some(!ctx.anim_expanded),
+            Action::Command("anim.method_expanded") => Some(ctx.anim_expanded),
             Action::Command(_) => None,
         }
     }
@@ -768,6 +773,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "perspective.reset",
     "perspective.center",
     "perspective.settings",
+    // ADR-38: Anim > Move.., Control > Panel On/Off and Set Range.., Method.
+    "anim.move",
+    "anim.panel",
+    "anim.set_range",
+    "anim.method_compressed",
+    "anim.method_expanded",
 ];
 
 impl Item {
@@ -1184,6 +1195,7 @@ mod tests {
             can_restore: false,
             anim_brush: false,
             spare_brush: false,
+            anim_expanded: false,
         }
     }
 
@@ -1482,7 +1494,10 @@ mod tests {
             assert!(Action::Command(id).enabled(&anim), "{id}");
         }
         assert!(menu_enabled(menu("Anim"), &c), "frames work (ADR-28)");
-        assert!(!Action::Command("anim.move").enabled(&c));
+        assert!(
+            Action::Command("anim.move").enabled(&c),
+            "Move works (ADR-38)"
+        );
         assert!(menu_enabled(menu("Picture"), &c));
         let effect = &MENUS[menu("Effect")];
         let item = |label: &str| effect.items.iter().find(|i| i.label == label).unwrap();

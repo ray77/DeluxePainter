@@ -26,6 +26,8 @@
 //!                                       goto or rate
 //!     [--animbrush-requester KIND]      show an AnimBrush requester: pick, make or settings
 //!                                       (ADR-36)
+//!     [--anim-panel]                    show the Animation Control Panel (ADR-38)
+//!     [--anim-control range|move]       show the Set Range or Move requester (ADR-38)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -34,6 +36,7 @@
 
 mod anim;
 mod animbrush;
+mod anim_control;
 mod autosave;
 mod browse;
 mod brush_menu;
@@ -461,6 +464,11 @@ fn main() -> eframe::Result {
                 }
             }
         }
+        // ADR-38: the Control Panel, Set Range and Move.
+        if let Err(e) = anim_control::snapshot_ui(&args, &doc, &mut ui) {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
         let doc = if args.iter().any(|a| a == "--light-table") {
             let spec = arg_value(&args, "--light-table").filter(|v| !v.starts_with("--"));
             let light = anim::parse_light_table(spec.as_deref()).unwrap_or_else(|e| {
@@ -844,6 +852,8 @@ struct PainterApp {
     stencil: Option<Vec<bool>>,
     /// Light Table and playback (ADR-28, anim.rs).
     anim: anim::AnimState,
+    /// Play range, Control Panel, Move settings and preview (ADR-38, anim_control.rs).
+    anim_control: anim_control::State,
     /// The settings file (ADR-33); `None` in tests, snapshots and with `--no-settings`.
     config: Option<config::ConfigStore>,
     /// Autosave, recovery and the quit question (ADR-34).
@@ -885,6 +895,7 @@ impl PainterApp {
             picked_brush: None,
             stencil: None,
             anim: anim::AnimState::default(),
+            anim_control: anim_control::State::default(),
             config: None,
             autosave: autosave::State::default(),
             animbrush: animbrush::AnimBrushState::default(),
@@ -907,6 +918,8 @@ impl PainterApp {
             || ui.file_requester.is_some()
             || ui.page_size_requester.is_some()
             || self.show_page.is_some()
+            || ui.anim_control.is_some()
+            || self.anim_control.preview.is_some()
     }
 
     fn set_picture(&mut self, doc: Document, extras: files::PictureExtras, path: PathBuf) {
@@ -1405,7 +1418,12 @@ impl PainterApp {
             }
             // Stencil ▸ Show disables painting meanwhile (ADR-31).
             Hit::Page { .. } if self.menu_data.effects.stencil_show => {}
-            Hit::Page { x, y } => self.press_page(x, y, right),
+            Hit::Page { x, y } => {
+                // ADR-38: the next Move starts where the brush was clicked down.
+                self.note_click(x, y);
+                self.press_page(x, y, right)
+            }
+            Hit::AnimPanel(hit) => self.panel_press(hit, right),
             Hit::TitleBar | Hit::Indicator | Hit::ToolboxBackground => {}
         }
     }
@@ -1476,6 +1494,12 @@ impl PainterApp {
                 "background.free" => self.free_background(),
                 // ADR-36 (animbrush.rs).
                 id if self.animbrush_takes(id) => self.animbrush_action(id),
+                // ADR-38 (anim_control.rs).
+                "anim.set_range"
+                | "anim.panel"
+                | "anim.method_compressed"
+                | "anim.method_expanded"
+                | "anim.move" => self.anim_control_action(id),
                 // ADR-28 (anim.rs).
                 id if id.starts_with("anim.") || id.starts_with("light_table.") => {
                     self.anim_action(id, ctx.input(|i| i.time));
@@ -1587,6 +1611,11 @@ impl eframe::App for PainterApp {
 
         if let Some(wait) = self.autosave_tick(now) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.5)));
+        }
+        // ADR-38: Set Range, Move and the Move preview are modal.
+        if self.anim_control_pass(&ctx, origin, ppp, scale, view) {
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
         }
         if self.ui.choice_requester.is_some() {
             self.choice_input(&ctx, origin, ppp, scale, view);
@@ -1727,6 +1756,9 @@ impl eframe::App for PainterApp {
                 if let Some(hit) = hit {
                     self.handle_press(hit, press_r);
                 }
+            } else if (down_l || down_r) && self.anim_control.knob.is_some() {
+                // ADR-38: the Control Panel's slider knob follows the pointer.
+                self.drag_knob(ux);
             } else if (down_l || down_r) && rect.contains(pos) {
                 if let Some((px, py)) = on {
                     self.handle_drag(px, py);
@@ -1794,6 +1826,7 @@ impl eframe::App for PainterApp {
             self.menu_keys(&ctx);
             self.anim_keys(&ctx);
             self.animbrush_keys(&ctx);
+            self.anim_control_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
@@ -3622,5 +3655,558 @@ mod tests {
         app.undo();
         assert_eq!(app.engine.document().target(), Target::default());
         assert_eq!(app.view(), View::of(DisplayMode::PAL_LORES));
+    }
+
+    // ---- ADR-38: Anim control (Set Range, Panel, Method, Move, Shift-1 … Shift-5, M,
+    // Alt-a) through the real ui() loop.
+
+    /// A key pressed and let go in one pass with `modifiers` held, as egui-winit reports
+    /// it: the logical key (what the layout types, when egui has a name for it, else the
+    /// physical key), the physical key and the typed text.
+    fn chord(
+        key: egui::Key,
+        physical: egui::Key,
+        modifiers: egui::Modifiers,
+        text: &str,
+    ) -> Vec<egui::Event> {
+        let event = |pressed| egui::Event::Key {
+            key,
+            physical_key: Some(physical),
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let mut events = vec![event(true)];
+        if !text.is_empty() {
+            events.push(egui::Event::Text(text.into()));
+        }
+        events.push(event(false));
+        events
+    }
+
+    /// A plain key pressed and let go in one pass.
+    fn tap(key: egui::Key) -> Vec<egui::Event> {
+        vec![key_event(key, true), key_event(key, false)]
+    }
+
+    fn pointer_button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A click with `button` on UI pixel `at`: down in one pass, up in the next; returns
+    /// the repaint delay egui asks for after it.
+    fn click_ui(
+        app: &mut PainterApp,
+        ctx: &egui::Context,
+        t: f64,
+        at: (i32, i32),
+        button: egui::PointerButton,
+    ) -> std::time::Duration {
+        let pos = ui_point(app, at);
+        ui_pass(
+            app,
+            ctx,
+            t,
+            vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, button, true),
+            ],
+        );
+        ui_pass(app, ctx, t + 0.02, vec![pointer_button(pos, button, false)])
+    }
+
+    /// Picks the menu item at the end of `path` (UI pixels, the menu title first) as on the
+    /// Amiga: right button down on the title bar, along the path, up over the item.
+    fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
+        use egui::PointerButton::Secondary;
+        let points: Vec<egui::Pos2> = path.iter().map(|&p| ui_point(app, p)).collect();
+        ui_pass(
+            app,
+            ctx,
+            t,
+            vec![
+                egui::Event::PointerMoved(points[0]),
+                pointer_button(points[0], Secondary, true),
+            ],
+        );
+        assert!(app.ui.menu.active, "the menu strip");
+        for (i, &p) in points.iter().enumerate().skip(1) {
+            ui_pass(
+                app,
+                ctx,
+                t + 0.01 * i as f64,
+                vec![egui::Event::PointerMoved(p)],
+            );
+        }
+        let last = points[points.len() - 1];
+        ui_pass(
+            app,
+            ctx,
+            t + 0.1,
+            vec![pointer_button(last, Secondary, false)],
+        );
+        assert!(!app.ui.menu.active);
+    }
+
+    /// UI pixels over the title of the menu holding the top-level item `id` and over it.
+    fn menu_item_path(app: &PainterApp, id: &'static str) -> [(i32, i32); 2] {
+        let (w, h) = app.view().ui_size();
+        let wanted = Action::Command(id);
+        let (m, item) = MENUS
+            .iter()
+            .enumerate()
+            .find_map(|(m, menu)| {
+                menu.items
+                    .iter()
+                    .position(|it| matches!(it.entry, menu::Entry::Action(a) if a == wanted))
+                    .map(|i| (m, i))
+            })
+            .expect("a top-level item");
+        let title_x = (0..w)
+            .find(|&x| {
+                let mut state = dpx_ui::MenuState::default();
+                state.open(w, h, x, 1);
+                state.menu == Some(m)
+            })
+            .expect("menu title");
+        let mbox = menu::menu_box(m, w, h);
+        let path = [(title_x, 1), (mbox.x + mbox.w / 2, mbox.item_top(item) + 1)];
+        let mut state = dpx_ui::MenuState::default();
+        state.open(w, h, path[0].0, path[0].1);
+        state.pointer(w, h, path[1].0, path[1].1);
+        assert_eq!(state.hovered_action(&app.ui.menu_context()), Some(wanted));
+        path
+    }
+
+    /// Passes as the idle window runs them (only when egui asks) while a playback runs;
+    /// returns the frames it showed (each once, in order) and the time it ended.
+    fn play_out(app: &mut PainterApp, ctx: &egui::Context, mut t: f64) -> (Vec<usize>, f64) {
+        let mut shown: Vec<usize> = app.anim.playing.iter().map(|p| p.shown).collect();
+        let mut delay = ui_pass(app, ctx, t, vec![]);
+        while let Some(p) = app.anim.playing {
+            if shown.last() != Some(&p.shown) {
+                shown.push(p.shown);
+            }
+            assert!(t < 10.0, "the playback ends");
+            assert!(
+                delay < std::time::Duration::from_secs(1),
+                "no repaint at {t}"
+            );
+            t += delay.as_secs_f64().max(1.0 / 60.0);
+            delay = ui_pass(app, ctx, t, vec![]);
+        }
+        (shown, t)
+    }
+
+    fn adr38_app(frames: u32) -> PainterApp {
+        let mut app = PainterApp::new();
+        app.engine
+            .execute(Command::SetFrameCount { count: frames })
+            .unwrap();
+        app.engine
+            .execute(Command::SetFrameRate { fps: 10 })
+            .unwrap();
+        app
+    }
+
+    #[test]
+    fn shifted_digits_reach_the_ends_repeat_go_to_and_play_backward() {
+        use dpx_core::anim::PlayMode;
+        use egui::Key::{Exclamationmark, Num1, Num2, Num3, Num4, Num5, Quote};
+        let ctx = egui::Context::default();
+        let mut app = adr38_app(5);
+        app.engine.execute(Command::GotoFrame { frame: 2 }).unwrap();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let shift = egui::Modifiers::SHIFT;
+        let current = |app: &PainterApp| app.engine.document().current_frame();
+        // Shift-2 on a German layout types '"' (egui: Quote): the last frame.
+        ui_pass(&mut app, &ctx, 0.1, chord(Quote, Num2, shift, "\""));
+        assert_eq!(current(&app), 4);
+        // Shift-1 on a US layout types '!': the first frame.
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.2,
+            chord(Exclamationmark, Num1, shift, "!"),
+        );
+        assert_eq!(current(&app), 0);
+        // Shift-3 ('#' has no egui key: the physical one) before any Go To: the requester.
+        ui_pass(&mut app, &ctx, 0.3, chord(Num3, Num3, shift, "#"));
+        assert!(app.ui.anim_requester.is_some(), "the Go to Frame requester");
+        let mut keys = tap(egui::Key::Backspace);
+        keys.push(egui::Event::Text("4".into()));
+        keys.extend(tap(egui::Key::Enter));
+        ui_pass(&mut app, &ctx, 0.4, keys);
+        assert!(app.ui.anim_requester.is_none());
+        assert_eq!(current(&app), 3);
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.5,
+            chord(Exclamationmark, Num1, shift, "!"),
+        );
+        assert_eq!(current(&app), 0);
+        ui_pass(&mut app, &ctx, 0.6, chord(Num3, Num3, shift, "#"));
+        assert!(app.ui.anim_requester.is_none(), "no requester now");
+        assert_eq!(current(&app), 3, "Shift-3 repeats the last Go To");
+        // Shift-4 loops backward until Esc.
+        ui_pass(&mut app, &ctx, 0.7, chord(Num4, Num4, shift, "$"));
+        assert_eq!(
+            app.anim.playing.map(|p| p.mode),
+            Some(PlayMode::LoopBackward)
+        );
+        ui_pass(&mut app, &ctx, 0.8, tap(egui::Key::Escape));
+        assert!(app.anim.playing.is_none());
+        // Shift-5 plays every frame once backward and stops on the first.
+        ui_pass(&mut app, &ctx, 0.9, chord(Num5, Num5, shift, "%"));
+        assert_eq!(
+            app.anim.playing.map(|p| p.mode),
+            Some(PlayMode::OnceBackward)
+        );
+        let (shown, _) = play_out(&mut app, &ctx, 0.95);
+        assert_eq!(shown, [4, 3, 2, 1, 0]);
+        assert_eq!(current(&app), 0);
+    }
+
+    #[test]
+    fn m_draws_a_move_and_alt_a_toggles_the_panel_through_the_ui_loop() {
+        use egui::Key::{A, Backspace, Enter, M, U};
+        let ctx = egui::Context::default();
+        let mut app = adr38_app(4);
+        app.ui.fg = 5;
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let view = app.view();
+        assert_eq!((view.ux, view.uy), (1, 1), "UI pixels are screen pixels");
+        // The 1-pixel brush clicked down at (40, 30).
+        click_ui(&mut app, &ctx, 0.1, (40, 30), egui::PointerButton::Primary);
+        assert_eq!(app.page().get(40, 30), Some(5));
+        // Shift-M: the Move requester. Dist X 12 (it has the cursor), Return = Draw.
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.2,
+            chord(M, M, egui::Modifiers::SHIFT, "M"),
+        );
+        assert!(matches!(
+            app.ui.anim_control,
+            Some(dpx_ui::AnimControlRequester::Move(_))
+        ));
+        let mut keys = tap(Backspace);
+        keys.push(egui::Event::Text("12".into()));
+        keys.extend(tap(Enter));
+        ui_pass(&mut app, &ctx, 0.3, keys);
+        assert!(app.ui.anim_control.is_none(), "Draw closes it");
+        let doc = app.engine.document();
+        for (f, x) in [40, 43, 46, 49].into_iter().enumerate() {
+            assert_eq!(doc.frame(f).unwrap().get(x, 30), Some(5), "frame {}", f + 1);
+        }
+        // `U` takes the whole move back in one step.
+        ui_pass(&mut app, &ctx, 0.4, chord(U, U, egui::Modifiers::NONE, "u"));
+        let doc = app.engine.document();
+        assert_eq!(doc.frame(3).unwrap().get(49, 30), Some(0));
+        assert_eq!(
+            doc.frame(0).unwrap().get(40, 30),
+            Some(5),
+            "the click stays"
+        );
+        // Alt-a (macOS: Option-a types 'å', egui reports the physical A) shows the panel
+        // and hides it again.
+        let alt_a = || chord(A, A, egui::Modifiers::ALT, "å");
+        ui_pass(&mut app, &ctx, 0.5, alt_a());
+        assert!(app.anim_control.panel);
+        ui_pass(&mut app, &ctx, 0.6, vec![]);
+        assert!(app.ui.anim_panel.is_some(), "the panel is drawn");
+        ui_pass(&mut app, &ctx, 0.7, alt_a());
+        ui_pass(&mut app, &ctx, 0.8, vec![]);
+        assert!(!app.anim_control.panel);
+        assert!(app.ui.anim_panel.is_none());
+        assert_eq!(
+            app.engine.document().frame(0).unwrap().get(40, 30),
+            Some(5),
+            "Alt-a is not an undo"
+        );
+    }
+
+    #[test]
+    fn cancel_after_a_refused_move_brings_back_the_settings_from_before() {
+        use dpx_core::anim_move::MovePath;
+        use egui::Key::{Backspace, Enter, Escape, M, Tab};
+        let ctx = egui::Context::default();
+        let mut app = adr38_app(4);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let shift_m = || chord(M, M, egui::Modifiers::SHIFT, "M");
+        let shown = |app: &PainterApp| match &app.ui.anim_control {
+            Some(dpx_ui::AnimControlRequester::Move(r)) => r.as_ref().clone(),
+            _ => panic!("the Move requester"),
+        };
+        // A move that is drawn (Dist X 12 over the 4 frames) keeps its settings.
+        ui_pass(&mut app, &ctx, 0.1, shift_m());
+        let mut keys = tap(Backspace);
+        keys.push(egui::Event::Text("12".into()));
+        keys.extend(tap(Enter));
+        ui_pass(&mut app, &ctx, 0.2, keys);
+        assert!(app.ui.anim_control.is_none(), "drawn");
+        let kept = MovePath {
+            dist: [12, 0, 0],
+            count: 4,
+            ..MovePath::default()
+        };
+        ui_pass(&mut app, &ctx, 0.3, shift_m());
+        assert_eq!(shown(&app), dpx_ui::MoveRequester::new(&kept, 4));
+        // With a 100×100 brush, Dist Z -310 and Count 999 with Trails is refused.
+        app.custom_brush = Some(dpx_core::BrushImage::from_image(
+            &IndexedImage::new(100, 100, 3),
+            None,
+        ));
+        let mut keys = [tap(Tab), tap(Tab), tap(Backspace)].concat();
+        keys.push(egui::Event::Text("-310".into()));
+        for _ in 0..6 {
+            keys.extend(tap(Tab));
+        }
+        keys.extend(tap(Backspace));
+        keys.push(egui::Event::Text("999".into()));
+        ui_pass(&mut app, &ctx, 0.4, keys);
+        let typed = MovePath {
+            dist: [12, 0, -310],
+            count: 999,
+            ..MovePath::default()
+        };
+        let mut expected = dpx_ui::MoveRequester::new(&typed, 4);
+        for _ in 0..8 {
+            expected.handle(ReqEvent::Key(ReqKey::Tab));
+        }
+        assert_eq!(shown(&app), expected, "typed in");
+        let revision = app.engine.document().revision();
+        let screen = app.view().ui_screen();
+        let Some(req) = &app.ui.anim_control else {
+            panic!("the Move requester");
+        };
+        let (ox, oy) = req.origin(screen.width, screen.height);
+        click_ui(
+            &mut app,
+            &ctx,
+            0.5,
+            (ox + 68, oy + 114),
+            egui::PointerButton::Primary,
+        );
+        assert!(app.ui.anim_control.is_some(), "Trails refused: still open");
+        assert_eq!(app.engine.document().revision(), revision, "nothing drawn");
+        let pens = dpx_ui::Pens::from_palette(app.engine.document().palette());
+        let mut quiet = shown(&app);
+        quiet.set_message("");
+        assert_ne!(shown(&app).render(&pens), quiet.render(&pens), "the reason");
+        // Esc = Cancel. Move again shows the settings from before (AGA p.255).
+        ui_pass(&mut app, &ctx, 0.7, tap(Escape));
+        assert!(app.ui.anim_control.is_none());
+        ui_pass(&mut app, &ctx, 0.8, shift_m());
+        assert_eq!(shown(&app), dpx_ui::MoveRequester::new(&kept, 4));
+    }
+
+    #[test]
+    fn the_control_panel_works_with_the_pointer_through_the_ui_loop() {
+        use dpx_core::anim::PlayMode;
+        use dpx_ui::PanelButton as B;
+        use dpx_ui::anim_panel::Layout;
+        use egui::PointerButton::{Primary, Secondary};
+        let ctx = egui::Context::default();
+        let mut app = adr38_app(5);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // Anim ▸ Control ▸ Panel On/Off.
+        let path = menu_path(&app, "anim.panel");
+        pick(&mut app, &ctx, 0.1, &path);
+        assert!(app.anim_control.panel);
+        ui_pass(&mut app, &ctx, 0.3, vec![]);
+        let screen = app.view().ui_screen();
+        let layout = Layout::new(screen.width, screen.height, app.ui.toolbox_visible);
+        let centre = |r: dpx_core::Rect| (r.x + r.w / 2, r.y + r.h / 2);
+        let current = |app: &PainterApp| app.engine.document().current_frame();
+        let count = |app: &PainterApp| app.engine.document().frame_count();
+        // Passes 0.1 s apart, forward only.
+        let clock = std::cell::Cell::new(0.4);
+        let next = || {
+            let t = clock.get();
+            clock.set(t + 0.1);
+            t
+        };
+        let click = |app: &mut PainterApp, at: (i32, i32), button| {
+            click_ui(app, &ctx, next(), at, button);
+        };
+        let press =
+            |app: &mut PainterApp, b: B, button| click(app, centre(layout.button(b)), button);
+        press(&mut app, B::Last, Primary);
+        assert_eq!(current(&app), 4);
+        assert_eq!(app.anim_control.held, None, "up again");
+        press(&mut app, B::First, Primary);
+        assert_eq!(current(&app), 0);
+        press(&mut app, B::Next, Primary);
+        assert_eq!(current(&app), 1);
+        press(&mut app, B::Previous, Primary);
+        assert_eq!(current(&app), 0);
+        press(&mut app, B::Add, Primary);
+        assert_eq!(count(&app), 6);
+        press(&mut app, B::Delete, Primary);
+        assert_eq!(count(&app), 5);
+        press(&mut app, B::LightTable, Primary);
+        assert!(app.anim.light_on);
+        press(&mut app, B::LightTable, Primary);
+        assert!(!app.anim.light_on);
+        for (b, mode) in [
+            (B::OnceForward, PlayMode::Once),
+            (B::LoopForward, PlayMode::Loop),
+            (B::PingPong, PlayMode::PingPong),
+            (B::LoopBackward, PlayMode::LoopBackward),
+            (B::OnceBackward, PlayMode::OnceBackward),
+        ] {
+            press(&mut app, b, Primary);
+            assert_eq!(app.anim.playing.map(|p| p.mode), Some(mode), "{b:?}");
+            ui_pass(&mut app, &ctx, next(), tap(egui::Key::Escape));
+            assert!(app.anim.playing.is_none());
+        }
+        // Go To with the right button: the Go to Frame requester.
+        press(&mut app, B::GoTo, Secondary);
+        assert!(app.ui.anim_requester.is_some());
+        ui_pass(&mut app, &ctx, next(), tap(egui::Key::Escape));
+        assert!(app.ui.anim_requester.is_none());
+        // The slider: a click right of the knob steps one frame, the knob drags.
+        press(&mut app, B::First, Primary);
+        let track = layout.track;
+        click(
+            &mut app,
+            (track.x + track.w - 2, track.y + track.h / 2),
+            Primary,
+        );
+        assert_eq!(current(&app), 1);
+        click(&mut app, (track.x + 1, track.y + track.h / 2), Primary);
+        assert_eq!(current(&app), 0);
+        let knob = app.ui.anim_panel.expect("the panel").knob(&layout);
+        let grab = ui_point(&app, centre(knob));
+        ui_pass(
+            &mut app,
+            &ctx,
+            next(),
+            vec![
+                egui::Event::PointerMoved(grab),
+                pointer_button(grab, Primary, true),
+            ],
+        );
+        assert!(app.anim_control.knob.is_some(), "the knob is held");
+        let end = ui_point(&app, (track.x + track.w - 1, knob.y));
+        ui_pass(&mut app, &ctx, next(), vec![egui::Event::PointerMoved(end)]);
+        assert_eq!(current(&app), 4, "dragged to the last frame");
+        let home = ui_point(&app, (track.x, knob.y));
+        ui_pass(
+            &mut app,
+            &ctx,
+            next(),
+            vec![egui::Event::PointerMoved(home)],
+        );
+        assert_eq!(current(&app), 0, "and back to the first");
+        ui_pass(
+            &mut app,
+            &ctx,
+            next(),
+            vec![pointer_button(home, Primary, false)],
+        );
+        assert!(app.anim_control.knob.is_none());
+        // The panel took every press: nothing was painted under it.
+        let doc = app.engine.document();
+        for f in 0..doc.frame_count() {
+            let frame = doc.frame(f).unwrap();
+            assert!(frame.pixels().iter().all(|&p| p == 0), "frame {}", f + 1);
+        }
+    }
+
+    #[test]
+    fn set_range_method_and_move_work_from_the_menus() {
+        use egui::Key::{Backspace, Enter, Num2, Num4, Num5, Tab};
+        use egui::PointerButton::Primary;
+        let ctx = egui::Context::default();
+        let mut app = adr38_app(10);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        let screen = app.view().ui_screen();
+        // Anim ▸ Control ▸ Set Range..: Frames 3 to 6.
+        let path = menu_path(&app, "anim.set_range");
+        pick(&mut app, &ctx, 0.1, &path);
+        let Some(req @ dpx_ui::AnimControlRequester::PlayRange(_)) = &app.ui.anim_control else {
+            panic!("the Set Range requester");
+        };
+        let (ox, oy) = req.origin(screen.width, screen.height);
+        click_ui(&mut app, &ctx, 0.3, (ox + 10, oy + 31), Primary);
+        let mut keys = tap(Backspace);
+        keys.push(egui::Event::Text("3".into()));
+        keys.extend(tap(Tab));
+        keys.extend(tap(Backspace));
+        keys.extend(tap(Backspace));
+        keys.push(egui::Event::Text("6".into()));
+        keys.extend(tap(Enter));
+        ui_pass(&mut app, &ctx, 0.4, keys);
+        assert!(app.ui.anim_control.is_none());
+        assert_eq!(app.anim_control.range, Some((2, 5)));
+        // From the last frame, `4` (Play) starts there: the range does not apply to it.
+        let shift = egui::Modifiers::SHIFT;
+        ui_pass(&mut app, &ctx, 0.5, chord(Num2, Num2, shift, "@"));
+        assert_eq!(app.engine.document().current_frame(), 9);
+        let none = egui::Modifiers::NONE;
+        ui_pass(&mut app, &ctx, 0.6, chord(Num4, Num4, none, "4"));
+        assert_eq!(app.anim.playing.map(|p| p.shown), Some(9));
+        ui_pass(&mut app, &ctx, 0.7, tap(egui::Key::Escape));
+        // `5` (Play once) plays frames 3 to 6 and stops on 6.
+        ui_pass(&mut app, &ctx, 0.8, chord(Num5, Num5, none, "5"));
+        let (shown, t) = play_out(&mut app, &ctx, 0.85);
+        assert_eq!(shown, [2, 3, 4, 5]);
+        assert_eq!(app.engine.document().current_frame(), 5);
+        // Anim ▸ Method: a radio pair with a check mark; no command.
+        let revision = app.engine.document().revision();
+        let checked = |app: &PainterApp, id: &'static str| {
+            Action::Command(id).checked(&app.ui.menu_context())
+        };
+        let path = menu_path(&app, "anim.method_expanded");
+        pick(&mut app, &ctx, t + 0.1, &path);
+        assert!(app.ui.anim_expanded);
+        assert_eq!(checked(&app, "anim.method_expanded"), Some(true));
+        assert_eq!(checked(&app, "anim.method_compressed"), Some(false));
+        let path = menu_path(&app, "anim.method_compressed");
+        pick(&mut app, &ctx, t + 0.3, &path);
+        assert!(!app.ui.anim_expanded);
+        assert_eq!(checked(&app, "anim.method_compressed"), Some(true));
+        assert_eq!(app.engine.document().revision(), revision);
+        // Anim ▸ Move..: the requester; Preview plays the wire frame over every frame (Count
+        // shows the frame count) and brings the requester back.
+        let path = menu_item_path(&app, "anim.move");
+        pick(&mut app, &ctx, t + 0.5, &path);
+        let Some(req @ dpx_ui::AnimControlRequester::Move(_)) = &app.ui.anim_control else {
+            panic!("the Move requester");
+        };
+        let (ox, oy) = req.origin(screen.width, screen.height);
+        let mut delay = click_ui(&mut app, &ctx, t + 0.7, (ox + 8, oy + 114), Primary);
+        assert!(app.anim_control.preview.is_some(), "the preview plays");
+        let mut t = t + 0.72;
+        let mut counters = std::collections::BTreeSet::new();
+        while app.anim_control.preview.is_some() {
+            counters.extend(app.ui.frame_counter);
+            assert!(t < 10.0, "the preview ends");
+            assert!(
+                delay < std::time::Duration::from_secs(1),
+                "no repaint at {t}"
+            );
+            t += delay.as_secs_f64().max(1.0 / 60.0);
+            delay = ui_pass(&mut app, &ctx, t, vec![]);
+        }
+        assert_eq!(counters.len(), 10, "every frame: {counters:?}");
+        assert!(
+            matches!(
+                app.ui.anim_control,
+                Some(dpx_ui::AnimControlRequester::Move(_))
+            ),
+            "the requester is back"
+        );
+        assert_eq!(app.engine.document().revision(), revision, "nothing drawn");
+        ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::Escape));
+        assert!(app.ui.anim_control.is_none());
     }
 }
