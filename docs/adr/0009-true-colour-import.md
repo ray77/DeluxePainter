@@ -16,3 +16,4 @@
   - A page smaller than the screen shows colour 0 around it; for transparent pictures that is pink. DeluxePaint pages are at least screen size; this is solved with "pages larger than the screen, overscan, custom sizes" (next Phase 2 item).
   - The colour used for transparent pixels is a parameter (`ReduceOptions::transparent`); choosing it in the UI (owner idea, 2026-11-10) comes with palette editing in Phase 3.
   - Brushes from true-colour files will reuse the same reduction (against the picture palette) in Phase 3.
+- Amendment (2026-11-11): the GUI's Picture ▸ Load.. of a PNG or JPEG now asks with the Import requester and fits the picture into the current page (ADR-42); `--open`, the CLI and MCP keep this ADR's behaviour.

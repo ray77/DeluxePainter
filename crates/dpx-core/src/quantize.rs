@@ -12,6 +12,14 @@
 //!   never used by pixels.
 //!
 //! Distances are weighted RGB (2·ΔR² + 4·ΔG² + 3·ΔB²), the same for clustering and mapping.
+//!
+//! The GUI's Import requester (ADR-42) adds an ordered (4×4 Bayer) dither next to
+//! Floyd–Steinberg and none, extra colours that count for the palette without being pixels
+//! ([`reduce_with`]: the page around an imported picture), [`reduce_to_palette`], which
+//! maps a picture onto a fixed palette (the current document's) instead of building one, and
+//! the two halves of [`reduce_with`] ([`build_palette`], [`map_built`]), so a dither change
+//! does not build the palette again. Nearest colours are found through a grid of candidate
+//! entries per RGB cell (`Finder`), which gives exactly the plain search's answers.
 
 use std::collections::HashMap;
 
@@ -49,7 +57,14 @@ pub enum Dither {
     None,
     /// Floyd–Steinberg error diffusion.
     FloydSteinberg,
+    /// Ordered dither with the 4×4 Bayer matrix (the pattern of the gradient fills' dither,
+    /// ADR-20) between each pixel's two nearest colours, by where it lies between them; a
+    /// pixel that is a palette colour keeps it (ADR-42).
+    Ordered,
 }
+
+/// 4×4 Bayer thresholds, 0..16 (the same matrix as the gradient fills' dither).
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReduceOptions {
@@ -108,7 +123,9 @@ fn luma(c: Rgb8) -> u32 {
     299 * u32::from(c.r) + 587 * u32::from(c.g) + 114 * u32::from(c.b)
 }
 
-/// Index into `pal` of the colour nearest to `c` (ties: lowest index).
+/// Index into `pal` of the colour nearest to `c` (ties: lowest index): the plain search
+/// that [`Finder`] must agree with.
+#[cfg(test)]
 fn nearest(pal: &[[f64; 3]], c: [f64; 3]) -> usize {
     let mut best = (f64::INFINITY, 0);
     for (i, &p) in pal.iter().enumerate() {
@@ -120,12 +137,213 @@ fn nearest(pal: &[[f64; 3]], c: [f64; 3]) -> usize {
     best.1
 }
 
+/// Cells per channel of [`Finder`]'s grid, and their width.
+const CELLS: usize = 16;
+const CELL_W: f64 = 16.0;
+
+/// Below this many searches a [`Finder`] looks at every entry (the grid costs more to make).
+const GRID_MIN_SEARCHES: usize = 16_384;
+
+/// The same answers as a plain search over every entry ([`nearest`]: the weighted distance,
+/// ties to the lowest index), found faster for many searches: the RGB cube is cut into
+/// 16×16×16 cells, and each cell keeps the entries that can be the nearest one (or the
+/// nearest one of another colour) for some point in it. For a cell, `m` is the smallest
+/// distance within which some entry lies from every point of the cell (its farthest corner);
+/// an entry whose distance from the cell's nearest point is above `m` can never be the
+/// nearest, so it is left out. Entries that can tie are kept, so the lowest index still wins.
+struct Finder<'a> {
+    pal: &'a [[f64; 3]],
+    grid: Option<Grid>,
+}
+
+/// Candidate entries per cell, for [`Finder::nearest`] and [`Finder::nearest_two`].
+struct Grid {
+    near: Vec<u16>,
+    near_at: Vec<u32>,
+    two: Vec<u16>,
+    two_at: Vec<u32>,
+}
+
+/// The cell of a channel value (0..=255; values outside are clamped).
+fn cell(v: f64) -> usize {
+    ((v / CELL_W) as usize).min(CELLS - 1)
+}
+
+impl<'a> Finder<'a> {
+    /// A finder for about `searches` searches.
+    fn new(pal: &'a [[f64; 3]], searches: usize) -> Self {
+        let grid = (searches >= GRID_MIN_SEARCHES && pal.len() > 4).then(|| Grid::new(pal));
+        Self { pal, grid }
+    }
+
+    /// The entries to look at for `c`, in index order.
+    fn candidates(&self, c: [f64; 3], two: bool) -> Candidates<'_> {
+        match &self.grid {
+            None => Candidates::All(0..self.pal.len()),
+            Some(g) => {
+                let k = (cell(c[0]) * CELLS + cell(c[1])) * CELLS + cell(c[2]);
+                let (list, at) = if two {
+                    (&g.two, &g.two_at)
+                } else {
+                    (&g.near, &g.near_at)
+                };
+                Candidates::Some(list[at[k] as usize..at[k + 1] as usize].iter())
+            }
+        }
+    }
+
+    /// Index of the entry nearest to `c` (ties: the lowest index); 0 for no entries.
+    fn nearest(&self, c: [f64; 3]) -> usize {
+        let mut best = (f64::INFINITY, 0usize);
+        for i in self.candidates(c, false) {
+            let d = dist(self.pal[i], c);
+            if d < best.0 {
+                best = (d, i);
+            }
+        }
+        best.1
+    }
+
+    /// The nearest entry and the nearest entry of another colour (ties: the lowest index),
+    /// if the palette has another colour.
+    fn nearest_two(&self, c: [f64; 3]) -> (usize, Option<usize>) {
+        let pal = self.pal;
+        let mut best = (f64::INFINITY, 0usize);
+        let mut second: (f64, Option<usize>) = (f64::INFINITY, None);
+        // Candidates come in index order, so `<` keeps the lowest index on ties.
+        for i in self.candidates(c, true) {
+            let d = dist(pal[i], c);
+            if d < best.0 {
+                if best.0.is_finite() && pal[best.1] != pal[i] {
+                    second = (best.0, Some(best.1));
+                }
+                best = (d, i);
+            } else if pal[i] != pal[best.1] && d < second.0 {
+                second = (d, Some(i));
+            }
+        }
+        (best.1, second.1)
+    }
+}
+
+enum Candidates<'g> {
+    All(std::ops::Range<usize>),
+    Some(std::slice::Iter<'g, u16>),
+}
+
+impl Iterator for Candidates<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Candidates::All(r) => r.next(),
+            Candidates::Some(it) => it.next().map(|&i| usize::from(i)),
+        }
+    }
+}
+
+impl Grid {
+    fn new(pal: &[[f64; 3]]) -> Self {
+        let mut grid = Grid {
+            near: Vec::new(),
+            near_at: vec![0],
+            two: Vec::new(),
+            two_at: vec![0],
+        };
+        let mut lows = vec![0.0f64; pal.len()];
+        let mut highs = vec![0.0f64; pal.len()];
+        // A little room for rounding: never leave out an entry that could tie.
+        let within = |d: f64, m: f64| d <= m * (1.0 + 1e-9) + 1e-6;
+        for r in 0..CELLS {
+            for g in 0..CELLS {
+                for b in 0..CELLS {
+                    let lo = [r as f64 * CELL_W, g as f64 * CELL_W, b as f64 * CELL_W];
+                    let hi = lo.map(|v| (v + CELL_W).min(255.0));
+                    for (i, p) in pal.iter().enumerate() {
+                        let (mut near, mut far) = (0.0, 0.0);
+                        for ch in 0..3 {
+                            let below = (lo[ch] - p[ch]).max(0.0);
+                            let above = (p[ch] - hi[ch]).max(0.0);
+                            let gap = below.max(above);
+                            near += WEIGHTS[ch] * gap * gap;
+                            let span = (p[ch] - lo[ch]).abs().max((hi[ch] - p[ch]).abs());
+                            far += WEIGHTS[ch] * span * span;
+                        }
+                        lows[i] = near;
+                        highs[i] = far;
+                    }
+                    // Every point of the cell has an entry within `m1`, and one of another
+                    // colour than its nearest within `m2`.
+                    let a = (0..pal.len())
+                        .min_by(|&x, &y| highs[x].total_cmp(&highs[y]))
+                        .unwrap_or(0);
+                    let m1 = highs[a];
+                    let m2 = (0..pal.len())
+                        .filter(|&i| pal[i] != pal[a])
+                        .map(|i| highs[i])
+                        .fold(f64::INFINITY, f64::min);
+                    for (i, &low) in lows.iter().enumerate() {
+                        if within(low, m1) {
+                            grid.near.push(i as u16);
+                        }
+                        if within(low, m2) {
+                            grid.two.push(i as u16);
+                        }
+                    }
+                    grid.near_at.push(grid.near.len() as u32);
+                    grid.two_at.push(grid.two.len() as u32);
+                }
+            }
+        }
+        grid
+    }
+}
+
 /// Reduces `img` to an indexed picture as described in the module documentation.
 pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
+    reduce_with(img, opts, &[]).0
+}
+
+/// Like [`reduce`], with `extra` colours and pixel counts that are not pixels of `img` but
+/// belong to the picture all the same (the page around an imported picture, ADR-42): they
+/// count for the histogram and the palette order. When the picture's own colours fit, they
+/// are kept exactly and an extra colour gets an entry of its own only while there is room
+/// (else it takes the nearest picture colour), so the extras never push a picture with few
+/// colours into quantizing. Also returns the palette index of each extra colour (its own
+/// entry, else the nearest).
+///
+/// [`build_palette`] then [`map_built`]: the palette does not depend on the dither.
+pub fn reduce_with(
+    img: &RgbaImage,
+    opts: &ReduceOptions,
+    extra: &[(Rgb8, u64)],
+) -> (Reduced, Vec<u8>) {
+    let built = build_palette(img, opts, extra);
+    map_built(img, &built, opts.dither, extra)
+}
+
+/// A palette made for a picture by [`build_palette`] (the first half of [`reduce_with`]); it
+/// does not depend on the dither, so [`map_built`] can map the same picture with any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Built {
+    /// (Reserved colour 0,) the entries, black padding to whole bitplanes.
+    pub palette: Palette,
+    /// What the reduction had to do.
+    pub reduction: Reduction,
+    /// The entries pixels may use, in palette order, from index `offset`.
+    entries: Vec<Rgb8>,
+    offset: usize,
+    transparent: bool,
+    depth: PaletteDepth,
+}
+
+/// The palette [`reduce_with`] makes for `img` and `extra` (`opts.dither` is not used).
+pub fn build_palette(img: &RgbaImage, opts: &ReduceOptions, extra: &[(Rgb8, u64)]) -> Built {
     let max = usize::from(opts.max_colors.clamp(2, 256));
     let transparent = img.pixels().iter().any(|&p| is_transparent(p));
     let offset = usize::from(transparent);
     let avail = max - offset;
+    let counted: Vec<(Rgb8, u64)> = extra.iter().copied().filter(|&(_, n)| n > 0).collect();
 
     let (entries, reduction) = match unique_colors(img, avail) {
         Some(counts) => {
@@ -136,6 +354,16 @@ pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
                 rounded |= s != c;
                 *merged.entry(s).or_default() += n;
             }
+            // Extra colours join while there is room; the picture's colours come first.
+            for &(c, n) in &counted {
+                let s = opts.depth.snap(c);
+                if let Some(e) = merged.get_mut(&s) {
+                    *e += n;
+                } else if merged.len() < avail {
+                    rounded |= s != c;
+                    merged.insert(s, n);
+                }
+            }
             let r = if rounded {
                 Reduction::Rounded
             } else {
@@ -143,10 +371,12 @@ pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
             };
             (merged.into_iter().collect::<Vec<_>>(), r)
         }
-        None => (palette_for(img, avail, opts.depth), Reduction::Quantized),
+        None => (
+            palette_for(img, avail, opts.depth, &counted),
+            Reduction::Quantized,
+        ),
     };
     let entries = order(entries);
-    let colors = entries.len();
 
     let mut pal: Vec<Rgb8> = Vec::with_capacity(max);
     if transparent {
@@ -155,54 +385,178 @@ pub fn reduce(img: &RgbaImage, opts: &ReduceOptions) -> Reduced {
     pal.extend(entries.iter().map(|&(c, _)| c));
     let padded = pal.len().max(2).next_power_of_two();
     pal.resize(padded, Rgb8::BLACK);
+    Built {
+        palette: Palette::new(pal).expect("2..=256 entries"),
+        reduction,
+        entries: entries.into_iter().map(|(c, _)| c).collect(),
+        offset,
+        transparent,
+        depth: opts.depth,
+    }
+}
 
-    let real: Vec<[f64; 3]> = entries.iter().map(|&(c, _)| to_f(c)).collect();
-    let pixels = match reduction {
+/// Maps `img` (the picture `built` was made for) onto its palette with `dither` (the second
+/// half of [`reduce_with`]); also returns the index of each `extra` colour.
+pub fn map_built(
+    img: &RgbaImage,
+    built: &Built,
+    dither: Dither,
+    extra: &[(Rgb8, u64)],
+) -> (Reduced, Vec<u8>) {
+    let offset = built.offset;
+    let real: Vec<[f64; 3]> = built.entries.iter().map(|&c| to_f(c)).collect();
+    let ids: Vec<u8> = (0..real.len()).map(|i| (i + offset) as u8).collect();
+    // For the extra colours only.
+    let finder = Finder::new(&real, extra.len());
+    let (pixels, extra_ids) = match built.reduction {
         Reduction::Exact | Reduction::Rounded => {
-            let index: HashMap<Rgb8, u8> = entries
+            let depth = built.depth;
+            let index: HashMap<Rgb8, u8> = built
+                .entries
                 .iter()
                 .enumerate()
-                .map(|(i, &(c, _))| (c, (i + offset) as u8))
+                .map(|(i, &c)| (c, (i + offset) as u8))
                 .collect();
-            img.pixels()
+            // Runs of one colour (enlarged pixel art) look it up once.
+            let mut last: Option<(Rgba8, u8)> = None;
+            let pixels = img
+                .pixels()
                 .iter()
                 .map(|&p| {
                     if is_transparent(p) {
-                        0
-                    } else {
-                        index[&opts.depth.snap(rgb(p))]
+                        return 0;
+                    }
+                    match last {
+                        Some((q, i)) if q == p => i,
+                        _ => {
+                            let i = index[&depth.snap(rgb(p))];
+                            last = Some((p, i));
+                            i
+                        }
                     }
                 })
-                .collect()
+                .collect();
+            let lookup = |c: Rgb8| {
+                index
+                    .get(&depth.snap(c))
+                    .copied()
+                    .unwrap_or_else(|| ids.get(finder.nearest(to_f(c))).copied().unwrap_or(0))
+            };
+            (pixels, extra.iter().map(|&(c, _)| lookup(c)).collect())
         }
-        Reduction::Quantized => match opts.dither {
-            Dither::None => map_nearest(img, &real, offset),
-            Dither::FloydSteinberg => map_floyd_steinberg(img, &real, offset),
-        },
+        Reduction::Quantized => {
+            let pixels = map_pixels(img, &real, &ids, dither);
+            let extra_ids = extra
+                .iter()
+                .map(|&(c, _)| ids[finder.nearest(to_f(c))])
+                .collect();
+            (pixels, extra_ids)
+        }
     };
-    Reduced {
+    let reduced = Reduced {
         image: IndexedImage::from_pixels(img.width(), img.height(), pixels)
             .expect("one index per pixel"),
-        palette: Palette::new(pal).expect("2..=256 entries"),
-        transparent_index: transparent.then_some(0),
-        reduction,
-        colors,
+        palette: built.palette.clone(),
+        transparent_index: built.transparent.then_some(0),
+        reduction: built.reduction,
+        colors: built.entries.len(),
+    };
+    (reduced, extra_ids)
+}
+
+/// A picture mapped onto a fixed palette ([`reduce_to_palette`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mapped {
+    pub image: IndexedImage,
+    /// The picture had transparent pixels: they are colour 0, which opaque pixels avoid.
+    pub transparent: bool,
+    /// Every opaque pixel was a palette colour already and keeps it exactly (no dithering).
+    pub exact: bool,
+}
+
+/// Maps `img` onto `palette` as it is (the Import requester's "Current" palette, ADR-42):
+/// every opaque pixel becomes the nearest palette colour by the weighted distance above
+/// (ties: the lowest index, so of duplicate entries the first is used), with `dither`. A
+/// picture made only of palette colours is mapped exactly, without dithering (as [`reduce`]
+/// keeps few colours exactly). Transparent pixels become colour 0; while the picture has
+/// any, opaque pixels do not use colour 0 (it marks transparency, as in [`reduce`]), unless
+/// the palette has no other colour.
+pub fn reduce_to_palette(img: &RgbaImage, palette: &Palette, dither: Dither) -> Mapped {
+    let transparent = img.pixels().iter().any(|&p| is_transparent(p));
+    let first = usize::from(transparent && palette.len() > 1);
+    let ids: Vec<u8> = (first..palette.len()).map(|i| i as u8).collect();
+    let colours: Vec<Rgb8> = ids
+        .iter()
+        .map(|&i| palette.get(i).unwrap_or(Rgb8::BLACK))
+        .collect();
+    // Exact colours: the lowest index of each.
+    let mut exact_index: HashMap<Rgb8, u8> = HashMap::new();
+    for (&i, &c) in ids.iter().zip(&colours) {
+        exact_index.entry(c).or_insert(i);
+    }
+    let exact = img
+        .pixels()
+        .iter()
+        .all(|&p| is_transparent(p) || exact_index.contains_key(&rgb(p)));
+    let pixels = if exact {
+        img.pixels()
+            .iter()
+            .map(|&p| {
+                if is_transparent(p) {
+                    0
+                } else {
+                    exact_index[&rgb(p)]
+                }
+            })
+            .collect()
+    } else {
+        let pal: Vec<[f64; 3]> = colours.iter().map(|&c| to_f(c)).collect();
+        map_pixels(img, &pal, &ids, dither)
+    };
+    Mapped {
+        image: IndexedImage::from_pixels(img.width(), img.height(), pixels)
+            .expect("one index per pixel"),
+        transparent,
+        exact,
+    }
+}
+
+/// Maps the opaque pixels to `ids[nearest entry of pal]` with `dither`; transparent pixels
+/// become 0.
+fn map_pixels(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8], dither: Dither) -> Vec<u8> {
+    match dither {
+        Dither::None => map_nearest(img, pal, ids),
+        Dither::FloydSteinberg => map_floyd_steinberg(img, pal, ids),
+        Dither::Ordered => map_ordered(img, pal, ids),
     }
 }
 
 /// The opaque colours with their pixel counts, or `None` if there are more than `limit`.
 fn unique_colors(img: &RgbaImage, limit: usize) -> Option<Vec<(Rgb8, u64)>> {
     let mut counts: HashMap<Rgb8, u64> = HashMap::new();
+    // Runs of one colour (enlarged pixel art, flat areas) are counted together.
+    let mut run: Option<(Rgb8, u64)> = None;
     for &p in img.pixels() {
         if is_transparent(p) {
             continue;
         }
-        *counts.entry(rgb(p)).or_default() += 1;
-        if counts.len() > limit {
-            return None;
+        let c = rgb(p);
+        match &mut run {
+            Some((r, n)) if *r == c => *n += 1,
+            _ => {
+                if let Some((r, n)) = run.replace((c, 1)) {
+                    *counts.entry(r).or_default() += n;
+                }
+                if !counts.contains_key(&c) && counts.len() >= limit {
+                    return None;
+                }
+            }
         }
     }
-    Some(counts.into_iter().collect())
+    if let Some((r, n)) = run {
+        *counts.entry(r).or_default() += n;
+    }
+    (counts.len() <= limit).then(|| counts.into_iter().collect())
 }
 
 /// Most used colour first, then dark to light (ties broken by RGB, so the order is stable).
@@ -222,27 +576,38 @@ struct Item {
     w: f64,
 }
 
-/// A new palette of at most `n` colours (with pixel weights) for the opaque pixels.
-fn palette_for(img: &RgbaImage, n: usize, depth: PaletteDepth) -> Vec<(Rgb8, u64)> {
-    // 6-bit-per-channel histogram; each bin keeps the exact mean of its pixels.
-    let mut bins: HashMap<u32, (u64, [u64; 3])> = HashMap::new();
-    for &p in img.pixels() {
-        if is_transparent(p) {
-            continue;
-        }
-        let key = (u32::from(p.r >> 2) << 12) | (u32::from(p.g >> 2) << 6) | u32::from(p.b >> 2);
-        let bin = bins.entry(key).or_default();
-        bin.0 += 1;
-        bin.1[0] += u64::from(p.r);
-        bin.1[1] += u64::from(p.g);
-        bin.1[2] += u64::from(p.b);
+/// A new palette of at most `n` colours (with pixel weights) for the opaque pixels and the
+/// `extra` colours.
+fn palette_for(
+    img: &RgbaImage,
+    n: usize,
+    depth: PaletteDepth,
+    extra: &[(Rgb8, u64)],
+) -> Vec<(Rgb8, u64)> {
+    // 6-bit-per-channel histogram; each bin keeps the exact mean of its pixels. A table of
+    // all 2^18 bins, read in key order (the order the items need).
+    let mut bins: Vec<(u64, [u64; 3])> = vec![(0, [0; 3]); 1 << 18];
+    let mut add = |c: Rgb8, count: u64| {
+        let key =
+            (usize::from(c.r >> 2) << 12) | (usize::from(c.g >> 2) << 6) | usize::from(c.b >> 2);
+        let bin = &mut bins[key];
+        bin.0 += count;
+        bin.1[0] += count * u64::from(c.r);
+        bin.1[1] += count * u64::from(c.g);
+        bin.1[2] += count * u64::from(c.b);
+    };
+    for &(c, count) in extra {
+        add(c, count);
     }
-    let mut keys: Vec<u32> = bins.keys().copied().collect();
-    keys.sort_unstable();
-    let mut items: Vec<Item> = keys
+    for &p in img.pixels() {
+        if !is_transparent(p) {
+            add(rgb(p), 1);
+        }
+    }
+    let mut items: Vec<Item> = bins
         .iter()
-        .map(|k| {
-            let (count, sum) = bins[k];
+        .filter(|(count, _)| *count > 0)
+        .map(|&(count, sum)| {
             let w = count as f64;
             Item {
                 c: [sum[0] as f64 / w, sum[1] as f64 / w, sum[2] as f64 / w],
@@ -374,8 +739,9 @@ fn kmeans(items: &[Item], mut centres: Vec<[f64; 3]>) -> (Vec<[f64; 3]>, Vec<f64
     let mut weights = vec![0.0; centres.len()];
     for pass in 0..=KMEANS_PASSES {
         let mut acc = vec![Sums::default(); centres.len()];
+        let finder = Finder::new(&centres, items.len());
         for it in items {
-            acc[nearest(&centres, it.c)].add(it);
+            acc[finder.nearest(it.c)].add(it);
         }
         weights = acc.iter().map(|s| s.w).collect();
         if pass == KMEANS_PASSES {
@@ -390,23 +756,92 @@ fn kmeans(items: &[Item], mut centres: Vec<[f64; 3]>) -> (Vec<[f64; 3]>, Vec<f64
     (centres, weights)
 }
 
-fn map_nearest(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<u8> {
-    let mut cache: HashMap<Rgb8, u8> = HashMap::new();
+fn map_nearest(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8]) -> Vec<u8> {
+    let finder = Finder::new(pal, img.pixels().len());
+    // Runs of one colour (flat areas, enlarged pixel art) are looked up once.
+    let mut last: Option<(Rgba8, u8)> = None;
     img.pixels()
         .iter()
         .map(|&p| {
             if is_transparent(p) {
                 return 0;
             }
-            *cache
-                .entry(rgb(p))
-                .or_insert_with(|| (nearest(pal, to_f(rgb(p))) + offset) as u8)
+            if let Some((q, i)) = last
+                && q == p
+            {
+                return i;
+            }
+            let i = ids[finder.nearest(to_f(rgb(p)))];
+            last = Some((p, i));
+            i
+        })
+        .collect()
+}
+
+/// The two colours the ordered dither chooses from for `c`, and where `c` lies between them:
+/// `(first, second, f)` with the nearest colour and the nearest colour different from it in
+/// index order (so the pattern does not change where the nearest colour changes), and `f` the
+/// position of `c` projected onto the line from the first to the second (weighted, 0 at the
+/// first, 1 at the second, clamped). A palette colour itself is always `f` = 0 or 1.
+fn ordered_pair(finder: &Finder, ids: &[u8], c: [f64; 3]) -> (u8, u8, f64) {
+    let pal = finder.pal;
+    let (k, other) = finder.nearest_two(c);
+    let Some(j) = other else {
+        let id = ids.get(k).copied().unwrap_or(0);
+        return (id, id, 0.0);
+    };
+    let (a, b) = if k < j { (k, j) } else { (j, k) };
+    let (pa, pb) = (pal[a], pal[b]);
+    let along: f64 = (0..3)
+        .map(|ch| WEIGHTS[ch] * (pb[ch] - pa[ch]) * (c[ch] - pa[ch]))
+        .sum();
+    let length: f64 = (0..3)
+        .map(|ch| WEIGHTS[ch] * (pb[ch] - pa[ch]) * (pb[ch] - pa[ch]))
+        .sum();
+    let f = if length > 0.0 {
+        (along / length).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (ids[a], ids[b], f)
+}
+
+/// Ordered dither with the 4×4 Bayer matrix between two palette colours ([`ordered_pair`]):
+/// a pixel at `f` between its two colours takes the second where `f` is above the cell's
+/// threshold `(t + ½) / 16`, so `f` of the 16 cells in every 4×4 block show the second
+/// colour. A pixel that is a palette colour never changes (`f` is 0 or 1), the mix follows any
+/// direction between two colours (hue as well as brightness), and the pattern depends on the
+/// pixel position only (deterministic; a flat area between two colours gets a regular
+/// texture). Transparent pixels become 0.
+fn map_ordered(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8]) -> Vec<u8> {
+    let finder = Finder::new(pal, img.pixels().len());
+    let w = (img.width() as usize).max(1);
+    let mut last: Option<(Rgba8, (u8, u8, f64))> = None;
+    img.pixels()
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            if is_transparent(p) {
+                return 0;
+            }
+            let pair = match last {
+                Some((q, pair)) if q == p => pair,
+                _ => {
+                    let pair = ordered_pair(&finder, ids, to_f(rgb(p)));
+                    last = Some((p, pair));
+                    pair
+                }
+            };
+            let (x, y) = (i % w, i / w);
+            let threshold = (f64::from(BAYER4[y % 4][x % 4]) + 0.5) / 16.0;
+            if pair.2 > threshold { pair.1 } else { pair.0 }
         })
         .collect()
 }
 
 /// Serpentine Floyd–Steinberg. Transparent pixels neither take nor pass on error.
-fn map_floyd_steinberg(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<u8> {
+fn map_floyd_steinberg(img: &RgbaImage, pal: &[[f64; 3]], ids: &[u8]) -> Vec<u8> {
+    let finder = Finder::new(pal, img.pixels().len());
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = vec![0u8; w * h];
     // One spare column on each side, so neighbours never need bounds checks.
@@ -427,8 +862,8 @@ fn map_floyd_steinberg(img: &RgbaImage, pal: &[[f64; 3]], offset: usize) -> Vec<
                 (src[1] + e[1]).clamp(0.0, 255.0),
                 (src[2] + e[2]).clamp(0.0, 255.0),
             ];
-            let k = nearest(pal, want);
-            out[y * w + x] = (k + offset) as u8;
+            let k = finder.nearest(want);
+            out[y * w + x] = ids[k];
             let err = [
                 want[0] - pal[k][0],
                 want[1] - pal[k][1],
@@ -675,6 +1110,174 @@ mod tests {
         let a = reduce(&img, &opts(32, PaletteDepth::Rgb8));
         let b = reduce(&img, &opts(32, PaletteDepth::Rgb8));
         assert_eq!(a, b);
+    }
+
+    /// A small deterministic pseudo-random sequence for the search tests.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *seed >> 33
+    }
+
+    #[test]
+    fn the_grid_search_gives_the_plain_searchs_answers() {
+        let mut seed = 7;
+        for size in [1usize, 2, 3, 16, 64, 256] {
+            let mut pal: Vec<[f64; 3]> = (0..size)
+                .map(|_| {
+                    let mut v = || (lcg(&mut seed) % 256) as f64;
+                    [v(), v(), v()]
+                })
+                .collect();
+            // Duplicates and colours on one grey line (ties along the axis).
+            if size >= 16 {
+                pal[5] = pal[2];
+                pal[9] = pal[2];
+                pal[10] = [10.0, 10.0, 10.0];
+                pal[11] = [30.0, 30.0, 30.0];
+            }
+            let linear = Finder::new(&pal, 0);
+            let grid = Finder::new(&pal, usize::MAX);
+            assert_eq!(grid.grid.is_some(), size > 4);
+            for q in 0..4000 {
+                let c = if q % 3 == 0 {
+                    pal[q % size]
+                } else if q % 3 == 1 && q % 2 == 0 {
+                    // On cell edges and the cube's faces.
+                    let mut v = || ((lcg(&mut seed) % 17) as f64 * 16.0).min(255.0);
+                    [v(), v(), v()]
+                } else {
+                    let mut v = || (lcg(&mut seed) % 2560) as f64 / 10.0;
+                    [v(), v(), v()]
+                };
+                for finder in [&linear, &grid] {
+                    assert_eq!(finder.nearest(c), nearest(&pal, c), "{size} {c:?}");
+                }
+                // Brute force: the nearest entry of another colour, lowest index on ties.
+                let k = nearest(&pal, c);
+                let mut want: Option<(f64, usize)> = None;
+                for (i, &p) in pal.iter().enumerate() {
+                    let d = dist(p, c);
+                    if p != pal[k] && want.is_none_or(|(b, _)| d < b) {
+                        want = Some((d, i));
+                    }
+                }
+                for finder in [&linear, &grid] {
+                    assert_eq!(
+                        finder.nearest_two(c),
+                        (k, want.map(|w| w.1)),
+                        "{size} {c:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(Finder::new(&[], 0).nearest([1.0, 2.0, 3.0]), 0);
+        assert_eq!(Finder::new(&[], usize::MAX).nearest([1.0, 2.0, 3.0]), 0);
+    }
+
+    #[test]
+    fn extra_colours_never_push_a_picture_into_quantizing() {
+        // Exactly 8 colours and an extra colour that is not one of them.
+        let cols: Vec<Rgba8> = (0..8u8)
+            .map(|i| Rgba8::opaque(30 * i + 10, 200 - 20 * i, 17 * i))
+            .collect();
+        let img = image(8, 2, |x, _| cols[x as usize]);
+        let grey = Rgb8::new(128, 128, 128);
+        let extra = [(grey, 1000)];
+        let (r, ids) = reduce_with(&img, &opts(8, PaletteDepth::Rgb8), &extra);
+        assert_eq!(r.reduction, Reduction::Exact);
+        assert_eq!(r.palette.len(), 8);
+        for x in 0..8 {
+            assert_eq!(shown(&r, x, 1), rgb(cols[x as usize]), "{x}");
+        }
+        // The extra takes the nearest picture colour.
+        let real: Vec<[f64; 3]> = r.palette.colors().iter().map(|&c| to_f(c)).collect();
+        assert_eq!(usize::from(ids[0]), nearest(&real, to_f(grey)));
+        // With room the extra gets an entry of its own.
+        let (r, ids) = reduce_with(&img, &opts(16, PaletteDepth::Rgb8), &extra);
+        assert_eq!(r.reduction, Reduction::Exact);
+        assert_eq!(r.palette.get(ids[0]), Some(grey));
+        assert_eq!(r.palette.get(0), Some(grey), "the most used colour first");
+        // One colour too many for the picture alone: quantized, the extra in the histogram.
+        let (r, _) = reduce_with(&img, &opts(4, PaletteDepth::Rgb8), &extra);
+        assert_eq!(r.reduction, Reduction::Quantized);
+        // Splitting into palette and mapping gives the same as one call.
+        let o = ReduceOptions {
+            dither: Dither::Ordered,
+            ..opts(4, PaletteDepth::Rgb8)
+        };
+        let built = build_palette(&img, &o, &extra);
+        assert_eq!(
+            map_built(&img, &built, o.dither, &extra),
+            reduce_with(&img, &o, &extra)
+        );
+    }
+
+    #[test]
+    fn ordered_dither_keeps_flat_palette_colours_and_mixes_any_two() {
+        // Pure black left, pure white right, a colour ramp between them.
+        let img = image(48, 8, |x, _| match x {
+            0..16 => Rgba8::opaque(0, 0, 0),
+            32.. => Rgba8::opaque(255, 255, 255),
+            _ => {
+                let v = ((x - 16) * 16) as u8;
+                Rgba8::opaque(v, (f64::from(v) * 0.6) as u8, 255 - v)
+            }
+        });
+        let pal = Palette::dpaint_default_32();
+        let m = reduce_to_palette(&img, &pal, Dither::Ordered);
+        assert!(!m.exact);
+        let (black, white) = (pal.nearest(Rgb8::BLACK), pal.nearest(Rgb8::WHITE));
+        assert_eq!(pal.get(black), Some(Rgb8::BLACK));
+        assert_eq!(pal.get(white), Some(Rgb8::WHITE));
+        for y in 0..8 {
+            for x in 0..16 {
+                assert_eq!(m.image.get(x, y), Some(black), "black {x},{y}");
+                assert_eq!(m.image.get(x + 32, y), Some(white), "white {x},{y}");
+            }
+        }
+        // A new palette: pure white beside a grey ramp keeps its white entry exactly.
+        let img = image(64, 8, |x, _| {
+            if x < 32 {
+                Rgba8::opaque(255, 255, 255)
+            } else {
+                let v = ((x - 32) * 7) as u8;
+                Rgba8::opaque(v, v, v)
+            }
+        });
+        for n in [4, 16, 32] {
+            let r = reduce(
+                &img,
+                &ReduceOptions {
+                    dither: Dither::Ordered,
+                    ..opts(n, PaletteDepth::Rgb8)
+                },
+            );
+            assert_eq!(r.reduction, Reduction::Quantized, "{n}");
+            assert!(r.palette.colors().contains(&Rgb8::WHITE), "{n}");
+            for y in 0..8 {
+                for x in 0..32 {
+                    assert_eq!(shown(&r, x, y), Rgb8::WHITE, "{n} colours, {x},{y}");
+                }
+            }
+        }
+        // Halfway between blue and orange (a hue change, not only brightness): half of every
+        // 4×4 cell each.
+        let two = Palette::new(vec![Rgb8::new(0, 0, 255), Rgb8::new(255, 128, 0)]).unwrap();
+        let mid = RgbaImage::new(8, 8, Rgba8::opaque(128, 64, 128));
+        let m = reduce_to_palette(&mid, &two, Dither::Ordered);
+        for (cx, cy) in [(0, 0), (4, 4)] {
+            let orange = (0..4)
+                .flat_map(|y| (0..4).map(move |x| (x, y)))
+                .filter(|&(x, y)| m.image.get(cx + x, cy + y) == Some(1))
+                .count();
+            assert_eq!(orange, 8, "cell {cx},{cy}");
+        }
+        // A quarter of the way: 4 of 16.
+        let quarter = RgbaImage::new(4, 4, Rgba8::opaque(64, 32, 191));
+        let m = reduce_to_palette(&quarter, &two, Dither::Ordered);
+        assert_eq!(m.image.pixels().iter().filter(|&&p| p == 1).count(), 4);
     }
 
     #[test]

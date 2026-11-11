@@ -110,14 +110,54 @@ pub fn scale_area(img: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     RgbaImage::from_pixels(width, height, pixels).expect("pixel count matches size")
 }
 
+/// Scales `img` to `width`×`height` by taking, for every output pixel, the source pixel under
+/// its centre (`floor((o + ½) · src / dst)` on each axis). No colour is new: enlarged pixel
+/// art stays crisp (whole factors repeat every pixel equally). Panics if `width` or `height`
+/// is 0.
+pub fn scale_nearest(img: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    assert!(width > 0 && height > 0, "target size must be non-zero");
+    if img.width() == width && img.height() == height {
+        return img.clone();
+    }
+    let (sw, sh) = (img.width() as u64, img.height() as u64);
+    if sw == 0 || sh == 0 {
+        return RgbaImage::new(width, height, Rgba8::new(0, 0, 0, 0));
+    }
+    let pick =
+        |o: u32, src: u64, dst: u32| ((2 * u64::from(o) + 1) * src / (2 * u64::from(dst))) as usize;
+    let xs: Vec<usize> = (0..width).map(|x| pick(x, sw, width)).collect();
+    let src = img.pixels();
+    let mut pixels = Vec::with_capacity(width as usize * height as usize);
+    for y in 0..height {
+        let row = pick(y, sh, height) * sw as usize;
+        pixels.extend(xs.iter().map(|&x| src[row + x]));
+    }
+    RgbaImage::from_pixels(width, height, pixels).expect("pixel count matches size")
+}
+
+/// Scales a picture for the Import requester (ADR-42): along an axis that grows (or keeps
+/// its size) the nearest source pixel is taken ([`scale_nearest`]), so pixel art stays crisp
+/// and no colours are mixed; along an axis that shrinks, areas are averaged
+/// ([`scale_area`]). Panics if `width` or `height` is 0.
+pub fn scale_fit(img: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    let grow_x = width >= img.width();
+    let grow_y = height >= img.height();
+    match (grow_x, grow_y) {
+        (true, true) => scale_nearest(img, width, height),
+        (false, false) => scale_area(img, width, height),
+        (true, false) => scale_area(&scale_nearest(img, width, img.height()), width, height),
+        (false, true) => scale_area(&scale_nearest(img, img.width(), height), width, height),
+    }
+}
+
 /// Largest page that shows a `src_w`×`src_h` picture of square pixels undistorted on a screen
 /// of `max_w`×`max_h` pixels whose pixels have the display shape `pixel_shape` = (x, y)
 /// (an Amiga pixel is shown `x` units wide and `y` units high, e.g. (1, 2) for HiRes
 /// non-laced). Never larger than `src` scaled to fit and never larger than `max`; each side at
 /// least 1. Rounds to the nearest pixel.
 ///
-/// Note: this may also enlarge a small picture; callers only call it for pictures that are
-/// too big for the screen.
+/// Note: this may also enlarge a small picture. ADR-9's load path calls it only for pictures
+/// too big for the screen; the Import requester (ADR-42) fits every picture with it.
 pub fn fit_size(
     src_w: u32,
     src_h: u32,
@@ -232,6 +272,39 @@ mod tests {
             }
         }
         assert!(out.get(36, 0).unwrap().r > out.get(0, 0).unwrap().r + 200);
+    }
+
+    #[test]
+    fn nearest_repeats_pixels_in_whole_blocks_and_mixes_nothing() {
+        let px: Vec<Rgba8> = (0..6).map(|i| grey(i * 40)).collect();
+        let img = RgbaImage::from_pixels(3, 2, px).unwrap();
+        let big = scale_nearest(&img, 12, 6);
+        for y in 0..6 {
+            for x in 0..12 {
+                assert_eq!(big.get(x, y), img.get(x / 4, y / 3), "{x},{y}");
+            }
+        }
+        // Uneven factors take only source colours.
+        let odd = scale_nearest(&img, 7, 5);
+        assert!(odd.pixels().iter().all(|p| img.pixels().contains(p)));
+        assert_eq!(scale_nearest(&img, 3, 2), img);
+    }
+
+    #[test]
+    fn scale_fit_enlarges_by_nearest_and_reduces_by_area_per_axis() {
+        let img =
+            RgbaImage::from_pixels(2, 2, vec![grey(0), grey(100), grey(200), grey(50)]).unwrap();
+        // Both axes grow: crisp.
+        let up = scale_fit(&img, 6, 6);
+        assert!(up.pixels().iter().all(|p| img.pixels().contains(p)));
+        // x grows, y shrinks: columns repeated, rows averaged.
+        let mixed = scale_fit(&img, 4, 1);
+        assert_eq!(mixed.get(0, 0), Some(grey(100)));
+        assert_eq!(mixed.get(1, 0), Some(grey(100)));
+        assert_eq!(mixed.get(2, 0), Some(grey(75)));
+        assert_eq!(mixed.get(3, 0), Some(grey(75)));
+        // Both shrink: area averaging.
+        assert_eq!(scale_fit(&img, 1, 1), scale_area(&img, 1, 1));
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub mod document;
 pub mod engine;
 pub mod gradient;
 pub mod image;
+// Picture ▸ Load's Import requester (ADR-42).
+pub mod import;
 pub mod mode;
 pub mod paint;
 pub mod palette;

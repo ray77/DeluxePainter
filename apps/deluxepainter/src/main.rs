@@ -31,6 +31,9 @@
 //!     [--stencil-paint X,Y,W,H]         Stencil ▸ Paint with that rectangle painted (ADR-39)
 //!     [--hover X,Y]                     the tooltip a pointer resting on UI pixel X,Y shows
 //!                                       (ADR-41)
+//!     [--import-requester FILE]         the Import requester for a PNG or JPEG (ADR-42)
+//!     [--import SPEC] [--import-apply]  … with position=centre|top_left;palette=new|current;
+//!                                       colors=N;dither=none|fs|ordered, or the page after Ok
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -46,6 +49,7 @@ mod brush_menu;
 mod config;
 mod effects;
 mod files;
+mod import;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -495,6 +499,11 @@ fn main() -> eframe::Result {
             }
             None => doc,
         };
+        // ADR-42: the Import requester for a PNG or JPEG, or its result after Ok.
+        let doc = import::snapshot(&args, &doc, &mut ui).unwrap_or_else(|(code, e)| {
+            eprintln!("{e}");
+            std::process::exit(code);
+        });
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
@@ -762,19 +771,44 @@ fn snapshot(
     ui: &UiState,
     custom_brush: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (w, h, rgba) = snapshot_rgba(scale, doc, view, scroll, ui, custom_brush);
+    write_png(path, w, h, &rgba)
+}
+
+/// The RGBA image [`snapshot`] writes: its width, height and pixels.
+fn snapshot_rgba(
+    scale: usize,
+    doc: &Document,
+    view: View,
+    scroll: (i32, i32),
+    ui: &UiState,
+    custom_brush: bool,
+) -> (u32, u32, Vec<u8>) {
     let mut screen = view.compose(doc.page(), scroll, doc.palette(), ui);
     if custom_brush && ui.toolbox_visible {
         let pens = Pens::from_palette(doc.palette());
         let x0 = view.ui_screen().toolbox_x();
-        dpx_ui::toolbox::draw_brush_unselected(&mut screen, x0, ui.brush, &pens, view.ux, view.uy);
+        // ADR-42: under the Import requester, which covers the toolbox.
+        import::under_import_requester(&mut screen, ui, (view.ux, view.uy), |screen| {
+            dpx_ui::toolbox::draw_brush_unselected(screen, x0, ui.brush, &pens, view.ux, view.uy);
+        });
     }
     let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
-    let rgba = to_rgba(&screen, doc.palette(), sx, sy);
-    write_png(
-        path,
+    let mut rgba = to_rgba(&screen, doc.palette(), sx, sy);
+    // ADR-42: the Import thumbnail in true colour over the indexed screen.
+    if let Some(req) = &ui.import_requester {
+        let frame_w = screen.width() as usize * sx;
+        req.overlay(
+            &mut rgba,
+            frame_w,
+            view.ux as usize * sx,
+            view.uy as usize * sy,
+        );
+    }
+    (
         screen.width() * sx as u32,
         screen.height() * sy as u32,
-        &rgba,
+        rgba,
     )
 }
 
@@ -886,6 +920,8 @@ struct PainterApp {
     perspective: perspective::PerspectiveState,
     /// Tooltips over the toolbox and the Control Panel (ADR-41, tooltip.rs).
     tooltip: tooltip::State,
+    /// Picture ▸ Load's Import requester for PNG and JPEG (ADR-42, import.rs).
+    import: import::ImportState,
 }
 
 impl PainterApp {
@@ -925,6 +961,7 @@ impl PainterApp {
             animbrush: animbrush::AnimBrushState::default(),
             perspective: perspective::PerspectiveState::default(),
             tooltip: tooltip::State::default(),
+            import: import::ImportState::default(),
         }
     }
 
@@ -942,6 +979,7 @@ impl PainterApp {
             || ui.note_requester.is_some()
             || ui.file_requester.is_some()
             || ui.page_size_requester.is_some()
+            || ui.import_requester.is_some()
             || self.show_page.is_some()
             || ui.anim_control.is_some()
             || self.anim_control.preview.is_some()
@@ -1124,7 +1162,10 @@ impl PainterApp {
             } => {
                 let path = browse::expand_home(&drawer).join(file);
                 match kind {
-                    FileKind::LoadPicture | FileKind::LoadAnim => self.load_picture(path),
+                    // ADR-42: only Picture ▸ Load.. asks how to import PNG and JPEG.
+                    FileKind::LoadPicture | FileKind::LoadAnim => {
+                        self.load_picture(path, kind == FileKind::LoadPicture)
+                    }
                     FileKind::SaveAnim => self.save_picture(anim_path(&path), overwrite, true),
                     FileKind::SavePicture => {
                         self.save_picture(project_path(&path), overwrite, false)
@@ -1146,8 +1187,13 @@ impl PainterApp {
         }
     }
 
-    fn load_picture(&mut self, path: PathBuf) {
+    /// Loads a picture file; with `ask`, PNG and JPEG pictures open the Import requester
+    /// instead (ADR-42).
+    fn load_picture(&mut self, path: PathBuf, ask: bool) {
         match files::load(&path) {
+            Ok(loaded) if ask && import::asks(&loaded.picture) => {
+                self.open_import(path, loaded.picture, loaded.notes);
+            }
             Ok(loaded) => {
                 let current = self.engine.document().target();
                 let (doc, extras, notes) = files::open_picture(loaded.picture, current);
@@ -1671,6 +1717,12 @@ impl eframe::App for PainterApp {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
+        // ADR-42: the Import requester after Picture ▸ Load.. of a PNG or JPEG.
+        if self.ui.import_requester.is_some() {
+            self.import_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
         if self.requester.is_some() {
             self.requester_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
@@ -2136,6 +2188,23 @@ impl PainterApp {
         view: View,
         at: (i32, i32),
     ) -> (Vec<ReqEvent>, u64) {
+        self.modal_events_with(ctx, origin, ppp, scale, view, at, true)
+    }
+
+    /// [`Self::modal_events`]; without `enter_repeats`, a held Return's auto-repeat is left
+    /// out, so only a new press answers the requester (ADR-42: the Return that picked the
+    /// file in the file requester must not also answer the Import requester it opened).
+    #[allow(clippy::too_many_arguments)]
+    fn modal_events_with(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: f32,
+        view: View,
+        at: (i32, i32),
+        enter_repeats: bool,
+    ) -> (Vec<ReqEvent>, u64) {
         let (rx, ry) = at;
         let mut out = Vec::new();
         let (hover, press, down, time, events) = ctx.input(|i| {
@@ -2175,8 +2244,14 @@ impl PainterApp {
                     out.extend(text.chars().map(|c| ReqEvent::Key(ReqKey::Char(c))));
                 }
                 egui::Event::Key {
-                    key, pressed: true, ..
+                    key,
+                    pressed: true,
+                    repeat,
+                    ..
                 } => {
+                    if repeat && !enter_repeats && key == egui::Key::Enter {
+                        continue;
+                    }
                     let k = match key {
                         egui::Key::ArrowUp => ReqKey::Up,
                         egui::Key::ArrowDown => ReqKey::Down,
@@ -2408,7 +2483,9 @@ impl PainterApp {
                 }
                 (None, None) => {
                     let screen = self.compose_screen();
-                    let rgba = to_rgba(&screen, self.palette(), 1, 1);
+                    let mut rgba = to_rgba(&screen, self.palette(), 1, 1);
+                    // ADR-42: the Import thumbnail in true colour over the indexed screen.
+                    self.import_overlay(&mut rgba, screen.width() as usize);
                     (screen, rgba)
                 }
             };
@@ -3535,7 +3612,13 @@ mod tests {
         app.run_action(Action::Command("picture.load"), &ctx);
         type_into(&mut app, "Photo.png");
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
-        assert!(app.ui.file_requester.is_none(), "loaded and closed");
+        assert!(app.ui.file_requester.is_none(), "closed");
+        // ADR-42: the Import requester asks first; Top left (Tab, Down), then Return.
+        assert!(app.ui.import_requester.is_some());
+        app.import_event(ReqEvent::Key(ReqKey::Tab));
+        app.import_event(ReqEvent::Key(ReqKey::Down));
+        app.import_event(ReqEvent::Key(ReqKey::Enter));
+        assert!(app.ui.import_requester.is_none(), "loaded");
         assert_eq!(app.engine.document().target(), before, "kept the screen");
         // 320x256 LoRes: 7:6 shown on square pixels → 299x256, on a screen-sized page.
         assert_eq!((app.page().width(), app.page().height()), (320, 256));
@@ -3543,9 +3626,9 @@ mod tests {
         assert_eq!(at(10), dpx_core::Rgb8::new(200, 40, 40));
         assert_eq!(at(290), dpx_core::Rgb8::new(40, 40, 200));
         assert_eq!(
-            app.page().get(310, 100),
-            Some(0),
-            "rest of the page: colour 0"
+            at(310),
+            Palette::dpaint_default_32().get(0).unwrap(),
+            "rest of the page: the BG colour"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
