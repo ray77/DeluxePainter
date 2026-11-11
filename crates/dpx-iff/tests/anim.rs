@@ -142,6 +142,26 @@ fn ranges_and_mode_survive_on_the_first_picture() {
     assert_eq!(a.camg, Some(0x0002_1000));
 }
 
+/// AnimBrush files (ADR-36) keep the transparent colour (BMHD masking 2) and the handle
+/// (GRAB) of the first picture; plain animations have neither.
+#[test]
+fn transparent_colour_and_grab_survive_on_the_first_picture() {
+    let fs = frames(9, 5, 8, 3);
+    let opts = EncodeOptions {
+        loop_frames: false,
+        transparent: Some(3),
+        grab: Some((4, 2)),
+        ..EncodeOptions::default()
+    };
+    let a = anim::read(&anim::encode(&fs, &pal(8), &opts).unwrap()).unwrap();
+    assert_eq!((a.transparent, a.grab), (Some(3), Some((4, 2))));
+    let got: Vec<&IndexedImage> = a.logical_frames().iter().map(|f| &f.image).collect();
+    assert_eq!(got, fs.iter().collect::<Vec<_>>());
+    let plain =
+        anim::read(&anim::encode(&fs, &pal(8), &EncodeOptions::default()).unwrap()).unwrap();
+    assert_eq!((plain.transparent, plain.grab), (None, None));
+}
+
 // ---- a file assembled byte by byte, independent of the crate's writer ------------------
 
 fn chunk(id: &[u8; 4], data: &[u8]) -> Vec<u8> {

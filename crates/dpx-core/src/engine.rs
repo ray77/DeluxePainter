@@ -110,6 +110,7 @@ fn command_bytes(command: &Command) -> u64 {
         Command::SetPage { pixels, .. } | Command::MergePage { pixels, .. } => pixels.len() as u64,
         Command::SetPalette { colors } => 3 * colors.len() as u64,
         Command::ArrangePalette { order } => order.len() as u64,
+        Command::AnimBrushPaint { brush, paint } => brush.bytes() + command_bytes(paint),
         _ => 0,
     }
 }

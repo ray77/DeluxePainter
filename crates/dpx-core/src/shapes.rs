@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::anim_brush::AnimBrush;
 use crate::command::{
     Command, CommandError, MAX_BRUSH_OFFSET, MAX_BRUSH_PIXELS, MAX_PAINT_WORK,
     POLYGON_CROSSING_WORK,
@@ -267,18 +268,44 @@ impl Shape {
         if path.dots || n == 1 {
             for i in 0..n {
                 for (s, points) in stampers.iter_mut().zip(&copies) {
+                    s.set_count(i as u64);
                     s.at(img, points[i]);
                 }
             }
             return;
         }
-        // Lines between consecutive points, then back to the first when closed.
+        // Lines between consecutive points, then back to the first when closed. Every copy
+        // starts each line at the original's stamp count (an AnimBrush cel, ADR-36), so the
+        // copies show the original's cels and a shape painted in parts stays the same.
         let close = (path.closed && n > 2).then_some((n - 1, 0));
+        let mut count = 0;
         for (a, b) in (1..n).map(|i| (i - 1, i)).chain(close) {
             for (s, points) in stampers.iter_mut().zip(&copies) {
+                s.set_count(count);
                 s.line(img, points[a], points[b]);
             }
+            count += u64::from(raster::line_steps(path.points[a], path.points[b])) + 1;
         }
+    }
+
+    /// Brush stamps [`Self::draw`] makes along the shape itself (not its symmetric copies),
+    /// those off the page included: the stamps an AnimBrush moves on by (ADR-36). 0 for a
+    /// filled shape, which uses no brush.
+    fn stamps(&self, filled: bool) -> u64 {
+        let path = self.path(filled);
+        let n = path.points.len();
+        if filled && !path.dots {
+            return 0;
+        }
+        if path.dots || n == 1 {
+            return n as u64;
+        }
+        let close = (path.closed && n > 2).then_some((n - 1, 0));
+        (1..n)
+            .map(|i| (i - 1, i))
+            .chain(close)
+            .map(|(a, b)| u64::from(raster::line_steps(path.points[a], path.points[b])) + 1)
+            .sum()
     }
 
     /// What [`Self::draw`] costs on a `size` page at most, in work units (see
@@ -336,9 +363,57 @@ impl Shape {
 }
 
 impl Command {
+    /// The Stroke or Shape that paints: the command itself, or the one an
+    /// [`Command::AnimBrushPaint`] wraps.
+    fn painting(&self) -> &Command {
+        match self {
+            Command::AnimBrushPaint { paint, .. } => paint,
+            other => other,
+        }
+    }
+
+    /// The cels of an [`Command::AnimBrushPaint`].
+    fn cels(&self) -> Option<&AnimBrush> {
+        match self {
+            Command::AnimBrushPaint { brush, .. } => Some(brush),
+            _ => None,
+        }
+    }
+
+    /// Brush stamps a Stroke or Shape makes along its path (not counting symmetric copies),
+    /// those off the page included; for an [`Command::AnimBrushPaint`] those of the command
+    /// it wraps. A front-end moves its AnimBrush on by this many stamps after the command
+    /// (ADR-36). 0 for other commands and filled shapes.
+    pub fn stamps(&self) -> u64 {
+        match self.painting() {
+            Command::Stroke {
+                points, continuous, ..
+            } => {
+                if *continuous && points.len() > 1 {
+                    points
+                        .windows(2)
+                        .map(|w| u64::from(raster::line_steps(w[0], w[1])) + 1)
+                        .sum()
+                } else {
+                    points.len() as u64
+                }
+            }
+            Command::Shape { shape, filled, .. } => shape.stamps(*filled),
+            _ => 0,
+        }
+    }
+
     /// The pen a Stroke or Shape paints with (ADR-18); `before` is the page before the
-    /// command. `None` for other commands.
+    /// command. For an [`Command::AnimBrushPaint`] the wrapped command's pen with the cels
+    /// (ADR-36). `None` for other commands.
     pub fn pen<'a>(&'a self, before: &'a IndexedImage, palette: &'a Palette) -> Option<Pen<'a>> {
+        if let Command::AnimBrushPaint { brush, paint } = self {
+            let pen = paint.pen(before, palette)?;
+            return Some(Pen {
+                cels: Some(brush),
+                ..pen
+            });
+        }
         let (brush, color, custom, mode, range, stencil, right, fx) = match self {
             Command::Stroke {
                 brush,
@@ -378,12 +453,16 @@ impl Command {
                 right: *right,
             },
             fx: *fx,
+            cels: None,
         })
     }
 
     /// The pixels of a Stroke's or Shape's brush relative to its hotspot (the custom brush if
-    /// there is one); `None` for an empty brush and other commands.
+    /// there is one, all cels of an AnimBrush); `None` for an empty brush and other commands.
     fn brush_extent(&self) -> Option<Rect> {
+        if let Some(c) = self.cels() {
+            return c.extent();
+        }
         match self {
             Command::Stroke { brush, custom, .. } | Command::Shape { brush, custom, .. } => {
                 match custom {
@@ -400,7 +479,7 @@ impl Command {
     /// [`MAX_PAINT_WORK`]). Stamps that cannot touch the page cost nothing. 0 for other
     /// commands.
     pub(crate) fn paint_work(&self, width: u32, height: u32, colors: usize) -> u64 {
-        let (brush, custom, mode, fx) = match self {
+        let (brush, custom, mode, fx) = match self.painting() {
             Command::Stroke {
                 brush,
                 custom,
@@ -418,11 +497,21 @@ impl Command {
             _ => return 0,
         };
         let per_pixel = crate::paint::pixel_work(mode, fx, colors);
-        let per_stamp = raster::stamp_cost(brush, custom, width, height).saturating_mul(per_pixel);
+        // An AnimBrush costs what its largest cel costs per stamp (ADR-36).
+        let stamp = match self.cels() {
+            Some(c) => c
+                .cels
+                .iter()
+                .map(|b| raster::stamp_cost(brush, Some(b), width, height))
+                .max()
+                .unwrap_or(0),
+            None => raster::stamp_cost(brush, custom, width, height),
+        };
+        let per_stamp = stamp.saturating_mul(per_pixel);
         let reach = self
             .brush_extent()
             .map_or_else(Rect::default, |e| raster::reach(e, width, height));
-        match self {
+        match self.painting() {
             Command::Stroke {
                 points, continuous, ..
             } => raster::path_stamps(points, *continuous, false, reach)
@@ -452,7 +541,7 @@ impl Command {
     /// should be valid for the document (see [`crate::Engine::execute`]).
     pub fn paint(&self, img: &mut IndexedImage, before: &IndexedImage, palette: &Palette) -> bool {
         if let Some(pen) = self.pen(before, palette) {
-            match self {
+            match self.painting() {
                 Command::Stroke {
                     points, continuous, ..
                 } => raster::stroke_pen(img, &pen, points, *continuous),
@@ -478,7 +567,7 @@ impl Command {
     /// The pixels of `page` that [`Self::paint`] can change, clipped to the page (empty if
     /// none); `None` for commands that are not page-pixel commands.
     pub fn paint_bounds(&self, page: &IndexedImage) -> Option<Rect> {
-        let r = match self {
+        let r = match self.painting() {
             Command::Stroke { points, .. } => self
                 .brush_extent()
                 .and_then(|e| raster::extent_bounds(e, points))

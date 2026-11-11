@@ -586,6 +586,10 @@ pub struct MenuContext {
     pub has_brush: bool,
     /// There is a picked-up brush to go back to (enables Brush ▸ Restore).
     pub can_restore: bool,
+    /// An AnimBrush exists (enables AnimBrush ▸ Save.., Settings.., Use and Free; ADR-36).
+    pub anim_brush: bool,
+    /// A spare brush exists (with a custom brush it enables Brush ▸ Spare ▸ Metamorph..).
+    pub spare_brush: bool,
 }
 
 impl Action {
@@ -608,6 +612,7 @@ impl Action {
                 IMPLEMENTED.contains(&id)
                     && (id != "color.recompute" || ctx.ham)
                     && brush_item_usable(id, ctx)
+                    && anim_brush_item_usable(id, ctx)
             }
             _ => true,
         }
@@ -620,6 +625,18 @@ fn brush_item_usable(id: &str, ctx: &MenuContext) -> bool {
         "brush.load" => true,
         "brush.restore" => ctx.can_restore,
         _ if id.starts_with("brush.") => ctx.has_brush,
+        _ => true,
+    }
+}
+
+/// AnimBrush items need an AnimBrush; Metamorph needs a custom brush and a spare brush
+/// (Metamorph starts from both, AGA p.243; ADR-36).
+fn anim_brush_item_usable(id: &str, ctx: &MenuContext) -> bool {
+    match id {
+        "animbrush.save" | "animbrush.settings" | "animbrush.use" | "animbrush.free" => {
+            ctx.anim_brush
+        }
+        "brush.metamorph" => ctx.has_brush && ctx.spare_brush,
         _ => true,
     }
 }
@@ -725,7 +742,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "brush.bg_to_fg",
     "brush.swap_bg_fg",
     "brush.change_transparency",
-    // Brush menu, interactive items and spare brush (ADR-30); Metamorph stays ghosted.
+    // Brush menu, interactive items and spare brush (ADR-30); Metamorph: ADR-36 below.
     "brush.stretch",
     "brush.rotate_any",
     "brush.shear",
@@ -735,6 +752,14 @@ pub const IMPLEMENTED: &[&str] = &[
     "brush.to_spare",
     "brush.swap_spare",
     "brush.remap",
+    // ADR-36: Anim > AnimBrush and Brush > Spare > Metamorph.
+    "animbrush.load",
+    "animbrush.save",
+    "animbrush.pick_up",
+    "animbrush.settings",
+    "animbrush.use",
+    "animbrush.free",
+    "brush.metamorph",
 ];
 
 impl Item {
@@ -1149,6 +1174,8 @@ mod tests {
             pixel_size: PixelSize::default(),
             has_brush: false,
             can_restore: false,
+            anim_brush: false,
+            spare_brush: false,
         }
     }
 
@@ -1419,8 +1446,33 @@ mod tests {
         assert!(Action::Command("brush.stretch").enabled(&with));
         assert!(
             !Action::Command("brush.metamorph").enabled(&with),
-            "Metamorph: ghosted"
+            "Metamorph: ghosted without a spare brush"
         );
+        // ADR-36: Metamorph needs both brushes; AnimBrush items need an AnimBrush.
+        let spare = MenuContext {
+            spare_brush: true,
+            ..with
+        };
+        assert!(Action::Command("brush.metamorph").enabled(&spare));
+        assert!(!Action::Command("brush.metamorph").enabled(&MenuContext {
+            spare_brush: true,
+            ..c
+        }));
+        assert!(Action::Command("animbrush.pick_up").enabled(&c));
+        assert!(Action::Command("animbrush.load").enabled(&c));
+        for id in [
+            "animbrush.save",
+            "animbrush.settings",
+            "animbrush.use",
+            "animbrush.free",
+        ] {
+            assert!(!Action::Command(id).enabled(&c), "{id}");
+            let anim = MenuContext {
+                anim_brush: true,
+                ..c
+            };
+            assert!(Action::Command(id).enabled(&anim), "{id}");
+        }
         assert!(menu_enabled(menu("Anim"), &c), "frames work (ADR-28)");
         assert!(!Action::Command("anim.move").enabled(&c));
         assert!(menu_enabled(menu("Picture"), &c));

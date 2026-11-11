@@ -11,7 +11,7 @@ use std::fmt;
 use dpx_core::{IndexedImage, Palette, Rgb8};
 
 use crate::iff::{self, Chunk, FormWriter, IffError, at, be_i16, be_u16, be_u32};
-use crate::ilbm::{self, ColorRange, Compression, Ilbm, IlbmError, RawChunk, SpecialMode};
+use crate::ilbm::{self, ColorRange, Compression, Ilbm, IlbmError, Masking, RawChunk, SpecialMode};
 
 /// Total pixels over all frames the reader accepts (guards against absurd allocations).
 pub const MAX_TOTAL_PIXELS: usize = 1 << 30;
@@ -227,6 +227,11 @@ pub struct Anim {
     /// How many trailing frames of [`Anim::frames`] are DPaint's closing loop frames (0 or 2).
     pub loop_frames: usize,
     pub dpan: Option<Dpan>,
+    /// The first picture's transparent colour (BMHD masking 2 or 3), as AnimBrush files keep
+    /// it (ADR-36).
+    pub transparent: Option<u16>,
+    /// The first picture's GRAB point (an AnimBrush's handle, ADR-36).
+    pub grab: Option<(i16, i16)>,
 }
 
 impl Anim {
@@ -919,6 +924,9 @@ pub fn read_with_notes(bytes: &[u8]) -> Result<(Anim, Vec<String>), AnimError> {
         frames,
         loop_frames,
         dpan,
+        transparent: matches!(first.masking, Masking::TransparentColor | Masking::Lasso)
+            .then_some(first.transparent_color),
+        grab: first.grab,
     };
     Ok((anim, notes))
 }
@@ -952,6 +960,10 @@ pub struct EncodeOptions {
     pub camg: Option<u32>,
     pub x_aspect: u8,
     pub y_aspect: u8,
+    /// Transparent colour of the first picture (BMHD masking 2), for AnimBrush files (ADR-36).
+    pub transparent: Option<u8>,
+    /// GRAB point of the first picture (an AnimBrush's handle, ADR-36).
+    pub grab: Option<(i16, i16)>,
 }
 
 impl Default for EncodeOptions {
@@ -963,6 +975,8 @@ impl Default for EncodeOptions {
             camg: None,
             x_aspect: 1,
             y_aspect: 1,
+            transparent: None,
+            grab: None,
         }
     }
 }
@@ -1056,6 +1070,11 @@ pub fn encode(
     first.ranges = opts.ranges.clone();
     first.x_aspect = opts.x_aspect;
     first.y_aspect = opts.y_aspect;
+    if let Some(t) = opts.transparent {
+        first.masking = Masking::TransparentColor;
+        first.transparent_color = u16::from(t);
+    }
+    first.grab = opts.grab;
     first.other_chunks = vec![
         RawChunk {
             id: *b"ANHD",
