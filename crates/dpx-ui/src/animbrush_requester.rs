@@ -69,8 +69,11 @@ impl AnimBrushRequester {
         let note = format!("2 to {max}");
         let field_x = LEFT + text_w(label) + GAP;
         let note_x = field_x + FIELD_W + GAP;
+        // Wide enough for the form's message about a number out of range, too.
+        let refused = format!("{label} must be {} to {max}", anim_brush::MIN_CELS);
         let w = (note_x + text_w(&note) + LEFT)
             .max(text_w(title) + 4 * LEFT)
+            .max(text_w(&refused) + 2 * LEFT)
             .max(168);
         let mut form = Form::new(title, w, 64);
         form.field(
@@ -96,14 +99,11 @@ impl AnimBrushRequester {
         Self::cel_count(AnimBrushReq::PickUp, "Pick up AnimBrush", value, max)
     }
 
-    /// Make AnimBrush (Metamorph): `value` cels suggested.
-    pub fn make(value: usize) -> Self {
-        Self::cel_count(
-            AnimBrushReq::Make,
-            "Make AnimBrush",
-            value,
-            anim_brush::MAX_CELS,
-        )
+    /// Make AnimBrush (Metamorph): `value` cels suggested, at most `max` (the cels that fit
+    /// the AnimBrush byte limit, [`anim_brush::max_morph_cels`]).
+    pub fn make(value: usize, max: usize) -> Self {
+        let max = max.min(anim_brush::MAX_CELS);
+        Self::cel_count(AnimBrushReq::Make, "Make AnimBrush", value, max)
     }
 
     /// AnimBrush Settings for a brush of `cels` cels: Duration, the current cel (from 1) and
@@ -300,11 +300,20 @@ mod tests {
         assert_eq!(key(&mut r, ReqKey::Enter), ToolReqResponse::Ok);
         assert_eq!(r.cels(), 5);
         assert_eq!(key(&mut r, ReqKey::Escape), ToolReqResponse::Cancel);
-        let mut m = AnimBrushRequester::make(11);
+        let mut m = AnimBrushRequester::make(11, anim_brush::MAX_CELS);
         assert_eq!(m.kind(), AnimBrushReq::Make);
         retype(&mut m, "999");
         assert_eq!(key(&mut m, ReqKey::Enter), ToolReqResponse::Ok);
         assert_eq!(m.cels(), 999);
+        // Big brushes: no more cels than fit the byte limit.
+        let mut m = AnimBrushRequester::make(200, 134);
+        assert_eq!(m.cels(), 134, "the suggestion is cut to the most");
+        retype(&mut m, "135");
+        assert_eq!(key(&mut m, ReqKey::Enter), ToolReqResponse::Continue);
+        let refused = text_w("Number of cels must be 2 to 134");
+        assert!(m.size().0 >= refused + 2 * LEFT, "the message fits");
+        retype(&mut m, "134");
+        assert_eq!(key(&mut m, ReqKey::Enter), ToolReqResponse::Ok);
     }
 
     #[test]
@@ -345,7 +354,7 @@ mod tests {
         let pens = Pens::from_palette(&Palette::dpaint_default_32());
         for r in [
             AnimBrushRequester::pick_up(2, 999),
-            AnimBrushRequester::make(8),
+            AnimBrushRequester::make(8, anim_brush::MAX_CELS),
             AnimBrushRequester::settings(999, 999, 999, CelDirection::Backward),
         ] {
             let (w, h) = r.size();

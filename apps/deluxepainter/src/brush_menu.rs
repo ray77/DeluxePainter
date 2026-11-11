@@ -104,6 +104,7 @@ impl PainterApp {
             "brush.restore" => {
                 if let Some(picked) = self.picked_brush.clone() {
                     self.custom_brush = Some(picked);
+                    self.leave_anim_brush(); // ADR-36
                     self.dirty = true;
                 }
                 return;
@@ -123,6 +124,7 @@ impl PainterApp {
                 // Nothing to swap with: both stay as they were.
                 if self.tools.spare_brush.is_some() && self.custom_brush.is_some() {
                     std::mem::swap(&mut self.tools.spare_brush, &mut self.custom_brush);
+                    self.leave_anim_brush(); // ADR-36
                     self.dirty = true;
                 }
                 return;
@@ -189,6 +191,7 @@ impl PainterApp {
             Ok((brush, changed)) => {
                 self.custom_brush = Some(brush.clone());
                 self.picked_brush = Some(brush);
+                self.leave_anim_brush(); // ADR-36
                 self.tools.brush_palette = Some(self.engine.document().palette().clone());
                 self.ui.file_requester = None;
                 let mut notes = Vec::new();

@@ -1243,6 +1243,7 @@ impl PainterApp {
         }
         self.custom_brush = Some(brush.clone());
         self.picked_brush = Some(brush);
+        self.leave_anim_brush(); // ADR-36
         self.tools.brush_palette = Some(self.engine.document().palette().clone());
         self.ui.mode = PaintMode::Matte;
         let (tool, filled) = self
@@ -1261,6 +1262,7 @@ impl PainterApp {
         }
         if let Some(b) = &self.picked_brush {
             self.custom_brush = Some(b.clone());
+            self.leave_anim_brush();
             self.dirty = true;
         }
     }
@@ -1282,6 +1284,7 @@ impl PainterApp {
     pub(crate) fn select_builtin_brush(&mut self, i: usize) {
         self.ui.brush = i.min(toolbox::BUILTIN_BRUSHES.len() - 1);
         self.custom_brush = None;
+        self.leave_anim_brush(); // ADR-36
         self.dirty = true;
     }
 

@@ -216,6 +216,45 @@ impl AnimBrush {
         })
     }
 
+    /// Like [`Self::map`], but `None` as soon as the new cels would hold more than
+    /// [`MAX_CEL_BYTES`]: a transform that would make the AnimBrush too big leaves it as it is
+    /// (the limit is a document rule, never lifted). The cels are made one after the other
+    /// and the work stops at the first one over the limit.
+    pub fn map_within(&self, f: impl FnMut(&BrushImage) -> BrushImage) -> Option<AnimBrush> {
+        self.map_within_bytes(MAX_CEL_BYTES, f)
+    }
+
+    fn map_within_bytes(
+        &self,
+        limit: u64,
+        mut f: impl FnMut(&BrushImage) -> BrushImage,
+    ) -> Option<AnimBrush> {
+        let mut bytes = 0u64;
+        let mut cels = Vec::with_capacity(self.cels.len());
+        for c in &self.cels {
+            let cel = f(c);
+            bytes += cel.pixels.len() as u64;
+            if bytes > limit {
+                return None;
+            }
+            cels.push(cel);
+        }
+        Some(AnimBrush {
+            cels,
+            duration: self.duration,
+            direction: self.direction,
+            clock: self.clock,
+        })
+    }
+
+    /// Every cel renumbered for an arranged palette (Color ▸ Palette ▸ Arrange, ADR-31), so
+    /// it keeps its look: see [`renumber_cel`]. Settings and clock stay.
+    pub fn renumber(&mut self, lut: &[u8; 256]) {
+        for cel in &mut self.cels {
+            renumber_cel(cel, lut);
+        }
+    }
+
     /// Every cel's colours, as palette `from` has them, become the nearest colours of `to`
     /// (transparent colours keep their index; indices whose colour is the same in both stay).
     /// Returns the brush and how many distinct colours changed. Used to fit a loaded AnimBrush
@@ -281,6 +320,15 @@ impl AnimBrush {
             out
         })
     }
+}
+
+/// Brush `cel` renumbered for an arranged palette: `lut[old]` is the new index of colour `old`
+/// ([`crate::remap::inverse`]), for its pixels and its transparent colour.
+pub fn renumber_cel(cel: &mut BrushImage, lut: &[u8; 256]) {
+    for p in &mut cel.pixels {
+        *p = lut[usize::from(*p)];
+    }
+    cel.transparent = cel.transparent.map(|t| lut[usize::from(t)]);
 }
 
 /// The lowest colour below `colors` that no cel uses, else 0.
@@ -465,6 +513,25 @@ impl Grid {
     }
 }
 
+/// The canvas every cel of a morph of `from` into `to` covers, relative to the handle: the
+/// union of both brushes.
+pub fn morph_canvas(from: &BrushImage, to: &BrushImage) -> Rect {
+    let ea = raster::brush_extent(from).unwrap_or_default();
+    let eb = raster::brush_extent(to).unwrap_or_default();
+    ea.union(eb)
+}
+
+/// Most cels a morph of `from` into `to` can have: every cel covers the [`morph_canvas`] and
+/// all of them together hold at most [`MAX_CEL_BYTES`] (and there are at most [`MAX_CELS`]).
+/// Below [`MIN_CELS`] when not even two cels fit.
+pub fn max_morph_cels(from: &BrushImage, to: &BrushImage) -> usize {
+    let c = morph_canvas(from, to);
+    let per_cel = u64::from(c.w.max(1).unsigned_abs()) * u64::from(c.h.max(1).unsigned_abs());
+    usize::try_from(MAX_CEL_BYTES / per_cel)
+        .unwrap_or(MAX_CELS)
+        .min(MAX_CELS)
+}
+
 fn lerp(a: i32, b: i32, t: f64) -> i32 {
     (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as i32
 }
@@ -482,11 +549,22 @@ fn lerp(a: i32, b: i32, t: f64) -> i32 {
 /// brushes' colours there (outside a brush: its nearest opaque pixel). The first and last cel
 /// are the brushes themselves. The transparent colour is `from`'s (else `to`'s, else the lowest
 /// unused colour) and painted pixels never take it.
-pub fn metamorph(from: &BrushImage, to: &BrushImage, cels: usize, palette: &Palette) -> AnimBrush {
+///
+/// `None`, before any work, when the cels would hold more than [`MAX_CEL_BYTES`] (more than
+/// [`max_morph_cels`]).
+pub fn metamorph(
+    from: &BrushImage,
+    to: &BrushImage,
+    cels: usize,
+    palette: &Palette,
+) -> Option<AnimBrush> {
     let cels = cels.clamp(MIN_CELS, MAX_CELS);
+    if cels > max_morph_cels(from, to) {
+        return None;
+    }
     let ea = raster::brush_extent(from).unwrap_or_default();
     let eb = raster::brush_extent(to).unwrap_or_default();
-    let canvas = ea.union(eb);
+    let canvas = morph_canvas(from, to);
     let grid = Grid {
         canvas,
         w: canvas.w as usize + 2,
@@ -559,7 +637,7 @@ pub fn metamorph(from: &BrushImage, to: &BrushImage, cels: usize, palette: &Pale
             cel
         })
         .collect();
-    AnimBrush::new(out)
+    Some(AnimBrush::new(out))
 }
 
 #[cfg(test)]
@@ -714,6 +792,62 @@ mod tests {
     }
 
     #[test]
+    fn transforms_stop_at_the_byte_limit() {
+        let mut b = cels(3);
+        b.set_direction(CelDirection::PingPong);
+        b.set_duration(5);
+        b.advance(2);
+        let flip = crate::brush_ops::flip_horizontal;
+        assert_eq!(b.map_within(flip), Some(b.map(flip)));
+        // Each cel grows from 1 to 4 bytes: 12 bytes fit a limit of 12, not one of 7, and the
+        // work stops at the cel that crosses the limit.
+        let mut made = 0;
+        let mut grow = |c: &BrushImage| {
+            made += 1;
+            solid(2, 2, c.pixels[0])
+        };
+        let grown = b.map_within_bytes(12, &mut grow).expect("fits");
+        assert_eq!(
+            (grown.bytes(), grown.clock, grown.duration),
+            (12, b.clock, 5)
+        );
+        assert_eq!(grown.direction, CelDirection::PingPong);
+        made = 0;
+        let mut grow = |c: &BrushImage| {
+            made += 1;
+            solid(2, 2, c.pixels[0])
+        };
+        assert!(b.map_within_bytes(7, &mut grow).is_none());
+        assert_eq!(made, 2, "the third cel is never made");
+    }
+
+    #[test]
+    fn arrange_renumbers_every_cel_and_keeps_its_look() {
+        let pal = Palette::dpaint_default_32();
+        let mut b = AnimBrush::new(vec![brush(2, 1, &[1, 2]), brush(2, 1, &[3, 0])]);
+        b.advance(1);
+        let before = b.clone();
+        // Colour 2 moves to the front: order[new] = old.
+        let mut order = crate::remap::identity(32);
+        crate::remap::move_entry(&mut order, 2, 0);
+        let arranged = Palette::new(crate::remap::arranged_palette(pal.colors(), &order)).unwrap();
+        b.renumber(&crate::remap::inverse(&order));
+        assert_eq!(b.cels[0].pixels, [2, 0]);
+        assert_eq!(b.cels[1].pixels, [3, 1]);
+        assert_eq!(
+            b.cels[1].transparent,
+            Some(1),
+            "the transparent colour follows"
+        );
+        for (old, new) in before.cels.iter().zip(&b.cels) {
+            for (&o, &n) in old.pixels.iter().zip(&new.pixels) {
+                assert_eq!(pal.get(o), arranged.get(n));
+            }
+        }
+        assert_eq!((b.clock, b.duration), (before.clock, before.duration));
+    }
+
+    #[test]
     fn cels_go_on_one_canvas_around_the_handle() {
         let mut small = brush(1, 1, &[5]);
         small.handle = (0, 0);
@@ -746,7 +880,7 @@ mod tests {
                 to.pixels[y * 7 + x] = 0;
             }
         }
-        let m = metamorph(&from, &to, 5, &pal);
+        let m = metamorph(&from, &to, 5, &pal).unwrap();
         assert_eq!(m.len(), 5);
         assert!(
             m.cels
@@ -790,8 +924,8 @@ mod tests {
         let from = brush(4, 2, &[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut to = brush(2, 4, &[9, 10, 11, 12, 13, 14, 15, 16]);
         to.transparent = Some(9);
-        let a = metamorph(&from, &to, 6, &pal);
-        assert_eq!(a, metamorph(&from, &to, 6, &pal));
+        let a = metamorph(&from, &to, 6, &pal).unwrap();
+        assert_eq!(Some(&a), metamorph(&from, &to, 6, &pal).as_ref());
         for c in &a.cels {
             assert_eq!(c.transparent, Some(0));
             // Only padding is transparent: from's colours never include 0 here.
@@ -801,14 +935,35 @@ mod tests {
         let opaque = last.pixels.iter().filter(|&&p| p != 0).count();
         assert_eq!(opaque, 7, "to has 7 opaque pixels");
         // Reversed order (Alt-b before Metamorph) starts with the other brush.
-        let r = metamorph(&to, &from, 6, &pal);
+        let r = metamorph(&to, &from, 6, &pal).unwrap();
         assert_eq!(
             r.cels[0].pixels.iter().filter(|&&p| p != 9).count(),
             7,
             "to first"
         );
         // At least two cels.
-        assert_eq!(metamorph(&from, &to, 0, &pal).len(), 2);
+        assert_eq!(metamorph(&from, &to, 0, &pal).map(|m| m.len()), Some(2));
+    }
+
+    #[test]
+    fn metamorph_refuses_more_cels_than_the_byte_limit_holds() {
+        let pal = Palette::dpaint_default_32();
+        let dot = solid(1, 1, 1);
+        let mut far = solid(1, 1, 2);
+        // The handles 8191 pixels apart: one 8192x8192 canvas, two cels hold the limit.
+        far.handle = (-8191, -8191);
+        assert_eq!(morph_canvas(&dot, &far), Rect::new(0, 0, 8192, 8192));
+        assert_eq!(max_morph_cels(&dot, &far), 2);
+        far.handle = (-8192, -8192);
+        assert_eq!(max_morph_cels(&dot, &far), 1, "not even two cels fit");
+        assert!(
+            metamorph(&dot, &far, 2, &pal).is_none(),
+            "refused before any work"
+        );
+        let big = solid(1000, 1000, 1);
+        assert_eq!(max_morph_cels(&big, &big), 134);
+        assert!(metamorph(&big, &big, 135, &pal).is_none());
+        assert_eq!(max_morph_cels(&dot, &dot), MAX_CELS);
     }
 
     /// A Stroke with a custom brush of cel 0, wrapped for `b`.

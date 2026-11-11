@@ -6,9 +6,10 @@
 //! The cels, their timing and the morph live in `dpx_core::anim_brush`; painting goes
 //! through `Command::AnimBrushPaint`. This module keeps the AnimBrush, makes its current cel
 //! the custom brush while it is in use, and moves its clock on after every committed stroke.
-//! "In use" means the custom brush is the AnimBrush's current cel: picking up or loading
-//! another brush, a built-in brush or Brush ▸ Restore leave the AnimBrush unused but kept
-//! (Use, `B` or a right-click on the Brush Selector bring it back).
+//! Whether it is in use is kept as a flag: picking up or loading another brush, a built-in
+//! brush, Brush ▸ Restore of the picked-up brush, Brush<->Spare and the right-click away leave
+//! the AnimBrush unused but kept, also when that brush looks like its current cel (Use, `B`
+//! or a right-click on the Brush Selector bring it back).
 
 use std::path::Path;
 
@@ -25,6 +26,8 @@ use crate::{PainterApp, files, note_requester};
 pub const NO_ANIM_BRUSH: &str = "No AnimBrush";
 /// Title of the note after Anim ▸ AnimBrush ▸ Load..
 pub const ANIM_BRUSH_LOADED: &str = "AnimBrush loaded";
+/// Title of the note when an AnimBrush would hold more than [`anim_brush::MAX_CEL_BYTES`].
+pub const ANIM_BRUSH_TOO_BIG: &str = "AnimBrush too big";
 /// Cels Make AnimBrush suggests when the picture has a single frame (the manual gives no
 /// default; with several frames it suggests one cel per frame).
 pub const DEFAULT_MORPH_CELS: usize = 8;
@@ -54,6 +57,10 @@ const TRANSFORMS: [&str; 15] = [
 pub struct AnimBrushState {
     /// The AnimBrush (cels, settings, clock); `None` before one is made and after Free.
     pub brush: Option<AnimBrush>,
+    /// The AnimBrush is the brush: set when it is made, loaded or brought back (Use, `B`,
+    /// right-click), cleared when another brush becomes the brush
+    /// ([`PainterApp::leave_anim_brush`]).
+    in_use: bool,
     /// `picked_brush` when the AnimBrush was made or loaded: while it has not changed, the
     /// AnimBrush is the brush made last and `B` restores it (`B` brings back the last custom
     /// brush or AnimBrush, AGA p.293).
@@ -140,7 +147,9 @@ pub fn snapshot_requester(args: &[String], doc: &Document) -> Option<ToolRequest
             let (count, current) = (doc.frame_count(), doc.current_frame());
             AnimBrushRequester::pick_up(suggested_cels(count, current), count.max(2))
         }
-        Some("make") => AnimBrushRequester::make(morph_cels(doc.frame_count())),
+        Some("make") => {
+            AnimBrushRequester::make(morph_cels(doc.frame_count()), anim_brush::MAX_CELS)
+        }
         Some("settings") => {
             AnimBrushRequester::settings(20, 20, 3, dpx_core::CelDirection::Forward)
         }
@@ -165,6 +174,19 @@ fn suggested_cels(count: usize, current: usize) -> usize {
     .min(anim_brush::MAX_CELS)
 }
 
+/// MiB of cels an AnimBrush may hold, for the notes.
+const MAX_CEL_MIB: u64 = anim_brush::MAX_CEL_BYTES / (1024 * 1024);
+
+/// The note when `cels` cels of a morph of `from` into `to` would hold too much.
+fn morph_too_big(from: &BrushImage, to: &BrushImage, cels: usize) -> String {
+    let c = anim_brush::morph_canvas(from, to);
+    format!(
+        "{cels} cels of {}x{} pixels (brush and spare brush around the handle) would hold \
+         more than {MAX_CEL_MIB} MiB",
+        c.w, c.h
+    )
+}
+
 /// Cels Make AnimBrush suggests: one per frame, or [`DEFAULT_MORPH_CELS`] on one frame.
 fn morph_cels(frames: usize) -> usize {
     if frames >= anim_brush::MIN_CELS {
@@ -180,18 +202,57 @@ impl PainterApp {
     pub(crate) fn animbrush_sync(&mut self, ctx: &egui::Context) {
         self.ui.has_anim_brush = self.animbrush.brush.is_some();
         self.ui.has_spare_brush = self.tools.spare_brush.is_some();
+        // Brush ▸ Restore (`B`) brings back the AnimBrush made last, also before any plain
+        // brush was picked up.
+        self.ui.can_restore |= self.animbrush_is_last();
         self.animbrush.alt = ctx.input(|i| i.modifiers.alt);
         if self.animbrush.armed && self.ui.tool != Tool::BrushSelect {
             self.animbrush.armed = false;
         }
     }
 
-    /// The AnimBrush is the brush: the custom brush is its current cel.
+    /// The AnimBrush is the brush. The flag decides; the custom brush must also be the
+    /// current cel, so a path that replaces the brush without
+    /// [`Self::leave_anim_brush`] can never make a stroke paint the cels.
     pub(crate) fn anim_brush_in_use(&self) -> bool {
-        self.animbrush
-            .brush
-            .as_ref()
-            .is_some_and(|b| self.custom_brush.as_ref() == Some(b.current_cel()))
+        self.animbrush.in_use
+            && self
+                .animbrush
+                .brush
+                .as_ref()
+                .is_some_and(|b| self.custom_brush.as_ref() == Some(b.current_cel()))
+    }
+
+    /// Another brush became the brush (a plain pick-up or load, Brush ▸ Restore of the
+    /// picked-up brush, a built-in brush, Brush<->Spare): the AnimBrush is kept but not in
+    /// use, even when that brush looks like its current cel.
+    pub(crate) fn leave_anim_brush(&mut self) {
+        self.animbrush.in_use = false;
+    }
+
+    /// Color ▸ Palette ▸ Arrange renumbered the colours with `lut` (`lut[old] = new`): the
+    /// AnimBrush's cels, the brush it was made after and the Any Angle originals follow, so
+    /// it stays in use and keeps its look (ADR-31: everything that holds colour numbers
+    /// follows an Arrange).
+    pub(crate) fn animbrush_arrange(&mut self, lut: &[u8; 256]) {
+        let s = &mut self.animbrush;
+        if let Some(b) = &mut s.brush {
+            b.renumber(lut);
+        }
+        if let Some(Some(b)) = &mut s.made_after {
+            anim_brush::renumber_cel(b, lut);
+        }
+        if let Some((made, original)) = &mut s.rotate_base {
+            for c in made.iter_mut().chain(original.iter_mut()) {
+                anim_brush::renumber_cel(c, lut);
+            }
+        }
+    }
+
+    /// The note that a change would make the AnimBrush hold too much.
+    fn too_big_note(&mut self, note: String) {
+        self.ui.note_requester = note_requester(ANIM_BRUSH_TOO_BIG, &[note]);
+        self.dirty = true;
     }
 
     /// The AnimBrush a new gesture paints with: while it is in use and every cel's colours
@@ -221,6 +282,7 @@ impl PainterApp {
     fn set_new_anim_brush(&mut self, brush: AnimBrush) {
         self.custom_brush = Some(brush.current_cel().clone());
         self.animbrush.brush = Some(brush);
+        self.animbrush.in_use = true;
         self.animbrush.made_after = Some(self.picked_brush.clone());
         self.animbrush.rotate_base = None;
         self.tools.brush_palette = Some(self.engine.document().palette().clone());
@@ -232,6 +294,7 @@ impl PainterApp {
     fn replace_anim_brush(&mut self, brush: AnimBrush) {
         self.custom_brush = Some(brush.current_cel().clone());
         self.animbrush.brush = Some(brush);
+        self.animbrush.in_use = true;
         self.dirty = true;
     }
 
@@ -239,6 +302,7 @@ impl PainterApp {
     fn use_anim_brush(&mut self) {
         if let Some(b) = &self.animbrush.brush {
             self.custom_brush = Some(b.current_cel().clone());
+            self.animbrush.in_use = true;
             self.dirty = true;
         }
     }
@@ -283,39 +347,42 @@ impl PainterApp {
                     self.open_file_requester(FileKind::SaveAnimBrush);
                 }
             }
-            "brush.metamorph" => {
-                if self.custom_brush.is_some() && self.tools.spare_brush.is_some() {
-                    let n = morph_cels(self.engine.document().frame_count());
-                    let req = AnimBrushRequester::make(n);
-                    self.ui.tool_requester = Some(ToolRequester::AnimBrush(req));
-                    self.dirty = true;
-                }
-            }
+            "brush.metamorph" => self.open_metamorph(),
             id => self.anim_brush_transform(id),
         }
     }
 
-    /// An instant Brush menu transform on every cel; the current cel stays current.
+    /// Brush ▸ Spare ▸ Metamorph..: the Make AnimBrush requester, its cel count limited to
+    /// what fits [`anim_brush::MAX_CEL_BYTES`]; a note when not even two cels fit.
+    fn open_metamorph(&mut self) {
+        let (Some(from), Some(to)) = (&self.custom_brush, &self.tools.spare_brush) else {
+            return;
+        };
+        let max = anim_brush::max_morph_cels(from, to);
+        if max < anim_brush::MIN_CELS {
+            let note = morph_too_big(from, to, anim_brush::MIN_CELS);
+            return self.too_big_note(note);
+        }
+        let n = morph_cels(self.engine.document().frame_count());
+        let req = AnimBrushRequester::make(n, max);
+        self.ui.tool_requester = Some(ToolRequester::AnimBrush(req));
+        self.dirty = true;
+    }
+
+    /// An instant Brush menu transform on every cel; the current cel stays current. A
+    /// transform that would make the cels hold more than [`anim_brush::MAX_CEL_BYTES`] (Double,
+    /// Outline) leaves the AnimBrush as it is and says so.
     fn anim_brush_transform(&mut self, id: &str) {
         let (fg, bg) = (self.ui.fg, self.ui.bg);
         let Some(b) = &self.animbrush.brush else {
             return;
         };
         let new = match id {
-            "brush.flip_horizontal" => Some(b.map(brush_ops::flip_horizontal)),
-            "brush.flip_vertical" => Some(b.map(brush_ops::flip_vertical)),
-            "brush.rotate_90" => Some(b.map(brush_ops::rotate_90)),
-            "brush.halve" => Some(b.map(brush_ops::halve)),
-            "brush.double" => Some(b.map(|c| brush_ops::double(c, true, true))),
-            "brush.double_horizontal" => Some(b.map(|c| brush_ops::double(c, true, false))),
-            "brush.double_vertical" => Some(b.map(|c| brush_ops::double(c, false, true))),
-            "brush.outline" => Some(b.map(|c| brush_ops::outline(c, fg))),
-            "brush.trim" => b.try_map(brush_ops::trim),
-            "brush.handle_center" => Some(b.map(brush_ops::handle_center)),
-            "brush.handle_corner" => Some(b.map(brush_ops::handle_next_corner)),
-            "brush.bg_to_fg" => Some(b.map(|c| brush_ops::replace_color(c, bg, fg))),
-            "brush.swap_bg_fg" => Some(b.map(|c| brush_ops::swap_colors(c, bg, fg))),
-            "brush.change_transparency" => Some(b.map(|c| brush_ops::set_transparent(c, bg))),
+            // Trim only shrinks; with nothing left in a cel nothing happens, as for one brush.
+            "brush.trim" => match b.try_map(brush_ops::trim) {
+                Some(t) => t,
+                None => return,
+            },
             "brush.remap" => {
                 let Some(from) = &self.tools.brush_palette else {
                     return;
@@ -323,14 +390,42 @@ impl PainterApp {
                 let now = self.engine.document().palette().clone();
                 let (new, _) = b.remap(from, &now);
                 self.tools.brush_palette = Some(now);
-                Some(new)
+                new
             }
-            _ => None,
+            _ => {
+                let f: Box<dyn Fn(&BrushImage) -> BrushImage> = match id {
+                    "brush.flip_horizontal" => Box::new(brush_ops::flip_horizontal),
+                    "brush.flip_vertical" => Box::new(brush_ops::flip_vertical),
+                    "brush.rotate_90" => Box::new(brush_ops::rotate_90),
+                    "brush.halve" => Box::new(brush_ops::halve),
+                    "brush.double" => Box::new(|c| brush_ops::double(c, true, true)),
+                    "brush.double_horizontal" => Box::new(|c| brush_ops::double(c, true, false)),
+                    "brush.double_vertical" => Box::new(|c| brush_ops::double(c, false, true)),
+                    "brush.outline" => Box::new(move |c| brush_ops::outline(c, fg)),
+                    "brush.handle_center" => Box::new(brush_ops::handle_center),
+                    "brush.handle_corner" => Box::new(brush_ops::handle_next_corner),
+                    "brush.bg_to_fg" => Box::new(move |c| brush_ops::replace_color(c, bg, fg)),
+                    "brush.swap_bg_fg" => Box::new(move |c| brush_ops::swap_colors(c, bg, fg)),
+                    "brush.change_transparency" => {
+                        Box::new(move |c| brush_ops::set_transparent(c, bg))
+                    }
+                    _ => return,
+                };
+                match b.map_within(f) {
+                    Some(new) => new,
+                    None => return self.cels_too_big_note(),
+                }
+            }
         };
-        if let Some(new) = new {
-            self.animbrush.rotate_base = None;
-            self.replace_anim_brush(new);
-        }
+        self.animbrush.rotate_base = None;
+        self.replace_anim_brush(new);
+    }
+
+    fn cels_too_big_note(&mut self) {
+        let note = format!(
+            "The cels would hold more than {MAX_CEL_MIB} MiB: the AnimBrush stays as it was"
+        );
+        self.too_big_note(note);
     }
 
     /// The end of a Brush menu drag gesture (Stretch, Any Angle, Shear, Bend, Place) while the
@@ -347,9 +442,19 @@ impl PainterApp {
             (Some((made, original)), XformKind::Rotate) if *made == b.cels => original.clone(),
             _ => b.cels.clone(),
         };
-        let cels: Vec<BrushImage> = bases.iter().map(|c| g.apply_to(c, colors)).collect();
-        self.animbrush.rotate_base = (g.kind() == XformKind::Rotate).then(|| (cels.clone(), bases));
-        let new = AnimBrush { cels, ..b.clone() };
+        let base = AnimBrush {
+            cels: bases,
+            duration: b.duration,
+            direction: b.direction,
+            clock: b.clock,
+        };
+        // Within the byte limit only (Stretch can make every cel far bigger).
+        let Some(new) = base.map_within(|c| g.apply_to(c, colors)) else {
+            self.cels_too_big_note();
+            return true;
+        };
+        self.animbrush.rotate_base =
+            (g.kind() == XformKind::Rotate).then(|| (new.cels.clone(), base.cels));
         self.replace_anim_brush(new);
         true
     }
@@ -433,8 +538,13 @@ impl PainterApp {
                     return;
                 };
                 let palette = self.engine.document().palette();
-                let b = anim_brush::metamorph(from, to, r.cels(), palette);
-                self.set_new_anim_brush(b);
+                match anim_brush::metamorph(from, to, r.cels(), palette) {
+                    Some(b) => self.set_new_anim_brush(b),
+                    None => {
+                        let note = morph_too_big(from, to, r.cels());
+                        self.too_big_note(note);
+                    }
+                }
             }
             AnimBrushReq::Settings => {
                 let in_use = self.anim_brush_in_use();
@@ -472,6 +582,7 @@ impl PainterApp {
         }
         if self.anim_brush_in_use() {
             self.custom_brush.clone_from(&self.picked_brush);
+            self.leave_anim_brush();
             self.dirty = true;
         } else {
             self.use_anim_brush();
@@ -1350,17 +1461,348 @@ mod tests {
             }
         }
         if let Ok(path) = std::env::var("DPX_ANIMBRUSH_PNG") {
-            let screen = app.compose_screen();
-            let scale = 3;
-            let (w, h) = (screen.width() * scale, screen.height() * scale);
-            let big: Vec<u8> = (0..h)
-                .flat_map(|y| (0..w).map(move |x| (x, y)))
-                .map(|(x, y)| screen.get((x / scale) as i32, (y / scale) as i32).unwrap())
-                .collect();
-            let big = IndexedImage::from_pixels(w, h, big).unwrap();
-            let png = dpx_formats::write_png(&big, app.palette()).unwrap();
-            std::fs::write(path, png).unwrap();
+            std::fs::write(path, screen_png(&app)).unwrap();
         }
+    }
+
+    /// The screen as a PNG at 3x.
+    fn screen_png(app: &PainterApp) -> Vec<u8> {
+        let screen = app.compose_screen();
+        let scale = 3;
+        let (w, h) = (screen.width() * scale, screen.height() * scale);
+        let big: Vec<u8> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| screen.get((x / scale) as i32, (y / scale) as i32).unwrap())
+            .collect();
+        let big = IndexedImage::from_pixels(w, h, big).unwrap();
+        dpx_formats::write_png(&big, app.palette()).unwrap()
+    }
+
+    /// With `DPX_ANIMBRUSH_PNG_DIR=dir`, the screen is written to `dir/name` (ADR-36 shots).
+    fn shot(app: &PainterApp, name: &str) {
+        if let Ok(dir) = std::env::var("DPX_ANIMBRUSH_PNG_DIR") {
+            std::fs::write(Path::new(&dir).join(name), screen_png(app)).unwrap();
+        }
+    }
+
+    /// Picks top-level menu item `id` with the right button (held on the title, let go on
+    /// the item); the path is checked with the menu's own pointer tracking.
+    fn menu_pick_item(app: &mut PainterApp, ctx: &egui::Context, t: f64, id: &'static str) {
+        use dpx_ui::menu::{self, MENUS};
+        let (w, h) = app.view().ui_size();
+        let wanted = Action::Command(id);
+        let (m, item) = MENUS
+            .iter()
+            .enumerate()
+            .find_map(|(m, menu)| {
+                let i = menu
+                    .items
+                    .iter()
+                    .position(|it| matches!(it.entry, menu::Entry::Action(a) if a == wanted));
+                i.map(|i| (m, i))
+            })
+            .expect("a top-level item");
+        let title_x = (0..w)
+            .find(|&x| {
+                let mut state = dpx_ui::MenuState::default();
+                state.open(w, h, x, 1);
+                state.menu == Some(m)
+            })
+            .expect("menu title");
+        let mbox = menu::menu_box(m, w, h);
+        let path = [(title_x, 1), (mbox.x + mbox.w / 2, mbox.item_top(item) + 1)];
+        let mut state = dpx_ui::MenuState::default();
+        state.open(w, h, path[0].0, path[0].1);
+        state.pointer(w, h, path[1].0, path[1].1);
+        assert_eq!(state.hovered_action(&app.ui.menu_context()), Some(wanted));
+        let [title, at] = path.map(|p| ui_point(app, p));
+        let moved = egui::Event::PointerMoved;
+        let down = button(title, Secondary, true, NONE);
+        pass(app, ctx, t, vec![moved(title), down], NONE);
+        pass(app, ctx, t + 0.02, vec![moved(at)], NONE);
+        pass(
+            app,
+            ctx,
+            t + 0.04,
+            vec![button(at, Secondary, false, NONE)],
+            NONE,
+        );
+    }
+
+    /// The window point over point `p` of the open tool requester.
+    fn requester_pos(app: &PainterApp, p: (i32, i32)) -> egui::Pos2 {
+        let req = app.ui.tool_requester.as_ref().expect("a requester");
+        let (w, h) = app.view().ui_size();
+        let (ox, oy) = req.origin(w, h);
+        ui_point(app, (ox + p.0, oy + p.1))
+    }
+
+    /// What `b`'s cels show through `palette`: each pixel's colour, `None` where transparent.
+    fn looks(b: &AnimBrush, palette: &Palette) -> Vec<Vec<Option<dpx_core::Rgb8>>> {
+        b.cels
+            .iter()
+            .map(|c| {
+                c.pixels
+                    .iter()
+                    .map(|&p| (Some(p) != c.transparent).then(|| palette.get(p).unwrap()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn arrange_renumbers_the_animbrush_so_it_stays_in_use_and_looks_the_same() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.run(Command::Clear { color: 0 });
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        pass(&mut app, &ctx, 0.1, vec![text("s")], NONE);
+        // A plain brush picked up first, then an AnimBrush of colours 1, 2 and 3 (made last).
+        app.picked_brush = Some(solid(2, 2, 1));
+        app.set_new_anim_brush(dots(3));
+        let before = looks(app.animbrush.brush.as_ref().unwrap(), app.palette());
+        ui_pass(&mut app, &ctx, 0.15, vec![]);
+        // Color ▸ Palette ▸ Arrange: colour 2 dragged to the front (0 and 1 move up), Return.
+        let t = menu_pick(&mut app, &ctx, 0.2, "palette.arrange");
+        let Some(ToolRequester::Arrange(r)) = &app.ui.tool_requester else {
+            panic!("the Arrange requester");
+        };
+        let centre = |c: Rect| (c.x + c.w / 2, c.y + c.h / 2);
+        let (from, to) = (centre(r.cell_rect(2)), centre(r.cell_rect(0)));
+        let (from, to) = (requester_pos(&app, from), requester_pos(&app, to));
+        pass(
+            &mut app,
+            &ctx,
+            t,
+            vec![egui::Event::PointerMoved(from)],
+            NONE,
+        );
+        let down = button(from, Primary, true, NONE);
+        pass(&mut app, &ctx, t + 0.02, vec![down], NONE);
+        pass(
+            &mut app,
+            &ctx,
+            t + 0.04,
+            vec![egui::Event::PointerMoved(to)],
+            NONE,
+        );
+        let up = button(to, Primary, false, NONE);
+        pass(&mut app, &ctx, t + 0.06, vec![up], NONE);
+        let enter = key_event(egui::Key::Enter, true);
+        ui_pass(&mut app, &ctx, t + 0.08, vec![enter]);
+        assert!(app.ui.tool_requester.is_none());
+        let original = Palette::dpaint_default_32();
+        assert_eq!(
+            app.palette().get(0),
+            original.get(2),
+            "colour 2 is at 0 now"
+        );
+        // The AnimBrush followed: still the brush, the same look, and `B` still restores it.
+        assert!(app.anim_brush_in_use());
+        let b = app.animbrush.brush.clone().unwrap();
+        assert_eq!(looks(&b, app.palette()), before);
+        assert!(
+            app.animbrush_is_last(),
+            "made after the (renumbered) picked-up brush"
+        );
+        // Two clicks stamp cel 1 and cel 2 in their old colours.
+        let mut t = t + 0.1;
+        for (i, x) in [40, 50].into_iter().enumerate() {
+            t = drag(&mut app, &ctx, t, &[(x, 40)], NONE);
+            let p = app.page().get(x, 40).unwrap();
+            assert_eq!(app.palette().get(p), before[i][0], "click {i}");
+        }
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().current(), 2);
+    }
+
+    #[test]
+    fn metamorph_never_makes_more_cels_than_the_byte_limit_holds() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // Handles 8192 pixels apart: not even two cels of their canvas fit. Alt+m explains.
+        let mut far = solid(1, 1, 2);
+        far.handle = (-8192, -8192);
+        app.custom_brush = Some(far);
+        pass(
+            &mut app,
+            &ctx,
+            0.1,
+            with(key(egui::Key::N, ALT), text("~")),
+            ALT,
+        );
+        app.custom_brush = Some(solid(1, 1, 1));
+        pass(&mut app, &ctx, 0.2, key(egui::Key::M, ALT), ALT);
+        assert!(app.ui.tool_requester.is_none());
+        shot(&app, "animbrush-too-big.png");
+        let note = app.ui.note_requester.take().expect("a note");
+        assert_eq!(note.title(), ANIM_BRUSH_TOO_BIG);
+        assert!(app.animbrush.brush.is_none());
+        // Two 1000x1000 brushes: Make AnimBrush takes 134 cels at most (134 MB of 128 MiB).
+        app.tools.spare_brush = Some(solid(1000, 1000, 2));
+        app.custom_brush = Some(solid(1000, 1000, 1));
+        pass(&mut app, &ctx, 0.3, key(egui::Key::M, ALT), ALT);
+        assert_eq!(requester(&app).cels(), DEFAULT_MORPH_CELS);
+        let bs = key_event(egui::Key::Backspace, true);
+        pass(&mut app, &ctx, 0.4, vec![bs, text("135")], NONE);
+        let enter = key_event(egui::Key::Enter, true);
+        ui_pass(&mut app, &ctx, 0.5, vec![enter]);
+        assert!(app.ui.tool_requester.is_some(), "135 cels are refused");
+        shot(&app, "animbrush-make-limit.png");
+        assert!(app.animbrush.brush.is_none());
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.6,
+            vec![key_event(egui::Key::Escape, true)],
+        );
+        assert!(app.ui.tool_requester.is_none());
+        // An Ok for more cels than fit makes nothing either; it says why.
+        app.animbrush_requester_ok(AnimBrushRequester::make(999, 999));
+        let note = app.ui.note_requester.take().expect("a note");
+        assert_eq!(note.title(), ANIM_BRUSH_TOO_BIG);
+        assert!(app.animbrush.brush.is_none());
+    }
+
+    #[test]
+    fn brush_transforms_that_would_pass_the_byte_limit_leave_the_animbrush_as_it_was() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // 33 cels of 1024x1024 (33 MiB): doubled they would hold 132 MiB, more than 128.
+        let cels = (0..33u8).map(|i| solid(1024, 1024, i % 5 + 1)).collect();
+        app.set_new_anim_brush(AnimBrush::new(cels));
+        ui_pass(&mut app, &ctx, 0.05, vec![]);
+        let t = menu_pick(&mut app, &ctx, 0.1, "brush.double");
+        let b = app.animbrush.brush.as_ref().unwrap();
+        assert!(b.cels.iter().all(|c| (c.width, c.height) == (1024, 1024)));
+        assert!(app.anim_brush_in_use());
+        let note = app.ui.note_requester.take().expect("a note");
+        assert_eq!(note.title(), ANIM_BRUSH_TOO_BIG);
+        // Brush ▸ Stretch with Shift (proportional): 400 cels of 1024x1 dragged 100 pixels
+        // down would become 4096x100 each, 156 MiB together.
+        let cels = (0..400)
+            .map(|i| solid(1024, 1, (i % 5 + 1) as u8))
+            .collect();
+        app.set_new_anim_brush(AnimBrush::new(cels));
+        let t = menu_pick(&mut app, &ctx, t, "brush.stretch");
+        let shift = egui::Modifiers::SHIFT;
+        drag(&mut app, &ctx, t, &[(100, 60), (100, 159)], shift);
+        let b = app.animbrush.brush.as_ref().unwrap();
+        assert!(b.cels.iter().all(|c| (c.width, c.height) == (1024, 1)));
+        assert!(app.anim_brush_in_use());
+        assert_eq!(app.custom_brush.as_ref(), Some(b.current_cel()));
+        let note = app.ui.note_requester.take().expect("a note");
+        assert_eq!(note.title(), ANIM_BRUSH_TOO_BIG);
+    }
+
+    #[test]
+    fn the_right_click_leaves_an_animbrush_whose_cel_looks_like_the_picked_up_brush() {
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.run(Command::Clear { color: 0 });
+        // Two 5x5 squares: colour 2 at (20, 20) and colour 1 at (40, 40).
+        for (at, c) in [(20, 2u8), (40, 1)] {
+            app.run(Command::Shape {
+                shape: dpx_core::Shape::Rect {
+                    from: (at, at),
+                    to: (at + 4, at + 4),
+                },
+                brush: Vec::new(),
+                color: c,
+                filled: true,
+                symmetry: None,
+                custom: None,
+                mode: dpx_core::DrawMode::Matte,
+                range: None,
+                stencil: None,
+                right: false,
+                fx: Default::default(),
+            });
+        }
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // Pick up P (colour 2), Alt+n to the spare, then pick up Q (colour 1): the manual's
+        // same-size brushes for Metamorph.
+        pass(&mut app, &ctx, 0.1, vec![text("b")], NONE);
+        let t = drag(&mut app, &ctx, 0.2, &[(20, 20), (24, 24)], NONE);
+        pass(
+            &mut app,
+            &ctx,
+            t,
+            with(key(egui::Key::N, ALT), text("~")),
+            ALT,
+        );
+        pass(&mut app, &ctx, t + 0.1, vec![text("b")], NONE);
+        let t = drag(&mut app, &ctx, t + 0.2, &[(40, 40), (44, 44)], NONE);
+        let q = app.custom_brush.clone().expect("Q");
+        assert_eq!(app.picked_brush.as_ref(), Some(&q));
+        // Brush ▸ Spare ▸ Metamorph.., Return: the first cel is Q itself.
+        ui_pass(&mut app, &ctx, t, vec![]);
+        let t = menu_pick(&mut app, &ctx, t + 0.1, "brush.metamorph");
+        ui_pass(&mut app, &ctx, t, vec![key_event(egui::Key::Enter, true)]);
+        let b = app.animbrush.brush.clone().expect("an AnimBrush");
+        assert_eq!(b.current_cel(), &q, "same-size brushes: cel 1 is the brush");
+        assert!(app.anim_brush_in_use());
+        // Right-click on the Brush Selector: the plain brush Q, not the AnimBrush.
+        let t = right_click_brush_selector(&mut app, &ctx, t + 0.1);
+        assert_eq!(app.custom_brush.as_ref(), Some(&q));
+        assert!(!app.anim_brush_in_use());
+        // A click paints Q and leaves the AnimBrush's clock alone.
+        pass(&mut app, &ctx, t, vec![text("s")], NONE);
+        let t = drag(&mut app, &ctx, t + 0.1, &[(100, 100)], NONE);
+        assert_eq!(app.page().get(100, 100), Some(1));
+        assert_eq!(app.animbrush.brush.as_ref(), Some(&b));
+        // The second right-click brings the AnimBrush back; a click then moves it on.
+        let t = right_click_brush_selector(&mut app, &ctx, t);
+        assert!(app.anim_brush_in_use());
+        let t = drag(&mut app, &ctx, t, &[(120, 100)], NONE);
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().current(), 1);
+        // A plain pick-up of a brush that looks like the current cel is a plain brush too.
+        app.animbrush.brush.as_mut().unwrap().set_current(0);
+        app.use_anim_brush();
+        pass(&mut app, &ctx, t, vec![text("b")], NONE);
+        let t = drag(&mut app, &ctx, t + 0.1, &[(40, 40), (44, 44)], NONE);
+        assert_eq!(app.custom_brush.as_ref(), Some(&q));
+        assert!(!app.anim_brush_in_use());
+        // So is Alt+b twice (the cel goes to the spare and comes back as a plain brush).
+        app.use_anim_brush();
+        pass(
+            &mut app,
+            &ctx,
+            t,
+            with(key(egui::Key::B, ALT), text("∫")),
+            ALT,
+        );
+        assert!(!app.anim_brush_in_use());
+        pass(
+            &mut app,
+            &ctx,
+            t + 0.1,
+            with(key(egui::Key::B, ALT), text("∫")),
+            ALT,
+        );
+        assert_eq!(app.custom_brush.as_ref(), Some(&q));
+        assert!(!app.anim_brush_in_use());
+    }
+
+    #[test]
+    fn brush_restore_is_on_while_b_would_restore_the_animbrush() {
+        let ctx = egui::Context::default();
+        let mut app = frames(2);
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // An AnimBrush before any plain brush was picked up.
+        pass(&mut app, &ctx, 0.1, vec![text("b")], NONE);
+        let t = drag(&mut app, &ctx, 0.2, &[(39, 39), (45, 45)], ALT);
+        ui_pass(&mut app, &ctx, t, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.anim_brush_in_use() && app.picked_brush.is_none());
+        // Right-click on the Brush Selector: the built-in brush (there is no other).
+        let t = right_click_brush_selector(&mut app, &ctx, t + 0.1);
+        assert!(app.custom_brush.is_none());
+        ui_pass(&mut app, &ctx, t, vec![]);
+        assert!(Action::Command("brush.restore").enabled(&app.ui.menu_context()));
+        // Brush ▸ Restore does what `B` does.
+        menu_pick_item(&mut app, &ctx, t + 0.1, "brush.restore");
+        assert!(app.anim_brush_in_use());
     }
 
     #[test]
