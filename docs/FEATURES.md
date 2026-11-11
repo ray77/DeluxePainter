@@ -86,8 +86,8 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 | P | Format | Import | Export |
 |---|---|---|---|
 | P0 | IFF ILBM (ByteRun1, mask, CMAP, CAMG) | ✓ | ✓ with ExportAnalyzer report |
-| P0 | PNG | ✓ (indexed as is; true colour quantised ✓ ADR-9; as layer later) | ✓ native resolution |
-| P0 | JPEG | ✓ (quantised, EXIF orientation; ADR-9) | ✗ (never) |
+| P0 | PNG | ✓ (indexed as is; true colour quantised ✓ ADR-9; Picture ▸ Load.. asks first: fit into the page, centre / top left, colour count or current palette, dither none / Floyd–Steinberg / ordered, true-colour thumbnail ✓ ADR-42; as layer later) | ✓ native resolution |
+| P0 | JPEG | ✓ (quantised, EXIF orientation; ADR-9; Import requester as for PNG, ADR-42) | ✗ (never) |
 | P2 | ILBM EHB / HAM6 / HAM8, CRNG/CCRT | ✓ (EHB opens as 64 free colours, HAM6/HAM8 decoded and reduced to the screen's palette, ADR-26; save writes plain indexed ILBM) | ✓ (CRNG/CCRT only; EHB/HAM export in Phase 5) |
 | P2 | IFF ANIM (op 5 first) | ✓ | ✓ |
 | P2 | IFF brushes / AnimBrushes | ✓ | ✓ |

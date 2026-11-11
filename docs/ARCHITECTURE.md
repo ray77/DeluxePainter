@@ -112,8 +112,8 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
 | `.dpxproj` | dpx-formats `project.rs` (ADR-23; the version 1 layout in `docs/PROJECT_FORMAT.md` is simpler than this sketch) | ZIP: `project.json` (schema_version, canvas, target, layer tree, frames), `palette.json`, `cels/<layer>/<frame>.bin` (zstd, tiled), `preview.png`, `source/` (preserved import chunks). Atomic save: temp file in same dir → fsync → rename. Zip-bomb/traversal/duplicate-entry checks. |
 | IFF ILBM | dpx-iff | Import all documented variants incl. EHB/HAM6/HAM8, CRNG/CCRT; export via `ExportAnalyzer` report → explicit confirmation if lossy. |
 | IFF ANIM | dpx-iff | Phase 6: op 5 first (most common, DPaint), verified against foreign files. |
-| PNG | dpx-formats | Import (indexed as is; true colour reduced by `dpx_core::quantize`, ADR-9; later also as RGBA layer), export composited native resolution. |
-| JPEG | dpx-formats | Import only (zune-jpeg, EXIF orientation), reduced like true-colour PNG (ADR-9). |
+| PNG | dpx-formats | Import (indexed as is; true colour reduced by `dpx_core::quantize`, ADR-9; the GUI's Picture ▸ Load.. goes through the Import requester and `dpx_core::import`, ADR-42; later also as RGBA layer), export composited native resolution. |
+| JPEG | dpx-formats | Import only (zune-jpeg, EXIF orientation), reduced like true-colour PNG (ADR-9; Import requester in the GUI, ADR-42). |
 
 ## 7. MCP (ADR-5)
 
