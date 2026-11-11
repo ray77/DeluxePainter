@@ -14,10 +14,10 @@
 use std::path::PathBuf;
 
 use dpx_core::import::{
-    self, COLOR_COUNTS, ImportOptions, ImportTarget, Imported, PaletteChoice, Position,
+    self, COLOR_COUNTS, Fitted, ImportOptions, ImportTarget, Imported, PaletteChoice, Position,
 };
 use dpx_core::quantize::{Dither, PaletteDepth, Reduction};
-use dpx_core::{Chipset, Document, RgbaImage};
+use dpx_core::{Chipset, Document, IndexedImage, RgbaImage};
 use dpx_ui::{ImportInfo, ImportRequester, ImportResponse, ReqEvent, UiState};
 use eframe::egui;
 
@@ -93,15 +93,38 @@ pub fn parse_dither(s: &str) -> Option<Dither> {
     }
 }
 
+/// From this many pixels of fitted picture on (bigger than any standard screen, e.g. pages
+/// made larger with Page Size), option changes are reduced on a background thread, so the
+/// requester never blocks; Ok waits for the result.
+pub(crate) const BACKGROUND_PIXELS: u64 = 2_000_000;
+
 /// The picture behind the open requester.
 pub(crate) struct Pending {
     path: PathBuf,
     /// Notes from reading the file (shown after Ok).
     notes: Vec<String>,
-    /// The picture fitted into the page (made once).
-    fitted: RgbaImage,
-    /// The page Ok gives with the requester's options (made again on every change).
+    /// The picture fitted into the page (made once) and the work option changes reuse;
+    /// `None` while a background job has it.
+    fitted: Option<Fitted>,
+    /// The page made with `made` (the thumbnail shows it; Ok takes it when `made` is the
+    /// requester's options).
     result: Imported,
+    made: ImportOptions,
+    /// A reduction running in the background.
+    job: Option<Job>,
+}
+
+/// A background reduction (big pages): it gives the fitted picture back with the page.
+pub(crate) struct Job {
+    options: ImportOptions,
+    done: std::sync::mpsc::Receiver<(Fitted, Imported)>,
+}
+
+impl Pending {
+    /// A reduction is running in the background.
+    pub(crate) fn busy(&self) -> bool {
+        self.job.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -154,24 +177,49 @@ fn notes_after(mut notes: Vec<String>, r: &Imported, palette: PaletteChoice) -> 
     notes
 }
 
-impl PainterApp {
-    /// The current document as the import's target.
-    fn import_target(&self) -> ImportTarget<'_> {
-        let doc = self.engine.document();
-        let t = doc.target();
-        ImportTarget {
-            page: (doc.page().width(), doc.page().height()),
-            pixel_shape: t.mode.pixel_shape(),
-            depth: match t.chipset {
-                Chipset::Ocs => PaletteDepth::Rgb4,
-                Chipset::Aga => PaletteDepth::Rgb8,
-            },
-            palette: doc.palette(),
-            bg: self.ui.bg,
-            transparent: files::TRANSPARENT_PINK,
-        }
+/// `doc` as the import's target, with the BG colour `bg`.
+fn import_target(doc: &Document, bg: u8) -> ImportTarget<'_> {
+    let t = doc.target();
+    ImportTarget {
+        page: (doc.page().width(), doc.page().height()),
+        pixel_shape: t.mode.pixel_shape(),
+        depth: match t.chipset {
+            Chipset::Ocs => PaletteDepth::Rgb4,
+            Chipset::Aga => PaletteDepth::Rgb8,
+        },
+        palette: doc.palette(),
+        bg,
+        transparent: files::TRANSPARENT_PINK,
     }
+}
 
+/// The requester's default colour count: the document's palette size in whole bitplanes
+/// (12 colours take 4 bitplanes: 16), so the default never gives fewer colours.
+pub(crate) fn default_colors(palette_len: usize) -> u16 {
+    (palette_len.clamp(2, 256) as u16).next_power_of_two()
+}
+
+/// Runs `draw` (marks drawn over the composed screen, such as the toolbox's toggles) without
+/// touching the Import requester: it covers the toolbox column, and the marks belong under it.
+pub(crate) fn under_import_requester(
+    screen: &mut IndexedImage,
+    ui: &UiState,
+    (ux, uy): (i32, i32),
+    draw: impl FnOnce(&mut IndexedImage),
+) {
+    let kept = ui.import_requester.as_ref().map(|req| {
+        let (ox, oy) = req.origin();
+        let (w, h) = req.size();
+        let rect = dpx_core::Rect::new(ox * ux, oy * uy, w * ux, h * uy);
+        (rect, screen.crop(rect))
+    });
+    draw(screen);
+    if let Some((rect, img)) = kept {
+        screen.blit(&img, rect.x, rect.y);
+    }
+}
+
+impl PainterApp {
     /// Opens the Import requester for a loaded PNG or JPEG (the file requester closes).
     pub(crate) fn open_import(&mut self, path: PathBuf, picture: Picture, notes: Vec<String>) {
         if let Some((image, colors)) = source(picture) {
@@ -194,14 +242,16 @@ impl PainterApp {
         let target = doc.target();
         let page = (doc.page().width(), doc.page().height());
         let shape = target.mode.pixel_shape();
-        let fitted = import::fit(&image, page, shape);
+        let mut fitted = Fitted::new(&image, page, shape);
         let max = target.mode.max_colors(target.chipset).unwrap_or(16);
         let current = doc.palette().len().min(256) as u16;
         let s = self.import.settings;
         let options = ImportOptions {
             position: s.position,
             palette: s.palette,
-            colors: s.colors.unwrap_or(current),
+            colors: s
+                .colors
+                .unwrap_or_else(|| default_colors(doc.palette().len())),
             dither: s.dither,
         };
         let info = ImportInfo {
@@ -210,17 +260,20 @@ impl PainterApp {
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
             size: (image.width(), image.height()),
             colors,
-            fitted: (fitted.width(), fitted.height()),
+            fitted: (fitted.image().width(), fitted.image().height()),
             page,
         };
         let screen = View::of_target(target).ui_size();
         let req = ImportRequester::new(info, options, max, current, screen, shape);
-        let result = import::reduce_fitted(&fitted, &req.options(), &self.import_target());
+        let made = req.options();
+        let result = fitted.reduce(&made, &import_target(doc, self.ui.bg));
         self.import.pending = Some(Pending {
             path,
             notes,
-            fitted,
+            fitted: Some(fitted),
             result,
+            made,
+            job: None,
         });
         self.ui.import_requester = Some(req);
         self.ui.file_requester = None;
@@ -246,11 +299,17 @@ impl PainterApp {
         scale: f32,
         view: View,
     ) {
+        // A background result that has arrived.
+        self.import_poll(false);
+        if self.import.pending.as_ref().is_some_and(Pending::busy) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         let Some(req) = &self.ui.import_requester else {
             return;
         };
         let at = req.origin();
-        let (events, _) = self.modal_events(ctx, origin, ppp, scale, view, at);
+        // A held Return (the one that picked the file) does not answer Ok.
+        let (events, _) = self.modal_events_with(ctx, origin, ppp, scale, view, at, false);
         for event in events {
             if self.ui.import_requester.is_none() {
                 break;
@@ -278,25 +337,114 @@ impl PainterApp {
         }
     }
 
+    /// Makes the page for the requester's options: at once, or for a big picture on a
+    /// background thread (while one runs, the next starts when it ends, with the options
+    /// wanted then).
     fn import_recompute(&mut self) {
-        let (Some(req), Some(p)) = (&self.ui.import_requester, &self.import.pending) else {
+        let (Some(req), Some(p)) = (&self.ui.import_requester, &mut self.import.pending) else {
             return;
         };
-        let result = import::reduce_fitted(&p.fitted, &req.options(), &self.import_target());
-        if let Some(p) = &mut self.import.pending {
-            p.result = result;
+        let wanted = req.options();
+        if p.job.is_some() || p.made == wanted {
+            return;
         }
-        self.refresh_import_thumbnail();
+        let Some(mut fitted) = p.fitted.take() else {
+            return;
+        };
+        let doc = self.engine.document();
+        let pixels = u64::from(fitted.image().width()) * u64::from(fitted.image().height());
+        if pixels < BACKGROUND_PIXELS {
+            p.result = fitted.reduce(&wanted, &import_target(doc, self.ui.bg));
+            p.made = wanted;
+            p.fitted = Some(fitted);
+            self.refresh_import_thumbnail();
+            return;
+        }
+        let t = import_target(doc, self.ui.bg);
+        let (page, pixel_shape, depth, bg, transparent) =
+            (t.page, t.pixel_shape, t.depth, t.bg, t.transparent);
+        let palette = doc.palette().clone();
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t = ImportTarget {
+                page,
+                pixel_shape,
+                depth,
+                palette: &palette,
+                bg,
+                transparent,
+            };
+            let result = fitted.reduce(&wanted, &t);
+            // The requester may be gone (Cancel): then nobody waits.
+            let _ = tx.send((fitted, result));
+        });
+        p.job = Some(Job {
+            options: wanted,
+            done,
+        });
+    }
+
+    /// Takes a finished background result (with `wait`, waits for it) and starts the next
+    /// one if the options changed meanwhile.
+    pub(crate) fn import_poll(&mut self, wait: bool) {
+        let Some(p) = &mut self.import.pending else {
+            return;
+        };
+        let Some(job) = &p.job else {
+            return;
+        };
+        let got = if wait {
+            job.done
+                .recv()
+                .map_err(|_| std::sync::mpsc::TryRecvError::Disconnected)
+        } else {
+            job.done.try_recv()
+        };
+        match got {
+            Ok((fitted, result)) => {
+                p.made = job.options;
+                p.fitted = Some(fitted);
+                p.result = result;
+                p.job = None;
+                self.dirty = true;
+                self.refresh_import_thumbnail();
+                self.import_recompute();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The reduction failed: nothing can be shown or taken over.
+                eprintln!("import: the colour reduction failed");
+                self.ui.import_requester = None;
+                self.import.pending = None;
+            }
+        }
+    }
+
+    /// Waits until the page for the requester's options is made.
+    fn import_settle(&mut self) {
+        while self.import.pending.as_ref().is_some_and(Pending::busy) {
+            self.import_poll(true);
+        }
+        self.import_recompute();
+        while self.import.pending.as_ref().is_some_and(Pending::busy) {
+            self.import_poll(true);
+        }
     }
 
     /// Ok: the page shown in the thumbnail becomes the picture, like Load (not undoable,
     /// ADR-8). Mode, chipset, screen and page size stay; the choices are remembered.
     fn import_ok(&mut self) {
+        // The page for exactly these options (a background job may still run).
+        self.import_settle();
         let (Some(req), Some(p)) = (self.ui.import_requester.take(), self.import.pending.take())
         else {
             return;
         };
         let opts = req.options();
+        debug_assert_eq!(
+            p.made, opts,
+            "Ok takes the page made with the requester's options"
+        );
         self.import.settings = ImportSettings {
             position: opts.position,
             palette: opts.palette,
@@ -1022,51 +1170,525 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_held_return_does_not_answer_the_import_requester() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("repeat");
+        write_png_rgb(&dir.join("Photo.png"), &photo(100, 80));
+        let mut app = PainterApp::new();
+        app.run(Command::Clear { color: 5 });
+        let before = app.engine.document().clone();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        app.run_action(dpx_ui::Action::Command("picture.load"), &ctx);
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.1,
+            vec![egui::Event::Text("Photo.png".into())],
+        );
+        ui_pass(&mut app, &ctx, 0.2, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.ui.file_requester.is_none());
+        assert!(
+            app.ui.import_requester.is_some(),
+            "the Import requester asks"
+        );
+        // Return is still held: egui marks the next press a repeat, as the OS's auto-repeat.
+        ui_pass(&mut app, &ctx, 0.7, vec![key_event(egui::Key::Enter, true)]);
+        let repeat = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        ui_pass(&mut app, &ctx, 0.8, vec![repeat]);
+        assert!(app.ui.import_requester.is_some(), "a held Return is no Ok");
+        assert_eq!(app.engine.document(), &before);
+        // Released and pressed again: Ok.
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.9,
+            vec![key_event(egui::Key::Enter, false)],
+        );
+        ui_pass(&mut app, &ctx, 1.0, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.ui.import_requester.is_none());
+        assert_ne!(app.engine.document(), &before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_default_count_holds_the_whole_palette() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("count");
+        write_png_rgb(&dir.join("Photo.png"), &photo(100, 80));
+        let mut app = PainterApp::new();
+        let twelve = Palette::new(
+            (0..12u8)
+                .map(|i| Rgb8::new(i * 20, 100, 255 - i * 20))
+                .collect(),
+        )
+        .unwrap();
+        let target = app.engine.document().target();
+        app.set_picture(
+            Document::from_picture(IndexedImage::new(320, 256, 0), twelve, target),
+            files::PictureExtras::default(),
+            dir.join("twelve.png"),
+        );
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        load_through_the_requester(&mut app, &ctx, &dir, "Photo.png");
+        let req = app.ui.import_requester.as_ref().unwrap();
+        assert_eq!(req.options().colors, 16, "12 colours take 4 bitplanes");
+        assert_eq!(req.shown_colors(), 16);
+        click(
+            &mut app,
+            &ctx,
+            0.1,
+            ImportControl::Palette(PaletteChoice::Current),
+        );
+        let req = app.ui.import_requester.as_ref().unwrap();
+        assert_eq!(
+            req.shown_colors(),
+            12,
+            "Current shows the palette's own size"
+        );
+        assert_eq!(default_colors(32), 32);
+        assert_eq!(default_colors(2), 2);
+        assert_eq!(default_colors(17), 32);
+        assert_eq!(default_colors(256), 256);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An indexed PNG with exactly the colour count, smaller than the page.
+    fn write_many_colours(path: &std::path::Path, w: u32, h: u32) -> (IndexedImage, Palette) {
+        let palette = Palette::new(
+            (0..32u32)
+                .map(|i| {
+                    Rgb8::new(
+                        (40 + i * 6) as u8,
+                        (255 - i * 5) as u8,
+                        ((i * 37) % 200 + 30) as u8,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut image = IndexedImage::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..w {
+                image.set(x as i32, y as i32, ((x / 3 + y * 7) % 32) as u8);
+            }
+        }
+        std::fs::write(path, dpx_formats::write_png(&image, &palette).unwrap()).unwrap();
+        (image, palette)
+    }
+
+    #[test]
+    fn a_32_colour_png_stays_exact_on_the_default_page() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("exact");
+        // 320×200 on the 320×256 page (56 rows of margin), and 40×30 enlarged 8×.
+        for (name, (w, h), zoom) in [("Wide.png", (320, 200), 1), ("Art.png", (40, 30), 8)] {
+            let (image, palette) = write_many_colours(&dir.join(name), w, h);
+            let mut app = PainterApp::new();
+            ui_pass(&mut app, &ctx, 0.0, vec![]);
+            load_through_the_requester(&mut app, &ctx, &dir, name);
+            let req = app.ui.import_requester.as_ref().unwrap();
+            assert_eq!(req.info().colors, Some(32));
+            assert_eq!(req.options().colors, 32);
+            assert_eq!(req.options().dither, Dither::FloydSteinberg);
+            ui_pass(
+                &mut app,
+                &ctx,
+                0.1,
+                vec![
+                    key_event(egui::Key::Enter, true),
+                    key_event(egui::Key::Enter, false),
+                ],
+            );
+            assert!(app.ui.import_requester.is_none());
+            let top = (256 - h * zoom) / 2;
+            let mut wrong = 0;
+            for y in 0..h * zoom {
+                for x in 0..w * zoom {
+                    let want =
+                        palette.get(image.get((x / zoom) as i32, (y / zoom) as i32).unwrap());
+                    if Some(shown(&app, x, top + y)) != want {
+                        wrong += 1;
+                    }
+                }
+            }
+            assert_eq!(wrong, 0, "{name}: every pixel its own colour");
+            assert_eq!(app.engine.document().palette().len(), 32);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toolbox_marks_stay_under_the_requester() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("marks");
+        write_png_rgb(&dir.join("Photo.png"), &photo(100, 80));
+        // NTSC LoRes (320×200) and the default PAL screen.
+        for ntsc in [true, false] {
+            let mut app = PainterApp::new();
+            if ntsc {
+                let mode = DisplayMode::new(dpx_core::Video::Ntsc, dpx_core::Resolution::Lo, false);
+                let target = Target::new(Chipset::Aga, mode);
+                app.set_picture(
+                    Document::from_picture(
+                        IndexedImage::new(320, 200, 0),
+                        Palette::dpaint_default_32(),
+                        target,
+                    ),
+                    files::PictureExtras::default(),
+                    dir.join("ntsc.iff"),
+                );
+            }
+            ui_pass(&mut app, &ctx, 0.0, vec![]);
+            load_through_the_requester(&mut app, &ctx, &dir, "Photo.png");
+            let plain = app.compose_screen();
+            // A custom brush (no built-in brush selected) and Symmetry on.
+            app.custom_brush = Some(dpx_core::BrushImage {
+                width: 1,
+                height: 1,
+                pixels: vec![1],
+                transparent: None,
+                handle: (0, 0),
+            });
+            app.tools.symmetry = true;
+            app.tools.grid = true;
+            let marked = app.compose_screen();
+            let req = app.ui.import_requester.as_ref().unwrap();
+            let (ox, oy) = req.origin();
+            let (w, h) = req.size();
+            for y in oy..oy + h {
+                for x in ox..ox + w {
+                    assert_eq!(marked.get(x, y), plain.get(x, y), "ntsc {ntsc}: {x},{y}");
+                }
+            }
+            // The snapshot path keeps the custom brush's mark under it too.
+            let view = app.view();
+            let doc = app.engine.document();
+            let (_, _, a) = crate::snapshot_rgba(1, doc, view, (0, 0), &app.ui, false);
+            let (fw, _, b) = crate::snapshot_rgba(1, doc, view, (0, 0), &app.ui, true);
+            for y in oy..oy + h {
+                for x in ox..ox + w {
+                    let o = (y as usize * fw as usize + x as usize) * 4;
+                    assert_eq!(a[o..o + 4], b[o..o + 4], "snapshot, ntsc {ntsc}: {x},{y}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshots_show_the_result_thumbnail_in_true_colour() {
+        use dpx_core::{Resolution, Video};
+        let dir = temp_dir("snapshot");
+        let file = dir.join("Photo.png");
+        write_png_rgb(&file, &photo(400, 300));
+        let file = file.to_string_lossy().into_owned();
+        // The default LoRes screen and a HiRes one (2×1 screen pixels per UI pixel).
+        let hires = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        );
+        let docs = [
+            PainterApp::new().engine.document().clone(),
+            Document::from_picture(
+                IndexedImage::new(640, 256, 0),
+                Palette::dpaint_default_32(),
+                hires,
+            ),
+        ];
+        for doc in docs {
+            let view = View::of_target(doc.target());
+            let args = |apply: bool| {
+                let mut a: Vec<String> = ["--import-requester", &file, "--import", "colors=256"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                if apply {
+                    a.push("--import-apply".into());
+                }
+                a
+            };
+            let mut ui = UiState::default();
+            let shown = snapshot(&args(false), &doc, &mut ui).unwrap();
+            assert_eq!(shown, doc, "the page is unchanged under the requester");
+            let mut after = UiState::default();
+            let result = snapshot(&args(true), &doc, &mut after).unwrap();
+            assert!(after.import_requester.is_none());
+            let req = ui.import_requester.clone().expect("the requester is shown");
+            let (tw, th) = req.thumb_size();
+            let want = import::thumbnail(result.page(), result.palette(), tw, th);
+            for scale in [1usize, 2] {
+                let (fw, _, rgba) = crate::snapshot_rgba(scale, &shown, view, (0, 0), &ui, false);
+                let (sx, sy) = (
+                    view.ux as usize * scale * view.fx as usize,
+                    view.uy as usize * scale * view.fy as usize,
+                );
+                let r = req.thumb_rect();
+                let mut true_colour = 0;
+                for y in 0..th as usize * sy {
+                    for x in 0..tw as usize * sx {
+                        let fx = r.x as usize * sx + x;
+                        let fy = r.y as usize * sy + y;
+                        let o = (fy * fw as usize + fx) * 4;
+                        let w = want.get((x / sx) as u32, (y / sy) as u32).unwrap();
+                        assert_eq!(rgba[o..o + 3], [w.r, w.g, w.b], "scale {scale}: {x},{y}");
+                        if !doc.palette().colors().contains(&Rgb8::new(w.r, w.g, w.b)) {
+                            true_colour += 1;
+                        }
+                    }
+                }
+                assert!(true_colour > (tw * th) as usize * sx * sy / 2);
+                // Around the box: the indexed frame (face gap, then the dark frame).
+                let pens = dpx_ui::Pens::from_palette(doc.palette());
+                let px = |ux: i32, uy: i32| {
+                    let o = ((uy as usize * sy) * fw as usize + ux as usize * sx) * 4;
+                    Rgb8::new(rgba[o], rgba[o + 1], rgba[o + 2])
+                };
+                assert_eq!(Some(px(r.x - 1, r.y - 1)), doc.palette().get(pens.face));
+                assert_eq!(Some(px(r.x - 2, r.y - 2)), doc.palette().get(pens.dark));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Presses and releases a requester control without the ui loop.
+    fn press(app: &mut PainterApp, c: ImportControl) {
+        let req = app.ui.import_requester.as_ref().expect("requester open");
+        let r = req.controls().into_iter().find(|&(k, _)| k == c).unwrap().1;
+        app.import_event(ReqEvent::Press(r.x + r.w / 2, r.y + r.h / 2));
+        app.import_event(ReqEvent::Release);
+    }
+
+    #[test]
+    fn big_pages_reduce_in_the_background_and_ok_waits_for_the_page() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("background");
+        write_png_rgb(&dir.join("Photo.png"), &photo(400, 200));
+        let mut app = PainterApp::new();
+        // A 2048×1024 page (Page Size): the picture is fitted to 2048×1024, 2.1 megapixels.
+        let target = app.engine.document().target();
+        app.set_picture(
+            Document::from_picture(
+                IndexedImage::new(2048, 1024, 0),
+                Palette::dpaint_default_32(),
+                target,
+            ),
+            files::PictureExtras::default(),
+            dir.join("big.iff"),
+        );
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        load_through_the_requester(&mut app, &ctx, &dir, "Photo.png");
+        let p = app.import.pending.as_ref().unwrap();
+        assert!(!p.busy(), "the first page is made when the requester opens");
+        let image = p.fitted.as_ref().unwrap().image().clone();
+        assert!(u64::from(image.width()) * u64::from(image.height()) >= BACKGROUND_PIXELS);
+        let first = app
+            .ui
+            .import_requester
+            .as_ref()
+            .unwrap()
+            .thumbnail()
+            .cloned();
+        // A change starts a background job; the old thumbnail stays until it ends.
+        press(&mut app, ImportControl::Dither(Dither::Ordered));
+        assert!(app.import.pending.as_ref().unwrap().busy());
+        assert_eq!(
+            app.ui
+                .import_requester
+                .as_ref()
+                .unwrap()
+                .thumbnail()
+                .cloned(),
+            first
+        );
+        // A second change while it runs; the requester still answers at once.
+        press(&mut app, ImportControl::Fewer);
+        let wanted = app.ui.import_requester.as_ref().unwrap().options();
+        assert_eq!((wanted.dither, wanted.colors), (Dither::Ordered, 16));
+        // The ui loop collects the results and starts the next job itself.
+        let mut t = 0.1;
+        for _ in 0..4000 {
+            if !app.import.pending.as_ref().unwrap().busy() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            ui_pass(&mut app, &ctx, t, vec![]);
+            t += 0.002;
+        }
+        let start = app.engine.document().clone();
+        let tg = import_target(&start, app.ui.bg);
+        let p = app.import.pending.as_ref().unwrap();
+        assert!(!p.busy());
+        assert_eq!(p.made, wanted);
+        let want = import::reduce_fitted(&image, &wanted, &tg);
+        assert_eq!(p.result, want, "the page for the last options");
+        let req = app.ui.import_requester.as_ref().unwrap();
+        let (tw, th) = req.thumb_size();
+        assert_eq!(
+            req.thumbnail(),
+            Some(&import::thumbnail(&want.page, &want.palette, tw, th))
+        );
+        // Ok right after a change waits for that change's page.
+        press(&mut app, ImportControl::Position(Position::TopLeft));
+        press(&mut app, ImportControl::Dither(Dither::None));
+        let last = app.ui.import_requester.as_ref().unwrap().options();
+        let want = import::reduce_fitted(&image, &last, &tg);
+        ui_pass(&mut app, &ctx, t, vec![key_event(egui::Key::Enter, true)]);
+        assert!(app.ui.import_requester.is_none());
+        let doc = app.engine.document();
+        assert_eq!(doc.page(), &want.page);
+        assert_eq!(doc.palette(), &want.palette);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn option_changes_reuse_palettes_and_the_mapped_picture() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("reuse");
+        write_png_rgb(&dir.join("Photo.png"), &photo(200, 160));
+        let mut app = PainterApp::new();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        load_through_the_requester(&mut app, &ctx, &dir, "Photo.png");
+        let made = |app: &PainterApp| {
+            let f = app
+                .import
+                .pending
+                .as_ref()
+                .unwrap()
+                .fitted
+                .as_ref()
+                .unwrap();
+            (f.palettes_made(), f.mappings_made())
+        };
+        assert_eq!(made(&app), (1, 1));
+        // A position change only places the same picture again.
+        press(&mut app, ImportControl::Position(Position::TopLeft));
+        assert_eq!(made(&app), (1, 1));
+        // A dither change maps again with the same palette.
+        press(&mut app, ImportControl::Dither(Dither::Ordered));
+        assert_eq!(made(&app), (1, 2));
+        // A new count builds a palette; going back reuses the first.
+        press(&mut app, ImportControl::Fewer);
+        assert_eq!(made(&app), (2, 3));
+        press(&mut app, ImportControl::More);
+        assert_eq!(made(&app), (2, 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Timings for ADR-42 (`cargo test [--release] -p deluxepainter -- --ignored --nocapture
-    /// import_timing`): opening the requester (fit, reduce, thumbnail) and one option change.
+    /// import_timing`): opening the requester (fit, first reduction, thumbnail) and one option
+    /// change at a time, on AGA documents with 256 colours (the slowest count, the default
+    /// there) on standard screens and on larger pages made with Page Size.
     #[test]
     #[ignore]
     fn import_timing() {
+        use dpx_core::{Resolution, Video};
+        let palette = Palette::new(
+            (0..=255u8)
+                .map(|i| Rgb8::new(i, i.wrapping_mul(3), 255 - i))
+                .collect(),
+        )
+        .unwrap();
+        let pages = [
+            ("LoRes 320x256", Resolution::Lo, false, (320, 256)),
+            ("HiRes laced 640x512", Resolution::Hi, true, (640, 512)),
+            (
+                "SuperHiRes laced 1280x512",
+                Resolution::SuperHi,
+                true,
+                (1280, 512),
+            ),
+            ("LoRes, page 1024x1024", Resolution::Lo, false, (1024, 1024)),
+            ("LoRes, page 4096x4096", Resolution::Lo, false, (4096, 4096)),
+        ];
+        let filter = std::env::var("IMPORT_TIMING").unwrap_or_default();
         for (w, h) in [(4032u32, 3024u32), (1280, 1024)] {
             let img = photo(w, h);
-            let mut app = PainterApp::new();
-            let t0 = std::time::Instant::now();
-            let colors = import::count_colors(&img, 256);
-            app.open_import_image(PathBuf::from("timing.png"), img, colors, Vec::new());
-            let open = t0.elapsed().as_secs_f64();
-            // One option change each: (Tab presses to its row, arrow), timed alone.
-            let mut changes = Vec::new();
-            let steps: [(&str, usize, ReqKey); 5] = [
-                ("position", 1, ReqKey::Down),
-                ("colours 32->256", 2, ReqKey::Right),
-                ("dither FS->ordered", 1, ReqKey::Down),
-                ("dither ordered->none", 0, ReqKey::Up),
-                ("palette new->current", 2, ReqKey::Down),
-            ];
-            for (name, tabs, k) in steps {
-                for _ in 0..tabs {
-                    app.import_event(ReqEvent::Key(ReqKey::Tab));
+            for (name, res, laced, page) in pages {
+                if !filter.is_empty() && !name.contains(&filter) {
+                    continue;
                 }
-                let reps = if name.starts_with("colours") { 3 } else { 1 };
-                let mut worst = 0.0f64;
-                for _ in 0..reps {
+                let mut app = PainterApp::new();
+                let target = Target::new(Chipset::Aga, DisplayMode::new(Video::Pal, res, laced));
+                app.set_picture(
+                    Document::from_picture(
+                        IndexedImage::new(page.0, page.1, 0),
+                        palette.clone(),
+                        target,
+                    ),
+                    files::PictureExtras::default(),
+                    PathBuf::from("start.iff"),
+                );
+                let t0 = std::time::Instant::now();
+                let colors = import::count_colors(&img, 256);
+                app.open_import_image(PathBuf::from("timing.png"), img.clone(), colors, Vec::new());
+                let open = t0.elapsed().as_secs_f64();
+                assert_eq!(
+                    app.ui.import_requester.as_ref().unwrap().options().colors,
+                    256
+                );
+                let mut times = Vec::new();
+                // Per change: how long the click blocks, and when the page is ready
+                // (later only on big pages, where a background job makes it).
+                let mut time = |app: &mut PainterApp, label: &str, c: ImportControl| {
                     let t = std::time::Instant::now();
-                    app.import_event(ReqEvent::Key(k));
-                    worst = worst.max(t.elapsed().as_secs_f64());
-                }
-                if name.starts_with("dither ordered") {
-                    // Up twice: ordered -> FS -> none; time the second.
-                    let t = std::time::Instant::now();
-                    app.import_event(ReqEvent::Key(k));
-                    worst = t.elapsed().as_secs_f64();
-                }
-                changes.push(format!("{name} {worst:.3} s"));
+                    press(app, c);
+                    let block = t.elapsed().as_secs_f64();
+                    app.import_settle();
+                    let ready = t.elapsed().as_secs_f64();
+                    times.push(if ready - block > 0.001 {
+                        format!("{label} {block:.3}/{ready:.3}")
+                    } else {
+                        format!("{label} {block:.3}")
+                    });
+                };
+                time(
+                    &mut app,
+                    "position",
+                    ImportControl::Position(Position::TopLeft),
+                );
+                time(
+                    &mut app,
+                    "fs->ordered",
+                    ImportControl::Dither(Dither::Ordered),
+                );
+                time(
+                    &mut app,
+                    "ordered->none",
+                    ImportControl::Dither(Dither::None),
+                );
+                time(
+                    &mut app,
+                    "none->fs",
+                    ImportControl::Dither(Dither::FloydSteinberg),
+                );
+                time(&mut app, "256->128", ImportControl::Fewer);
+                time(&mut app, "128->256", ImportControl::More);
+                time(
+                    &mut app,
+                    "new->current",
+                    ImportControl::Palette(PaletteChoice::Current),
+                );
+                time(
+                    &mut app,
+                    "current->new",
+                    ImportControl::Palette(PaletteChoice::New),
+                );
+                let t = std::time::Instant::now();
+                app.import_event(ReqEvent::Key(ReqKey::Enter));
+                let ok = t.elapsed().as_secs_f64();
+                println!(
+                    "{w}x{h} on {name}: open {open:.3}; {}; ok {ok:.3}",
+                    times.join(", ")
+                );
             }
-            let o = app.ui.import_requester.as_ref().unwrap().options();
-            println!(
-                "{w}x{h}: open {open:.3} s; {}; final {o:?}",
-                changes.join(", ")
-            );
         }
     }
 }

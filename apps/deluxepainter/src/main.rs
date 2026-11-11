@@ -761,11 +761,27 @@ fn snapshot(
     ui: &UiState,
     custom_brush: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (w, h, rgba) = snapshot_rgba(scale, doc, view, scroll, ui, custom_brush);
+    write_png(path, w, h, &rgba)
+}
+
+/// The RGBA image [`snapshot`] writes: its width, height and pixels.
+fn snapshot_rgba(
+    scale: usize,
+    doc: &Document,
+    view: View,
+    scroll: (i32, i32),
+    ui: &UiState,
+    custom_brush: bool,
+) -> (u32, u32, Vec<u8>) {
     let mut screen = view.compose(doc.page(), scroll, doc.palette(), ui);
     if custom_brush && ui.toolbox_visible {
         let pens = Pens::from_palette(doc.palette());
         let x0 = view.ui_screen().toolbox_x();
-        dpx_ui::toolbox::draw_brush_unselected(&mut screen, x0, ui.brush, &pens, view.ux, view.uy);
+        // ADR-42: under the Import requester, which covers the toolbox.
+        import::under_import_requester(&mut screen, ui, (view.ux, view.uy), |screen| {
+            dpx_ui::toolbox::draw_brush_unselected(screen, x0, ui.brush, &pens, view.ux, view.uy);
+        });
     }
     let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
     let mut rgba = to_rgba(&screen, doc.palette(), sx, sy);
@@ -779,11 +795,10 @@ fn snapshot(
             view.uy as usize * sy,
         );
     }
-    write_png(
-        path,
+    (
         screen.width() * sx as u32,
         screen.height() * sy as u32,
-        &rgba,
+        rgba,
     )
 }
 
@@ -2150,6 +2165,23 @@ impl PainterApp {
         view: View,
         at: (i32, i32),
     ) -> (Vec<ReqEvent>, u64) {
+        self.modal_events_with(ctx, origin, ppp, scale, view, at, true)
+    }
+
+    /// [`Self::modal_events`]; without `enter_repeats`, a held Return's auto-repeat is left
+    /// out, so only a new press answers the requester (ADR-42: the Return that picked the
+    /// file in the file requester must not also answer the Import requester it opened).
+    #[allow(clippy::too_many_arguments)]
+    fn modal_events_with(
+        &mut self,
+        ctx: &egui::Context,
+        origin: egui::Pos2,
+        ppp: f32,
+        scale: f32,
+        view: View,
+        at: (i32, i32),
+        enter_repeats: bool,
+    ) -> (Vec<ReqEvent>, u64) {
         let (rx, ry) = at;
         let mut out = Vec::new();
         let (hover, press, down, time, events) = ctx.input(|i| {
@@ -2189,8 +2221,14 @@ impl PainterApp {
                     out.extend(text.chars().map(|c| ReqEvent::Key(ReqKey::Char(c))));
                 }
                 egui::Event::Key {
-                    key, pressed: true, ..
+                    key,
+                    pressed: true,
+                    repeat,
+                    ..
                 } => {
+                    if repeat && !enter_repeats && key == egui::Key::Enter {
+                        continue;
+                    }
                     let k = match key {
                         egui::Key::ArrowUp => ReqKey::Up,
                         egui::Key::ArrowDown => ReqKey::Down,

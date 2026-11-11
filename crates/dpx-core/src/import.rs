@@ -6,7 +6,9 @@
 //! dither, Floyd–Steinberg or a 4×4 ordered dither.
 //!
 //! The fitting is the slow part for big photos, so it is separate ([`fit`]); the requester
-//! keeps the fitted picture and only reruns [`reduce_fitted`] when an option changes.
+//! keeps the fitted picture ([`Fitted`]) and only reduces it again when an option changes,
+//! reusing the palettes made so far (a dither change only maps again) and the indexed
+//! picture (a position change only places it again).
 //! [`thumbnail`] makes the requester's preview from the very page Ok will give.
 
 use crate::image::IndexedImage;
@@ -129,57 +131,230 @@ pub fn place(size: (u32, u32), page: (u32, u32), position: Position) -> (u32, u3
 /// Reduces a picture already fitted to the page ([`fit`]) and places it on the page.
 ///
 /// - The page around the picture is the BG colour. With a new palette its colour counts for
-///   the palette like that many picture pixels and is mapped to its own entry (or the nearest
-///   one); with the current palette it is the BG colour's index exactly. Either way it takes
-///   no part in dithering, so the edge of the page stays clean.
+///   the palette like that many picture pixels; it gets its own entry while there is room,
+///   else the nearest one: a picture whose own colours fit is always kept exactly
+///   ([`quantize::reduce_with`]). With the current palette it is the BG colour's index
+///   exactly. Either way it takes no part in dithering, so the edge of the page stays clean.
 /// - New palette: ADR-9's reduction with `colors` entries (exact when the picture has no more
 ///   colours, rounded to the chipset's depth), padded with black to exactly `colors` entries;
 ///   transparent pixels become colour 0, reserved and pink.
 /// - Current palette: kept exactly ([`quantize::reduce_to_palette`]); transparent pixels
 ///   become colour 0, which opaque pixels then avoid.
+///
+/// [`Fitted::reduce`] gives the same and reuses work between calls.
 pub fn reduce_fitted(fitted: &RgbaImage, opts: &ImportOptions, t: &ImportTarget) -> Imported {
+    let mapped = match opts.palette {
+        PaletteChoice::New => {
+            let ro = new_options(opts, t);
+            let extra = margin_extra(fitted, t);
+            map_new(
+                fitted,
+                &quantize::build_palette(fitted, &ro, &extra),
+                opts,
+                &extra,
+            )
+        }
+        PaletteChoice::Current => map_current(fitted, opts, t),
+    };
+    mapped.place(t.page, opts.position)
+}
+
+/// The reduction's options for a new palette.
+fn new_options(opts: &ImportOptions, t: &ImportTarget) -> ReduceOptions {
+    ReduceOptions {
+        max_colors: color_count(opts.colors, 256),
+        depth: t.depth,
+        dither: opts.dither,
+        transparent: t.transparent,
+    }
+}
+
+/// The BG colour and the number of page pixels the fitted picture leaves to it (the same for
+/// both positions).
+fn margin_extra(fitted: &RgbaImage, t: &ImportTarget) -> [(Rgb8, u64); 1] {
     let (pw, ph) = t.page;
     let size = (fitted.width().min(pw), fitted.height().min(ph));
-    let at = place(size, t.page, opts.position);
     let margin = u64::from(pw) * u64::from(ph) - u64::from(size.0) * u64::from(size.1);
-    let bg = t.bg.min((t.palette.len() - 1) as u8);
-    let (pixels, palette, fill, transparent, reduction) = match opts.palette {
-        PaletteChoice::New => {
-            let colors = color_count(opts.colors, 256);
-            let ro = ReduceOptions {
-                max_colors: colors,
-                depth: t.depth,
-                dither: opts.dither,
-                transparent: t.transparent,
-            };
-            let bg_rgb = t.palette.get(bg).unwrap_or(Rgb8::BLACK);
-            let extra = [(bg_rgb, margin)];
-            let (r, ids) = quantize::reduce_with(fitted, &ro, &extra);
-            let mut entries = r.palette.colors().to_vec();
-            entries.resize(usize::from(colors).max(entries.len()), Rgb8::BLACK);
-            let palette = Palette::new(entries).expect("2..=256 entries");
-            (r.image, palette, ids[0], r.transparent_index, r.reduction)
+    let bg_rgb = t.palette.get(bg_index(t)).unwrap_or(Rgb8::BLACK);
+    [(bg_rgb, margin)]
+}
+
+fn bg_index(t: &ImportTarget) -> u8 {
+    t.bg.min((t.palette.len() - 1) as u8)
+}
+
+/// The fitted picture in indexed colours, before it is placed on the page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Mapped {
+    pixels: IndexedImage,
+    palette: Palette,
+    /// The page around the picture.
+    fill: u8,
+    transparent: Option<u8>,
+    reduction: Reduction,
+}
+
+impl Mapped {
+    fn place(&self, page: (u32, u32), position: Position) -> Imported {
+        let (pw, ph) = page;
+        let size = (self.pixels.width().min(pw), self.pixels.height().min(ph));
+        let at = place(size, page, position);
+        let mut out = IndexedImage::new(pw, ph, self.fill);
+        out.blit(&self.pixels, at.0 as i32, at.1 as i32);
+        Imported {
+            page: out,
+            palette: self.palette.clone(),
+            transparent_color: self.transparent,
+            reduction: self.reduction,
+            at,
+            size,
         }
-        PaletteChoice::Current => {
-            let m = quantize::reduce_to_palette(fitted, t.palette, opts.dither);
-            let reduction = if m.exact {
-                Reduction::Exact
-            } else {
-                Reduction::Quantized
-            };
-            let transparent = m.transparent.then_some(0);
-            (m.image, t.palette.clone(), bg, transparent, reduction)
+    }
+}
+
+fn map_new(
+    fitted: &RgbaImage,
+    built: &quantize::Built,
+    opts: &ImportOptions,
+    extra: &[(Rgb8, u64)],
+) -> Mapped {
+    let colors = color_count(opts.colors, 256);
+    let (r, ids) = quantize::map_built(fitted, built, opts.dither, extra);
+    let mut entries = r.palette.colors().to_vec();
+    entries.resize(usize::from(colors).max(entries.len()), Rgb8::BLACK);
+    Mapped {
+        pixels: r.image,
+        palette: Palette::new(entries).expect("2..=256 entries"),
+        fill: ids[0],
+        transparent: r.transparent_index,
+        reduction: r.reduction,
+    }
+}
+
+fn map_current(fitted: &RgbaImage, opts: &ImportOptions, t: &ImportTarget) -> Mapped {
+    let m = quantize::reduce_to_palette(fitted, t.palette, opts.dither);
+    Mapped {
+        pixels: m.image,
+        palette: t.palette.clone(),
+        fill: bg_index(t),
+        transparent: m.transparent.then_some(0),
+        reduction: if m.exact {
+            Reduction::Exact
+        } else {
+            Reduction::Quantized
+        },
+    }
+}
+
+/// What a result depends on apart from the position (which only moves the picture).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Key {
+    palette: PaletteChoice,
+    /// With a new palette only.
+    colors: u16,
+    dither: Dither,
+    page: (u32, u32),
+    depth: PaletteDepth,
+    current: Palette,
+    bg: u8,
+    transparent: Rgb8,
+}
+
+impl Key {
+    fn new(opts: &ImportOptions, t: &ImportTarget) -> Self {
+        Self {
+            palette: opts.palette,
+            colors: match opts.palette {
+                PaletteChoice::New => color_count(opts.colors, 256),
+                PaletteChoice::Current => 0,
+            },
+            dither: opts.dither,
+            page: t.page,
+            depth: t.depth,
+            current: t.palette.clone(),
+            bg: t.bg,
+            transparent: t.transparent,
         }
-    };
-    let mut page = IndexedImage::new(pw, ph, fill);
-    page.blit(&pixels, at.0 as i32, at.1 as i32);
-    Imported {
-        page,
-        palette,
-        transparent_color: transparent,
-        reduction,
-        at,
-        size,
+    }
+}
+
+/// A picture fitted into the page ([`fit`], the slow part for big photos, done once) and
+/// what the Import requester's option changes can reuse: every new palette made so far (it
+/// depends on the colour count, not on the dither or the position) and the last indexed
+/// picture (a position change only places it again). [`Fitted::reduce`] gives exactly
+/// [`reduce_fitted`]'s result.
+#[derive(Clone, Debug)]
+pub struct Fitted {
+    image: RgbaImage,
+    palettes: Vec<(Key, quantize::Built)>,
+    last: Option<(Key, Mapped)>,
+    /// How often a picture was mapped onto a palette (for tests and timings).
+    mappings: usize,
+}
+
+impl Fitted {
+    /// `img` fitted into `page` ([`fit`]).
+    pub fn new(img: &RgbaImage, page: (u32, u32), pixel_shape: (u32, u32)) -> Self {
+        Self::of(fit(img, page, pixel_shape))
+    }
+
+    /// A picture that is fitted already.
+    pub fn of(image: RgbaImage) -> Self {
+        Self {
+            image,
+            palettes: Vec::new(),
+            last: None,
+            mappings: 0,
+        }
+    }
+
+    pub fn image(&self) -> &RgbaImage {
+        &self.image
+    }
+
+    /// How many new palettes were built so far.
+    pub fn palettes_made(&self) -> usize {
+        self.palettes.len()
+    }
+
+    /// How many times the picture was mapped onto a palette so far (a position change
+    /// does not map it again).
+    pub fn mappings_made(&self) -> usize {
+        self.mappings
+    }
+
+    /// [`reduce_fitted`] of the fitted picture, reusing earlier work.
+    pub fn reduce(&mut self, opts: &ImportOptions, t: &ImportTarget) -> Imported {
+        let key = Key::new(opts, t);
+        if let Some((k, m)) = &self.last
+            && *k == key
+        {
+            return m.place(t.page, opts.position);
+        }
+        let mapped = match opts.palette {
+            PaletteChoice::New => {
+                let palette_key = Key {
+                    dither: Dither::None,
+                    ..key.clone()
+                };
+                let extra = margin_extra(&self.image, t);
+                let i = match self.palettes.iter().position(|(k, _)| *k == palette_key) {
+                    Some(i) => i,
+                    None => {
+                        let built =
+                            quantize::build_palette(&self.image, &new_options(opts, t), &extra);
+                        self.palettes.push((palette_key, built));
+                        self.palettes.len() - 1
+                    }
+                };
+                map_new(&self.image, &self.palettes[i].1, opts, &extra)
+            }
+            PaletteChoice::Current => map_current(&self.image, opts, t),
+        };
+        let result = mapped.place(t.page, opts.position);
+        self.last = Some((key, mapped));
+        self.mappings += 1;
+        result
     }
 }
 
@@ -388,6 +563,125 @@ mod tests {
         assert!(
             used.iter()
                 .all(|c| cols.iter().any(|p| (p.r, p.g, p.b) == (c.r, c.g, c.b)))
+        );
+    }
+
+    /// `n` different 12-bit colours (exact on OCS too), none of them black.
+    fn many_colours(n: u32) -> Vec<Rgba8> {
+        (0..n)
+            .map(|i| {
+                let c = |v: u32| (v % 16 * 17) as u8;
+                Rgba8::opaque(c(i), c(15 + i * 3), c(i / 16 * 5 + 2))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_picture_with_as_many_colours_as_the_count_stays_exact_with_margins() {
+        // 32 colours (the count), none the BG colour, on pages with margins: the picture
+        // keeps every colour; the margin takes the nearest of them (no room for its own).
+        let cols = many_colours(32);
+        assert_eq!(
+            cols.iter()
+                .map(|p| (p.r, p.g, p.b))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            32
+        );
+        let pal = Palette::dpaint_default_32();
+        let bg = pal.get(0).unwrap();
+        assert!(!cols.iter().any(|p| Rgb8::new(p.r, p.g, p.b) == bg));
+        let art = image(8, 4, |x, y| cols[(y * 8 + x) as usize]);
+        for depth in [PaletteDepth::Rgb8, PaletteDepth::Rgb4] {
+            // 1:1 with margin rows, and enlarged 4× (32×16 on 32×24).
+            for (page, zoom) in [((8, 6), 1), ((32, 24), 4)] {
+                for dither in [Dither::None, Dither::FloydSteinberg, Dither::Ordered] {
+                    for position in [Position::Centre, Position::TopLeft] {
+                        let t = ImportTarget {
+                            depth,
+                            ..target(page, &pal)
+                        };
+                        let o = ImportOptions {
+                            position,
+                            ..opts(PaletteChoice::New, 32, dither)
+                        };
+                        let r = import(&art, &o, &t);
+                        let what = format!("{depth:?} {page:?} {dither:?} {position:?}");
+                        assert_eq!(r.reduction, Reduction::Exact, "{what}");
+                        assert_eq!(r.size, (8 * zoom, 4 * zoom), "{what}");
+                        let mut used = std::collections::HashSet::new();
+                        for y in 0..r.size.1 {
+                            for x in 0..r.size.0 {
+                                let src = art.get(x / zoom, y / zoom).unwrap();
+                                let got = shown(&r, r.at.0 + x, r.at.1 + y);
+                                assert_eq!(got, Rgb8::new(src.r, src.g, src.b), "{what} {x},{y}");
+                                used.insert(got);
+                            }
+                        }
+                        assert_eq!(used.len(), 32, "{what}");
+                        // The margin: the picture colour nearest to the BG colour.
+                        let margin = shown(&r, 0, page.1 - 1);
+                        let nearest = cols
+                            .iter()
+                            .map(|p| Rgb8::new(p.r, p.g, p.b))
+                            .min_by_key(|c| {
+                                let d = |a: u8, b: u8| (i32::from(a) - i32::from(b)).pow(2);
+                                2 * d(c.r, bg.r) + 4 * d(c.g, bg.g) + 3 * d(c.b, bg.b)
+                            })
+                            .unwrap();
+                        assert_eq!(margin, nearest, "{what}");
+                    }
+                }
+            }
+        }
+        // 31 colours: the BG colour gets the free entry.
+        let art = image(31, 1, |x, _| cols[x as usize]);
+        let r = import(
+            &art,
+            &opts(PaletteChoice::New, 32, Dither::FloydSteinberg),
+            &target((31, 3), &pal),
+        );
+        assert_eq!(r.reduction, Reduction::Exact);
+        assert_eq!(shown(&r, 0, 0), bg);
+        assert_eq!(shown(&r, 5, 1), Rgb8::new(cols[5].r, cols[5].g, cols[5].b));
+    }
+
+    #[test]
+    fn the_cached_reduction_gives_the_plain_result() {
+        let img = photo(80, 50);
+        let pal = Palette::dpaint_default_32();
+        let t = ImportTarget {
+            bg: 3,
+            ..target((96, 64), &pal)
+        };
+        let mut fitted = Fitted::new(&img, t.page, t.pixel_shape);
+        assert_eq!(fitted.image(), &fit(&img, t.page, t.pixel_shape));
+        let mut o = opts(PaletteChoice::New, 16, Dither::FloydSteinberg);
+        let mut steps = Vec::new();
+        for change in 0..14 {
+            match change % 7 {
+                0 => o.position = Position::TopLeft,
+                1 => o.dither = Dither::Ordered,
+                2 => o.colors = 64,
+                3 => o.position = Position::Centre,
+                4 => o.palette = PaletteChoice::Current,
+                5 => o.dither = Dither::None,
+                _ => {
+                    o.palette = PaletteChoice::New;
+                    o.colors = 16;
+                }
+            }
+            steps.push(o);
+        }
+        for o in steps {
+            let want = reduce_fitted(fitted.image(), &o, &t);
+            assert_eq!(fitted.reduce(&o, &t), want, "{o:?}");
+        }
+        // Another target (BG colour) is not answered from the cache.
+        let other = ImportTarget { bg: 1, ..t };
+        assert_eq!(
+            fitted.reduce(&o, &other),
+            reduce_fitted(fitted.image(), &o, &other)
         );
     }
 

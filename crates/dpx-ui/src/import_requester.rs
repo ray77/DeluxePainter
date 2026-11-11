@@ -9,7 +9,7 @@
 //!
 //! Drawn in UI (LoRes) pixels with palette-derived pens, square corners, like the other
 //! requesters: Return = Ok, Esc = Cancel. Tab moves the keyboard focus from option to option
-//! (the focused label is drawn in the select pen) and the arrow keys change the focused
+//! (the focused label is highlighted like a menu item) and the arrow keys change the focused
 //! option. The layout follows the screen size: the thumbnail takes the room right of the
 //! options, so the requester fits a 320×200 screen and grows on bigger ones.
 
@@ -234,6 +234,16 @@ impl ImportRequester {
         LEFT + LABELS.iter().map(|l| font.text_width(l)).max().unwrap_or(0) + 6
     }
 
+    /// The focus bar behind a row label at `y`.
+    fn label_bar(label: &str, y: i32) -> Rect {
+        Rect::new(
+            LEFT - 1,
+            y - 1,
+            Font::builtin().text_width(label) + 2,
+            ROW_H,
+        )
+    }
+
     fn radio_rect(at: (i32, i32), label: &str) -> Rect {
         Rect::new(
             at.0,
@@ -369,7 +379,13 @@ impl ImportRequester {
         let before = self.options;
         match c {
             ImportControl::Position(p) => self.options.position = p,
-            ImportControl::Palette(p) => self.options.palette = p,
+            ImportControl::Palette(p) => {
+                self.options.palette = p;
+                // A ghosted row cannot keep the focus: it goes to the palette row.
+                if self.focus == Some(ImportRow::Colors) && !self.colors_enabled() {
+                    self.focus = Some(ImportRow::Palette);
+                }
+            }
             ImportControl::Dither(d) => self.options.dither = d,
             ImportControl::Fewer | ImportControl::More if self.enabled(c) => {
                 let i = COLOR_COUNTS
@@ -508,23 +524,6 @@ impl ImportRequester {
         );
         img.hline(1, w - 2, geom::RULE_Y, pens.dark);
 
-        // Row labels; the focused one in the select pen.
-        let rows_y = [
-            geom::POSITION_Y,
-            geom::PALETTE_Y,
-            geom::COLORS_Y,
-            geom::DITHER_Y,
-        ];
-        for ((row, label), y) in ROWS.iter().zip(LABELS).zip(rows_y) {
-            let pen = if self.focus == Some(*row) {
-                pens.select
-            } else if *row == ImportRow::Colors && !self.colors_enabled() {
-                pens.ghost.unwrap_or(pens.dark)
-            } else {
-                pens.dark
-            };
-            font.draw(&mut img, LEFT, y, label, pen);
-        }
         let ghost_text = |img: &mut IndexedImage, x: i32, y: i32, text: &str| {
             font.draw(img, x, y, text, pens.ghost.unwrap_or(pens.dark));
             if pens.ghost.is_none() {
@@ -535,6 +534,30 @@ impl ImportRequester {
                 );
             }
         };
+        // Row labels. The focused one is highlighted like a menu item (a bar in the select
+        // pen, the text in a pen that differs from it), which shows on every palette, also
+        // where the select pen is the dark one (2 and 4 colours). A ghosted row shows no focus.
+        let rows_y = [
+            geom::POSITION_Y,
+            geom::PALETTE_Y,
+            geom::COLORS_Y,
+            geom::DITHER_Y,
+        ];
+        for ((row, label), y) in ROWS.iter().zip(LABELS).zip(rows_y) {
+            if *row == ImportRow::Colors && !self.colors_enabled() {
+                ghost_text(&mut img, LEFT, y, label);
+            } else if self.focus == Some(*row) {
+                let r = Self::label_bar(label, y);
+                img.fill_rect(r.x, r.y, r.w, r.h, pens.select);
+                let ink = [pens.shine, pens.face, pens.dark]
+                    .into_iter()
+                    .find(|&p| p != pens.select)
+                    .unwrap_or(pens.dark);
+                font.draw(&mut img, LEFT, y, label, ink);
+            } else {
+                font.draw(&mut img, LEFT, y, label, pens.dark);
+            }
+        }
         for (c, r) in self.controls() {
             let radio = |img: &mut IndexedImage, on: bool, label: &str| {
                 draw_box(img, (r.x, r.y), on, false, pens);
@@ -858,7 +881,7 @@ mod tests {
         key(&mut r, ReqKey::Tab);
         assert_eq!(key(&mut r, ReqKey::Up), ImportResponse::Changed);
         assert_eq!(r.options().dither, Dither::None);
-        // The focused label is drawn in the select pen.
+        // The focused label is highlighted in the select pen.
         let p = pens();
         let img = r.render(&p);
         let select = (geom::DITHER_Y..geom::DITHER_Y + 8)
@@ -866,6 +889,75 @@ mod tests {
             .filter(|&(x, y)| img.get(x, y) == Some(p.select))
             .count();
         assert!(select > 0);
+    }
+
+    /// The default palette cut to its first `n` entries.
+    fn first(n: usize) -> Pens {
+        let all = Palette::dpaint_default_32();
+        Pens::from_palette(&Palette::new(all.colors()[..n].to_vec()).unwrap())
+    }
+
+    /// The pixels of a label's focus bar.
+    fn label_area(img: &IndexedImage, label: &str, y: i32) -> Vec<Option<u8>> {
+        let r = ImportRequester::label_bar(label, y);
+        (r.y..r.y + r.h)
+            .flat_map(|y| (r.x..r.x + r.w).map(move |x| (x, y)))
+            .map(|(x, y)| img.get(x, y))
+            .collect()
+    }
+
+    #[test]
+    fn focus_shows_on_two_and_four_colour_screens() {
+        for n in [2, 4, 8, 32] {
+            let p = first(n);
+            let mut r = requester((320, 256));
+            let plain = r.render(&p);
+            key(&mut r, ReqKey::Tab);
+            assert_eq!(r.focus(), Some(ImportRow::Position));
+            let focused = r.render(&p);
+            let (a, b) = (
+                label_area(&plain, LABELS[0], geom::POSITION_Y),
+                label_area(&focused, LABELS[0], geom::POSITION_Y),
+            );
+            assert_ne!(a, b, "{n} colours: the focus is visible");
+            // The label stays readable: its text differs from the bar.
+            let distinct: std::collections::HashSet<_> = b.iter().collect();
+            assert!(distinct.len() >= 2, "{n} colours");
+        }
+    }
+
+    #[test]
+    fn a_ghosted_colour_row_is_ghosted_whole_and_drops_the_focus() {
+        // Two colours: no ghost pen, so the label gets the dot pattern like the count.
+        let p = first(2);
+        assert_eq!(p.ghost, None);
+        let mut r = requester((320, 256));
+        let new = r.render(&p);
+        let current = rect_of(&r, ImportControl::Palette(PaletteChoice::Current));
+        click(&mut r, current);
+        let ghosted = r.render(&p);
+        assert_ne!(
+            label_area(&new, LABELS[2], geom::COLORS_Y),
+            label_area(&ghosted, LABELS[2], geom::COLORS_Y),
+            "the Colours label is ghosted too"
+        );
+        // Focus on Colours, then Current with the mouse: the focus moves to Palette, and
+        // the ghosted label shows no focus.
+        let p = pens();
+        let mut r = requester((320, 256));
+        for _ in 0..3 {
+            key(&mut r, ReqKey::Tab);
+        }
+        assert_eq!(r.focus(), Some(ImportRow::Colors));
+        click(&mut r, current);
+        assert_eq!(r.focus(), Some(ImportRow::Palette));
+        let img = r.render(&p);
+        assert!(
+            label_area(&img, LABELS[2], geom::COLORS_Y)
+                .iter()
+                .all(|&c| c != Some(p.select))
+        );
+        assert!(label_area(&img, LABELS[1], geom::PALETTE_Y).contains(&Some(p.select)));
     }
 
     #[test]

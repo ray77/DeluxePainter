@@ -1851,20 +1851,28 @@ impl PainterApp {
                 (Tool::Symmetry, self.tools.symmetry),
                 (Tool::Magnify, self.tools.magnify.is_some()),
             ];
-            for (tool, _) in on.iter().filter(|(_, on)| *on) {
-                toolbox::draw_toggle_on(&mut screen, x0, *tool, &pens, view.ux, view.uy);
-            }
-            // While a custom brush is the brush, no built-in brush is selected.
-            if self.custom_brush.is_some() {
-                toolbox::draw_brush_unselected(
-                    &mut screen,
-                    x0,
-                    self.ui.brush,
-                    &pens,
-                    view.ux,
-                    view.uy,
-                );
-            }
+            // ADR-42: the Import requester covers the toolbox; the marks stay under it.
+            crate::import::under_import_requester(
+                &mut screen,
+                &self.ui,
+                (view.ux, view.uy),
+                |screen| {
+                    for (tool, _) in on.iter().filter(|(_, on)| *on) {
+                        toolbox::draw_toggle_on(screen, x0, *tool, &pens, view.ux, view.uy);
+                    }
+                    // While a custom brush is the brush, no built-in brush is selected.
+                    if self.custom_brush.is_some() {
+                        toolbox::draw_brush_unselected(
+                            screen,
+                            x0,
+                            self.ui.brush,
+                            &pens,
+                            view.ux,
+                            view.uy,
+                        );
+                    }
+                },
+            );
         }
         if let Some(Stroke {
             kind: Kind::Text { at, lines },
