@@ -499,13 +499,16 @@ impl PainterApp {
     /// Effect ▸ Background ▸ Lock FG (AGA p.275, tutorial p.119): the pixels painted since
     /// Background ▸ Fix, whatever their colour, become an area stencil.
     fn lock_fg(&mut self) {
-        let Some(bg) = self.menu_data.background.clone() else {
+        // ADR-44: the layer the background was fixed on (a layer that went has none).
+        let doc = self.engine.document();
+        let fixed = self.menu_data.background.as_ref();
+        let Some((bg, layer)) = fixed.and_then(|b| Some((&b.image, doc.layer(b.layer)?))) else {
             return self.note(
                 LOCK_FG,
                 "Lock FG needs a fixed background: Effect ▸ Background ▸ Fix first".into(),
             );
         };
-        match AreaStencil::from_changes(self.engine.document().page(), &bg) {
+        match AreaStencil::from_changes(layer, bg) {
             None => self.note(
                 LOCK_FG,
                 "The page size changed since Background ▸ Fix".into(),
@@ -587,7 +590,7 @@ impl PainterApp {
 
     /// Ends Stencil ▸ Paint: the mask becomes the area stencil of the frame it was painted
     /// for.
-    fn leave_stencil_paint(&mut self) {
+    pub(crate) fn leave_stencil_paint(&mut self) {
         self.finish_stroke();
         let Some(p) = self.ps_mut().painting.take() else {
             return;
@@ -763,13 +766,14 @@ impl PainterApp {
         let (mut base, mask) = if let Some(p) = &self.ps().painting {
             let mut mask = p.engine.document().page().clone();
             let pal = p.engine.document().palette();
-            let mut base = doc.page();
+            // ADR-44: the frame as it shows, all visible layers.
+            let mut base = doc.composite();
             let preview = match &self.stroke {
                 Some(s) => {
                     let cmd = s.preview_command();
                     if cmd.is_none() {
                         // The Brush Selector's frame: shown as the tools draw it.
-                        base = &s.preview;
+                        base = s.shown(doc);
                     }
                     cmd
                 }
@@ -784,11 +788,11 @@ impl PainterApp {
                     m.paint(&mut mask, &before, pal);
                 }
             }
-            (base.clone(), AreaStencil::from_image(&mask))
+            (base.into_owned(), AreaStencil::from_image(&mask))
         } else if self.menu_data.effects.stencil_show
             && let Some(a) = self.active_area()
         {
-            (doc.page().clone(), a.clone())
+            (doc.composite().into_owned(), a.clone())
         } else {
             return;
         };
@@ -799,7 +803,8 @@ impl PainterApp {
                 .menu_data
                 .spare
                 .as_ref()
-                .map(|s| s.engine.document().page());
+                .map(|s| s.engine.document().composite());
+            let spare = spare.as_deref();
             let light = self.anim.light;
             base = crate::anim::light_table_page(doc, &base, light, spare, self.ui.bg, light.dim);
         }
@@ -831,10 +836,11 @@ pub fn snapshot_view(
             i32::MAX
         ));
     }
-    let page = doc.page();
-    let mut mask = stencil::AreaStencil::free(page).to_image();
+    // ADR-44: over the frame as it shows.
+    let page = doc.composite();
+    let mut mask = stencil::AreaStencil::free(&page).to_image();
     mask.fill_rect(x, y, w, h, stencil::PROTECTED);
-    let shown = stencil::view(page, &AreaStencil::from_image(&mask), doc.palette());
+    let shown = stencil::view(&page, &AreaStencil::from_image(&mask), doc.palette());
     ui.flags = "s".into();
     Ok(Document::from_picture(
         shown,

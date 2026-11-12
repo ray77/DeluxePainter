@@ -2,8 +2,9 @@
 //! Delete.. and About.., Color ▸ Cycle, Palette ▸ Restore / Load.. / Save.., Effect ▸
 //! Background ▸ Fix / Free.
 //!
-//! Pixel changes go through document commands (`MergePage`, `SetPage`); this module only
-//! keeps the app-side state (the spare page, the fixed background, the cycling clock).
+//! Pixel changes go through document commands (`MergePage`, `SetPage`, `SetPicture` for
+//! layered pages); this module only keeps the app-side state (the spare page, the fixed
+//! background, the cycling clock).
 
 use std::path::Path;
 use std::time::Duration;
@@ -27,8 +28,23 @@ pub struct OtherPage {
     pub engine: Engine,
     pub scroll: (i32, i32),
     pub picture_path: Option<std::path::PathBuf>,
-    pub background: Option<IndexedImage>,
+    pub background: Option<FixedBackground>,
     pub bg: u8,
+}
+
+/// Effect ▸ Background ▸ Fix: the picture CLR goes back to and the layer it was taken from
+/// (by its number, ADR-44). CLR restores it on that layer only; on every other layer CLR
+/// clears as without a fixed background.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedBackground {
+    pub image: IndexedImage,
+    pub layer: usize,
+}
+
+/// One visible layer: the page is one picture, as every page was before ADR-44, and the
+/// spare page commands copy that picture (`SetPage`), keeping the other frames.
+fn single_picture(doc: &Document) -> bool {
+    matches!(doc.layers(), [only] if only.visible)
 }
 
 /// App state of the menu commands in ADR-15.
@@ -37,7 +53,7 @@ pub struct MenuData {
     /// The spare page; `None` until it is first used (a blank page then).
     pub spare: Option<OtherPage>,
     /// Effect ▸ Background ▸ Fix: the fixed picture of the shown page.
-    pub background: Option<IndexedImage>,
+    pub background: Option<FixedBackground>,
     /// Palette as of the last picture load; `None` = the start palette.
     pub loaded_palette: Option<Palette>,
     /// Color ▸ Cycle: when cycling was switched on (egui time, seconds).
@@ -231,17 +247,20 @@ impl PainterApp {
     }
 
     /// CLR on a fixed background restores it instead of filling the page with BG
-    /// (manual AGA p.256). Other commands pass unchanged.
+    /// (manual AGA p.256), on the layer it was fixed on (ADR-44). Other commands, and CLR
+    /// on another layer, pass unchanged.
     pub(crate) fn with_fixed_background(&self, command: Command) -> Command {
-        let page = self.engine.document().page();
+        let doc = self.engine.document();
+        let page = doc.page();
         match (&command, &self.menu_data.background) {
-            (Command::Clear { .. }, Some(bg))
-                if (bg.width(), bg.height()) == (page.width(), page.height()) =>
+            (Command::Clear { .. }, Some(FixedBackground { image, layer }))
+                if *layer == doc.active_layer()
+                    && (image.width(), image.height()) == (page.width(), page.height()) =>
             {
                 Command::SetPage {
-                    width: bg.width(),
-                    height: bg.height(),
-                    pixels: bg.pixels().to_vec(),
+                    width: image.width(),
+                    height: image.height(),
+                    pixels: image.pixels().to_vec(),
                 }
             }
             _ => command,
@@ -306,15 +325,23 @@ impl PainterApp {
     }
 
     /// Picture ▸ Spare ▸ Copy to Spare (Ctrl+`j`): the spare becomes a copy of the shown page
-    /// (one undo step on the spare page).
+    /// (one undo step on the spare page). With one visible layer on both pages that is the
+    /// page's picture, into the spare's current frame; otherwise (ADR-44) the spare becomes
+    /// a copy of the whole picture, every frame with every layer (`SetPicture`), since the
+    /// layer stack belongs to all frames.
     pub(crate) fn copy_to_spare(&mut self) {
         self.finish_stroke();
-        let page = self.engine.document().page().clone();
         let mut other = self.take_spare();
-        let command = Command::SetPage {
-            width: page.width(),
-            height: page.height(),
-            pixels: page.pixels().to_vec(),
+        let doc = self.engine.document();
+        let command = if single_picture(doc) && single_picture(other.engine.document()) {
+            let page = doc.page();
+            Command::SetPage {
+                width: page.width(),
+                height: page.height(),
+                pixels: page.pixels().to_vec(),
+            }
+        } else {
+            Command::set_picture(doc)
         };
         if let Err(e) = other.engine.execute(command) {
             eprintln!("copy to spare: {e}");
@@ -324,13 +351,15 @@ impl PainterApp {
     }
 
     /// Picture ▸ Spare ▸ Merge in Front / Back (undoable). Colour 0 is transparent: in front,
-    /// the spare's colour-0 pixels; in back, the shown page's (ADR-15).
+    /// the spare's colour-0 pixels; in back, the shown page's (ADR-15). The spare as it shows
+    /// (all visible layers) merges into the active layer (ADR-44); in back only where the
+    /// page as it shows is colour 0 (`MergePage` looks at every visible layer).
     pub(crate) fn merge_spare(&mut self, front: bool) {
         if self.menu_data.spare.is_none() {
             return; // A blank spare changes nothing.
         }
         let other = self.take_spare();
-        let page = other.engine.document().page();
+        let page = other.engine.document().composite();
         let command = Command::MergePage {
             width: page.width(),
             height: page.height(),
@@ -343,15 +372,23 @@ impl PainterApp {
     }
 
     /// Picture ▸ Spare ▸ Delete This Page: the shown page is replaced by the spare (one undo
-    /// step brings it back) and the spare is freed.
+    /// step brings it back) and the spare is freed. With one visible layer on both pages the
+    /// spare's picture replaces the page's (the current frame); otherwise (ADR-44) the
+    /// picture becomes the spare's whole picture, every frame with every layer
+    /// (`SetPicture`), as Swap would show it.
     pub(crate) fn delete_page(&mut self) {
         self.finish_stroke();
         let other = self.take_spare();
-        let page = other.engine.document().page();
-        let command = Command::SetPage {
-            width: page.width(),
-            height: page.height(),
-            pixels: page.pixels().to_vec(),
+        let spare = other.engine.document();
+        let command = if single_picture(self.engine.document()) && single_picture(spare) {
+            let page = spare.page();
+            Command::SetPage {
+                width: page.width(),
+                height: page.height(),
+                pixels: page.pixels().to_vec(),
+            }
+        } else {
+            Command::set_picture(spare)
         };
         match self.engine.execute(command) {
             Ok(_) => {
@@ -439,10 +476,15 @@ impl PainterApp {
         }
     }
 
-    /// Effect ▸ Background ▸ Fix: CLR goes back to the page as it is now.
+    /// Effect ▸ Background ▸ Fix: CLR goes back to the page as it is now, on this layer
+    /// (ADR-44: the active layer as it is now).
     pub(crate) fn fix_background(&mut self) {
         self.finish_stroke();
-        self.menu_data.background = Some(self.engine.document().page().clone());
+        let doc = self.engine.document();
+        self.menu_data.background = Some(FixedBackground {
+            image: doc.page().clone(),
+            layer: doc.active_layer(),
+        });
     }
 
     /// Effect ▸ Background ▸ Free: CLR fills with the BG colour again.
@@ -763,14 +805,14 @@ mod tests {
         app.undo();
         assert_eq!(app.page().get(2, 2), Some(0));
         // Copy to Spare (Ctrl+j), then swap: the same picture.
-        let shown = app.page().clone();
+        let shown = app.page().into_owned();
         keys(
             &mut app,
             0.0,
             vec![key(egui::Key::J, egui::Modifiers::CTRL)],
         );
         act(&mut app, "spare.swap");
-        assert_eq!(app.page(), &shown);
+        assert_eq!(&*app.page(), &shown);
     }
 
     #[test]
@@ -959,7 +1001,7 @@ mod tests {
         let mut app = PainterApp::new();
         dot(&mut app, 1, 1, 3);
         let doc = app.engine.document().palette().clone();
-        let page = app.page().clone();
+        let page = app.page().into_owned();
         // Colours 2-4 at 60 steps per second, 10-12 reverse at 30 per second.
         app.extras.ranges = vec![
             ColorRange {
@@ -994,7 +1036,7 @@ mod tests {
         assert_eq!(app.palette().get(2), doc.get(3), "two steps");
         // The document, its pixels and the other colours do not change.
         assert_eq!(app.engine.document().palette(), &doc);
-        assert_eq!(app.page(), &page);
+        assert_eq!(&*app.page(), &page);
         assert_eq!(app.palette().get(5), doc.get(5));
         // Tab again: the document palette is shown.
         keys(

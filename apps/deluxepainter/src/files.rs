@@ -694,18 +694,25 @@ pub fn page_at_least_screen(doc: Document) -> (Document, Option<String>) {
     }
     let (w, h) = (pw.max(sw), ph.max(sh));
     let note = format!("page enlarged from {pw}x{ph} to the {w}x{h} screen, picture top-left");
-    // Every animation frame grows the same way (ADR-28).
-    let frames: Vec<IndexedImage> = doc
-        .frames()
+    // Every animation frame (ADR-28) and every layer (ADR-44) grows the same way; colour 0
+    // is the background below and transparent above.
+    let frames: Vec<Vec<IndexedImage>> = (0..doc.frame_count())
         .map(|f| {
-            let mut page = IndexedImage::new(w, h, 0);
-            page.blit(f, 0, 0);
-            page
+            (0..doc.layer_count())
+                .filter_map(|l| doc.cel(f, l))
+                .map(|cel| {
+                    let mut page = IndexedImage::new(w, h, 0);
+                    page.blit(cel, 0, 0);
+                    page
+                })
+                .collect()
         })
         .collect();
-    let grown = Document::from_frames(
+    let grown = Document::from_layers(
         frames,
+        doc.layers().to_vec(),
         doc.current_frame(),
+        doc.active_layer(),
         doc.fps(),
         doc.palette().clone(),
         doc.target(),
@@ -813,10 +820,15 @@ pub fn encode_document(
             doc.current_frame() + 1
         ));
     }
+    // ADR-44: a picture file holds what the frames show, all visible layers flattened.
+    if format != SaveFormat::Project {
+        notes.extend(dpx_core::layer::flatten_note(doc.layers()));
+    }
     match format {
         SaveFormat::Ilbm => {
             let mode = doc.target().mode;
-            let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
+            let picture = doc.composite().into_owned();
+            let mut out = Ilbm::from_indexed(picture, doc.palette().clone());
             out.camg = Some(doc.target().camg());
             (out.x_aspect, out.y_aspect) = mode.aspect();
             let (sw, sh) = doc.target().screen;
@@ -836,7 +848,8 @@ pub fn encode_document(
             let mode = doc.target().mode;
             let (xa, ya) = mode.aspect();
             let (w, h) = (doc.page().width(), doc.page().height());
-            let images: Vec<IndexedImage> = doc.frames().cloned().collect();
+            let images: Vec<IndexedImage> =
+                doc.composite_frames().map(|f| f.into_owned()).collect();
             let fps = doc.fps();
             let opts = dpx_iff::anim::EncodeOptions {
                 hold: dpx_iff::anim::Hold::PerFrame(anim_doc::holds_for_fps(fps, images.len())),
@@ -875,8 +888,8 @@ pub fn encode_document(
                 drops.push(format!("transparent colour {c}"));
             }
             notes.extend(drops.into_iter().map(|d| format!("PNG cannot store: {d}")));
-            let bytes =
-                dpx_formats::write_png(doc.page(), doc.palette()).map_err(|e| e.to_string())?;
+            let bytes = dpx_formats::write_png(&doc.composite(), doc.palette())
+                .map_err(|e| e.to_string())?;
             notes.extend(export_notes(doc, format));
             Ok((bytes, notes))
         }
@@ -1041,7 +1054,7 @@ pub fn info(path: &Path) -> Result<String, String> {
                 doc.palette().len()
             );
             out += &format!(
-                "  target: {:?} {}, screen {}x{}\n  {}, 1 layer{}\n",
+                "  target: {:?} {}, screen {}x{}\n  {}, {}{}\n",
                 t.chipset,
                 t.mode.name(),
                 t.screen.0,
@@ -1053,6 +1066,10 @@ pub fn info(path: &Path) -> Result<String, String> {
                         doc.current_frame() + 1,
                         doc.fps()
                     ),
+                },
+                match doc.layer_count() {
+                    1 => "1 layer".to_string(),
+                    n => format!("{n} layers (layer {} active)", doc.active_layer()),
                 },
                 match &p.spare {
                     Some(s) => format!(", spare page {}x{}", s.width(), s.height()),
@@ -1081,6 +1098,16 @@ pub fn info(path: &Path) -> Result<String, String> {
             if let Some(c) = p.extras.transparent_color {
                 out += &format!("  transparent colour: {c}\n");
             }
+            // ADR-44: the layers, bottom first, when they are not the one "Background".
+            if !dpx_core::layer::is_default_stack(doc.layers()) {
+                for (i, l) in doc.layers().iter().enumerate() {
+                    out += &format!(
+                        "  layer {i}: {:?}{}\n",
+                        l.name,
+                        if l.visible { "" } else { ", hidden" }
+                    );
+                }
+            }
         }
         Picture::TrueColor { .. } => unreachable!("handled above"),
     }
@@ -1088,7 +1115,8 @@ pub fn info(path: &Path) -> Result<String, String> {
         let mut seen = [false; 256];
         let frames: Vec<&IndexedImage> = match &loaded.picture {
             Picture::Anim(a) => a.frames.iter().collect(),
-            Picture::Project(p) => p.document.frames().collect(),
+            // Every frame and layer (ADR-44).
+            Picture::Project(p) => p.document.cels().collect(),
             _ => vec![img],
         };
         for &p in frames.iter().flat_map(|f| f.pixels()) {

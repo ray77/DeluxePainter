@@ -1,4 +1,5 @@
 //! Reading pixels and rendering the page to PNG for the agent. Read-only; no pixel logic.
+//! Both read the picture as it shows: the current frame's visible layers (ADR-44).
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -83,7 +84,7 @@ pub fn get_pixels(
             (r.w as u64) * (r.h as u64)
         )));
     }
-    let crop = doc.page().crop(r);
+    let crop = doc.composite().crop(r);
     let pixels = match encoding {
         PixelEncoding::Rows => serde_json::Value::Array(
             crop.pixels()
@@ -132,7 +133,7 @@ pub fn render_png(
         )));
     }
     let (ow, oh) = (ow as u32, oh as u32);
-    let crop = doc.page().crop(r);
+    let crop = doc.composite().crop(r);
     let colors = doc.palette().colors();
     let s = scale as usize;
     let mut rgb = Vec::with_capacity(ow as usize * oh as usize * 3);
@@ -167,4 +168,60 @@ pub fn render_png(
 
 pub fn to_base64(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dpx_core::{Command, Engine, Palette};
+
+    /// ADR-44: what the agent reads and sees is the frame as it shows, all visible layers.
+    #[test]
+    fn pixels_and_renders_show_the_visible_layers() {
+        let mut e = Engine::new(Document::new(8, 4, Palette::dpaint_default_32()));
+        e.execute(Command::Clear { color: 4 }).unwrap();
+        e.execute(Command::AddLayer { name: None }).unwrap();
+        e.execute(Command::SetPage {
+            width: 8,
+            height: 4,
+            pixels: [vec![0, 5, 5, 0, 0, 0, 0, 0], vec![0; 24]].concat(),
+        })
+        .unwrap();
+        let row = |e: &Engine| {
+            let r = get_pixels(
+                e.document(),
+                Some(RectArg {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 1,
+                }),
+                PixelEncoding::Rows,
+            )
+            .unwrap();
+            r.pixels[0].clone()
+        };
+        assert_eq!(row(&e), serde_json::json!([4, 5, 5, 4]));
+        e.execute(Command::SetLayerVisible {
+            layer: 1,
+            visible: false,
+        })
+        .unwrap();
+        assert_eq!(row(&e), serde_json::json!([4, 4, 4, 4]));
+        e.undo().unwrap();
+        // The render's pixel 0 is colour 4 (orange), pixel 1 colour 5 (yellow).
+        let png = render_png(e.document(), None, None).unwrap().png;
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .unwrap();
+        let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut rgb).unwrap();
+        let pal = e.document().palette();
+        let c = |i: u8| {
+            let c = pal.get(i).unwrap();
+            vec![c.r, c.g, c.b]
+        };
+        assert_eq!(rgb[0..3], c(4)[..]);
+        assert_eq!(rgb[3..6], c(5)[..]);
+    }
 }

@@ -1,5 +1,6 @@
-//! Tooltips (ADR-41): a one-line box naming the toolbox button, or the Animation Control Panel
-//! button, under the resting pointer, with the paint-screen key that does the same. DeluxePaint
+//! Tooltips (ADR-41): a one-line box naming the toolbox button, the Animation Control Panel
+//! button or the layer panel button (ADR-44) under the resting pointer, with the paint-screen
+//! key that does the same. DeluxePaint
 //! IV has no tooltips; this is a DeluxePainter addition, drawn in UI (LoRes) pixels like the
 //! rest of the interface: face-coloured, a 1-pixel dark border, square corners.
 //!
@@ -12,6 +13,7 @@ use dpx_core::{IndexedImage, Rect};
 
 use crate::anim_panel::{self, PanelButton, PanelHit};
 use crate::font::{self, Font};
+use crate::layer_panel::{self, LayerButton, LayerHit};
 use crate::pens::Pens;
 use crate::screen::{Hit, Screen, UiState};
 use crate::toolbox::Tool;
@@ -72,6 +74,8 @@ pub enum TooltipTarget {
     Tool { tool: Tool, filled: bool },
     /// A button of the Animation Control Panel (not its slider).
     Panel(PanelButton),
+    /// A button of the layer panel (ADR-44).
+    Layer(LayerButton),
 }
 
 impl TooltipTarget {
@@ -84,6 +88,7 @@ impl TooltipTarget {
                 filled: filled_half && tool.is_split(),
             }),
             Hit::AnimPanel(PanelHit::Button(b)) => Some(Self::Panel(b)),
+            Hit::LayerPanel(LayerHit::Button(b)) => Some(Self::Layer(b)),
             _ => None,
         }
     }
@@ -108,6 +113,7 @@ impl TooltipTarget {
         match self {
             Self::Tool { tool, filled } => tool_name(tool, filled),
             Self::Panel(b) => panel_name(b),
+            Self::Layer(b) => b.name(),
         }
     }
 
@@ -116,6 +122,8 @@ impl TooltipTarget {
         match self {
             Self::Tool { tool, filled } => tool_key(tool, filled),
             Self::Panel(b) => panel_key(b),
+            // No key runs a layer command.
+            Self::Layer(_) => None,
         }
     }
 }
@@ -260,13 +268,18 @@ impl Tooltip {
             TooltipTarget::Panel(b) => ui
                 .anim_panel
                 .map(|_| anim_panel::Layout::new(screen_w, screen_h, ui.toolbox_visible).button(b)),
+            TooltipTarget::Layer(b) => {
+                layer_panel::Layout::of(ui, screen_w, screen_h).map(|l| l.button(b))
+            }
         }
     }
 
     /// Where the box goes on a `screen_w`×`screen_h` UI screen; `None` when its button is
     /// not shown. Tools: left of the toolbox (2 pixels free), top at the button's top. Panel
     /// buttons: above the panel (2 pixels free), left edge at the button's left edge, kept
-    /// left of the toolbox. Always inside the screen.
+    /// left of the toolbox. Layer panel buttons (ADR-44): left of the panel's column, top at
+    /// the button's top; for the docked panel left of the toolbox, as tools, since the box
+    /// is drawn on the screen. Always inside the screen.
     pub fn layout(&self, screen_w: i32, screen_h: i32, ui: &UiState) -> Option<Rect> {
         let button = self.button(screen_w, screen_h, ui)?;
         let (w, h) = self.size();
@@ -280,6 +293,15 @@ impl Tooltip {
             TooltipTarget::Panel(_) => {
                 let panel = anim_panel::Layout::new(screen_w, screen_h, ui.toolbox_visible).panel;
                 (button.x, panel.y - geom::GAP - h, panel.x + panel.w)
+            }
+            TooltipTarget::Layer(_) => {
+                let panel = layer_panel::Layout::of(ui, screen_w, screen_h)?.panel;
+                let column = if panel.x >= screen_w && ui.toolbox_visible {
+                    Screen::new(screen_w, screen_h).toolbox_x()
+                } else {
+                    panel.x.min(screen_w)
+                };
+                (column - geom::GAP - w, button.y, screen_w)
             }
         };
         let x = x.min(right - w).min(screen_w - w).max(0);
@@ -351,6 +373,7 @@ mod tests {
             }
         }
         targets.extend(all_buttons().map(TooltipTarget::Panel));
+        targets.extend(crate::layer_panel::BUTTONS.map(TooltipTarget::Layer));
         targets
     }
 
@@ -361,6 +384,7 @@ mod tests {
                 count: 4,
                 ..AnimPanel::default()
             }),
+            layer_panel: Some(crate::layer_panel::LayerPanel::default()),
             ..UiState::default()
         }
     }
@@ -435,6 +459,54 @@ mod tests {
         for t in all_targets() {
             assert!(t.text().chars().all(|c| (' '..='~').contains(&c)), "{t:?}");
         }
+    }
+
+    #[test]
+    fn layer_panel_buttons_name_themselves_beside_the_panel() {
+        use crate::layer_panel::{LayerButton, LayerPanel, Layout};
+        let expected = [
+            (LayerButton::New, "New Layer"),
+            (LayerButton::Copy, "Copy Layer"),
+            (LayerButton::Delete, "Delete Layer"),
+            (LayerButton::Up, "Move Layer Up"),
+            (LayerButton::Down, "Move Layer Down"),
+            (LayerButton::Merge, "Merge Down"),
+        ];
+        for (b, text) in expected {
+            assert_eq!(TooltipTarget::Layer(b).text(), text, "{b:?}");
+            assert_eq!(
+                TooltipTarget::of_hit(Hit::LayerPanel(LayerHit::Button(b))),
+                Some(TooltipTarget::Layer(b))
+            );
+        }
+        for hit in [LayerHit::Eye(0), LayerHit::Name(1), LayerHit::Background] {
+            assert_eq!(TooltipTarget::of_hit(Hit::LayerPanel(hit)), None, "{hit:?}");
+        }
+        // Docked right of the screen: the box goes left of the toolbox, on the screen.
+        let mut docked = LayerPanel::default();
+        docked.docked = true;
+        let mut ui = UiState {
+            layer_panel: Some(docked),
+            ..UiState::default()
+        };
+        let tip = Tooltip::new(TooltipTarget::Layer(LayerButton::Merge), KeyMode::Paint);
+        let button = Layout::docked(320, 256).button(LayerButton::Merge);
+        assert_eq!(tip.button(320, 256, &ui), Some(button));
+        let r = tip.layout(320, 256, &ui).unwrap();
+        assert_eq!(r.x + r.w, 320 - 24 - geom::GAP);
+        assert_eq!(r.y + r.h, 256, "kept on the screen");
+        ui.toolbox_visible = false;
+        let r = tip.layout(320, 256, &ui).unwrap();
+        assert_eq!(
+            r.x + r.w,
+            320 - geom::GAP,
+            "at the screen's edge without the toolbox"
+        );
+        // No panel, or a hidden one: no box.
+        ui.layer_panel.as_mut().unwrap().hidden = true;
+        assert_eq!(tip.layout(320, 256, &ui), None);
+        ui.layer_panel = None;
+        assert_eq!(tip.layout(320, 256, &ui), None);
     }
 
     #[test]
@@ -580,6 +652,11 @@ mod tests {
                             if button.x + r.w <= panel.x + panel.w {
                                 assert_eq!(r.x, button.x, "{at}");
                             }
+                        }
+                        TooltipTarget::Layer(_) => {
+                            let column = crate::layer_panel::Layout::of(&ui, w, h).unwrap();
+                            assert_eq!(r.x + r.w, column.panel.x - geom::GAP, "{at}");
+                            assert_eq!(r.y, button.y.min(h - r.h), "{at}");
                         }
                     }
                 }

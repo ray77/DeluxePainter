@@ -2,8 +2,8 @@
 //! Color Set Load/Save, Effect ▸ AntiAlias / Process / Translucency, Effect ▸ Stencil ▸ Show /
 //! Load.. / Save..
 //!
-//! Every document change goes through a command: Arrange is `ArrangePalette`, Remap a
-//! `SetPage` of [`dpx_core::remap::remap_to_palette`]. The paint effects are carried by the
+//! Every document change goes through a command: Arrange is `ArrangePalette`, Remap
+//! `RemapColors` (every frame and layer, ADR-44). The paint effects are carried by the
 //! stroke and shape commands (`fx`, see [`dpx_core::PaintFx`]); this module keeps their
 //! settings, the title-bar flags and the display-only stencil view.
 
@@ -176,23 +176,60 @@ impl PainterApp {
 
     /// The Arrange requester's Ok: one `ArrangePalette` command, and everything that holds
     /// colour numbers follows (FG and BG, the stencil, the brushes, the spare page, the fixed
-    /// background), so nothing changes its look.
+    /// background), so nothing changes its look. An order that one of the pictures cannot
+    /// take (ADR-44: a colour of an upper layer, the spare's or the fixed background's, would
+    /// become the transparent colour 0) changes nothing at all.
     pub(crate) fn apply_arrange(&mut self, order: &[u8]) {
         if order == remap::identity(order.len()).as_slice() {
             return;
         }
         self.finish_stroke();
         self.track_palette();
-        let base = self.menu_data.effects.remap_base.take();
         let old_palette = self.engine.document().palette().clone();
-        if let Err(e) = self.engine.execute(Command::ArrangePalette {
+        let n = order.len();
+        let arrange = || Command::ArrangePalette {
             order: order.to_vec(),
-        }) {
+        };
+        // The spare page follows only while it has the shown page's palette.
+        let spare = self.menu_data.spare.as_mut().filter(|s| {
+            let palette = s.engine.document().palette();
+            palette == &old_palette && palette.len() == n
+        });
+        let spare_background = spare.as_ref().and_then(|s| s.background.clone());
+        let spare_refuses = spare.and_then(|s| {
+            let dry = dpx_core::Request {
+                command: arrange(),
+                expected_revision: None,
+                dry_run: true,
+            };
+            s.engine.execute(dry).err()
+        });
+        let to_zero = order.first().copied().unwrap_or(0);
+        let fixed_refuses = [
+            self.menu_data.background.as_ref(),
+            spare_background.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.layer > 0 && to_zero != 0 && b.image.pixels().contains(&to_zero));
+        if let Some(e) = spare_refuses {
+            eprintln!("arrange palette: the spare page: {e}");
+            return;
+        }
+        if fixed_refuses {
+            eprintln!(
+                "arrange palette: colour {to_zero} would become colour 0, which is transparent \
+                 on the layer the fixed background belongs to"
+            );
+            return;
+        }
+        let base = self.menu_data.effects.remap_base.take();
+        if let Err(e) = self.engine.execute(arrange()) {
             eprintln!("arrange palette: {e}");
+            self.menu_data.effects.remap_base = base;
             return;
         }
         let lut = remap::inverse(order);
-        let n = order.len();
         self.ui.fg = lut[usize::from(self.ui.fg)];
         self.ui.bg = lut[usize::from(self.ui.bg)];
         let arrange_stencil = |s: &mut Vec<bool>| {
@@ -218,18 +255,22 @@ impl PainterApp {
         }
         self.animbrush_arrange(&lut); // ADR-36: the AnimBrush's cels too.
         if let Some(bg) = &mut self.menu_data.background {
-            let pixels = remap::reindex(bg.pixels(), order);
-            *bg = dpx_core::IndexedImage::from_pixels(bg.width(), bg.height(), pixels)
-                .expect("same size");
+            // ADR-44: as its layer is arranged (colour 0 stays transparent above the bottom).
+            bg.image = remap::arranged_picture(&bg.image, order, bg.layer > 0);
         }
         if let Some(spare) = &mut self.menu_data.spare
             && spare.engine.document().palette() == &old_palette
             && spare.engine.document().palette().len() == n
         {
-            let _ = spare.engine.execute(Command::ArrangePalette {
-                order: order.to_vec(),
-            });
+            // Checked above: it cannot be refused, so the spare never keeps the old palette
+            // for `take_spare` to relabel.
+            if let Err(e) = spare.engine.execute(arrange()) {
+                eprintln!("arrange palette: the spare page: {e}");
+            }
             spare.bg = lut[usize::from(spare.bg)];
+            if let Some(bg) = &mut spare.background {
+                bg.image = remap::arranged_picture(&bg.image, order, bg.layer > 0);
+            }
         }
         // The arrangement is a palette change the picture is already in step with; a pending
         // Remap base is arranged along with the pixels.
@@ -250,13 +291,21 @@ impl PainterApp {
                 "The palette has not changed since the picture was last in step with it",
             );
         };
+        // ADR-44: every frame and layer, one undo step (colour 0 stays transparent above the
+        // bottom layer); nothing is run when no pixel would change.
         let doc = self.engine.document();
-        let out = remap::remap_to_palette(doc.page(), base.colors(), doc.palette());
-        if &out != doc.page() {
-            self.run(Command::SetPage {
-                width: out.width(),
-                height: out.height(),
-                pixels: out.pixels().to_vec(),
+        let lower = remap::nearest_lut(base.colors(), doc.palette());
+        let upper = remap::nearest_lut_upper(base.colors(), doc.palette());
+        let changes = (0..doc.layer_count()).any(|l| {
+            let lut = if l == 0 { &lower } else { &upper };
+            (0..doc.frame_count()).any(|f| {
+                doc.cel(f, l)
+                    .is_some_and(|c| c.pixels().iter().any(|&p| lut[usize::from(p)] != p))
+            })
+        });
+        if changes {
+            self.run(Command::RemapColors {
+                from: base.colors().to_vec(),
             });
         }
     }

@@ -1,9 +1,9 @@
 //! DeluxePainter core: document model and command engine shared by the GUI, CLI and MCP
 //! front-ends.
 //!
-//! Phase 1: one indexed page with its palette, changed only through [`Engine`] (validated
-//! [`Command`]s with multi-level undo/redo). Layers and frames follow (see
-//! `docs/ARCHITECTURE.md`).
+//! A [`Document`] holds animation frames (ADR-28) of one layer stack (ADR-44) with one
+//! palette, changed only through [`Engine`] (validated [`Command`]s with multi-level
+//! undo/redo).
 
 // Animation frames (ADR-28).
 pub mod anim;
@@ -21,6 +21,8 @@ pub mod gradient;
 // Hardware rules, export notes and screen presets (ADR-46).
 pub mod hardware;
 pub mod image;
+// Layers (ADR-44).
+pub mod layer;
 // Picture ▸ Load's Import requester (ADR-42).
 pub mod import;
 pub mod mode;
@@ -45,6 +47,7 @@ pub use document::Document;
 pub use engine::{Engine, Outcome, Request};
 pub use gradient::{Direction as GradientDirection, FillType};
 pub use image::{IndexedImage, Rect};
+pub use layer::Layer;
 pub use mode::{Chipset, DisplayMode, Resolution, Target, Video};
 pub use paint::{AntiAlias, BrushImage, DrawMode, PaintContext, PaintFx, ProcessMode};
 pub use palette::{Palette, PaletteError, Rgb8};

@@ -166,7 +166,10 @@ pub enum Command {
     /// Picture ▸ Spare ▸ Merge in Front / Back: combines the page with another page
     /// (`width`×`height`, top-left aligned, clipped to the page). `front`: the other page lies
     /// on top and its `transparent` pixels let the page show through; otherwise the page lies
-    /// on top and its own `transparent` pixels show the other page (ADR-15).
+    /// on top and its own `transparent` pixels show the other page (ADR-15). With layers
+    /// (ADR-44) the active layer is painted; in back the other page goes only where the frame
+    /// as it shows (all visible layers) and the active layer are both `transparent`, so it
+    /// lies behind the whole picture.
     MergePage {
         width: u32,
         height: u32,
@@ -206,6 +209,11 @@ pub enum Command {
     /// Color ▸ Palette ▸ Arrange (ADR-31): reorders the palette, `order[new] = old` (a
     /// permutation of all entries), and renumbers the pixels so the picture looks the same.
     ArrangePalette { order: Vec<u8> },
+    /// Color ▸ Remap (ADR-31): every picture of every frame and layer repainted with the
+    /// colours of `from` (1 to 256 entries: the palette its pixels were drawn for) looked up
+    /// in the current palette, nearest colour; colours beyond `from` stay. Above the bottom
+    /// layer colour 0 stays transparent and no other colour becomes 0 (ADR-44).
+    RemapColors { from: Vec<Rgb8> },
     /// Painting with an AnimBrush (ADR-36): `paint`, a Stroke or Shape, stamps the cels of
     /// `brush` in turn instead of its own custom brush. Stamp `k` along the path (and of
     /// every symmetric copy) paints the cel the brush reaches `k` stamps after its clock;
@@ -256,6 +264,55 @@ pub enum Command {
         area: crate::stencil::AreaStencil,
         command: Box<Command>,
     },
+    // ---- Layers (ADR-44). Layer numbers start at 0, the bottom layer; every frame holds one
+    // picture per layer. On every layer above the bottom one colour 0 is transparent. Every
+    // page command above paints the active layer of the current frame. Each layer command
+    // is one undo step, except SelectLayer, a setting like GotoFrame.
+    /// A new transparent layer (colour 0 everywhere, in every frame) above the active one;
+    /// it becomes active. Without a name it is called "Layer N" (the smallest N unused).
+    AddLayer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// A copy of layer `layer` (every frame, name + " copy", same visibility) above it; the
+    /// copy becomes active.
+    DuplicateLayer { layer: u32 },
+    /// Removes layer `layer` from every frame; the last layer cannot go. The layer below
+    /// becomes active if the active one goes (the new bottom layer when it was the bottom).
+    DeleteLayer { layer: u32 },
+    /// Moves layer `from` to position `to` in every frame (the others close up); the active
+    /// layer stays the same layer. A layer moved to the bottom becomes opaque.
+    MoveLayer { from: u32, to: u32 },
+    /// Makes layer `layer` the active one: a setting, no undo step (as GotoFrame).
+    SelectLayer { layer: u32 },
+    /// Shows or hides layer `layer`; hidden layers do not show and are not exported.
+    SetLayerVisible { layer: u32, visible: bool },
+    /// Renames layer `layer` (at most 255 characters).
+    RenameLayer { layer: u32, name: String },
+    /// Merges layer `layer` into the one below it in every frame: its pixels other than
+    /// colour 0 cover the lower layer, whether shown or hidden; the result keeps the lower
+    /// layer's name and visibility.
+    MergeLayerDown { layer: u32 },
+    /// Flattens every frame into one layer showing what the frame shows (hidden layers
+    /// go): it keeps the bottom layer's name and is visible.
+    FlattenLayers,
+    /// Replaces the whole picture (Picture ▸ Spare ▸ Copy to Spare and Delete This Page on
+    /// layered pages): every frame and the layer stack become `frames` and `layers`
+    /// (`frames[f][l]` holds layer `l` of frame `f`, bottom layer first, `width`×`height`
+    /// pixels row by row); frame `current` and layer `active` become the page. Palette,
+    /// target and rate stay. Another page size must fit the target's page limits; layers and
+    /// frames keep the limits of `add_layer` and the frame commands.
+    /// [`Command::set_picture`] makes one from a document.
+    SetPicture {
+        width: u32,
+        height: u32,
+        layers: Vec<crate::Layer>,
+        frames: Vec<Vec<Vec<u8>>>,
+        #[serde(default)]
+        current: u32,
+        #[serde(default)]
+        active: u32,
+    },
 }
 
 impl Command {
@@ -284,8 +341,13 @@ pub(crate) enum Footprint {
     Document,
     /// The frames (number, order, contents, current one) change; size and palette stay.
     Frames,
-    /// A setting (current frame, rate): applied without an undo step (ADR-28).
+    /// A setting (current frame, rate, active layer): applied without an undo step (ADR-28).
     Setting,
+    /// The layer stack and every frame's layer pictures change (ADR-44); size and palette
+    /// stay.
+    Layers,
+    /// Only layer names or visibility change (ADR-44).
+    LayerInfo,
 }
 
 impl Command {
@@ -421,6 +483,9 @@ impl Command {
         if let Command::MoveBrush { .. } = self {
             return crate::anim_move::validate(self, doc);
         }
+        if self.is_layer_command() {
+            return crate::layer::validate(self, doc);
+        }
         let colors = doc.palette.len();
         let color = |c: u8| check_color(c, colors);
         match self {
@@ -475,12 +540,14 @@ impl Command {
                         "page {width}x{height} is smaller than the {sw}x{sh} screen"
                     )));
                 }
-                // All frames take the new size (ADR-28).
-                check_frame_count(doc.frame_count(), *width, *height)?;
+                // All frames take the new size (ADR-28); without `retain` one layer is left
+                // (ADR-44), with it every layer takes the new size.
+                let layers = if *retain { doc.layer_count() } else { 1 };
+                check_frame_count(doc.frame_count(), layers, *width, *height)?;
                 if *retain {
                     let kept = Rect::new(0, 0, *width as i32, *height as i32);
                     let max_used = doc
-                        .frames()
+                        .cels()
                         .filter_map(|f| f.crop(kept).pixels().iter().max().copied())
                         .max();
                     if let Some(max_used) = max_used
@@ -509,7 +576,7 @@ impl Command {
                 fill,
             } => {
                 color(*fill)?;
-                check_frame_count(doc.frame_count(), *width, *height)?;
+                check_frame_count(doc.frame_count(), doc.layer_count(), *width, *height)?;
                 if doc.target.page_fits(*width, *height) {
                     Ok(())
                 } else {
@@ -531,6 +598,15 @@ impl Command {
                     return Err(CommandError::invalid(format!(
                         "page {width}x{height}: all {} frames are {}x{}",
                         doc.frame_count(),
+                        doc.page.width(),
+                        doc.page.height()
+                    )));
+                }
+                if !same && doc.layer_count() > 1 {
+                    // So do all layers (ADR-44).
+                    return Err(CommandError::invalid(format!(
+                        "page {width}x{height}: all {} layers are {}x{}",
+                        doc.layer_count(),
                         doc.page.width(),
                         doc.page.height()
                     )));
@@ -582,6 +658,16 @@ impl Command {
             | Command::GotoFrame { .. }
             | Command::SetFrameRate { .. }
             | Command::MoveBrush { .. } => unreachable!("frame commands are checked above"),
+            Command::AddLayer { .. }
+            | Command::DuplicateLayer { .. }
+            | Command::DeleteLayer { .. }
+            | Command::MoveLayer { .. }
+            | Command::SelectLayer { .. }
+            | Command::SetLayerVisible { .. }
+            | Command::RenameLayer { .. }
+            | Command::MergeLayerDown { .. }
+            | Command::FlattenLayers
+            | Command::SetPicture { .. } => unreachable!("layer commands are checked above"),
             Command::Stenciled { area, command } => {
                 check_area(area, &doc.page)?;
                 let same = |w: u32, h: u32| (w, h) == (doc.page.width(), doc.page.height());
@@ -602,15 +688,36 @@ impl Command {
                 }
                 command.validate(doc)
             }
-            Command::ArrangePalette { order } => {
-                if crate::remap::is_permutation(order, colors) {
+            Command::RemapColors { from } => {
+                if (1..=256).contains(&from.len()) {
                     Ok(())
                 } else {
-                    Err(CommandError::new(
+                    Err(CommandError::invalid(format!(
+                        "remap needs 1 to 256 colours, got {}",
+                        from.len()
+                    )))
+                }
+            }
+            Command::ArrangePalette { order } => {
+                if !crate::remap::is_permutation(order, colors) {
+                    return Err(CommandError::new(
                         ErrorCode::PaletteRangeInvalid,
                         format!("order must be a permutation of the {colors} palette entries"),
-                    ))
+                    ));
                 }
+                // ADR-44: above the bottom layer colour 0 stays transparent, so no other
+                // colour there may become entry 0.
+                let to_zero = order[0];
+                if to_zero != 0 && upper_layers_use(doc, to_zero) {
+                    return Err(CommandError::new(
+                        ErrorCode::PaletteRangeInvalid,
+                        format!(
+                            "colour {to_zero} would become colour 0, which is transparent on \
+                             the upper layers that use it"
+                        ),
+                    ));
+                }
+                Ok(())
             }
         }
     }
@@ -646,8 +753,26 @@ impl Command {
             | Command::CopyFrame { .. }
             | Command::InsertFrameCopies { .. }
             | Command::DeleteFrames { .. } => Footprint::Frames,
-            Command::GotoFrame { .. } | Command::SetFrameRate { .. } => Footprint::Setting,
+            Command::GotoFrame { .. }
+            | Command::SetFrameRate { .. }
+            | Command::SelectLayer { .. } => Footprint::Setting,
+            Command::AddLayer { .. }
+            | Command::DuplicateLayer { .. }
+            | Command::DeleteLayer { .. }
+            | Command::MoveLayer { .. }
+            | Command::MergeLayerDown { .. }
+            | Command::FlattenLayers => Footprint::Layers,
+            Command::SetPicture { width, height, .. } => {
+                if (*width, *height) == (doc.page.width(), doc.page.height()) {
+                    Footprint::Layers
+                } else {
+                    Footprint::Document
+                }
+            }
+            Command::SetLayerVisible { .. } | Command::RenameLayer { .. } => Footprint::LayerInfo,
             Command::ArrangePalette { .. } => Footprint::Document,
+            // Every frame's pictures change; size and palette stay.
+            Command::RemapColors { .. } => Footprint::Frames,
             // Several frames and the current one change (ADR-38).
             Command::MoveBrush { .. } => Footprint::Frames,
             Command::Stenciled { command, .. } => command.footprint(doc),
@@ -683,6 +808,9 @@ impl Command {
         if let Command::MoveBrush { .. } = self {
             return crate::anim_move::apply(self, doc);
         }
+        if self.is_layer_command() {
+            return crate::layer::apply(self, doc);
+        }
         let page = &mut doc.page;
         match self {
             Command::Stroke { .. }
@@ -717,13 +845,19 @@ impl Command {
                 screen,
                 chipset,
             } => {
-                doc.for_each_frame(|frame| {
-                    let mut new_page = IndexedImage::new(*width, *height, 0);
-                    if *retain {
-                        new_page.blit(frame, 0, 0);
-                    }
-                    *frame = new_page;
-                });
+                if *retain {
+                    doc.for_each_cel(|_, cel| {
+                        let mut new_page = IndexedImage::new(*width, *height, 0);
+                        new_page.blit(cel, 0, 0);
+                        *cel = new_page;
+                    });
+                } else {
+                    // A cleared page has one layer, "Background" (ADR-44).
+                    let blank = std::sync::Arc::new(IndexedImage::new(*width, *height, 0));
+                    let frames = vec![vec![blank]; doc.frame_count()];
+                    let current = doc.current;
+                    doc.set_layered(frames, vec![crate::Layer::background()], current, 0);
+                }
                 let chipset = chipset.unwrap_or(doc.target.chipset);
                 // The kept entries this rounds are counted in `Outcome::rounded_colors`
                 // ([`Self::rounded_colors`]), so no front-end changes colours silently.
@@ -737,10 +871,12 @@ impl Command {
                 height,
                 fill,
             } => {
-                doc.for_each_frame(|frame| {
-                    let mut new_page = IndexedImage::new(*width, *height, *fill);
-                    new_page.blit(frame, 0, 0);
-                    *frame = new_page;
+                // New area: the fill (BG) colour on the bottom layer, transparent above it.
+                doc.for_each_cel(|layer, cel| {
+                    let fill = if layer == 0 { *fill } else { 0 };
+                    let mut new_page = IndexedImage::new(*width, *height, fill);
+                    new_page.blit(cel, 0, 0);
+                    *cel = new_page;
                 });
             }
             Command::SetPage {
@@ -758,6 +894,11 @@ impl Command {
                 front,
                 transparent,
             } => {
+                // In back, the frame as it shows decides (ADR-44): a pixel of the active layer
+                // that is transparent but lies over another layer's colour is no hole in the
+                // picture. With one visible layer that is the page itself.
+                let shown = (!*front).then(|| doc.composite().into_owned());
+                let page = &mut doc.page;
                 let w = (*width).min(page.width()) as usize;
                 let h = (*height).min(page.height()) as usize;
                 let pw = page.width() as usize;
@@ -765,9 +906,15 @@ impl Command {
                 for y in 0..h {
                     let other = &pixels[y * *width as usize..][..w];
                     for (x, &o) in other.iter().enumerate() {
-                        let p = &mut merged[y * pw + x];
-                        if (*front && o != *transparent) || (!*front && *p == *transparent) {
-                            *p = o;
+                        let i = y * pw + x;
+                        let take = match &shown {
+                            None => o != *transparent,
+                            Some(shown) => {
+                                merged[i] == *transparent && shown.pixels()[i] == *transparent
+                            }
+                        };
+                        if take {
+                            merged[i] = o;
                         }
                     }
                 }
@@ -782,12 +929,28 @@ impl Command {
             | Command::GotoFrame { .. }
             | Command::SetFrameRate { .. }
             | Command::MoveBrush { .. } => unreachable!("frame commands are applied above"),
+            Command::AddLayer { .. }
+            | Command::DuplicateLayer { .. }
+            | Command::DeleteLayer { .. }
+            | Command::MoveLayer { .. }
+            | Command::SelectLayer { .. }
+            | Command::SetLayerVisible { .. }
+            | Command::RenameLayer { .. }
+            | Command::MergeLayerDown { .. }
+            | Command::FlattenLayers
+            | Command::SetPicture { .. } => unreachable!("layer commands are applied above"),
+            Command::RemapColors { from } => {
+                let lower = crate::remap::nearest_lut(from, &doc.palette);
+                let upper = crate::remap::nearest_lut_upper(from, &doc.palette);
+                doc.for_each_cel(|layer, cel| {
+                    *cel = crate::remap::remap_with(cel, if layer == 0 { &lower } else { &upper });
+                });
+            }
             Command::ArrangePalette { order } => {
-                // Every animation frame shares the palette (ADR-28), so all are renumbered.
-                doc.for_each_frame(|frame| {
-                    let pixels = crate::remap::reindex(frame.pixels(), order);
-                    *frame = IndexedImage::from_pixels(frame.width(), frame.height(), pixels)
-                        .expect("same size");
+                // Every animation frame and layer shares the palette (ADR-28, ADR-44), so
+                // all are renumbered; above the bottom layer colour 0 stays transparent.
+                doc.for_each_cel(|layer, cel| {
+                    *cel = crate::remap::arranged_picture(cel, order, layer > 0);
                 });
                 doc.palette =
                     Palette::new(crate::remap::arranged_palette(doc.palette.colors(), order))
@@ -937,7 +1100,12 @@ pub(crate) fn check_area(
 }
 
 /// Checks a page passed in a command: `width`×`height` pixels, all inside the palette.
-fn other_page(width: u32, height: u32, pixels: &[u8], colors: usize) -> Result<(), CommandError> {
+pub(crate) fn other_page(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    colors: usize,
+) -> Result<(), CommandError> {
     if !(1..=MAX_PAGE_SIDE).contains(&width) || !(1..=MAX_PAGE_SIDE).contains(&height) {
         return Err(CommandError::invalid(format!(
             "page {width}x{height} is outside 1..={MAX_PAGE_SIDE}"
@@ -957,6 +1125,13 @@ fn other_page(width: u32, height: u32, pixels: &[u8], colors: usize) -> Result<(
         )),
         _ => Ok(()),
     }
+}
+
+/// True if a layer above the bottom one of any frame uses colour `c` (ADR-44).
+fn upper_layers_use(doc: &Document, c: u8) -> bool {
+    (1..doc.layer_count()).any(|l| {
+        (0..doc.frame_count()).any(|f| doc.cel(f, l).is_some_and(|p| p.pixels().contains(&c)))
+    })
 }
 
 /// Keeps the first `n` entries; missing ones become a grey ramp from black to white. Every

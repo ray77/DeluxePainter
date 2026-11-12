@@ -1052,7 +1052,7 @@ mod tests {
             vec![egui::Event::PointerMoved(elsewhere)],
         );
         assert!(app.stroke.is_none());
-        assert_eq!(app.page(), app.engine.document().page());
+        assert_eq!(&*app.page(), app.engine.document().page());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

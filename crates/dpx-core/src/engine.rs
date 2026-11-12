@@ -60,6 +60,8 @@ enum Before {
     /// Arrange Palette: the order that arranges the palette and every frame back. Exact, and
     /// no copy of the frames is kept.
     Arranged(Vec<u8>),
+    /// Layer names and visibility (ADR-44).
+    LayerInfo(Vec<crate::Layer>),
 }
 
 impl Before {
@@ -71,6 +73,7 @@ impl Before {
             Before::Pixels { pixels, .. } => pixels.pixels().len() as u64,
             Before::Palette(p) => 3 * p.len() as u64,
             Before::Arranged(order) => order.len() as u64,
+            Before::LayerInfo(layers) => layers.iter().map(|l| l.name.len() as u64 + 1).sum(),
             Before::Document(snapshot) => {
                 let mut seen: HashSet<*const IndexedImage> =
                     doc.others.iter().map(Arc::as_ptr).collect();
@@ -112,8 +115,18 @@ fn command_bytes(command: &Command) -> u64 {
             points(brush.len() + n) + custom(c)
         }
         Command::SetPage { pixels, .. } | Command::MergePage { pixels, .. } => pixels.len() as u64,
-        Command::SetPalette { colors } => 3 * colors.len() as u64,
+        Command::SetPalette { colors } | Command::RemapColors { from: colors } => {
+            3 * colors.len() as u64
+        }
+        Command::AddLayer { name: Some(name) } | Command::RenameLayer { name, .. } => {
+            name.len() as u64
+        }
         Command::ArrangePalette { order } => order.len() as u64,
+        Command::SetPicture { layers, frames, .. } => {
+            let names: u64 = layers.iter().map(|l| l.name.len() as u64).sum();
+            let pixels: u64 = frames.iter().flatten().map(|p| p.len() as u64).sum();
+            names + pixels
+        }
         Command::AnimBrushPaint { brush, paint } => brush.bytes() + command_bytes(paint),
         Command::MoveBrush {
             brush,
@@ -140,6 +153,8 @@ struct Step {
     before: Before,
     /// The current frame when the command ran (ADR-28): undo and redo go back to it.
     frame: usize,
+    /// The active layer when the command ran (ADR-44): undo and redo go back to it.
+    layer: usize,
     /// Memory this step keeps (its snapshot and its command's data), for the byte budget.
     bytes: u64,
 }
@@ -148,9 +163,9 @@ struct Step {
 pub struct Engine {
     doc: Document,
     undo: VecDeque<Step>,
-    /// Undone commands with their frame, most recent last; redo replays them (commands are
-    /// deterministic).
-    redo: Vec<(Command, usize)>,
+    /// Undone commands with their frame and active layer, most recent last; redo replays
+    /// them (commands are deterministic).
+    redo: Vec<(Command, usize, usize)>,
     undo_limit: usize,
     /// Most bytes the undo steps may keep together; beyond it the oldest steps are dropped.
     undo_byte_limit: u64,
@@ -204,7 +219,9 @@ impl Engine {
     /// The command the next [`Self::redo`] replays, with the frame it runs on (after an undo:
     /// the command just undone).
     pub fn next_redo(&self) -> Option<(&Command, usize)> {
-        self.redo.last().map(|(command, frame)| (command, *frame))
+        self.redo
+            .last()
+            .map(|(command, frame, _)| (command, *frame))
     }
 
     /// Validates and executes a command as one undo step. A new command clears the redo list.
@@ -243,18 +260,19 @@ impl Engine {
         Ok(outcome(self))
     }
 
-    /// Reverts the most recent step. A pixel step of another frame makes that frame current
-    /// first, so the change shows (ADR-28); the outcome then names the whole page.
+    /// Reverts the most recent step. A pixel step of another frame or layer makes that frame
+    /// current and that layer active first, so the change shows (ADR-28, ADR-44); the
+    /// outcome then names the whole page.
     pub fn undo(&mut self) -> Result<Outcome, CommandError> {
         let step = self
             .undo
             .pop_back()
             .ok_or_else(|| CommandError::new(ErrorCode::NothingToUndo, "nothing to undo"))?;
         self.undo_bytes -= step.bytes;
-        let switched = step.frame != self.doc.current;
+        let switched = (step.frame, step.layer) != (self.doc.current, self.doc.active);
         let footprint = match step.before {
             Before::Pixels { rect, pixels } => {
-                self.doc.go_to(step.frame);
+                self.doc.focus(step.frame, step.layer);
                 self.doc.page.blit(&pixels, rect.x, rect.y);
                 Footprint::Pixels(rect)
             }
@@ -271,28 +289,32 @@ impl Engine {
                 Footprint::Document
             }
             Before::Arranged(order) => {
-                // Back on its frame, as a document snapshot would be.
-                self.doc.go_to(step.frame);
+                // Back on its frame and layer, as a document snapshot would be.
+                self.doc.focus(step.frame, step.layer);
                 Command::ArrangePalette { order }.apply(&mut self.doc);
                 Footprint::Document
             }
+            Before::LayerInfo(layers) => {
+                self.doc.layers = layers;
+                Footprint::LayerInfo
+            }
         };
-        self.redo.push((step.command, step.frame));
+        self.redo.push((step.command, step.frame, step.layer));
         self.doc.revision += 1;
         Ok(self.outcome_on(footprint, switched))
     }
 
-    /// Re-applies the most recently undone command, on the frame it first ran on (the
-    /// outcome names the whole page when that frame was not current).
+    /// Re-applies the most recently undone command, on the frame and layer it first ran on
+    /// (the outcome names the whole page when they were not current).
     pub fn redo(&mut self) -> Result<Outcome, CommandError> {
-        let (command, frame) = self
+        let (command, frame, layer) = self
             .redo
             .pop()
             .ok_or_else(|| CommandError::new(ErrorCode::NothingToRedo, "nothing to redo"))?;
         // The document is back in the state the command was first validated against (only
-        // the current frame may differ: settings keep the redo list).
-        let switched = frame != self.doc.current;
-        self.doc.go_to(frame);
+        // the current frame and the active layer may differ: settings keep the redo list).
+        let switched = (frame, layer) != (self.doc.current, self.doc.active);
+        self.doc.focus(frame, layer);
         command.validate(&self.doc)?;
         let footprint = command.footprint(&self.doc);
         let rounded_colors = command.rounded_colors(&self.doc);
@@ -314,18 +336,21 @@ impl Engine {
                 pixels: self.doc.page.crop(rect),
             },
             (_, Footprint::Palette) => Before::Palette(self.doc.palette.clone()),
-            // Other frames are shared, not copied (Arc).
-            (_, Footprint::Document | Footprint::Frames | Footprint::Setting) => {
-                Before::Document(Box::new(self.doc.clone()))
-            }
+            (_, Footprint::LayerInfo) => Before::LayerInfo(self.doc.layers.clone()),
+            // Other frames and layers are shared, not copied (Arc).
+            (
+                _,
+                Footprint::Document | Footprint::Frames | Footprint::Layers | Footprint::Setting,
+            ) => Before::Document(Box::new(self.doc.clone())),
         };
-        let frame = self.doc.current;
+        let (frame, layer) = (self.doc.current, self.doc.active);
         command.apply(&mut self.doc);
         let bytes = before.bytes(&self.doc) + command_bytes(&command);
         self.undo.push_back(Step {
             command,
             before,
             frame,
+            layer,
             bytes,
         });
         self.undo_bytes += bytes;
@@ -355,7 +380,10 @@ impl Engine {
             Footprint::Pixels(r) => ((!r.is_empty()).then_some(r), false, false),
             Footprint::Palette => (None, true, false),
             Footprint::Document => (Some(self.doc.page.bounds()), true, true),
-            Footprint::Frames | Footprint::Setting => (Some(self.doc.page.bounds()), false, false),
+            // ADR-44: what the page shows changes with the layers.
+            Footprint::Frames | Footprint::Setting | Footprint::Layers | Footprint::LayerInfo => {
+                (Some(self.doc.page.bounds()), false, false)
+            }
         };
         Outcome {
             revision: self.doc.revision,
@@ -1677,6 +1705,44 @@ mod tests {
         }
         assert!(e.document().frames().all(|f| f.get(0, 0) == Some(0)));
         assert_eq!(e.document().palette(), &Palette::dpaint_default_32());
+    }
+
+    #[test]
+    fn layer_steps_share_the_frames_pictures() {
+        // ADR-44: a new layer is one clear picture shared by every frame, a copy shares the
+        // copied pictures; their undo steps keep about one page, not the animation.
+        let mut e = Engine::new(Document::new(64, 64, Palette::dpaint_default_32()));
+        e.execute(Command::SetFrameCount { count: 200 }).unwrap();
+        let animation = 200 * 64 * 64;
+        for cmd in [
+            Command::AddLayer { name: None },
+            Command::DuplicateLayer { layer: 1 },
+            Command::MoveLayer { from: 2, to: 1 },
+            Command::SetLayerVisible {
+                layer: 0,
+                visible: false,
+            },
+            Command::RenameLayer {
+                layer: 0,
+                name: "Sky".into(),
+            },
+            Command::DeleteLayer { layer: 2 },
+        ] {
+            e.execute(cmd.clone()).unwrap();
+            assert_eq!(e.undo_bytes, e.undo.iter().map(|s| s.bytes).sum::<u64>());
+            assert!(held_bytes(&e) <= e.undo_bytes, "{cmd:?}");
+            assert!(e.undo_bytes < animation / 10, "{cmd:?}: {}", e.undo_bytes);
+        }
+        // Merging pictures that hold something makes new ones; the step keeps the old ones.
+        e.execute(Command::Clear { color: 3 }).unwrap();
+        e.execute(Command::MergeLayerDown { layer: 1 }).unwrap();
+        assert!(held_bytes(&e) <= e.undo_bytes);
+        while e.can_undo() {
+            e.undo().unwrap();
+        }
+        assert_eq!(e.document().layer_count(), 1);
+        assert_eq!(e.document().frame_count(), 1);
+        assert_eq!(e.undo_bytes, 0);
     }
 
     #[test]

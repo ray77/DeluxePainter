@@ -26,13 +26,22 @@ pub const MAX_FPS: u8 = 60;
 /// Most frames of `width`×`height` pixels within [`MAX_FRAMES`] and [`MAX_FRAME_BYTES`]
 /// (at least one: a single page is always allowed).
 pub fn max_frames_for(width: u32, height: u32) -> usize {
-    let bytes = u64::from(width) * u64::from(height);
+    max_frames_for_layers(width, height, 1)
+}
+
+/// Most frames of `layers` pictures of `width`×`height` pixels each (ADR-44: every frame
+/// holds one picture per layer) within [`MAX_FRAMES`] and [`MAX_FRAME_BYTES`]. With one
+/// layer at least one (a single page is always allowed); with more, 0 when even one frame
+/// of that many layers holds more than [`MAX_FRAME_BYTES`].
+pub fn max_frames_for_layers(width: u32, height: u32, layers: usize) -> usize {
+    let bytes = u64::from(width) * u64::from(height) * layers.max(1) as u64;
     if bytes == 0 {
         return MAX_FRAMES;
     }
-    usize::try_from(MAX_FRAME_BYTES / bytes)
+    let n = usize::try_from(MAX_FRAME_BYTES / bytes)
         .unwrap_or(MAX_FRAMES)
-        .clamp(1, MAX_FRAMES)
+        .min(MAX_FRAMES);
+    if layers <= 1 { n.max(1) } else { n }
 }
 
 /// Effect ▸ LightTable: which other images show behind the current frame, and whether they

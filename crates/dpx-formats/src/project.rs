@@ -2,7 +2,9 @@
 //!
 //! A ZIP container with a JSON manifest and one indexed PNG per layer of every animation
 //! frame. Single-frame documents are written as format version 1, exactly as before frames
-//! existed; animations as version 2 (ADR-28). The reader validates
+//! existed; animations as version 2 (ADR-28); documents with more than one layer, or one
+//! layer that is not the default visible "Background", as version 3 (ADR-44). The reader
+//! validates
 //! everything it is given (versions, entry names, sizes, PNG kind and palette) and the writer
 //! is deterministic, so the same project always gives the same bytes. The app maps its
 //! picture-file extras (colour ranges, grab point, transparent colour) from and to
@@ -12,7 +14,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{Cursor, Read, Write};
 
-use dpx_core::{Document, IndexedImage, Palette, Rgb8, Target, anim};
+use dpx_core::{Document, IndexedImage, Layer, Palette, Rgb8, Target, anim, layer};
 use serde::{Deserialize, Serialize};
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
@@ -22,14 +24,19 @@ use crate::png_io::{PngImage, read_png, write_png};
 /// The format name in the manifest.
 pub const FORMAT: &str = "dpxproj";
 /// The newest format version this build reads. Version 1: one frame; version 2 (ADR-28):
-/// 1..N animation frames plus the current frame and the playback rate.
-pub const FORMAT_VERSION: u32 = 2;
+/// 1..N animation frames plus the current frame and the playback rate; version 3 (ADR-44):
+/// the layer stack (names, visibility, the active layer) and one picture per layer of
+/// every frame.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The version a document is written as: 1 for a single frame (byte-identical to the files
-/// of earlier builds, so they stay readable by them), 2 for an animation.
+/// of earlier builds, so they stay readable by them), 2 for an animation, 3 for a document
+/// whose layers are not the one visible "Background" layer of every earlier document.
 pub fn format_version_for(doc: &Document) -> u32 {
-    // Version 1 has no fps field: a one-frame document with its own rate needs version 2.
-    if doc.frame_count() > 1 || doc.fps() != anim::DEFAULT_FPS {
+    if !layer::is_default_stack(doc.layers()) {
+        3
+    } else if doc.frame_count() > 1 || doc.fps() != anim::DEFAULT_FPS {
+        // Version 1 has no fps field: a one-frame document with its own rate needs version 2.
         2
     } else {
         1
@@ -38,7 +45,6 @@ pub fn format_version_for(doc: &Document) -> u32 {
 
 const MANIFEST: &str = "manifest.json";
 const SPARE_PATH: &str = "spare/page.png";
-const LAYER_NAME: &str = "Background";
 
 /// What the reader accepts. [`Limits::default`] is for real use; tests lower the numbers.
 #[derive(Clone, Copy, Debug)]
@@ -56,7 +62,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_entries: 1024,
+            // Every picture a document may hold (ADR-44: 999 frames of 32 layers on a small
+            // page), the manifest and the spare page.
+            max_entries: anim::MAX_FRAMES * layer::MAX_LAYERS + 2,
             max_total_bytes: 256 * 1024 * 1024,
             max_manifest_bytes: 1024 * 1024,
             max_pixels: 64 * 1024 * 1024,
@@ -184,6 +192,20 @@ struct Manifest {
     /// Version 2: playback rate in frames per second (1 to 60).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fps: Option<u8>,
+    /// Version 3: the layer stack, bottom first (ADR-44).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layers: Option<Vec<StackEntry>>,
+    /// Version 3: the active layer when the project was saved (0 = bottom).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_layer: Option<u32>,
+}
+
+/// One layer of the stack (version 3).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StackEntry {
+    name: String,
+    visible: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,7 +224,11 @@ struct FrameEntry {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LayerEntry {
-    name: String,
+    /// The layer's name: in every entry of versions 1 and 2. Version 3 names its layers once,
+    /// in the stack, and writes none here (so long names do not repeat for every frame and
+    /// the manifest stays small); a name read here must then be the stack's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     image: String,
 }
 
@@ -228,10 +254,13 @@ pub fn write_project(project: &Project) -> Result<Vec<u8>, ProjectError> {
     let png = |image: &IndexedImage| {
         write_png(image, palette).map_err(|e| ProjectError::Write(e.to_string()))
     };
-    let frame_pngs = doc.frames().map(png).collect::<Result<Vec<_>, _>>()?;
+    // Frame by frame, bottom layer first (one picture per frame for a single layer).
+    let cel_pngs = doc.cels().map(png).collect::<Result<Vec<_>, _>>()?;
     let spare_png = project.spare.as_ref().map(png).transpose()?;
     let version = format_version_for(doc);
     let animated = version >= 2;
+    let layered = version >= 3;
+    let layers = doc.layers();
     let manifest = Manifest {
         format: FORMAT.into(),
         format_version: version,
@@ -245,12 +274,16 @@ pub fn write_project(project: &Project) -> Result<Vec<u8>, ProjectError> {
         ranges: project.extras.ranges.clone(),
         grab: project.extras.grab,
         transparent_color: project.extras.transparent_color,
-        frames: (0..frame_pngs.len())
+        frames: (0..doc.frame_count())
             .map(|f| FrameEntry {
-                layers: vec![LayerEntry {
-                    name: LAYER_NAME.into(),
-                    image: layer_path(f, 0),
-                }],
+                layers: layers
+                    .iter()
+                    .enumerate()
+                    .map(|(l, layer)| LayerEntry {
+                        name: (!layered).then(|| layer.name.clone()),
+                        image: layer_path(f, l),
+                    })
+                    .collect(),
             })
             .collect(),
         spare: project.spare.as_ref().map(|s| SpareEntry {
@@ -260,14 +293,25 @@ pub fn write_project(project: &Project) -> Result<Vec<u8>, ProjectError> {
         }),
         current_frame: animated.then_some(doc.current_frame() as u32),
         fps: animated.then_some(doc.fps()),
+        layers: layered.then(|| {
+            layers
+                .iter()
+                .map(|l| StackEntry {
+                    name: l.name.clone(),
+                    visible: l.visible,
+                })
+                .collect()
+        }),
+        active_layer: layered.then_some(doc.active_layer() as u32),
     };
     let mut json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| ProjectError::Write(format!("manifest: {e}")))?;
     json.push(b'\n');
 
     let mut entries: Vec<(String, Vec<u8>)> = vec![(MANIFEST.into(), json)];
-    for (f, data) in frame_pngs.into_iter().enumerate() {
-        entries.push((layer_path(f, 0), data));
+    let count = layers.len();
+    for (i, data) in cel_pngs.into_iter().enumerate() {
+        entries.push((layer_path(i / count, i % count), data));
     }
     if let Some(spare) = spare_png {
         entries.push((SPARE_PATH.into(), spare));
@@ -421,9 +465,14 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
         .collect::<Result<Vec<_>, _>>()?;
     let palette = Palette::new(colors).map_err(|e| invalid(format!("palette: {e}")))?;
 
-    // Frames: version 1 holds exactly one, version 2 one or more (ADR-28); every frame has
-    // exactly one layer so far.
+    // Frames: version 1 holds exactly one, versions 2 and 3 one or more (ADR-28); every frame
+    // has one layer up to version 2, the layers of the stack in version 3 (ADR-44).
     let version = m.format_version;
+    if version < 3 && (m.layers.is_some() || m.active_layer.is_some()) {
+        return Err(invalid(format!(
+            "version {version} has no layers or active_layer (they came with version 3)"
+        )));
+    }
     if version == 1 {
         if m.frames.len() != 1 {
             return Err(invalid(format!(
@@ -439,10 +488,53 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
     } else if m.frames.is_empty() {
         return Err(invalid("the manifest lists no frames"));
     }
-    let max_frames = anim::max_frames_for(m.page.width, m.page.height);
+    // The layer stack: version 3 names it, earlier versions have the one layer of their
+    // frames (named as in the first frame; earlier builds always wrote "Background").
+    let (stack, active): (Vec<Layer>, usize) = if version >= 3 {
+        let (Some(stack), Some(active)) = (&m.layers, m.active_layer) else {
+            return Err(invalid(format!(
+                "version {version} needs layers and active_layer"
+            )));
+        };
+        if stack.is_empty() || stack.len() > layer::MAX_LAYERS {
+            return Err(invalid(format!(
+                "{} layers: 1 to {} are accepted",
+                stack.len(),
+                layer::MAX_LAYERS
+            )));
+        }
+        if active as usize >= stack.len() {
+            return Err(invalid(format!(
+                "active_layer {active} is outside the {} layers (counted from 0)",
+                stack.len()
+            )));
+        }
+        let stack = stack
+            .iter()
+            .map(|l| Layer {
+                name: l.name.clone(),
+                visible: l.visible,
+            })
+            .collect();
+        (stack, active as usize)
+    } else {
+        let name = m
+            .frames
+            .first()
+            .and_then(|f| f.layers.first())
+            .and_then(|l| l.name.clone())
+            .unwrap_or_else(|| layer::BACKGROUND.to_string());
+        (vec![Layer::new(name)], 0)
+    };
+    let max_frames = anim::max_frames_for_layers(m.page.width, m.page.height, stack.len());
     if m.frames.len() > max_frames {
+        let of = if stack.len() > 1 {
+            format!(" of {} layers", stack.len())
+        } else {
+            String::new()
+        };
         return Err(ProjectError::TooLarge(format!(
-            "{} frames of {}x{} pixels; at most {max_frames} are accepted.",
+            "{} frames{of} of {}x{} pixels; at most {max_frames} are accepted.",
             m.frames.len(),
             m.page.width,
             m.page.height
@@ -470,19 +562,45 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
             anim::MAX_FPS
         )));
     }
-    let mut layers: Vec<&LayerEntry> = Vec::with_capacity(m.frames.len());
+    let mut layers: Vec<&LayerEntry> = Vec::with_capacity(m.frames.len() * stack.len());
     for (f, frame) in m.frames.iter().enumerate() {
-        let [layer] = frame.layers.as_slice() else {
-            return Err(invalid(format!(
-                "frame {f} must hold exactly one layer, the manifest lists {}",
-                frame.layers.len()
-            )));
-        };
-        if layer.name.chars().count() > 255 {
-            return Err(invalid("layer name is longer than 255 characters"));
+        if frame.layers.len() != stack.len() {
+            return Err(invalid(if stack.len() == 1 {
+                format!(
+                    "frame {f} must hold exactly one layer, the manifest lists {}",
+                    frame.layers.len()
+                )
+            } else {
+                format!(
+                    "frame {f} must hold the {} layers, the manifest lists {}",
+                    stack.len(),
+                    frame.layers.len()
+                )
+            }));
         }
-        check_name(&layer.image)?;
-        layers.push(layer);
+        for (l, entry) in frame.layers.iter().enumerate() {
+            match &entry.name {
+                None if version < 3 => {
+                    return Err(invalid(format!(
+                        "frame {f} layer {l} has no name (version {version} names every \
+                         frame's layer)"
+                    )));
+                }
+                None => {}
+                Some(name) if name.chars().count() > layer::MAX_NAME_CHARS => {
+                    return Err(invalid("layer name is longer than 255 characters"));
+                }
+                Some(name) if version >= 3 && *name != stack[l].name => {
+                    return Err(invalid(format!(
+                        "frame {f} layer {l} is called {name:?}, the stack says {:?}",
+                        stack[l].name
+                    )));
+                }
+                Some(_) => {}
+            }
+            check_name(&entry.image)?;
+            layers.push(entry);
+        }
     }
     if let Some(s) = &m.spare {
         check_name(&s.image)?;
@@ -512,10 +630,14 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
         let data = read_entry(path, budget)?;
         decode_layer(path, &data, w, h, &palette, limits)
     };
-    let frames = layers
+    let cels = layers
         .iter()
         .map(|l| image(&l.image, m.page.width, m.page.height))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut cels = cels.into_iter();
+    let frames: Vec<Vec<IndexedImage>> = (0..m.frames.len())
+        .map(|_| cels.by_ref().take(stack.len()).collect())
+        .collect();
     let spare = match &m.spare {
         Some(s) => Some(image(&s.image, s.width, s.height)?),
         None => None,
@@ -537,7 +659,7 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
     // mode, the palette fits its colour count and OCS entries are 12-bit.
     dpx_core::hardware::check_palette(m.target, &palette)
         .map_err(|e| ProjectError::Hardware(format!("{}.", e.message)))?;
-    let document = Document::from_frames(frames, current, fps, palette, m.target)
+    let document = Document::from_layers(frames, stack, current, active, fps, palette, m.target)
         .map_err(|e| invalid(e.message))?;
     let extras = ProjectExtras {
         ranges: m.ranges,
@@ -1139,11 +1261,267 @@ mod tests {
             m["frames"] = serde_json::Value::Array(vec![one; 1000]);
         });
         assert!(matches!(many, Err(ProjectError::TooLarge(_))));
-        // A newer version than 2 is named.
+        // Version 3 needs its layer fields; a newer version than 3 is named.
+        assert!(err(&|m| m["format_version"] = 3.into()).contains("needs layers"));
         assert!(matches!(
-            changed(&|m| m["format_version"] = 3.into()),
-            Err(ProjectError::NewerVersion(3))
+            changed(&|m| m["format_version"] = 4.into()),
+            Err(ProjectError::NewerVersion(4))
         ));
+        // A version-2 manifest cannot carry the version-3 fields.
+        assert!(err(&|m| m["active_layer"] = 0.into()).contains("came with version 3"));
+    }
+
+    /// `frames` frames of three layers ("Background", "Sky" hidden, "Top"): layer `l` of
+    /// frame `f` holds a pattern of its own; frame `current` and layer `active` current.
+    fn layered(frames: usize, current: usize, active: usize) -> Project {
+        let colors = 16;
+        let cel = |f: usize, l: usize| {
+            let mut img = IndexedImage::new(12, 6, 0);
+            for y in 0..6 {
+                for x in 0..12 {
+                    let v = (x * (l + 1) + y * 3 + f * 5) % colors;
+                    // Upper layers keep holes of colour 0 (transparent).
+                    let v = if l > 0 && (x + y + f).is_multiple_of(3) {
+                        0
+                    } else {
+                        v
+                    };
+                    img.set(x as i32, y as i32, v as u8);
+                }
+            }
+            img
+        };
+        let pictures = (0..frames)
+            .map(|f| (0..3).map(|l| cel(f, l)).collect())
+            .collect();
+        let mut stack = vec![Layer::background(), Layer::new("Sky"), Layer::new("Top")];
+        stack[1].visible = false;
+        let doc = Document::from_layers(
+            pictures,
+            stack,
+            current,
+            active,
+            12,
+            sample_palette(colors),
+            Target::default(),
+        )
+        .unwrap();
+        Project::new(doc, ProjectExtras::default())
+    }
+
+    #[test]
+    fn layered_animations_round_trip_bit_identical_as_version_3() {
+        let p = layered(4, 2, 1);
+        let bytes = write_project(&p).unwrap();
+        let back = read_project(&bytes).unwrap();
+        // Every picture of every frame and layer, the stack, the active layer and the
+        // current frame come back exactly.
+        assert_eq!(back.document, p.document);
+        assert_eq!(
+            back.document.cels().collect::<Vec<_>>(),
+            p.document.cels().collect::<Vec<_>>()
+        );
+        assert_eq!(back.document.layers(), p.document.layers());
+        assert_eq!(
+            (back.document.current_frame(), back.document.active_layer()),
+            (2, 1)
+        );
+        assert_eq!(bytes, write_project(&back).unwrap(), "deterministic");
+        let m = manifest_of(&bytes);
+        assert_eq!(m["format_version"], 3);
+        assert_eq!(m["active_layer"], 1);
+        assert_eq!(
+            m["layers"],
+            serde_json::json!([
+                { "name": "Background", "visible": true },
+                { "name": "Sky", "visible": false },
+                { "name": "Top", "visible": true }
+            ])
+        );
+        assert_eq!(m["layers"][2]["name"], "Top");
+        assert_eq!(
+            m["frames"][1]["layers"][2],
+            serde_json::json!({ "image": "frames/1/layers/2.png" }),
+            "the frames do not repeat the names"
+        );
+        let names: Vec<String> = entries(&bytes).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names.len(), 1 + 4 * 3);
+        assert_eq!(
+            names[..5],
+            [
+                "manifest.json",
+                "frames/0/layers/0.png",
+                "frames/0/layers/1.png",
+                "frames/0/layers/2.png",
+                "frames/1/layers/0.png",
+            ]
+        );
+        // One frame of several layers is version 3 too.
+        let one = layered(1, 0, 2);
+        let bytes = write_project(&one).unwrap();
+        assert_eq!(manifest_of(&bytes)["format_version"], 3);
+        assert_eq!(read_project(&bytes).unwrap().document, one.document);
+    }
+
+    #[test]
+    fn a_single_layer_is_version_3_only_when_it_is_not_the_default() {
+        let doc = project(8, 4, 4).document;
+        assert_eq!(format_version_for(&doc), 1);
+        let renamed = Document::from_layers(
+            vec![vec![doc.page().clone()]],
+            vec![Layer::new("Ink")],
+            0,
+            0,
+            anim::DEFAULT_FPS,
+            doc.palette().clone(),
+            doc.target(),
+        )
+        .unwrap();
+        let hidden = Document::from_layers(
+            vec![vec![doc.page().clone()]],
+            vec![Layer {
+                visible: false,
+                ..Layer::background()
+            }],
+            0,
+            0,
+            anim::DEFAULT_FPS,
+            doc.palette().clone(),
+            doc.target(),
+        )
+        .unwrap();
+        for d in [renamed, hidden] {
+            let bytes = write_project(&Project::new(d.clone(), ProjectExtras::default())).unwrap();
+            assert_eq!(manifest_of(&bytes)["format_version"], 3);
+            assert_eq!(read_project(&bytes).unwrap().document, d);
+        }
+    }
+
+    #[test]
+    fn version_3_rules_are_checked() {
+        let bytes = write_project(&layered(2, 1, 2)).unwrap();
+        let changed = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut e = entries(&bytes);
+            let mut m = manifest_of(&bytes);
+            f(&mut m);
+            e[0].1 = serde_json::to_vec(&m).unwrap();
+            read_project(&zip_entries(&e).unwrap())
+        };
+        let err = |f: &dyn Fn(&mut serde_json::Value)| changed(f).unwrap_err().details();
+        assert!(changed(&|_| {}).is_ok());
+        assert!(
+            err(&|m| {
+                m.as_object_mut().unwrap().remove("layers");
+            })
+            .contains("needs layers")
+        );
+        assert!(err(&|m| m["active_layer"] = 3.into()).contains("active_layer"));
+        assert!(err(&|m| m["layers"] = serde_json::json!([])).contains("1 to"));
+        // A frame entry may name its layer, as the stack does.
+        assert!(changed(&|m| m["frames"][1]["layers"][1]["name"] = "Sky".into()).is_ok());
+        assert!(
+            err(&|m| m["frames"][1]["layers"][1]["name"] = "Sea".into()).contains("the stack says")
+        );
+        assert!(err(&|m| m["layers"][1]["name"] = "x".repeat(256).into()).contains("255"));
+        assert!(err(&|m| m["layers"][1]["opacity"] = 50.into()).contains("unknown field"));
+        // A frame without all layers, and a layer whose picture is missing.
+        assert!(
+            err(&|m| {
+                m["frames"][0]["layers"].as_array_mut().unwrap().pop();
+            })
+            .contains("must hold the 3 layers")
+        );
+        let mut e = entries(&bytes);
+        e.retain(|(n, _)| n != "frames/1/layers/1.png");
+        let missing = read_project(&zip_entries(&e).unwrap()).unwrap_err();
+        assert!(missing.details().contains("missing entry"), "{missing}");
+        // Too many layers.
+        assert!(
+            err(&|m| {
+                let one = m["layers"][0].clone();
+                m["layers"] = serde_json::Value::Array(vec![one; layer::MAX_LAYERS + 1]);
+            })
+            .contains("layers")
+        );
+        // Frames times layers beyond the memory limit are refused before decoding: 3 layers
+        // of 2048x2048 pictures leave room for 10 frames.
+        let many = changed(&|m| {
+            m["page"] = serde_json::json!({ "width": 2048, "height": 2048 });
+            let one = m["frames"][0].clone();
+            m["frames"] = serde_json::Value::Array(vec![one; 11]);
+        });
+        assert!(matches!(many, Err(ProjectError::TooLarge(_))), "{many:?}");
+    }
+
+    #[test]
+    fn older_versions_keep_their_layer_name() {
+        let bytes = with_manifest(|m| m["frames"][0]["layers"][0]["name"] = "Ink".into());
+        let back = read_project(&bytes).unwrap();
+        assert_eq!(back.document.layers(), [Layer::new("Ink")]);
+        // Versions 1 and 2 name every frame's layer.
+        let bytes = with_manifest(|m| {
+            m["frames"][0]["layers"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("name");
+        });
+        let e = read_project(&bytes).unwrap_err();
+        assert!(e.details().contains("has no name"), "{e}");
+        let bytes = write_project(&project(8, 4, 4)).unwrap();
+        assert_eq!(
+            read_project(&bytes).unwrap().document.layers(),
+            [Layer::background()]
+        );
+    }
+
+    /// The largest manifests the program writes: every picture entry a document may hold on
+    /// the smallest page any mode allows (320x200; frames times layers within 128 MiB) and
+    /// layer names of 255 characters that JSON writes as six bytes each. They must stay
+    /// readable: before the frames stopped repeating the names, 21 frames of 32 such layers
+    /// already passed the 1 MiB the reader takes.
+    #[test]
+    fn the_largest_layered_documents_read_back() {
+        let screen = Target {
+            screen: (320, 200),
+            ..Target::default()
+        };
+        let worst = |layers: usize| {
+            let frames = anim::max_frames_for_layers(320, 200, layers);
+            let blank = IndexedImage::new(320, 200, 0);
+            let name = |l: usize| {
+                let mut n: String = "\u{1}".repeat(layer::MAX_NAME_CHARS - 3);
+                n.push_str(&format!("{l:03}"));
+                n
+            };
+            let stack = (0..layers).map(|l| Layer::new(name(l))).collect();
+            let pictures = vec![vec![blank; layers]; frames];
+            let doc = Document::from_layers(
+                pictures,
+                stack,
+                frames - 1,
+                layers - 1,
+                anim::MAX_FPS,
+                sample_palette(256),
+                screen,
+            )
+            .unwrap();
+            (Project::new(doc, ProjectExtras::default()), frames * layers)
+        };
+        // 3 layers give the most pictures (699 frames, 2097 pictures), 32 the longest stack.
+        for layers in [3, layer::MAX_LAYERS] {
+            let (p, pictures) = worst(layers);
+            assert!(pictures >= 2080, "{pictures}");
+            let bytes = write_project(&p).unwrap();
+            let manifest = &entries(&bytes)[0].1;
+            assert!(
+                (manifest.len() as u64) < Limits::default().max_manifest_bytes / 4,
+                "{} bytes",
+                manifest.len()
+            );
+            let back = read_project(&bytes).unwrap();
+            assert_eq!(back.document.layers(), p.document.layers());
+            assert_eq!(back.document.frame_count(), p.document.frame_count());
+        }
     }
 
     #[test]

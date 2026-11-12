@@ -190,6 +190,7 @@ pub fn validate_hardware(doc: &Document) -> Result<(), ToolError> {
 /// mode's CAMG, pixel aspect and screen size; PNG cannot store the display mode (noted).
 /// Every format names a custom or overscan screen, and IFF what the file cannot carry of the
 /// target (`dpx_core::hardware::export_notes`, as the app's exports, ADR-46).
+/// Every format holds the picture as it shows: the visible layers flattened (ADR-44, noted).
 pub fn encode_document(
     doc: &Document,
     format: Format,
@@ -204,9 +205,11 @@ pub fn encode_document(
             doc.frame_count()
         ));
     }
+    notes.extend(dpx_core::layer::flatten_note(doc.layers()));
     match format {
         Format::Ilbm => {
-            let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
+            let picture = doc.composite().into_owned();
+            let mut out = Ilbm::from_indexed(picture, doc.palette().clone());
             out.camg = Some(doc.target().camg());
             (out.x_aspect, out.y_aspect) = doc.target().mode.aspect();
             let (sw, sh) = doc.target().screen;
@@ -220,7 +223,8 @@ pub fn encode_document(
         Format::Anim => {
             let mode = doc.target().mode;
             let (x_aspect, y_aspect) = mode.aspect();
-            let images: Vec<IndexedImage> = doc.frames().cloned().collect();
+            let images: Vec<IndexedImage> =
+                doc.composite_frames().map(|f| f.into_owned()).collect();
             let opts = dpx_iff::anim::EncodeOptions {
                 hold: dpx_iff::anim::Hold::PerFrame(dpx_iff::anim_doc::holds_for_fps(
                     doc.fps(),
@@ -237,7 +241,7 @@ pub fn encode_document(
             Ok((bytes, notes))
         }
         Format::Png => {
-            let bytes = dpx_formats::write_png(doc.page(), doc.palette())
+            let bytes = dpx_formats::write_png(&doc.composite(), doc.palette())
                 .map_err(|e| ToolError::new("INVALID_FILE", e.to_string()))?;
             notes.push(format!(
                 "PNG cannot store: display mode {}",
@@ -403,6 +407,40 @@ mod tests {
         assert_eq!(format_for_save("a.png").unwrap(), Format::Png);
         assert!(format_for_save("a.jpg").is_err());
         assert!(format_for_save("a").is_err());
+    }
+
+    /// ADR-44: a picture holds what the frames show (all visible layers), with a note.
+    #[test]
+    fn saved_pictures_hold_the_visible_layers() {
+        use dpx_core::{Command, Engine};
+        let mut e = Engine::new(doc());
+        e.execute(Command::AddLayer { name: None }).unwrap();
+        e.execute(Command::Clear { color: 2 }).unwrap();
+        e.execute(Command::AddFrames { count: 1 }).unwrap();
+        // Frame 2's upper layer is cleared: the bottom layer's colour 7 at (3, 4) shows.
+        e.execute(Command::Clear { color: 0 }).unwrap();
+        let d = e.document();
+        for format in [Format::Ilbm, Format::Png, Format::Anim] {
+            let (bytes, notes) = encode_document(d, format).unwrap();
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains("2 layers saved as one picture")),
+                "{format:?}: {notes:?}"
+            );
+            let (back, _) = decode_picture("x", &bytes).unwrap();
+            let last = back.frame_count() - 1;
+            assert_eq!(
+                back.frame(last).unwrap(),
+                d.composite_frame(1).unwrap().as_ref(),
+                "{format:?}"
+            );
+            assert_eq!(back.frame(last).unwrap().get(3, 4), Some(7));
+        }
+        // Frame 1 shows the upper layer's colour 2 everywhere.
+        let (bytes, _) = encode_document(d, Format::Anim).unwrap();
+        let (back, _) = decode_picture("x", &bytes).unwrap();
+        assert!(back.frame(0).unwrap().pixels().iter().all(|&p| p == 2));
     }
 
     #[test]

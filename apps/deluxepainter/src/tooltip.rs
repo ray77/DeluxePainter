@@ -754,6 +754,12 @@ mod tests {
         match target {
             TooltipTarget::Tool { tool, filled } => tool_at(tool, filled),
             TooltipTarget::Panel(b) => panel_at(b, true),
+            // ADR-44: the overlay's button (no key runs one, so no key check reaches it).
+            TooltipTarget::Layer(b) => {
+                let r = dpx_ui::layer_panel::Layout::overlay(SCREEN.0, SCREEN.1, true, true, false)
+                    .button(b);
+                (r.x + r.w / 2, r.y + r.h / 2)
+            }
         }
     }
 

@@ -160,8 +160,8 @@ pub fn validate_picture(doc: &Document) -> Result<(), HardwareError> {
     check(doc, true)
 }
 
-// TODO(wave8-integration): with the layers of ADR-44 an export is the flattened picture; check
-// that (rule 5 over every layer's pixels) rather than the bottom page alone.
+/// Rule 5 covers every picture of every frame and layer (ADR-44): an export is the visible
+/// layers flattened, and every layer must fit the palette, shown or hidden.
 fn check(doc: &Document, smaller_pages: bool) -> Result<(), HardwareError> {
     let t = doc.target();
     let (w, h) = (doc.page().width(), doc.page().height());
@@ -188,7 +188,7 @@ fn check(doc: &Document, smaller_pages: bool) -> Result<(), HardwareError> {
         )));
     }
     check_depth(t, doc.palette())?;
-    if let Some(max) = doc.frames().filter_map(|f| f.pixels().iter().max()).max()
+    if let Some(max) = doc.cels().filter_map(|c| c.pixels().iter().max()).max()
         && usize::from(*max) >= colors
     {
         return Err(error(format!(
@@ -332,6 +332,18 @@ mod tests {
             IndexedImage::new(320, 256, 7),
         ];
         let d = Document::from_frames(frames, 0, 10, two, Target::default()).unwrap();
+        let e = validate(&d).unwrap_err();
+        assert_eq!(e.message, "pixel colour 7 is outside the 2-colour palette");
+        // ... and in any layer, a hidden one above the active bottom layer too (ADR-44).
+        let two = Palette::new(vec![Rgb8::BLACK, Rgb8::WHITE]).unwrap();
+        let frames = vec![vec![
+            IndexedImage::new(320, 256, 1),
+            IndexedImage::new(320, 256, 7),
+        ]];
+        let mut hidden = crate::Layer::new("Top");
+        hidden.visible = false;
+        let layers = vec![crate::Layer::background(), hidden];
+        let d = Document::from_layers(frames, layers, 0, 0, 10, two, Target::default()).unwrap();
         let e = validate(&d).unwrap_err();
         assert_eq!(e.message, "pixel colour 7 is outside the 2-colour palette");
     }

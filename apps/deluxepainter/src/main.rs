@@ -39,6 +39,8 @@
 //!     [--requester-keys K,K..]          keys for `--requester` first: up, down, tab, enter,
 //!                                       or a letter (h Chipset, p Preset) (ADR-46)
 //!     [--export-note NAME]              the note Picture > Export.. shows for NAME (ADR-46)
+//!     [--layers-panel [docked]]         show the layer panel (ADR-44) over the screen's right
+//!                                       edge, or docked in the work area right of the screen
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -51,10 +53,15 @@ mod animbrush;
 mod autosave;
 mod browse;
 mod brush_menu;
+// ADR-44: the composite on screen, in exports and in saved projects.
+#[cfg(test)]
+mod composite_tests;
 mod config;
 mod effects;
 mod files;
 mod import;
+// The layer panel (ADR-44).
+mod layers;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -65,6 +72,7 @@ mod settings;
 mod tools;
 mod tooltip;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -496,7 +504,9 @@ fn main() -> eframe::Result {
                 eprintln!("--light-table: {e}");
                 std::process::exit(2);
             });
-            let page = anim::light_table_page(&doc, doc.page(), light, None, ui.bg, light.dim);
+            // ADR-44: the frame as it shows, all visible layers.
+            let shown = doc.composite();
+            let page = anim::light_table_page(&doc, &shown, light, None, ui.bg, light.dim);
             Document::from_picture(page, doc.palette().clone(), doc.target())
         } else {
             doc
@@ -527,6 +537,8 @@ fn main() -> eframe::Result {
                 recovery::format_utc(recovery::unix_now()),
             ));
         }
+        // ADR-44: the layer panel (`--layers-panel`) or the title bar's layer name.
+        layers::snapshot_ui(&args, &mut engine, &mut ui, view);
         // ADR-41: the tooltip of a resting pointer.
         if let Err(e) =
             tooltip::snapshot_hover(&args, doc.palette().len(), &view.ui_screen(), &mut ui)
@@ -540,7 +552,7 @@ fn main() -> eframe::Result {
                 (view.screen_w as u32, view.screen_h as u32),
                 scroll,
             );
-            let screen = sp.render(doc.page(), doc.palette().len());
+            let screen = sp.render(&doc.composite(), doc.palette().len());
             let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
             let rgba = to_rgba(&screen, doc.palette(), sx, sy);
             if let Err(e) = write_png(
@@ -797,7 +809,9 @@ fn snapshot(
     ui: &UiState,
     custom_brush: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (w, h, rgba) = snapshot_rgba(scale, doc, view, scroll, ui, custom_brush);
+    let shot = snapshot_rgba(scale, doc, view, scroll, ui, custom_brush);
+    // ADR-44: the docked layer panel right of the screen.
+    let (w, h, rgba) = layers::with_docked_strip(shot, doc.palette(), ui, view, scale);
     write_png(path, w, h, &rgba)
 }
 
@@ -810,7 +824,8 @@ fn snapshot_rgba(
     ui: &UiState,
     custom_brush: bool,
 ) -> (u32, u32, Vec<u8>) {
-    let mut screen = view.compose(doc.page(), scroll, doc.palette(), ui);
+    // ADR-44: the picture as it shows, all visible layers.
+    let mut screen = view.compose(&doc.composite(), scroll, doc.palette(), ui);
     if custom_brush && ui.toolbox_visible {
         let pens = Pens::from_palette(doc.palette());
         let x0 = view.ui_screen().toolbox_x();
@@ -948,6 +963,8 @@ struct PainterApp {
     tooltip: tooltip::State,
     /// Picture ▸ Load's Import requester for PNG and JPEG (ADR-42, import.rs).
     import: import::ImportState,
+    /// The layer panel (ADR-44, layers.rs).
+    layers: layers::State,
 }
 
 impl PainterApp {
@@ -988,6 +1005,7 @@ impl PainterApp {
             perspective: perspective::PerspectiveState::default(),
             tooltip: tooltip::State::default(),
             import: import::ImportState::default(),
+            layers: layers::State::default(),
         }
     }
 
@@ -1432,18 +1450,23 @@ impl PainterApp {
     }
 
     /// The page as shown: while the screen is composed the Light Table picture or the playing
-    /// frame (ADR-28), else the stroke preview while painting, else the document page.
-    fn page(&self) -> &IndexedImage {
+    /// frame (ADR-28), else the current frame with the stroke preview while painting, else
+    /// the current frame. A frame shows all its visible layers (ADR-44); with one layer
+    /// that is the page itself, borrowed. Display only: commands read
+    /// `self.engine.document().page()`, the active layer.
+    fn page(&self) -> Cow<'_, IndexedImage> {
         if let Some(shown) = &self.anim.shown {
-            return shown;
+            return Cow::Borrowed(shown);
         }
         // ADR-37: the perspective brush, its wire frame and the cross hairs.
         if let Some(shown) = &self.perspective.shown {
-            return shown;
+            return Cow::Borrowed(shown);
         }
-        self.stroke
-            .as_ref()
-            .map_or(self.engine.document().page(), |s| &s.preview)
+        let doc = self.engine.document();
+        match &self.stroke {
+            Some(s) => s.shown(doc),
+            None => doc.composite(),
+        }
     }
 
     /// Executes a command; a pending stroke is committed first so the order stays intact.
@@ -1542,6 +1565,7 @@ impl PainterApp {
                 self.press_page(x, y, right)
             }
             Hit::AnimPanel(hit) => self.panel_press(hit, right),
+            Hit::LayerPanel(hit) => self.layer_panel_press(hit, right),
             Hit::TitleBar | Hit::Indicator | Hit::ToolboxBackground => {}
         }
     }
@@ -1685,6 +1709,8 @@ impl eframe::App for PainterApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // ADR-44: the time for double-clicks; a held panel button goes up.
+        self.layers_pass(&ctx);
         self.ui.has_brush = self.custom_brush.is_some();
         self.ui.can_restore = self.picked_brush.is_some();
         self.animbrush_sync(&ctx);
@@ -1732,8 +1758,10 @@ impl eframe::App for PainterApp {
         let (view, scale) = self.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
+        // ADR-44: a docked layer panel right of the screen is centred with it.
+        let frame_w = img_w + self.lay_out_layer_strip(view, scale);
         let origin_px = egui::vec2(
-            ((window.w - img_w) / 2) as f32,
+            ((window.w - frame_w) / 2) as f32,
             ((window.h - img_h) / 2) as f32,
         );
         let origin = area.min + origin_px / ppp;
@@ -1869,13 +1897,17 @@ impl eframe::App for PainterApp {
             if on.is_some() {
                 self.pointer_page = on;
             }
-            let inside = on.filter(|&(px, py)| self.page().bounds().contains(px, py));
+            // Every picture shown has the page's size.
+            let page = self.engine.document().page().bounds();
+            let inside = on.filter(|&(px, py)| page.contains(px, py));
             let hit = match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
                 Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
                 h => Some(h),
             };
             // ADR-41 (tooltip.rs).
             self.tooltip_hover(&ctx, hit);
+            // ADR-44: the wheel over the layer panel scrolls its list.
+            self.layer_hover(hit);
             let on_page = match hit {
                 Some(Hit::Page { x, y }) => Some((x, y)),
                 _ => None,
@@ -1887,7 +1919,9 @@ impl eframe::App for PainterApp {
                 self.ui.coords = on_page;
                 self.dirty |= self.ui.prefs.get(dpx_ui::Pref::Coords);
             }
-            if press_r && hit == Some(Hit::TitleBar) {
+            if (press_l || press_r) && self.layer_rename_press(hit) {
+                // ADR-44: the press ended a layer rename (it takes the name, as Return).
+            } else if press_r && hit == Some(Hit::TitleBar) {
                 self.ui.menu.open(sw, sh, ux, uy);
                 self.dirty = true;
             } else if press_l || press_r {
@@ -1909,6 +1943,7 @@ impl eframe::App for PainterApp {
         } else {
             self.hover_brush(None);
             self.tooltip_hover(&ctx, None);
+            self.layer_hover(None);
         }
         if !(down_l || down_r) {
             self.release();
@@ -1916,6 +1951,11 @@ impl eframe::App for PainterApp {
         self.tick(&ctx);
         if self.ui.menu.active {
             // Keyboard shortcuts are ignored while the menu strip is shown.
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-44: while a layer name is edited, its gadget takes every key.
+        if self.layer_rename_keys(&ctx) {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -1967,6 +2007,8 @@ impl eframe::App for PainterApp {
             self.animbrush_keys(&ctx);
             self.anim_control_keys(&ctx);
             self.palette_stencil_keys(&ctx);
+            // ADR-44: `L` shows or hides the layer panel.
+            self.layer_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
@@ -2122,6 +2164,7 @@ impl PainterApp {
                     };
                     self.scroll_to(self.scroll.0 + dx, self.scroll.1 + dy);
                 }
+                egui::Event::MouseWheel { unit, delta, .. } if self.layer_wheel(unit, delta) => {}
                 egui::Event::MouseWheel { unit, delta, .. } => {
                     // DeluxePainter addition: wheel and trackpad scroll the page. Positive
                     // deltas move the content down/right, i.e. show the part above/left.
@@ -2422,7 +2465,7 @@ impl PainterApp {
         let palette = req.palette();
         let screen = self
             .view()
-            .compose(self.page(), self.scroll, &palette, &self.ui);
+            .compose(&self.page(), self.scroll, &palette, &self.ui);
         let rgba = to_rgba(&screen, &palette, 1, 1);
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [screen.width() as usize, screen.height() as usize],
@@ -2505,6 +2548,9 @@ impl PainterApp {
             self.prepare_perspective_view();
             self.prepare_anim_view();
             self.prepare_stencil_view();
+            // ADR-44: after the Control Panel's state (the overlay keeps above it).
+            self.sync_layer_panel();
+            self.upload_layer_strip(ctx);
             let (screen, rgba) = match (&self.requester, &self.show_page) {
                 (Some(req), _) => {
                     let screen = req.render();
@@ -2512,7 +2558,7 @@ impl PainterApp {
                     (screen, rgba)
                 }
                 (None, Some(sp)) => {
-                    let screen = sp.render(self.page(), self.palette().len());
+                    let screen = sp.render(&self.page(), self.palette().len());
                     let rgba = to_rgba(&screen, self.palette(), 1, 1);
                     (screen, rgba)
                 }
@@ -2555,6 +2601,8 @@ impl PainterApp {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             painter.image(t.id(), rect, uv, egui::Color32::WHITE);
         }
+        // ADR-44: the docked layer panel right of the screen.
+        self.paint_layer_strip(painter, rect);
     }
 }
 
@@ -2695,7 +2743,10 @@ mod tests {
         let (view, scale) = app.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
-        let (ox, oy) = (((1280 - img_w) / 2) as f32, ((1024 - img_h) / 2) as f32);
+        // ADR-44: centred together with a docked layer panel.
+        let frame_w = img_w + app.layer_strip_px(view, scale);
+        let (ww, wh) = app.window.map_or((1280, 1024), |w| (w.w, w.h));
+        let (ox, oy) = (((ww - frame_w) / 2) as f32, ((wh - img_h) / 2) as f32);
         let sx = (x * view.ux) as f32 + 0.5;
         let sy = (y * view.uy) as f32 + 0.5;
         egui::pos2(
@@ -3363,7 +3414,7 @@ mod tests {
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
         assert!(app.ui.file_requester.is_none(), "loaded and closed");
         assert_eq!(app.engine.document().target().mode, hi);
-        assert_eq!(app.page(), &img);
+        assert_eq!(&*app.page(), &img);
         assert_eq!(app.view().screen_w, 640);
 
         // Save writes the project and offers the picture's name as one (ADR-27).
@@ -3581,14 +3632,14 @@ mod tests {
         let (ox, oy) = req.origin(ui_screen.width, ui_screen.height);
         let with = app
             .view()
-            .compose(app.page(), app.scroll, app.palette(), &app.ui);
+            .compose(&app.page(), app.scroll, app.palette(), &app.ui);
         let ok = (ox + 128, oy + req.height() - 10);
         app.note_event(ReqEvent::Press(ok.0 - ox, ok.1 - oy));
         app.note_event(ReqEvent::Release);
         assert!(app.ui.note_requester.is_none(), "Ok closes");
         let without = app
             .view()
-            .compose(app.page(), app.scroll, app.palette(), &app.ui);
+            .compose(&app.page(), app.scroll, app.palette(), &app.ui);
         assert_ne!(with, without);
 
         // A picture without notes opens none, and neither does one with only DeluxePaint's
@@ -3680,7 +3731,7 @@ mod tests {
         // Shown while painting, but not yet in the document.
         assert_eq!(app.page().get(20, 14), Some(2));
         assert_eq!(app.engine.document().page().get(20, 14), Some(0));
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         app.finish_stroke();
         assert_eq!(app.engine.document().page(), &preview);
         assert_eq!(app.engine.document().revision(), 1);
@@ -3692,7 +3743,7 @@ mod tests {
             "whole stroke undone at once"
         );
         app.redo();
-        assert_eq!(app.page(), &preview);
+        assert_eq!(&*app.page(), &preview);
 
         // Right-click on UNDO redoes, left-click undoes.
         app.handle_press(
@@ -3710,7 +3761,7 @@ mod tests {
             },
             true,
         );
-        assert_eq!(app.page(), &preview);
+        assert_eq!(&*app.page(), &preview);
     }
 
     #[test]
@@ -3765,9 +3816,9 @@ mod tests {
         app.scroll_to(0, 0);
         let screen = app
             .view()
-            .compose(app.page(), (0, 0), app.palette(), &app.ui);
+            .compose(&app.page(), (0, 0), app.palette(), &app.ui);
         assert_eq!(screen.get(5, 100), Some(0));
-        let mut marked = app.page().clone();
+        let mut marked = app.page().into_owned();
         marked.set(325, 300, 9);
         let screen = app
             .view()
@@ -3922,7 +3973,7 @@ mod tests {
 
     /// Picks the menu item at the end of `path` (UI pixels, the menu title first) as on the
     /// Amiga: right button down on the title bar, along the path, up over the item.
-    fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
+    pub(crate) fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
         use egui::PointerButton::Secondary;
         let points: Vec<egui::Pos2> = path.iter().map(|&p| ui_point(app, p)).collect();
         ui_pass(
