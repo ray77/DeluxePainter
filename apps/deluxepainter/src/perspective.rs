@@ -760,15 +760,18 @@ impl PainterApp {
         }
         let doc = self.engine.document();
         let (page, palette) = (doc.page(), doc.palette());
-        let mut shown = page.clone();
+        let mut stamped = page.clone();
         if !self.stencil_painting()
             && let Some(cmd) = self.perspective_preview_stamp()
         {
             let cmd = self.with_area_stencil(cmd);
             if cmd.check_paint(page, palette).is_ok() {
-                cmd.paint(&mut shown, page, palette);
+                cmd.paint(&mut stamped, page, palette);
             }
         }
+        // ADR-44: the stamp goes into the active layer; the frame shows all visible layers
+        // and the marks lie on top of them.
+        let mut shown = doc.composite_with(&stamped).into_owned();
         self.draw_perspective_marks(&mut shown);
         self.perspective.shown = Some(shown);
     }

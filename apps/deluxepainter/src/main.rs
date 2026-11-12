@@ -58,6 +58,7 @@ mod settings;
 mod tools;
 mod tooltip;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -484,7 +485,9 @@ fn main() -> eframe::Result {
                 eprintln!("--light-table: {e}");
                 std::process::exit(2);
             });
-            let page = anim::light_table_page(&doc, doc.page(), light, None, ui.bg, light.dim);
+            // ADR-44: the frame as it shows, all visible layers.
+            let shown = doc.composite();
+            let page = anim::light_table_page(&doc, &shown, light, None, ui.bg, light.dim);
             Document::from_picture(page, doc.palette().clone(), doc.target())
         } else {
             doc
@@ -528,7 +531,7 @@ fn main() -> eframe::Result {
                 (view.screen_w as u32, view.screen_h as u32),
                 scroll,
             );
-            let screen = sp.render(doc.page(), doc.palette().len());
+            let screen = sp.render(&doc.composite(), doc.palette().len());
             let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
             let rgba = to_rgba(&screen, doc.palette(), sx, sy);
             if let Err(e) = write_png(
@@ -784,7 +787,8 @@ fn snapshot_rgba(
     ui: &UiState,
     custom_brush: bool,
 ) -> (u32, u32, Vec<u8>) {
-    let mut screen = view.compose(doc.page(), scroll, doc.palette(), ui);
+    // ADR-44: the picture as it shows, all visible layers.
+    let mut screen = view.compose(&doc.composite(), scroll, doc.palette(), ui);
     if custom_brush && ui.toolbox_visible {
         let pens = Pens::from_palette(doc.palette());
         let x0 = view.ui_screen().toolbox_x();
@@ -1397,18 +1401,23 @@ impl PainterApp {
     }
 
     /// The page as shown: while the screen is composed the Light Table picture or the playing
-    /// frame (ADR-28), else the stroke preview while painting, else the document page.
-    fn page(&self) -> &IndexedImage {
+    /// frame (ADR-28), else the current frame with the stroke preview while painting, else
+    /// the current frame. A frame shows all its visible layers (ADR-44); with one layer
+    /// that is the page itself, borrowed. Display only: commands read
+    /// `self.engine.document().page()`, the active layer.
+    fn page(&self) -> Cow<'_, IndexedImage> {
         if let Some(shown) = &self.anim.shown {
-            return shown;
+            return Cow::Borrowed(shown);
         }
         // ADR-37: the perspective brush, its wire frame and the cross hairs.
         if let Some(shown) = &self.perspective.shown {
-            return shown;
+            return Cow::Borrowed(shown);
         }
-        self.stroke
-            .as_ref()
-            .map_or(self.engine.document().page(), |s| &s.preview)
+        let doc = self.engine.document();
+        match &self.stroke {
+            Some(s) => doc.composite_with(&s.preview),
+            None => doc.composite(),
+        }
     }
 
     /// Executes a command; a pending stroke is committed first so the order stays intact.
@@ -1834,7 +1843,9 @@ impl eframe::App for PainterApp {
             if on.is_some() {
                 self.pointer_page = on;
             }
-            let inside = on.filter(|&(px, py)| self.page().bounds().contains(px, py));
+            // Every picture shown has the page's size.
+            let page = self.engine.document().page().bounds();
+            let inside = on.filter(|&(px, py)| page.contains(px, py));
             let hit = match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
                 Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
                 h => Some(h),
@@ -2387,7 +2398,7 @@ impl PainterApp {
         let palette = req.palette();
         let screen = self
             .view()
-            .compose(self.page(), self.scroll, &palette, &self.ui);
+            .compose(&self.page(), self.scroll, &palette, &self.ui);
         let rgba = to_rgba(&screen, &palette, 1, 1);
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [screen.width() as usize, screen.height() as usize],
@@ -2477,7 +2488,7 @@ impl PainterApp {
                     (screen, rgba)
                 }
                 (None, Some(sp)) => {
-                    let screen = sp.render(self.page(), self.palette().len());
+                    let screen = sp.render(&self.page(), self.palette().len());
                     let rgba = to_rgba(&screen, self.palette(), 1, 1);
                     (screen, rgba)
                 }
@@ -3328,7 +3339,7 @@ mod tests {
         app.file_requester_event(ReqEvent::Key(ReqKey::Enter), 0);
         assert!(app.ui.file_requester.is_none(), "loaded and closed");
         assert_eq!(app.engine.document().target().mode, hi);
-        assert_eq!(app.page(), &img);
+        assert_eq!(&*app.page(), &img);
         assert_eq!(app.view().screen_w, 640);
 
         // Save writes the project and offers the picture's name as one (ADR-27).
@@ -3545,14 +3556,14 @@ mod tests {
         let (ox, oy) = req.origin(ui_screen.width, ui_screen.height);
         let with = app
             .view()
-            .compose(app.page(), app.scroll, app.palette(), &app.ui);
+            .compose(&app.page(), app.scroll, app.palette(), &app.ui);
         let ok = (ox + 128, oy + req.height() - 10);
         app.note_event(ReqEvent::Press(ok.0 - ox, ok.1 - oy));
         app.note_event(ReqEvent::Release);
         assert!(app.ui.note_requester.is_none(), "Ok closes");
         let without = app
             .view()
-            .compose(app.page(), app.scroll, app.palette(), &app.ui);
+            .compose(&app.page(), app.scroll, app.palette(), &app.ui);
         assert_ne!(with, without);
 
         // A picture without notes opens none, and neither does one with only DeluxePaint's
@@ -3644,7 +3655,7 @@ mod tests {
         // Shown while painting, but not yet in the document.
         assert_eq!(app.page().get(20, 14), Some(2));
         assert_eq!(app.engine.document().page().get(20, 14), Some(0));
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         app.finish_stroke();
         assert_eq!(app.engine.document().page(), &preview);
         assert_eq!(app.engine.document().revision(), 1);
@@ -3656,7 +3667,7 @@ mod tests {
             "whole stroke undone at once"
         );
         app.redo();
-        assert_eq!(app.page(), &preview);
+        assert_eq!(&*app.page(), &preview);
 
         // Right-click on UNDO redoes, left-click undoes.
         app.handle_press(
@@ -3674,7 +3685,7 @@ mod tests {
             },
             true,
         );
-        assert_eq!(app.page(), &preview);
+        assert_eq!(&*app.page(), &preview);
     }
 
     #[test]
@@ -3729,9 +3740,9 @@ mod tests {
         app.scroll_to(0, 0);
         let screen = app
             .view()
-            .compose(app.page(), (0, 0), app.palette(), &app.ui);
+            .compose(&app.page(), (0, 0), app.palette(), &app.ui);
         assert_eq!(screen.get(5, 100), Some(0));
-        let mut marked = app.page().clone();
+        let mut marked = app.page().into_owned();
         marked.set(325, 300, 9);
         let screen = app
             .view()

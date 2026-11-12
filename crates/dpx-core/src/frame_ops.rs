@@ -1,11 +1,10 @@
 //! Validation and application of the frame commands (ADR-28), kept apart from the page
 //! commands in `command.rs`. Frame numbers are 0-based here; the interface counts from 1.
-
-use std::sync::Arc;
+//! A frame is all its layer pictures (ADR-44): frame commands copy, move and delete them
+//! together.
 
 use crate::command::{Command, CommandError, ErrorCode};
 use crate::document::{Document, check_fps, check_frame_count};
-use crate::image::IndexedImage;
 
 /// Frame `f` must exist.
 fn frame_exists(doc: &Document, f: u32, what: &str) -> Result<usize, CommandError> {
@@ -35,10 +34,12 @@ fn frame_range(doc: &Document, first: u32, last: u32) -> Result<(usize, usize), 
     Ok((a, b))
 }
 
-/// A document of `count` frames of the current page size must stay within the limits.
+/// A document of `count` frames of the current page size and layers must stay within the
+/// limits.
 fn room_for(doc: &Document, count: u64) -> Result<(), CommandError> {
     let (w, h) = (doc.page.width(), doc.page.height());
-    check_frame_count(usize::try_from(count).unwrap_or(usize::MAX), w, h)
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    check_frame_count(count, doc.layer_count(), w, h)
 }
 
 pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError> {
@@ -139,11 +140,11 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
     match *cmd {
         Command::SetFrameCount { count } => {
             let count = count as usize;
-            let mut frames = doc.frame_arcs();
+            let mut frames = doc.frame_cels();
             if count > total {
                 // Copies of the current frame after it (AGA p.236: "step to the frame you want
                 // to add frames after").
-                let copy = Arc::clone(&frames[current]);
+                let copy = frames[current].clone();
                 let at = current + 1;
                 frames.splice(at..at, std::iter::repeat_n(copy, count - total));
                 doc.set_frames(frames, current);
@@ -158,17 +159,17 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
         }
         Command::AddFrames { count } => {
             let count = count as usize;
-            let mut frames = doc.frame_arcs();
-            let copy = Arc::clone(&frames[current]);
+            let mut frames = doc.frame_cels();
+            let copy = frames[current].clone();
             let at = current + 1;
             frames.splice(at..at, std::iter::repeat_n(copy, count));
             doc.set_frames(frames, current + count);
         }
         Command::CopyFrame { first, last } => {
-            let mut frames = doc.frame_arcs();
-            let copy = Arc::clone(&frames[current]);
+            let mut frames = doc.frame_cels();
+            let copy = frames[current].clone();
             for f in &mut frames[first as usize..=last as usize] {
-                *f = Arc::clone(&copy);
+                f.clone_from(&copy);
             }
             doc.set_frames(frames, current);
         }
@@ -178,7 +179,7 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
             before,
         } => {
             let (a, b, at) = (first as usize, last as usize, before as usize);
-            let mut frames = doc.frame_arcs();
+            let mut frames = doc.frame_cels();
             let copies: Vec<_> = frames[a..=b].to_vec();
             let n = copies.len();
             frames.splice(at..at, copies);
@@ -190,12 +191,12 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
             let (a, b) = (first as usize, last as usize);
             let n = b - a + 1;
             if n == total {
-                // Nothing is left: one frame in the fill (BG) colour.
-                let (w, h) = (doc.page.width(), doc.page.height());
-                doc.set_frames(vec![Arc::new(IndexedImage::new(w, h, fill))], 0);
+                // Nothing is left: one frame in the fill (BG) colour (its upper layers clear).
+                let blank = doc.blank_frame(fill);
+                doc.set_frames(vec![blank], 0);
                 return;
             }
-            let mut frames = doc.frame_arcs();
+            let mut frames = doc.frame_cels();
             frames.drain(a..=b);
             let left = frames.len();
             let current = if current < a {
@@ -217,7 +218,7 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Palette, Target};
+    use crate::{IndexedImage, Palette, Target};
 
     /// Five 2x1 frames; frame i is filled with colour i + 1.
     fn doc(current: usize) -> Document {

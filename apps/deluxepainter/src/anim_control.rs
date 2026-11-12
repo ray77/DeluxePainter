@@ -609,9 +609,10 @@ impl PainterApp {
         });
         if let Some(p) = &self.anim_control.preview
             && let Some(stamp) = p.plan.stamps.get(p.step)
-            && let Some(frame) = doc.frame(stamp.frame)
+            && let Some(frame) = doc.composite_frame(stamp.frame)
         {
-            let mut page: IndexedImage = frame.clone();
+            // ADR-44: the frame as it shows, all visible layers.
+            let mut page: IndexedImage = frame.into_owned();
             if let Some(c) = anim_move::outline(p.size, p.handle, &stamp.pose, &p.eye) {
                 anim_move::draw_outline(&mut page, &c, self.ui.fg);
             }

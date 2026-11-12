@@ -2,8 +2,8 @@
 //! Color Set Load/Save, Effect ▸ AntiAlias / Process / Translucency, Effect ▸ Stencil ▸ Show /
 //! Load.. / Save..
 //!
-//! Every document change goes through a command: Arrange is `ArrangePalette`, Remap a
-//! `SetPage` of [`dpx_core::remap::remap_to_palette`]. The paint effects are carried by the
+//! Every document change goes through a command: Arrange is `ArrangePalette`, Remap
+//! `RemapColors` (every frame and layer, ADR-44). The paint effects are carried by the
 //! stroke and shape commands (`fx`, see [`dpx_core::PaintFx`]); this module keeps their
 //! settings, the title-bar flags and the display-only stencil view.
 
@@ -250,13 +250,21 @@ impl PainterApp {
                 "The palette has not changed since the picture was last in step with it",
             );
         };
+        // ADR-44: every frame and layer, one undo step (colour 0 stays transparent above the
+        // bottom layer); nothing is run when no pixel would change.
         let doc = self.engine.document();
-        let out = remap::remap_to_palette(doc.page(), base.colors(), doc.palette());
-        if &out != doc.page() {
-            self.run(Command::SetPage {
-                width: out.width(),
-                height: out.height(),
-                pixels: out.pixels().to_vec(),
+        let lower = remap::nearest_lut(base.colors(), doc.palette());
+        let upper = remap::nearest_lut_upper(base.colors(), doc.palette());
+        let changes = (0..doc.layer_count()).any(|l| {
+            let lut = if l == 0 { &lower } else { &upper };
+            (0..doc.frame_count()).any(|f| {
+                doc.cel(f, l)
+                    .is_some_and(|c| c.pixels().iter().any(|&p| lut[usize::from(p)] != p))
+            })
+        });
+        if changes {
+            self.run(Command::RemapColors {
+                from: base.colors().to_vec(),
             });
         }
     }

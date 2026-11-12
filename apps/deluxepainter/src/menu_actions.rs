@@ -304,10 +304,11 @@ impl PainterApp {
     }
 
     /// Picture ▸ Spare ▸ Copy to Spare (Ctrl+`j`): the spare becomes a copy of the shown page
-    /// (one undo step on the spare page).
+    /// (one undo step on the spare page), the picture as it shows (all visible layers,
+    /// ADR-44) going into the spare's active layer.
     pub(crate) fn copy_to_spare(&mut self) {
         self.finish_stroke();
-        let page = self.engine.document().page().clone();
+        let page = self.engine.document().composite().into_owned();
         let mut other = self.take_spare();
         let command = Command::SetPage {
             width: page.width(),
@@ -322,13 +323,14 @@ impl PainterApp {
     }
 
     /// Picture ▸ Spare ▸ Merge in Front / Back (undoable). Colour 0 is transparent: in front,
-    /// the spare's colour-0 pixels; in back, the shown page's (ADR-15).
+    /// the spare's colour-0 pixels; in back, the shown page's (ADR-15). The spare as it shows
+    /// (all visible layers) merges into the active layer (ADR-44).
     pub(crate) fn merge_spare(&mut self, front: bool) {
         if self.menu_data.spare.is_none() {
             return; // A blank spare changes nothing.
         }
         let other = self.take_spare();
-        let page = other.engine.document().page();
+        let page = other.engine.document().composite();
         let command = Command::MergePage {
             width: page.width(),
             height: page.height(),
@@ -341,11 +343,12 @@ impl PainterApp {
     }
 
     /// Picture ▸ Spare ▸ Delete This Page: the shown page is replaced by the spare (one undo
-    /// step brings it back) and the spare is freed.
+    /// step brings it back) and the spare is freed. The spare as it shows (all visible
+    /// layers) replaces the active layer (ADR-44).
     pub(crate) fn delete_page(&mut self) {
         self.finish_stroke();
         let other = self.take_spare();
-        let page = other.engine.document().page();
+        let page = other.engine.document().composite();
         let command = Command::SetPage {
             width: page.width(),
             height: page.height(),
@@ -754,14 +757,14 @@ mod tests {
         app.undo();
         assert_eq!(app.page().get(2, 2), Some(0));
         // Copy to Spare (Ctrl+j), then swap: the same picture.
-        let shown = app.page().clone();
+        let shown = app.page().into_owned();
         keys(
             &mut app,
             0.0,
             vec![key(egui::Key::J, egui::Modifiers::CTRL)],
         );
         act(&mut app, "spare.swap");
-        assert_eq!(app.page(), &shown);
+        assert_eq!(&*app.page(), &shown);
     }
 
     #[test]
@@ -949,7 +952,7 @@ mod tests {
         let mut app = PainterApp::new();
         dot(&mut app, 1, 1, 3);
         let doc = app.engine.document().palette().clone();
-        let page = app.page().clone();
+        let page = app.page().into_owned();
         // Colours 2-4 at 60 steps per second, 10-12 reverse at 30 per second.
         app.extras.ranges = vec![
             ColorRange {
@@ -984,7 +987,7 @@ mod tests {
         assert_eq!(app.palette().get(2), doc.get(3), "two steps");
         // The document, its pixels and the other colours do not change.
         assert_eq!(app.engine.document().palette(), &doc);
-        assert_eq!(app.page(), &page);
+        assert_eq!(&*app.page(), &page);
         assert_eq!(app.palette().get(5), doc.get(5));
         // Tab again: the document palette is shown.
         keys(

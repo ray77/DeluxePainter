@@ -108,6 +108,11 @@ impl IndexedImage {
         &self.pixels
     }
 
+    /// The pixels to change in place (the size stays).
+    pub(crate) fn pixels_mut(&mut self) -> &mut [u8] {
+        &mut self.pixels
+    }
+
     /// `Rect::new(0, 0, width, height)`.
     pub fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width as i32, self.height as i32)

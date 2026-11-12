@@ -217,7 +217,11 @@ pub fn validate_hardware(doc: &Document) -> Result<(), ToolError> {
             "palette entry {i} is not a 12-bit OCS colour"
         )));
     }
-    if let Some(&max) = doc.page().pixels().iter().max()
+    // Every picture of every frame and layer (ADR-44).
+    if let Some(max) = doc
+        .cels()
+        .filter_map(|c| c.pixels().iter().max().copied())
+        .max()
         && usize::from(max) >= colors
     {
         return Err(hardware(format!(
@@ -229,6 +233,7 @@ pub fn validate_hardware(doc: &Document) -> Result<(), ToolError> {
 
 /// Encodes the document after validating its hardware limits. ILBM carries the display
 /// mode's CAMG, pixel aspect and screen size; PNG cannot store the display mode (noted).
+/// Every format holds the picture as it shows: the visible layers flattened (ADR-44, noted).
 pub fn encode_document(
     doc: &Document,
     format: Format,
@@ -243,9 +248,11 @@ pub fn encode_document(
             doc.frame_count()
         ));
     }
+    notes.extend(dpx_core::layer::flatten_note(doc.layers()));
     match format {
         Format::Ilbm => {
-            let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
+            let picture = doc.composite().into_owned();
+            let mut out = Ilbm::from_indexed(picture, doc.palette().clone());
             out.camg = Some(doc.target().camg());
             (out.x_aspect, out.y_aspect) = doc.target().mode.aspect();
             let (sw, sh) = doc.target().screen;
@@ -258,7 +265,8 @@ pub fn encode_document(
         Format::Anim => {
             let mode = doc.target().mode;
             let (x_aspect, y_aspect) = mode.aspect();
-            let images: Vec<IndexedImage> = doc.frames().cloned().collect();
+            let images: Vec<IndexedImage> =
+                doc.composite_frames().map(|f| f.into_owned()).collect();
             let opts = dpx_iff::anim::EncodeOptions {
                 hold: dpx_iff::anim::Hold::PerFrame(dpx_iff::anim_doc::holds_for_fps(
                     doc.fps(),
@@ -274,7 +282,7 @@ pub fn encode_document(
             Ok((bytes, notes))
         }
         Format::Png => {
-            let bytes = dpx_formats::write_png(doc.page(), doc.palette())
+            let bytes = dpx_formats::write_png(&doc.composite(), doc.palette())
                 .map_err(|e| ToolError::new("INVALID_FILE", e.to_string()))?;
             notes.push(format!(
                 "PNG cannot store: display mode {}",

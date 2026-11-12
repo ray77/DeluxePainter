@@ -1,4 +1,5 @@
 //! Reading pixels and rendering the page to PNG for the agent. Read-only; no pixel logic.
+//! Both read the picture as it shows: the current frame's visible layers (ADR-44).
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -83,7 +84,7 @@ pub fn get_pixels(
             (r.w as u64) * (r.h as u64)
         )));
     }
-    let crop = doc.page().crop(r);
+    let crop = doc.composite().crop(r);
     let pixels = match encoding {
         PixelEncoding::Rows => serde_json::Value::Array(
             crop.pixels()
@@ -132,7 +133,7 @@ pub fn render_png(
         )));
     }
     let (ow, oh) = (ow as u32, oh as u32);
-    let crop = doc.page().crop(r);
+    let crop = doc.composite().crop(r);
     let colors = doc.palette().colors();
     let s = scale as usize;
     let mut rgb = Vec::with_capacity(ow as usize * oh as usize * 3);

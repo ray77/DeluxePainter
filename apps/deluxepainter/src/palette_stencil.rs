@@ -742,13 +742,14 @@ impl PainterApp {
         let (mut base, mask) = if let Some(p) = &self.ps().painting {
             let mut mask = p.engine.document().page().clone();
             let pal = p.engine.document().palette();
-            let mut base = doc.page();
+            // ADR-44: the frame as it shows, all visible layers.
+            let mut base = doc.composite();
             let preview = match &self.stroke {
                 Some(s) => {
                     let cmd = s.preview_command();
                     if cmd.is_none() {
                         // The Brush Selector's frame: shown as the tools draw it.
-                        base = &s.preview;
+                        base = doc.composite_with(&s.preview);
                     }
                     cmd
                 }
@@ -763,11 +764,11 @@ impl PainterApp {
                     m.paint(&mut mask, &before, pal);
                 }
             }
-            (base.clone(), AreaStencil::from_image(&mask))
+            (base.into_owned(), AreaStencil::from_image(&mask))
         } else if self.menu_data.effects.stencil_show
             && let Some(a) = self.active_area()
         {
-            (doc.page().clone(), a.clone())
+            (doc.composite().into_owned(), a.clone())
         } else {
             return;
         };
@@ -778,7 +779,8 @@ impl PainterApp {
                 .menu_data
                 .spare
                 .as_ref()
-                .map(|s| s.engine.document().page());
+                .map(|s| s.engine.document().composite());
+            let spare = spare.as_deref();
             let light = self.anim.light;
             base = crate::anim::light_table_page(doc, &base, light, spare, self.ui.bg, light.dim);
         }
@@ -810,10 +812,11 @@ pub fn snapshot_view(
             i32::MAX
         ));
     }
-    let page = doc.page();
-    let mut mask = stencil::AreaStencil::free(page).to_image();
+    // ADR-44: over the frame as it shows.
+    let page = doc.composite();
+    let mut mask = stencil::AreaStencil::free(&page).to_image();
     mask.fill_rect(x, y, w, h, stencil::PROTECTED);
-    let shown = stencil::view(page, &AreaStencil::from_image(&mask), doc.palette());
+    let shown = stencil::view(&page, &AreaStencil::from_image(&mask), doc.palette());
     ui.flags = "s".into();
     Ok(Document::from_picture(
         shown,

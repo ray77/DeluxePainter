@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(app.page().get(0, h / 2 - 1), Some(4));
         // Undo restores the page.
         app.undo();
-        assert_eq!(app.page(), &IndexedImage::new(w as u32, h as u32, 0));
+        assert_eq!(&*app.page(), &IndexedImage::new(w as u32, h as u32, 0));
         // Back to Solid.
         app.tools.fill.gradient = None;
         assert_eq!(app.fill_type(), FillType::Solid);

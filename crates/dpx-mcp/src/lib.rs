@@ -133,6 +133,8 @@ fn describe(engine: &Engine) -> DocumentState {
         can_redo: engine.can_redo(),
         frames: doc.frame_count(),
         current_frame: doc.current_frame(),
+        // TODO(wave8-integration): report the layer stack (doc.layers(), active_layer()) and
+        // add the layer tools (list_layers, create_layer, select_layer: ADR-44).
     }
 }
 
@@ -141,6 +143,9 @@ fn default_engine() -> Engine {
 }
 
 /// Arguments of `execute_command`.
+// TODO(wave8-integration): name the layer ops (ADR-44: add_layer, duplicate_layer,
+// delete_layer, move_layer, select_layer, set_layer_visible, rename_layer, merge_layer_down,
+// flatten_layers) and remap_colors here, next to the MCP layer tools.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ExecuteArgs {
     /// A dpx-core `Command` as JSON, tagged by `op` (snake_case). Ops: `stroke` {brush, color,

@@ -1830,23 +1830,21 @@ impl PainterApp {
         let pens = Pens::from_palette(palette);
         let (w, h) = (view.screen_w, view.screen_h);
         let magnify = self.magnify_layout(view);
+        // The picture as shown (all visible layers, ADR-44), made once for both halves.
+        let page = self.page();
         let mut shown = match magnify {
-            None => self
-                .page()
-                .crop(Rect::new(self.scroll.0, self.scroll.1, w, h)),
+            None => page.crop(Rect::new(self.scroll.0, self.scroll.1, w, h)),
             Some(m) => {
                 let mut shown = IndexedImage::new(w as u32, h as u32, pens.dark);
                 shown.blit(
-                    &self
-                        .page()
-                        .crop(Rect::new(self.scroll.0, self.scroll.1, m.split, h)),
+                    &page.crop(Rect::new(self.scroll.0, self.scroll.1, m.split, h)),
                     0,
                     0,
                 );
                 shown.fill_rect(m.split, 0, m.start - m.split, h, pens.face);
                 shown.fill_rect(m.split, 0, view.ux, h, pens.shine);
                 shown.fill_rect(m.start - view.ux, 0, view.ux, h, pens.dark);
-                let big = raster::magnified(self.page(), m.source, m.zoom, pens.dark);
+                let big = raster::magnified(&page, m.source, m.zoom, pens.dark);
                 shown.blit(&big.crop(Rect::new(0, 0, m.end - m.start, h)), m.start, 0);
                 shown
             }
@@ -2178,9 +2176,13 @@ mod tests {
         assert_eq!(app.engine.document().revision(), 1, "exactly one command");
         let painted = app.engine.document().page().clone();
         app.undo();
-        assert_eq!(app.page(), &IndexedImage::new(320, 256, 0), "undo restores");
+        assert_eq!(
+            &*app.page(),
+            &IndexedImage::new(320, 256, 0),
+            "undo restores"
+        );
         app.redo();
-        assert_eq!(app.page(), &painted, "redo repeats exactly");
+        assert_eq!(&*app.page(), &painted, "redo repeats exactly");
         painted
     }
 
@@ -2199,14 +2201,14 @@ mod tests {
         });
         press(&mut app, 10, 10);
         app.handle_drag(40, 30);
-        assert_eq!(app.page(), &IndexedImage::new(320, 256, 0), "no preview");
+        assert_eq!(&*app.page(), &IndexedImage::new(320, 256, 0), "no preview");
         app.release();
         assert_eq!(app.engine.document().revision(), 0, "nothing committed");
         // The same gesture with a valid brush is previewed.
         let mut app = self::app(Tool::Line, false);
         press(&mut app, 10, 10);
         app.handle_drag(40, 30);
-        assert_ne!(app.page(), &IndexedImage::new(320, 256, 0));
+        assert_ne!(&*app.page(), &IndexedImage::new(320, 256, 0));
     }
 
     #[test]
@@ -2216,7 +2218,7 @@ mod tests {
         app.handle_drag(40, 30);
         app.handle_drag(50, 20);
         assert_eq!(app.page().get(40, 30), Some(0), "old rubber band erased");
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         assert_eq!(app.engine.document().revision(), 0, "nothing committed yet");
         app.release();
         assert_eq!(committed_once(&mut app), preview);
@@ -2242,7 +2244,7 @@ mod tests {
             assert!(app.ui.filled);
             press(&mut app, 20, 10);
             app.handle_drag(30, 20);
-            let preview = app.page().clone();
+            let preview = app.page().into_owned();
             app.release();
             let page = committed_once(&mut app);
             assert_eq!(page, preview, "{tool:?}: preview = result");
@@ -2321,7 +2323,7 @@ mod tests {
         app.release();
         assert!(app.stroke.is_some(), "waiting for the bend");
         app.handle_hover(50, 10);
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         assert_eq!(preview.get(50, 10), Some(2), "passes through the pointer");
         press(&mut app, 50, 10);
         assert_eq!(committed_once(&mut app), preview);
@@ -2352,7 +2354,7 @@ mod tests {
         press(&mut app, 7, 9);
         app.handle_drag(41, 40);
         app.release();
-        let page = app.page().clone();
+        let page = app.page().into_owned();
         assert_eq!(
             page.get(0, 16),
             Some(2),
@@ -2382,7 +2384,7 @@ mod tests {
         }
         app.handle_drag(120, 100);
         app.spray(SPRAYS_PER_FRAME);
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         let n = preview.pixels().iter().filter(|&&p| p == 2).count();
         assert!(n > 10, "sprayed {n} pixels");
         for (i, &p) in preview.pixels().iter().enumerate() {
@@ -2406,7 +2408,7 @@ mod tests {
         assert_eq!(app.ui.tool, Tool::Line, "a toggle keeps the tool");
         press(&mut app, 200, 128);
         app.handle_drag(220, 128);
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         app.release();
         let page = committed_once(&mut app);
         assert_eq!(page, preview);
@@ -2439,7 +2441,7 @@ mod tests {
         app.tool_key(ToolKey::Char('r'));
         assert_eq!(app.ui.tool, Tool::Text);
         assert!(app.typing());
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         assert!(preview.pixels().contains(&2));
         app.tool_key(ToolKey::Escape);
         assert!(!app.typing());
@@ -2610,7 +2612,7 @@ mod tests {
         // Matte: own colours; the colour-0 border is transparent. Handle (7, 4).
         press(&mut app, 100, 100);
         app.release();
-        let page = app.page().clone();
+        let page = app.page().into_owned();
         assert_eq!(page.get(95, 98), Some(5));
         assert_eq!(page.get(97, 99), Some(7));
         assert_eq!(page.get(93, 96), Some(3), "transparent");
@@ -2637,7 +2639,7 @@ mod tests {
         app.select_tool(Tool::Line, false);
         press(&mut app, 40, 200);
         app.handle_drag(90, 220);
-        let preview = app.page().clone();
+        let preview = app.page().into_owned();
         app.release();
         assert_eq!(app.engine.document().page(), &preview);
         assert_eq!(preview.get(35, 198), Some(5), "brush at the start");
@@ -2661,7 +2663,7 @@ mod tests {
         // Leaving the page hides it; nothing was committed.
         app.hover_brush(None);
         assert!(app.stroke.is_none());
-        assert_eq!(app.page(), app.engine.document().page());
+        assert_eq!(&*app.page(), app.engine.document().page());
         assert_eq!(app.engine.document().revision(), rev);
         // A click while it is shown paints exactly one stamp.
         app.handle_hover(100, 100);

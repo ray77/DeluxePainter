@@ -48,9 +48,11 @@ pub struct AnimState {
     pub shown: Option<IndexedImage>,
 }
 
-/// The Light Table picture of `doc` (ADR-28): `base` (the current frame, or its stroke
-/// preview) with the chosen other frames and the `spare` page showing through its `empty`
-/// (BG colour) pixels, nearest first, dimmed if Dim is on. Display only.
+/// The Light Table picture of `doc` (ADR-28): `base` (the current frame as it shows, or the
+/// active layer for Merge) with the chosen other frames and the `spare` page showing
+/// through its `empty` (BG colour) pixels, nearest first, dimmed if Dim is on. The other
+/// frames show as they look, all visible layers (ADR-44); `spare` is the spare page as it
+/// shows. Display only.
 pub fn light_table_page(
     doc: &Document,
     base: &IndexedImage,
@@ -59,11 +61,12 @@ pub fn light_table_page(
     empty: u8,
     dim: bool,
 ) -> IndexedImage {
-    let mut under: Vec<&IndexedImage> = light
+    let frames: Vec<_> = light
         .frames(doc.current_frame(), doc.frame_count())
         .into_iter()
-        .filter_map(|f| doc.frame(f))
+        .filter_map(|f| doc.composite_frame(f))
         .collect();
+    let mut under: Vec<&IndexedImage> = frames.iter().map(|f| f.as_ref()).collect();
     if light.spare
         && let Some(s) = spare
     {
@@ -103,7 +106,8 @@ pub fn parse_light_table(spec: Option<&str>) -> Result<LightTable, String> {
 pub fn snapshot_requester(kind: &str, doc: &Document) -> Option<AnimRequester> {
     let (count, current) = (doc.frame_count(), doc.current_frame() + 1);
     let page = doc.page();
-    let max = anim::max_frames_for(page.width(), page.height());
+    // ADR-44: every frame holds one picture per layer.
+    let max = anim::max_frames_for_layers(page.width(), page.height(), doc.layer_count());
     Some(match kind {
         "count" => AnimRequester::frame_count(count, max),
         "add" => AnimRequester::add_frames(max.saturating_sub(count)),
@@ -130,7 +134,9 @@ impl PainterApp {
         }
         let doc = self.engine.document();
         let (count, current) = (doc.frame_count(), doc.current_frame());
-        let max = anim::max_frames_for(doc.page().width(), doc.page().height());
+        // ADR-44: every frame holds one picture per layer.
+        let page = doc.page();
+        let max = anim::max_frames_for_layers(page.width(), page.height(), doc.layer_count());
         let open = |req: AnimRequester| Some(req);
         let requester = match id {
             "anim.set_frame_count" => open(AnimRequester::frame_count(count, max)),
@@ -363,7 +369,7 @@ impl PainterApp {
 
     /// LightTable ▸ Merge: the images shown (not dimmed) become part of the current frame,
     /// and the Light Table switches off. DeluxePaint cannot undo this; here it is one undo
-    /// step (`SetPage`).
+    /// step (`SetPage`). They go into the active layer, through its BG pixels (ADR-44).
     fn merge_light_table(&mut self) {
         self.finish_stroke();
         if !self.anim.light_on {
@@ -374,7 +380,8 @@ impl PainterApp {
             .menu_data
             .spare
             .as_ref()
-            .map(|s| s.engine.document().page());
+            .map(|s| s.engine.document().composite());
+        let spare = spare.as_deref();
         let merged = light_table_page(doc, doc.page(), self.anim.light, spare, self.ui.bg, false);
         self.anim.light_on = false;
         if &merged != doc.page() {
@@ -396,16 +403,18 @@ impl PainterApp {
         let shown_frame = self.anim.playing.map_or(doc.current_frame(), |p| p.shown);
         self.ui.frame_counter = (count > 1).then_some((shown_frame + 1, count));
         if self.anim.playing.is_some() {
-            self.anim.shown = doc.frame(shown_frame).cloned();
+            // ADR-44: the frame as it shows.
+            self.anim.shown = doc.composite_frame(shown_frame).map(|f| f.into_owned());
         } else if self.anim.light_on && (count > 1 || self.anim.light.spare) {
             let spare = self
                 .menu_data
                 .spare
                 .as_ref()
-                .map(|s| s.engine.document().page());
+                .map(|s| s.engine.document().composite());
+            let spare = spare.as_deref();
             let page = light_table_page(
                 doc,
-                self.page(),
+                &self.page(),
                 self.anim.light,
                 spare,
                 self.ui.bg,

@@ -1008,7 +1008,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = frames(4);
         app.engine.execute(Command::GotoFrame { frame: 1 }).unwrap();
-        let before = app.page().clone();
+        let before = app.page().into_owned();
         ui_pass(&mut app, &ctx, 0.0, vec![]);
         pass(&mut app, &ctx, 0.1, vec![text("b")], NONE);
         assert_eq!(app.ui.tool, Tool::BrushSelect);
@@ -1026,7 +1026,7 @@ mod tests {
         }
         assert!(app.anim_brush_in_use());
         assert_eq!(app.ui.mode, PaintMode::Matte);
-        assert_eq!(app.page(), &before, "picking up an AnimBrush never cuts");
+        assert_eq!(&*app.page(), &before, "picking up an AnimBrush never cuts");
         assert_eq!(app.engine.document().current_frame(), 1);
         // The menu items that need an AnimBrush are on now.
         ui_pass(&mut app, &ctx, t + 0.1, vec![]);
@@ -1182,7 +1182,7 @@ mod tests {
         want.advance(cmd.stamps());
         let mut reference = dpx_core::Engine::new(doc);
         reference.execute(cmd).unwrap();
-        assert_eq!(app.page(), reference.document().page());
+        assert_eq!(&*app.page(), reference.document().page());
         assert_eq!(app.animbrush.brush.as_ref().unwrap().clock, want.clock);
         let shown: std::collections::BTreeSet<u8> = (20..45)
             .flat_map(|x| (60..68).map(move |y| (x, y)))

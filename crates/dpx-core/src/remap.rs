@@ -1,8 +1,8 @@
 //! Palette arrangement and remapping (ADR-31): Color ▸ Palette ▸ Arrange and Color ▸ Remap.
 //!
 //! Pure functions on palettes and index buffers; [`crate::Command::ArrangePalette`] applies
-//! [`arranged_palette`] and [`reindex`] as one undoable step, Remap is a `SetPage` of
-//! [`remap_to_palette`].
+//! [`arranged_palette`] and [`reindex`] as one undoable step, [`crate::Command::RemapColors`]
+//! applies [`remap_to_palette`] (every frame and layer, ADR-44).
 
 use crate::image::IndexedImage;
 use crate::palette::{Palette, Rgb8};
@@ -79,10 +79,27 @@ pub fn nearest_lut(from: &[Rgb8], to: &Palette) -> [u8; 256] {
     lut
 }
 
+/// [`nearest_lut`] for a layer above the bottom one (ADR-44), where colour 0 is
+/// transparent: 0 stays 0, every other colour goes to the nearest entry but 0 (so nothing
+/// opaque turns transparent).
+pub fn nearest_lut_upper(from: &[Rgb8], to: &Palette) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate().skip(1) {
+        *v = from
+            .get(i)
+            .map_or(i as u8, |&c| to.nearest_excluding(c, &[0]));
+    }
+    lut
+}
+
 /// Color ▸ Remap: the page repainted with the colours of `from` (the palette its pixels were
 /// drawn for) looked up in `to` (the current palette), nearest colour.
 pub fn remap_to_palette(page: &IndexedImage, from: &[Rgb8], to: &Palette) -> IndexedImage {
-    let lut = nearest_lut(from, to);
+    remap_with(page, &nearest_lut(from, to))
+}
+
+/// `page` with every pixel `p` replaced by `lut[p]`.
+pub fn remap_with(page: &IndexedImage, lut: &[u8; 256]) -> IndexedImage {
     let pixels = page.pixels().iter().map(|&p| lut[usize::from(p)]).collect();
     IndexedImage::from_pixels(page.width(), page.height(), pixels).expect("same size")
 }
