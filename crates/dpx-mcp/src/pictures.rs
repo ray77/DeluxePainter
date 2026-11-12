@@ -5,7 +5,7 @@
 //! reduction (ADR-9) and are not supported here (ADR-24).
 
 use dpx_core::quantize::PaletteDepth;
-use dpx_core::{Chipset, DisplayMode, Document, IndexedImage, Palette, Rgb8, Target};
+use dpx_core::{DisplayMode, Document, IndexedImage, Palette, Rgb8, Target};
 use dpx_iff::{Ilbm, Masking, SpecialMode, ilbm};
 
 use crate::error::ToolError;
@@ -180,55 +180,16 @@ fn hardware(msg: String) -> ToolError {
 }
 
 /// The hardware rules of the document's target, checked before anything is written. Nothing
-/// is reduced silently: a violation is an error.
+/// is reduced silently: a violation is an error. The rules live in `dpx_core::hardware`
+/// (ADR-46), shared with the GUI's and the CLI's exports.
 pub fn validate_hardware(doc: &Document) -> Result<(), ToolError> {
-    let t = doc.target();
-    let (w, h) = (doc.page().width(), doc.page().height());
-    let colors = doc.palette().len();
-    let Some(max) = t.mode.max_colors(t.chipset) else {
-        return Err(hardware(format!(
-            "{:?} cannot show {}",
-            t.chipset,
-            t.mode.name()
-        )));
-    };
-    if colors > usize::from(max) {
-        return Err(hardware(format!(
-            "{colors} colours exceed the {max} of {} on {:?}",
-            t.mode.name(),
-            t.chipset
-        )));
-    }
-    if !t.page_fits(w, h) {
-        let ((min_w, min_h), (max_w, max_h)) = t.page_limits();
-        return Err(hardware(format!(
-            "page {w}x{h} is outside the {min_w}x{min_h}..{max_w}x{max_h} limits of {}",
-            t.mode.name()
-        )));
-    }
-    if t.chipset == Chipset::Ocs
-        && let Some(i) = doc
-            .palette()
-            .colors()
-            .iter()
-            .position(|c| Rgb8::from_rgb4(c.to_rgb4()) != *c)
-    {
-        return Err(hardware(format!(
-            "palette entry {i} is not a 12-bit OCS colour"
-        )));
-    }
-    if let Some(&max) = doc.page().pixels().iter().max()
-        && usize::from(max) >= colors
-    {
-        return Err(hardware(format!(
-            "pixel colour {max} is outside the {colors}-colour palette"
-        )));
-    }
-    Ok(())
+    dpx_core::hardware::validate(doc).map_err(|e| ToolError::new(e.code(), e.message))
 }
 
 /// Encodes the document after validating its hardware limits. ILBM carries the display
 /// mode's CAMG, pixel aspect and screen size; PNG cannot store the display mode (noted).
+/// Every format names a custom or overscan screen, and IFF what the file cannot carry of the
+/// target (`dpx_core::hardware::export_notes`, as the app's exports, ADR-46).
 pub fn encode_document(
     doc: &Document,
     format: Format,
@@ -253,6 +214,7 @@ pub fn encode_document(
             out.page_height = sh as i16;
             let bytes = ilbm::write(&out, ilbm::Compression::ByteRun1)
                 .map_err(|e| hardware(e.to_string()))?;
+            notes.extend(dpx_core::hardware::export_notes(doc, true));
             Ok((bytes, notes))
         }
         Format::Anim => {
@@ -271,6 +233,7 @@ pub fn encode_document(
             };
             let bytes = dpx_iff::anim::encode(&images, doc.palette(), &opts)
                 .map_err(|e| hardware(e.to_string()))?;
+            notes.extend(dpx_core::hardware::export_notes(doc, true));
             Ok((bytes, notes))
         }
         Format::Png => {
@@ -280,6 +243,7 @@ pub fn encode_document(
                 "PNG cannot store: display mode {}",
                 doc.target().mode.name()
             ));
+            notes.extend(dpx_core::hardware::export_notes(doc, false));
             Ok((bytes, notes))
         }
     }
@@ -288,6 +252,7 @@ pub fn encode_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dpx_core::Chipset;
 
     fn data(name: &str) -> Vec<u8> {
         std::fs::read(format!(
@@ -403,6 +368,33 @@ mod tests {
                 .message
                 .contains("limits")
         );
+    }
+
+    /// ADR-46: save_picture names a custom screen in every format and, for IFF, the chipset
+    /// the file cannot carry, as the app's exports do.
+    #[test]
+    fn saved_pictures_name_custom_screens_and_the_lost_chipset() {
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let d = Document::from_picture(
+            IndexedImage::new(320, 240, 0),
+            Palette::dpaint_default_32(),
+            ocs,
+        );
+        let custom = "320x240 is a custom screen size on PAL:Low Res (standard 320x256); exact \
+                      hardware compatibility is not guaranteed";
+        let chipset = "IFF files store no chipset: this OCS picture reopens as AGA";
+        for f in [Format::Ilbm, Format::Anim] {
+            let (_, notes) = encode_document(&d, f).unwrap();
+            assert_eq!(notes, [custom, chipset], "{f:?}");
+        }
+        let (_, notes) = encode_document(&d, Format::Png).unwrap();
+        assert_eq!(
+            notes,
+            ["PNG cannot store: display mode PAL:Low Res", custom]
+        );
+        // A standard AGA screen says nothing more.
+        let (_, notes) = encode_document(&doc(), Format::Ilbm).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]

@@ -117,6 +117,9 @@ pub enum ProjectError {
     Invalid(String),
     /// The project cannot be written as described.
     Write(String),
+    /// The palette breaks the target's colour limits (ADR-46), e.g. an OCS colour that is
+    /// not 12-bit, as builds before ADR-46 could save.
+    Hardware(String),
 }
 
 impl ProjectError {
@@ -127,6 +130,7 @@ impl ProjectError {
             ProjectError::TooLarge(_) => "Project file is too large".into(),
             ProjectError::Invalid(_) => "Project file is damaged".into(),
             ProjectError::Write(_) => "Cannot write project".into(),
+            ProjectError::Hardware(_) => "Project breaks hardware rules".into(),
         }
     }
 
@@ -139,7 +143,8 @@ impl ProjectError {
             ProjectError::NotAProject(d)
             | ProjectError::TooLarge(d)
             | ProjectError::Invalid(d)
-            | ProjectError::Write(d) => d.clone(),
+            | ProjectError::Write(d)
+            | ProjectError::Hardware(d) => d.clone(),
         }
     }
 }
@@ -528,6 +533,10 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
             m.target.mode.name()
         )));
     }
+    // The colour limits of the target are document rules too (ADR-46): the chipset shows the
+    // mode, the palette fits its colour count and OCS entries are 12-bit.
+    dpx_core::hardware::check_palette(m.target, &palette)
+        .map_err(|e| ProjectError::Hardware(format!("{}.", e.message)))?;
     let document = Document::from_frames(frames, current, fps, palette, m.target)
         .map_err(|e| invalid(e.message))?;
     let extras = ProjectExtras {
@@ -711,8 +720,45 @@ mod tests {
         let back = round_trip(&Project::new(doc, ProjectExtras::default()));
         assert_eq!(back.document.target().screen, (704, 480));
         let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
-        let doc = Document::from_picture(sample_image(320, 256, 16), sample_palette(16), ocs);
+        let twelve_bit = Palette::from_rgb4(&(0..16).map(|i| i * 0x111).collect::<Vec<_>>());
+        let doc = Document::from_picture(sample_image(320, 256, 16), twelve_bit.unwrap(), ocs);
         round_trip(&Project::new(doc, ProjectExtras::default()));
+    }
+
+    /// ADR-46: the target's colour limits are checked on reading, not only the screen.
+    #[test]
+    fn colour_limits_of_the_target_are_checked() {
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let write = |palette: Palette, target: Target| {
+            let doc = Document::from_picture(sample_image(320, 240, 2), palette, target);
+            write_project(&Project::new(doc, ProjectExtras::default())).unwrap()
+        };
+        // A 12-bit OCS palette on the 320x240 custom screen reads back.
+        let back = read_project(&write(Palette::dpaint_default_32(), ocs)).unwrap();
+        assert_eq!(back.document.target(), ocs);
+        // A colour that is not 12-bit (builds before ADR-46 could save one).
+        let e = read_project(&write(sample_palette(32), ocs)).unwrap_err();
+        assert!(matches!(e, ProjectError::Hardware(_)), "{e}");
+        assert_eq!(e.summary(), "Project breaks hardware rules");
+        assert_eq!(e.details(), "palette entry 1 is not a 12-bit OCS colour.");
+        // More colours than the mode shows on the chipset.
+        let e =
+            read_project(&write(Palette::new(vec![Rgb8::BLACK; 64]).unwrap(), ocs)).unwrap_err();
+        assert_eq!(
+            e.details(),
+            "64 colours exceed the 32 of PAL:Low Res on Ocs."
+        );
+        // A mode the chipset cannot show.
+        let shi = DisplayMode::new(Video::Pal, Resolution::SuperHi, false);
+        let bytes = write(Palette::dpaint_default_32(), Target::new(Chipset::Aga, shi));
+        let mut m = manifest_of(&bytes);
+        m["target"]["chipset"] = "ocs".into();
+        let mut e = entries(&bytes);
+        e[0].1 = serde_json::to_vec(&m).unwrap();
+        let e = read_project(&zip_entries(&e).unwrap()).unwrap_err();
+        assert_eq!(e.details(), "Ocs cannot show PAL:Super-High Res.");
+        // AGA takes any colours.
+        read_project(&write(sample_palette(32), Target::default())).unwrap();
     }
 
     #[test]

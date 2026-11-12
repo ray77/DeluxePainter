@@ -11,7 +11,7 @@ use crate::anim_brush::{self, AnimBrush};
 use crate::document::{Document, check_frame_count};
 use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
-use crate::mode::DisplayMode;
+use crate::mode::{Chipset, DisplayMode};
 use crate::paint::{BrushImage, DrawMode, PaintFx};
 use crate::palette::{Palette, Rgb8};
 use crate::shapes::{Shape, Symmetry};
@@ -134,7 +134,11 @@ pub enum Command {
     /// Picture ▸ Screen Format: display mode, palette size and page size. With `retain` the
     /// picture is kept (top-left aligned, cut off if the page shrinks), otherwise the page is
     /// cleared to colour 0. New palette entries get a grey ramp; dropped entries must be
-    /// unused when `retain` is set.
+    /// unused when `retain` is set. Mode, colours and screen are checked against the
+    /// resulting chipset. On OCS every palette entry becomes a 12-bit colour: the grey ramp,
+    /// and kept entries of an AGA palette when the chipset changes to OCS, are rounded to the
+    /// nearest 12-bit value (ADR-46), and the outcome counts the kept entries rounded
+    /// (`Outcome::rounded_colors`). Undo restores the whole previous target.
     SetFormat {
         mode: DisplayMode,
         colors: u16,
@@ -144,6 +148,9 @@ pub enum Command {
         /// Screen size; `None` = the mode's standard size (ADR-11).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         screen: Option<(u32, u32)>,
+        /// The chipset (ADR-46); `None` keeps the current one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chipset: Option<Chipset>,
     },
     /// Picture ▸ Page Size: the picture stays top-left; new area gets `fill` (the BG colour),
     /// a smaller page crops (ADR-10).
@@ -432,15 +439,13 @@ impl Command {
                 height,
                 retain,
                 screen,
+                chipset,
             } => {
-                let max = mode.max_colors(doc.target.chipset).ok_or_else(|| {
+                let chipset = chipset.unwrap_or(doc.target.chipset);
+                let max = mode.max_colors(chipset).ok_or_else(|| {
                     CommandError::new(
                         ErrorCode::UnsupportedMode,
-                        format!(
-                            "{} is not available on {:?}",
-                            mode.name(),
-                            doc.target.chipset
-                        ),
+                        format!("{} is not available on {chipset:?}", mode.name()),
                     )
                 })?;
                 if !n.is_power_of_two() || *n < 2 || *n > max {
@@ -481,13 +486,19 @@ impl Command {
                     if let Some(max_used) = max_used
                         && u16::from(max_used) >= *n
                     {
-                        return Err(CommandError::new(
-                            ErrorCode::PaletteRangeInvalid,
+                        let need = (u16::from(max_used) + 1).next_power_of_two();
+                        let message = if need > max {
                             format!(
-                                "the picture uses colour {max_used}; keep at least {} colours",
-                                (u16::from(max_used) + 1).next_power_of_two()
-                            ),
-                        ));
+                                "the picture uses colour {max_used}; {} on {chipset:?} has at \
+                                 most {max} colours (turn Retain Picture off)",
+                                mode.name()
+                            )
+                        } else {
+                            format!(
+                                "the picture uses colour {max_used}; keep at least {need} colours"
+                            )
+                        };
+                        return Err(CommandError::new(ErrorCode::PaletteRangeInvalid, message));
                     }
                 }
                 Ok(())
@@ -544,13 +555,23 @@ impl Command {
                 other_page(*width, *height, pixels, colors)
             }
             Command::SetPalette { colors: new } => {
-                if new.len() == colors {
-                    Ok(())
-                } else {
-                    Err(CommandError::invalid(format!(
+                if new.len() != colors {
+                    return Err(CommandError::invalid(format!(
                         "palette must keep {colors} colours, got {}",
                         new.len()
-                    )))
+                    )));
+                }
+                // OCS colours are 12-bit, a document rule (ADR-46).
+                match crate::hardware::first_unshowable(doc.target.chipset, new) {
+                    Some((i, c)) => Err(CommandError::new(
+                        ErrorCode::PaletteRangeInvalid,
+                        format!(
+                            "colour {i} {c} is not a 12-bit OCS colour (each channel a \
+                             multiple of 0x11, e.g. {})",
+                            crate::hardware::snap(Chipset::Ocs, c)
+                        ),
+                    )),
+                    None => Ok(()),
                 }
             }
             Command::SetFrameCount { .. }
@@ -633,6 +654,27 @@ impl Command {
         }
     }
 
+    /// How many kept palette entries this command rounds to colours its chipset shows
+    /// (ADR-46): a SetFormat to OCS rounds the entries of an AGA palette that are not 12-bit
+    /// (a change of the colours, reported in `Outcome::rounded_colors`, never silent). New
+    /// grey-ramp entries are not counted; every other command rounds nothing. Call only after
+    /// [`Self::validate`], before [`Self::apply`].
+    pub(crate) fn rounded_colors(&self, doc: &Document) -> u16 {
+        let Command::SetFormat {
+            colors, chipset, ..
+        } = self
+        else {
+            return 0;
+        };
+        let chipset = chipset.unwrap_or(doc.target.chipset);
+        let kept = usize::from(*colors).min(doc.palette.len());
+        let rounded = doc.palette.colors()[..kept]
+            .iter()
+            .filter(|&&c| crate::hardware::snap(chipset, c) != c)
+            .count();
+        rounded as u16
+    }
+
     /// Applies the command. Call only after [`Self::validate`].
     pub(crate) fn apply(&self, doc: &mut Document) {
         if self.is_frame_command() {
@@ -673,6 +715,7 @@ impl Command {
                 height,
                 retain,
                 screen,
+                chipset,
             } => {
                 doc.for_each_frame(|frame| {
                     let mut new_page = IndexedImage::new(*width, *height, 0);
@@ -681,7 +724,11 @@ impl Command {
                     }
                     *frame = new_page;
                 });
-                doc.palette = resized_palette(&doc.palette, usize::from(*colors));
+                let chipset = chipset.unwrap_or(doc.target.chipset);
+                // The kept entries this rounds are counted in `Outcome::rounded_colors`
+                // ([`Self::rounded_colors`]), so no front-end changes colours silently.
+                doc.palette = resized_palette(&doc.palette, usize::from(*colors), chipset);
+                doc.target.chipset = chipset;
                 doc.target.mode = *mode;
                 doc.target.screen = screen.unwrap_or(mode.size());
             }
@@ -912,8 +959,9 @@ fn other_page(width: u32, height: u32, pixels: &[u8], colors: usize) -> Result<(
     }
 }
 
-/// Keeps the first `n` entries; missing ones become a grey ramp from black to white.
-fn resized_palette(palette: &Palette, n: usize) -> Palette {
+/// Keeps the first `n` entries; missing ones become a grey ramp from black to white. Every
+/// entry is snapped to what `chipset` shows (12-bit on OCS, [`crate::hardware::snap`]).
+fn resized_palette(palette: &Palette, n: usize, chipset: Chipset) -> Palette {
     let mut colors: Vec<Rgb8> = palette.colors().iter().copied().take(n).collect();
     let start = colors.len();
     let extra = n - start;
@@ -925,6 +973,7 @@ fn resized_palette(palette: &Palette, n: usize) -> Palette {
         };
         colors.push(Rgb8::new(v, v, v));
     }
+    crate::hardware::snap_colors(chipset, &mut colors);
     Palette::new(colors).expect("1..=256 entries")
 }
 

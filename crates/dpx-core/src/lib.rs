@@ -18,6 +18,8 @@ pub mod command;
 pub mod document;
 pub mod engine;
 pub mod gradient;
+// Hardware rules, export notes and screen presets (ADR-46).
+pub mod hardware;
 pub mod image;
 // Picture ▸ Load's Import requester (ADR-42).
 pub mod import;

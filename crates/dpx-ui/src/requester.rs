@@ -2,9 +2,15 @@
 //! Format ("Choose Display Mode", DeluxePaint IV AGA): like the original it appears on its
 //! own HiRes screen (640×256) with Workbench-style colours. Layout after `Choose_Setup.png`;
 //! exact geometry is still to calibrate (AMIGA_GUI_FIDELITY.md).
+//!
+//! Documented deviation (ADR-46): below the original gadgets a row adds a Preset cycle
+//! gadget (named screen formats such as "Pixel art 320x240 (custom)", which set mode, screen
+//! and page) and a Chipset cycle gadget (OCS/AGA; the mode list and Max Colors follow it, and
+//! Use sends it). DeluxePaint IV AGA has neither. The window is taller for that row.
 
 use std::sync::OnceLock;
 
+use dpx_core::mode::{PRESETS, Preset};
 use dpx_core::{Chipset, Command, DisplayMode, IndexedImage, Palette, Target};
 
 use crate::bitmap::{self, Bitmap};
@@ -27,6 +33,13 @@ pub fn palette() -> Palette {
 /// Version line in the credits panel.
 const VERSION: &str = concat!("Version ", env!("CARGO_PKG_VERSION"));
 
+/// Most lines of a message ("Use" refused) in the information panel.
+const MESSAGE_LINES: usize = 4;
+/// Line pitch of the information panel's lines.
+const INFO_LINE_H: i32 = 9;
+/// Line pitch of a message's lines in its bar.
+const MESSAGE_LINE_H: i32 = 11;
+
 mod geom {
     pub const SCREEN_W: i32 = 640;
     pub const SCREEN_H: i32 = 256;
@@ -34,7 +47,8 @@ mod geom {
     pub const WIN_X: i32 = 16;
     pub const WIN_Y: i32 = 13;
     pub const WIN_W: i32 = 608;
-    pub const WIN_H: i32 = 206;
+    /// Taller than the original's for the Preset/Chipset row (ADR-46).
+    pub const WIN_H: i32 = 236;
     pub const LEFT_X: i32 = 28;
     pub const LEFT_W: i32 = 344;
     pub const RIGHT_X: i32 = 384;
@@ -64,7 +78,12 @@ mod geom {
     pub const INFO_H: i32 = 66;
     pub const CREDITS_Y: i32 = 114;
     pub const CREDITS_H: i32 = 72;
-    pub const BUTTON_Y: i32 = 198;
+    /// The Preset (left column) and Chipset (right column) row (ADR-46).
+    pub const PRESET_Y: i32 = 204;
+    pub const PRESET_W: i32 = NUM_H_X + NUM_W - CYCLE_X;
+    pub const CHIPSET_W: i32 = 140;
+    pub const CHIPSET_X: i32 = RIGHT_X + (RIGHT_W - CHIPSET_W) / 2;
+    pub const BUTTON_Y: i32 = 228;
     pub const BUTTON_W: i32 = 64;
     pub const BUTTON_H: i32 = 14;
     pub const USE_X: i32 = 28;
@@ -162,15 +181,37 @@ pub struct ScreenFormatRequester {
     pointer: (i32, i32),
     /// Shown in the information panel, e.g. why "Use" was refused.
     message: Option<String>,
+    /// The shown entry of [`PRESETS`] (ADR-46): the preset the mode and screen size match,
+    /// else Custom; cycling the gadget picks the next one.
+    preset: usize,
+}
+
+/// The modes `chipset` can show, in list order.
+fn modes_of(chipset: Chipset) -> Vec<DisplayMode> {
+    DisplayMode::all()
+        .into_iter()
+        .filter(|m| m.max_colors(chipset).is_some())
+        .collect()
+}
+
+fn other(chipset: Chipset) -> Chipset {
+    match chipset {
+        Chipset::Ocs => Chipset::Aga,
+        Chipset::Aga => Chipset::Ocs,
+    }
+}
+
+fn chipset_name(chipset: Chipset) -> &'static str {
+    match chipset {
+        Chipset::Ocs => "OCS",
+        Chipset::Aga => "AGA",
+    }
 }
 
 impl ScreenFormatRequester {
     /// Opens the requester for a document with this target, page size and colour count.
     pub fn new(target: Target, page: (u32, u32), colors: usize) -> Self {
-        let modes: Vec<DisplayMode> = DisplayMode::all()
-            .into_iter()
-            .filter(|m| m.max_colors(target.chipset).is_some())
-            .collect();
+        let modes = modes_of(target.chipset);
         let selected = modes.iter().position(|&m| m == target.mode).unwrap_or(0);
         let mut r = Self {
             chipset: target.chipset,
@@ -188,19 +229,129 @@ impl ScreenFormatRequester {
             drag: None,
             pointer: (0, 0),
             message: None,
+            preset: 0,
         };
         r.clamp_colors();
         r.reveal_selected();
-        let mode = r.mode();
-        r.screen_choice = if target.screen == mode.size() {
+        r.show_screen(target.screen);
+        r.sync_preset();
+        r
+    }
+
+    /// Shows `screen` in the Screen Size gadget: Standard, Overscan or Custom with its size.
+    fn show_screen(&mut self, screen: (u32, u32)) {
+        let mode = self.mode();
+        self.screen_choice = if screen == mode.size() {
             ScreenChoice::Standard
-        } else if target.screen == mode.overscan_size() {
+        } else if screen == mode.overscan_size() {
             ScreenChoice::Overscan
         } else {
             ScreenChoice::Custom
         };
-        r.set_fields(target.screen);
-        r
+        self.set_fields(screen);
+    }
+
+    /// The chipset "Use" sends (ADR-46).
+    pub fn chipset(&self) -> Chipset {
+        self.chipset
+    }
+
+    /// The preset shown in the Preset gadget (ADR-46).
+    pub fn preset(&self) -> &'static Preset {
+        &PRESETS[self.preset]
+    }
+
+    /// Shows the preset the mode and screen size now match (else Custom).
+    fn sync_preset(&mut self) {
+        self.preset = Preset::index_of(self.mode(), self.screen_size());
+    }
+
+    /// True if the other chipset can show the selected mode (OCS has no SuperHiRes); the
+    /// Chipset gadget is ghosted otherwise.
+    pub fn chipset_switchable(&self) -> bool {
+        self.mode().max_colors(other(self.chipset)).is_some()
+    }
+
+    /// The Chipset gadget: OCS ↔ AGA. The mode list keeps only the modes the chipset shows
+    /// and the palette size is limited to the mode's maximum there.
+    fn cycle_chipset(&mut self) {
+        if !self.chipset_switchable() {
+            // Only SuperHiRes is missing on OCS.
+            self.message = Some(format!(
+                "Super-High Res needs {}",
+                chipset_name(self.chipset)
+            ));
+            return;
+        }
+        let mode = self.mode();
+        self.chipset = other(self.chipset);
+        self.modes = modes_of(self.chipset);
+        self.selected = self.modes.iter().position(|&m| m == mode).unwrap_or(0);
+        self.clamp_colors();
+        self.reveal_selected();
+        self.message = None;
+    }
+
+    /// The Preset gadget: the next preset the chipset can show. A preset sets the mode, the
+    /// screen size and a screen-sized page, and limits the palette size to the mode's
+    /// maximum; Custom keeps them and opens the screen size for typing.
+    fn cycle_preset(&mut self) {
+        let n = PRESETS.len();
+        let next = (1..=n)
+            .map(|step| (self.preset + step) % n)
+            .find(|&i| PRESETS[i].format.is_none() || PRESETS[i].target(self.chipset).is_some())
+            .unwrap_or(n - 1);
+        self.apply_preset(next);
+    }
+
+    fn apply_preset(&mut self, i: usize) {
+        self.preset = i;
+        self.active = None;
+        self.message = None;
+        match PRESETS[i].format {
+            Some((mode, screen)) => {
+                let Some(at) = self.modes.iter().position(|&m| m == mode) else {
+                    return;
+                };
+                self.selected = at;
+                self.clamp_colors();
+                self.reveal_selected();
+                self.show_screen(screen);
+                self.page = PageChoice::Screen;
+            }
+            None => {
+                let shown = self.screen_size();
+                self.screen_choice = ScreenChoice::Custom;
+                self.set_fields(shown);
+            }
+        }
+    }
+
+    /// Picks the preset with this id, as the gadget would (for `--snapshot`); `false` if
+    /// there is none or the chipset cannot show it.
+    pub fn choose_preset(&mut self, id: &str) -> bool {
+        match PRESETS.iter().position(|p| p.id == id) {
+            Some(i) if PRESETS[i].format.is_none() || PRESETS[i].target(self.chipset).is_some() => {
+                self.apply_preset(i);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The Preset gadget's area in requester pixels (ADR-46).
+    pub fn preset_gadget() -> dpx_core::Rect {
+        preset_rect().public()
+    }
+
+    /// The Chipset gadget's area in requester pixels (ADR-46).
+    pub fn chipset_gadget() -> dpx_core::Rect {
+        chipset_rect().public()
+    }
+
+    /// The Use button's area in requester pixels.
+    pub fn use_button() -> dpx_core::Rect {
+        button_rect(Button::Use).public()
     }
 
     fn set_fields(&mut self, (w, h): (u32, u32)) {
@@ -240,6 +391,7 @@ impl ScreenFormatRequester {
             self.set_fields(shown);
         }
         self.message = None;
+        self.sync_preset();
     }
 
     pub fn mode(&self) -> DisplayMode {
@@ -268,8 +420,15 @@ impl ScreenFormatRequester {
         self.scroll = self.scroll.min(self.modes.len().saturating_sub(rows));
     }
 
+    /// Selects the mode in row `i` of the list. Selecting the selected mode again (Up on the
+    /// first row, a click on the selected one) changes nothing, so a Custom preset stays.
     fn select(&mut self, i: usize) {
-        self.selected = i.min(self.modes.len() - 1);
+        let i = i.min(self.modes.len() - 1);
+        if i == self.selected {
+            self.reveal_selected();
+            return;
+        }
+        self.selected = i;
         self.clamp_colors();
         self.reveal_selected();
         self.message = None;
@@ -280,6 +439,7 @@ impl ScreenFormatRequester {
                 self.set_fields(std);
             }
         }
+        self.sync_preset();
     }
 
     /// Page size that "Use" would set.
@@ -301,6 +461,7 @@ impl ScreenFormatRequester {
             height,
             retain: self.retain,
             screen: Some(self.screen_size()),
+            chipset: Some(self.chipset),
         }
     }
 
@@ -309,7 +470,18 @@ impl ScreenFormatRequester {
         self.message = Some(text.into());
     }
 
+    /// Feeds one event. A refusal message describes the command it refused: whatever changes
+    /// the command "Use" sends (a gadget, a key, a typed size) clears it.
     pub fn handle(&mut self, event: ReqEvent) -> ReqResponse {
+        let before = self.command();
+        let response = self.handle_event(event);
+        if self.command() != before {
+            self.message = None;
+        }
+        response
+    }
+
+    fn handle_event(&mut self, event: ReqEvent) -> ReqResponse {
         match event {
             ReqEvent::Press(x, y) => {
                 self.pointer = (x, y);
@@ -367,6 +539,15 @@ impl ScreenFormatRequester {
                         self.retain = !self.retain;
                         ReqResponse::Continue
                     }
+                    // ADR-46: Preset and cHipset (underlined in their labels).
+                    'p' => {
+                        self.cycle_preset();
+                        ReqResponse::Continue
+                    }
+                    'h' => {
+                        self.cycle_chipset();
+                        ReqResponse::Continue
+                    }
                     _ => ReqResponse::Continue,
                 },
                 _ => ReqResponse::Continue,
@@ -379,16 +560,24 @@ impl ScreenFormatRequester {
         }
     }
 
+    /// A key for the active number box. Only a change of its text clears the message and
+    /// shows the preset the new size matches: a cursor key, or a key with no box active,
+    /// leaves the Preset gadget as it is (Custom stays Custom).
     fn edit(&mut self, k: ReqKey) {
         if self.screen_choice != ScreenChoice::Custom {
             return;
         }
-        match self.active {
-            Some(0) => self.field_w.key(k),
-            Some(1) => self.field_h.key(k),
-            _ => {}
+        let field = match self.active {
+            Some(0) => &mut self.field_w,
+            Some(1) => &mut self.field_h,
+            _ => return,
+        };
+        let before = field.text().to_string();
+        field.key(k);
+        if field.text() != before {
+            self.message = None;
+            self.sync_preset();
         }
-        self.message = None;
     }
 
     fn activate(&self, b: Button) -> ReqResponse {
@@ -437,6 +626,10 @@ impl ScreenFormatRequester {
             self.slider_to(x);
         } else if check_rect().contains(p) || retain_label_rect().contains(p) {
             self.retain = !self.retain;
+        } else if preset_rect().contains(p) {
+            self.cycle_preset();
+        } else if chipset_rect().contains(p) {
+            self.cycle_chipset();
         } else if button_rect(Button::Use).contains(p) {
             self.drag = Some(Drag::Button(Button::Use));
         } else if button_rect(Button::Cancel).contains(p) {
@@ -661,6 +854,31 @@ impl ScreenFormatRequester {
         );
         underline(&mut img, lx, geom::PALETTE_Y + 2, 'R', pens.dark);
 
+        // ADR-46: Preset (left column) and Chipset (right column), keys P and H.
+        let pr = preset_rect();
+        let label_y = geom::PRESET_Y - 10;
+        let px = pr.x + (pr.w - font.text_width("Preset")) / 2;
+        font.draw(&mut img, px, label_y, "Preset", pens.shine);
+        underline(&mut img, px, label_y, 'P', pens.shine);
+        cycle_at(&mut img, pr, self.preset().label, false, &pens);
+        let cr = chipset_rect();
+        let cx = cr.x + (cr.w - font.text_width("Chipset")) / 2;
+        font.draw(&mut img, cx, label_y, "Chipset", pens.shine);
+        underline(
+            &mut img,
+            cx + font.text_width("C"),
+            label_y,
+            'h',
+            pens.shine,
+        );
+        cycle_at(
+            &mut img,
+            cr,
+            chipset_name(self.chipset),
+            !self.chipset_switchable(),
+            &pens,
+        );
+
         // Display information.
         let info = Rect::new(geom::RIGHT_X, geom::INFO_Y, geom::RIGHT_W, geom::INFO_H);
         centred(
@@ -681,37 +899,42 @@ impl ScreenFormatRequester {
         let (ax, ay) = m.aspect();
         let (fx, fy) = m.pixel_shape();
         let lines = [
-            format!(
-                "Chipset = {}",
-                match self.chipset {
-                    Chipset::Ocs => "OCS",
-                    Chipset::Aga => "AGA",
-                }
-            ),
+            format!("Chipset = {}", chipset_name(self.chipset)),
             format!("Max Colors = {max} of {depth}"),
             format!("Size = {sw}x{sh}"),
             format!("Max Size = {ow}x{oh}"),
             format!("Pixel Shape = {fx}:{fy}"),
             format!("Aspect = {ax}:{ay}"),
         ];
+        // A message ("Use" refused) is a bar at the panel's bottom (wrapped, up to
+        // MESSAGE_LINES lines, so a long refusal such as ADR-46's colour rules stays inside);
+        // the information lines it would cut into are left out, never shown in part.
+        let message = self.message.as_ref().map(|msg| {
+            let lines = crate::note_requester::wrap(msg, info.w - 12);
+            let top = message_top(info, lines.len());
+            (lines, top)
+        });
+        let bar_top = message.as_ref().map_or(info.y + info.h, |(_, top)| *top);
         for (i, line) in lines.iter().enumerate() {
-            font.draw(
-                &mut img,
-                info.x + 6,
-                info.y + 2 + i as i32 * 9,
-                line,
-                pens.dark,
-            );
+            let y = info_line_y(info, i);
+            if y + crate::font::GLYPH_H > bar_top {
+                break;
+            }
+            font.draw(&mut img, info.x + 6, y, line, pens.dark);
         }
-        if let Some(msg) = &self.message {
-            img.fill_rect(
-                info.x + 1,
-                info.y + info.h - 12,
-                info.w - 2,
-                11,
-                pens.select,
-            );
-            font.draw(&mut img, info.x + 6, info.y + info.h - 11, msg, pens.shine);
+        if let Some((lines, top)) = message {
+            // Inside the bevel (its vertical edges are two pixels wide).
+            let bottom = info.y + info.h - 1;
+            img.fill_rect(info.x + 2, top, info.w - 4, bottom - top, pens.select);
+            for (i, line) in lines.iter().take(MESSAGE_LINES).enumerate() {
+                font.draw(
+                    &mut img,
+                    info.x + 6,
+                    top + 1 + MESSAGE_LINE_H * i as i32,
+                    line,
+                    pens.shine,
+                );
+            }
         }
 
         // Credits.
@@ -793,6 +1016,28 @@ impl Rect {
     fn inset(&self, d: i32) -> Self {
         Self::new(self.x + d, self.y + d, self.w - 2 * d, self.h - 2 * d)
     }
+
+    fn public(self) -> dpx_core::Rect {
+        dpx_core::Rect::new(self.x, self.y, self.w, self.h)
+    }
+}
+
+fn preset_rect() -> Rect {
+    Rect::new(
+        geom::CYCLE_X,
+        geom::PRESET_Y,
+        geom::PRESET_W,
+        geom::GADGET_H,
+    )
+}
+
+fn chipset_rect() -> Rect {
+    Rect::new(
+        geom::CHIPSET_X,
+        geom::PRESET_Y,
+        geom::CHIPSET_W,
+        geom::GADGET_H,
+    )
 }
 
 fn list_rect() -> Rect {
@@ -824,6 +1069,19 @@ fn slider_rect() -> Rect {
         geom::SLIDER_W,
         geom::FIELD_H,
     )
+}
+
+/// Top of the information panel's `i`-th line.
+fn info_line_y(info: Rect, i: usize) -> i32 {
+    info.y + 2 + INFO_LINE_H * i as i32
+}
+
+/// Top of the message bar for a message of `lines` wrapped lines (at most MESSAGE_LINES are
+/// shown): one row above and below each line of text, the bar ending on the panel's last
+/// inner row.
+fn message_top(info: Rect, lines: usize) -> i32 {
+    let shown = lines.clamp(1, MESSAGE_LINES) as i32;
+    info.y + info.h - 1 - (MESSAGE_LINE_H * shown - 1)
 }
 
 fn check_rect() -> Rect {
@@ -883,13 +1141,22 @@ fn underline(img: &mut IndexedImage, x: i32, y: i32, c: char, pen: u8) {
 }
 
 fn cycle(img: &mut IndexedImage, y: i32, text: &str, pens: &Pens) {
-    let r = cycle_rect(y);
+    cycle_at(img, cycle_rect(y), text, false, pens);
+}
+
+/// A cycle gadget at `r`; `ghosted` draws its glyph and text in the ghost pen (the
+/// requester's palette always has one), for a choice that cannot be changed now.
+fn cycle_at(img: &mut IndexedImage, r: Rect, text: &str, ghosted: bool, pens: &Pens) {
     raised(img, r, pens);
+    let ink = match (ghosted, pens.ghost) {
+        (true, Some(ghost)) => ghost,
+        _ => pens.dark,
+    };
     let g = glyphs();
-    draw_bitmap(img, &g.cycle, r.x + 5, r.y + 3, pens.dark);
+    draw_bitmap(img, &g.cycle, r.x + 5, r.y + 3, ink);
     img.vline(r.x + 16, r.y + 2, r.y + r.h - 3, pens.dark);
     img.vline(r.x + 17, r.y + 2, r.y + r.h - 3, pens.shine);
-    centred(img, r.x + 18, r.w - 18, r.y + 3, text, pens.dark);
+    centred(img, r.x + 18, r.w - 18, r.y + 3, text, ink);
 }
 
 /// A number field; `editable = false` draws it ghosted (fixed by the current choice).
@@ -985,6 +1252,7 @@ mod tests {
                 height: 256,
                 retain: true,
                 screen: Some((320, 256)),
+                chipset: Some(Chipset::Aga),
             }
         );
         // The selected row is visible.
@@ -1027,6 +1295,7 @@ mod tests {
                 height: 256,
                 retain: false,
                 screen: Some((640, 200)),
+                chipset: Some(Chipset::Aga),
             })
         );
     }
@@ -1223,5 +1492,397 @@ mod tests {
         press_cycle(&mut c);
         c.handle(ReqEvent::Key(ReqKey::Tab));
         assert_eq!(c.render().width(), 640);
+    }
+
+    // ---- ADR-46: Preset and Chipset gadgets ----
+
+    fn press_rect(r: &mut ScreenFormatRequester, g: dpx_core::Rect) {
+        r.handle(ReqEvent::Press(g.x + g.w / 2, g.y + g.h / 2));
+        r.handle(ReqEvent::Release);
+    }
+
+    fn preset_ids(r: &ScreenFormatRequester) -> &'static str {
+        r.preset().id
+    }
+
+    #[test]
+    fn preset_follows_mode_and_screen() {
+        let r = req();
+        assert_eq!(preset_ids(&r), "pal_lores");
+        let px = ScreenFormatRequester::new(
+            Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240),
+            (320, 240),
+            32,
+        );
+        assert_eq!(preset_ids(&px), "pixel_art_320x240");
+        assert_eq!(px.screen_choice(), ScreenChoice::Custom);
+        let over =
+            ScreenFormatRequester::new(Target::default().with_screen(368, 283), (368, 283), 32);
+        assert_eq!(preset_ids(&over), "custom");
+        // Changing the mode or the screen by the other gadgets updates it.
+        let mut r = req();
+        r.handle(ReqEvent::Key(ReqKey::Up));
+        assert_eq!(r.mode().name(), "PAL:High Res Laced");
+        assert_eq!(preset_ids(&r), "pal_hires_laced");
+        r.handle(ReqEvent::Key(ReqKey::Up));
+        assert_eq!(preset_ids(&r), "pal_hires");
+        press_cycle(&mut r);
+        assert_eq!(preset_ids(&r), "custom", "overscan is no preset");
+        press_cycle(&mut r);
+        press_cycle(&mut r);
+        assert_eq!(preset_ids(&r), "pal_hires");
+        // Typing a custom size that a preset has picks it.
+        let mut r = req();
+        press_cycle(&mut r);
+        press_cycle(&mut r);
+        r.handle(ReqEvent::Press(geom::NUM_H_X + 10, geom::SCREEN_SIZE_Y + 5));
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Backspace));
+        }
+        type_str(&mut r, "283");
+        assert_eq!(preset_ids(&r), "custom");
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Backspace));
+        }
+        type_str(&mut r, "240");
+        r.handle(ReqEvent::Key(ReqKey::Tab));
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Backspace));
+        }
+        type_str(&mut r, "320");
+        assert_eq!(r.screen_size(), (320, 240));
+        assert_eq!(preset_ids(&r), "pixel_art_320x240");
+    }
+
+    #[test]
+    fn preset_gadget_sets_mode_screen_page_and_colours() {
+        let mut r = ScreenFormatRequester::new(Target::default(), (640, 400), 256);
+        // Keep Same with a bigger page; the preset makes the page the screen.
+        r.handle(ReqEvent::Press(geom::CYCLE_X + 50, geom::PAGE_SIZE_Y + 5));
+        assert_eq!(r.page_size(), (640, 400));
+        let g = ScreenFormatRequester::preset_gadget();
+        press_rect(&mut r, g);
+        assert_eq!(preset_ids(&r), "pixel_art_320x240");
+        assert_eq!(r.mode(), DisplayMode::PAL_LORES);
+        assert_eq!(r.screen_choice(), ScreenChoice::Custom);
+        assert_eq!((r.screen_size(), r.page_size()), ((320, 240), (320, 240)));
+        assert_eq!(r.colors(), 256);
+        // Every preset in turn, then Custom, then round again (key P).
+        let mut seen = vec![preset_ids(&r)];
+        for _ in 0..PRESETS.len() {
+            r.handle(ReqEvent::Key(ReqKey::Char('p')));
+            seen.push(preset_ids(&r));
+            let p = r.preset();
+            if let Some((mode, screen)) = p.format {
+                assert_eq!(
+                    (r.mode(), r.screen_size(), r.page_size()),
+                    (mode, screen, screen)
+                );
+                let standard = screen == mode.size();
+                assert_eq!(r.screen_choice() == ScreenChoice::Standard, standard);
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "pixel_art_320x240",
+                "ntsc_hires",
+                "pal_hires",
+                "ntsc_hires_laced",
+                "pal_hires_laced",
+                "custom",
+                "ntsc_lores",
+                "pal_lores",
+                "pixel_art_320x240"
+            ]
+        );
+        // Custom keeps the mode and screen and opens the size for typing.
+        let mut r = req();
+        while preset_ids(&r) != "pal_hires_laced" {
+            r.handle(ReqEvent::Key(ReqKey::Char('p')));
+        }
+        r.handle(ReqEvent::Key(ReqKey::Char('p')));
+        assert_eq!(preset_ids(&r), "custom");
+        assert_eq!(r.screen_choice(), ScreenChoice::Custom);
+        assert_eq!(r.screen_size(), (640, 512));
+        assert_eq!(r.mode().name(), "PAL:High Res Laced");
+        // On OCS a HiRes preset limits the palette to 16 colours.
+        let mut ocs = ScreenFormatRequester::new(
+            Target::new(Chipset::Ocs, DisplayMode::PAL_LORES),
+            (320, 256),
+            32,
+        );
+        assert!(ocs.choose_preset("pal_hires"));
+        assert_eq!(ocs.colors(), 16);
+        assert!(!ocs.choose_preset("nope"));
+        match ocs.command() {
+            Command::SetFormat {
+                chipset, colors, ..
+            } => assert_eq!((chipset, colors), (Some(Chipset::Ocs), 16)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chipset_gadget_refilters_modes_and_colours() {
+        let mut r = req();
+        assert_eq!((r.chipset(), r.modes.len()), (Chipset::Aga, 12));
+        assert_eq!(r.colors(), 32);
+        // To OCS: no SuperHiRes, PAL:Low Res stays selected, 32 colours stay.
+        press_rect(&mut r, ScreenFormatRequester::chipset_gadget());
+        assert_eq!((r.chipset(), r.modes.len()), (Chipset::Ocs, 8));
+        assert_eq!(r.mode(), DisplayMode::PAL_LORES);
+        assert_eq!(r.colors(), 32);
+        // The slider stops at the OCS maximum.
+        let s = slider_rect();
+        r.handle(ReqEvent::Press(s.x + s.w - 1, s.y + 5));
+        r.handle(ReqEvent::Release);
+        assert_eq!(r.colors(), 32);
+        // Key H back to AGA: 256 colours possible again.
+        r.handle(ReqEvent::Key(ReqKey::Char('h')));
+        assert_eq!((r.chipset(), r.modes.len()), (Chipset::Aga, 12));
+        r.handle(ReqEvent::Press(s.x + s.w - 1, s.y + 5));
+        r.handle(ReqEvent::Release);
+        assert_eq!(r.colors(), 256);
+        // AGA 256 -> OCS clamps to 32; an OCS HiRes mode clamps to 16.
+        r.handle(ReqEvent::Key(ReqKey::Char('h')));
+        assert_eq!(r.colors(), 32);
+        let hi = r
+            .modes
+            .iter()
+            .position(|m| m.name() == "PAL:High Res")
+            .unwrap();
+        r.select(hi);
+        assert_eq!(r.colors(), 16);
+        match r.command() {
+            Command::SetFormat { chipset, .. } => assert_eq!(chipset, Some(Chipset::Ocs)),
+            other => panic!("unexpected {other:?}"),
+        }
+        // On a SuperHiRes mode OCS is impossible: the gadget is ghosted and says why.
+        let mut r = req();
+        let shi = r
+            .modes
+            .iter()
+            .position(|m| m.name() == "PAL:Super-High Res")
+            .unwrap();
+        r.select(shi);
+        assert!(!r.chipset_switchable());
+        r.handle(ReqEvent::Key(ReqKey::Char('h')));
+        assert_eq!(r.chipset(), Chipset::Aga);
+        assert_eq!(r.message.as_deref(), Some("Super-High Res needs AGA"));
+        let pens = Pens::from_palette(&palette());
+        let g = ScreenFormatRequester::chipset_gadget();
+        let ink = |img: &IndexedImage, pen| {
+            (g.y + 2..g.y + g.h - 2)
+                .any(|y| (g.x + 20..g.x + g.w - 2).any(|x| img.get(x, y) == Some(pen)))
+        };
+        let ghosted = r.render();
+        assert!(ink(&ghosted, pens.ghost.unwrap()) && !ink(&ghosted, pens.dark));
+        let normal = req().render();
+        assert!(ink(&normal, pens.dark) && !ink(&normal, pens.ghost.unwrap()));
+    }
+
+    #[test]
+    fn a_long_message_wraps_inside_the_information_panel() {
+        let mut r = req();
+        r.set_message(
+            "the picture uses colour 31; PAL:High Res on Ocs has at most 16 colours (turn \
+             Retain Picture off)",
+        );
+        let img = r.render();
+        let plain = req().render();
+        let pens = Pens::from_palette(&palette());
+        let info = Rect::new(geom::RIGHT_X, geom::INFO_Y, geom::RIGHT_W, geom::INFO_H);
+        // Outside the panel nothing changed; inside, several rows of the select bar.
+        for y in 0..geom::SCREEN_H {
+            for x in 0..geom::SCREEN_W {
+                if !info.contains((x, y)) {
+                    assert_eq!(img.get(x, y), plain.get(x, y), "({x}, {y})");
+                }
+            }
+        }
+        let bar_rows = (info.y..info.y + info.h)
+            .filter(|&y| img.get(info.x + 2, y) == Some(pens.select))
+            .count();
+        assert!(bar_rows >= 33, "three or more lines: {bar_rows}");
+    }
+
+    /// The message bar covers whole information lines only: the lines above it are drawn
+    /// as without a message, the rows between them and the bar are plain panel, so no line
+    /// shows in part (1 to 4 message lines; one line keeps all six information lines).
+    #[test]
+    fn the_message_bar_never_cuts_an_information_line() {
+        let pens = Pens::from_palette(&palette());
+        let info = Rect::new(geom::RIGHT_X, geom::INFO_Y, geom::RIGHT_W, geom::INFO_H);
+        let plain = req().render();
+        let words = |n: usize| vec!["Retain"; n].join(" ");
+        // Messages of 1 to 4 wrapped lines (6 show as 4), and the information lines left
+        // whole above them.
+        for (message_lines, info_lines) in [(1, 6), (2, 4), (3, 3), (4, 2), (6, 2)] {
+            let text = (1..200)
+                .map(words)
+                .find(|t| crate::note_requester::wrap(t, info.w - 12).len() == message_lines)
+                .expect("a message of that many lines");
+            let mut r = req();
+            r.set_message(text);
+            let img = r.render();
+            let inner = info.x + 2..info.x + info.w - 2;
+            let row_is = |y: i32, pen: u8| inner.clone().all(|x| img.get(x, y) == Some(pen));
+            let top = (info.y..info.y + info.h)
+                .find(|&y| row_is(y, pens.select))
+                .expect("the bar");
+            let last_line_end = info.y + 2 + 9 * (info_lines - 1) + crate::font::GLYPH_H;
+            for y in info.y + 1..last_line_end {
+                for x in inner.clone() {
+                    assert_eq!(
+                        img.get(x, y),
+                        plain.get(x, y),
+                        "{message_lines}: ({x}, {y})"
+                    );
+                }
+            }
+            assert!(
+                last_line_end <= top,
+                "{message_lines}: {last_line_end} {top}"
+            );
+            for y in last_line_end..top {
+                assert!(
+                    row_is(y, pens.face),
+                    "{message_lines}: row {y} is plain panel"
+                );
+            }
+            // The bar reaches the panel's last inner row; its text has a row above and below.
+            let bottom = info.y + info.h - 2;
+            assert!((top..=bottom).all(|y| img.get(info.x + 2, y) == Some(pens.select)));
+            assert_eq!(bottom + 1 - top, 11 * message_lines.min(4) as i32 - 1);
+            assert!(row_is(top, pens.select) && row_is(bottom, pens.select));
+        }
+    }
+
+    /// A refusal describes the command it refused: Retain Picture (key or click), Page Size
+    /// and the other gadgets that change what Use sends clear it; keys that change nothing
+    /// keep it.
+    #[test]
+    fn a_change_to_what_use_sends_clears_the_message() {
+        let refusal = "the picture uses colour 31; turn Retain Picture off";
+        // A page larger than the screen, so Keep Same changes the page Use sends.
+        let mut r = ScreenFormatRequester::new(Target::default(), (640, 400), 32);
+        r.set_message(refusal);
+        r.handle(ReqEvent::Key(ReqKey::Char('r')));
+        assert!(!r.retain);
+        assert_eq!(r.message, None, "key r");
+        for at in [check_rect(), retain_label_rect()] {
+            r.set_message(refusal);
+            r.handle(ReqEvent::Press(at.x + 4, at.y + at.h / 2));
+            r.handle(ReqEvent::Release);
+            assert_eq!(r.message, None, "click on {at:?}");
+        }
+        r.set_message(refusal);
+        r.handle(ReqEvent::Press(geom::CYCLE_X + 50, geom::PAGE_SIZE_Y + 5));
+        assert_eq!((r.page, r.page_size()), (PageChoice::KeepSame, (640, 400)));
+        assert_eq!(r.message, None, "Page Size");
+        // Nothing changes: the message stays.
+        r.set_message(refusal);
+        for k in [
+            ReqKey::Left,
+            ReqKey::Home,
+            ReqKey::Backspace,
+            ReqKey::Char('x'),
+        ] {
+            r.handle(ReqEvent::Key(k));
+        }
+        r.handle(ReqEvent::Scroll(1));
+        assert_eq!(r.message.as_deref(), Some(refusal));
+    }
+
+    /// Custom, picked with the Preset gadget, stays until the mode or the size changes: keys
+    /// that change nothing do not flip it back to the preset of the same format, so the next
+    /// press goes on to the first preset.
+    #[test]
+    fn custom_stays_until_something_changes() {
+        let to_custom = || {
+            let mut r = req();
+            while preset_ids(&r) != "custom" {
+                r.handle(ReqEvent::Key(ReqKey::Char('p')));
+            }
+            assert_eq!(r.mode().name(), "PAL:High Res Laced");
+            r
+        };
+        let mut r = to_custom();
+        for k in [
+            ReqKey::Left,
+            ReqKey::Home,
+            ReqKey::End,
+            ReqKey::Backspace,
+            ReqKey::Tab,
+            ReqKey::Right,
+        ] {
+            r.handle(ReqEvent::Key(k));
+            assert_eq!(preset_ids(&r), "custom", "{k:?}");
+        }
+        // A click on the selected mode, too.
+        let row = (r.selected - r.scroll) as i32;
+        r.handle(ReqEvent::Press(list_rect().x + 20, row_y(row)));
+        r.handle(ReqEvent::Release);
+        assert_eq!(preset_ids(&r), "custom");
+        r.handle(ReqEvent::Key(ReqKey::Char('p')));
+        assert_eq!(preset_ids(&r), "ntsc_lores");
+        // A real change of the size shows the preset it matches.
+        let mut r = to_custom();
+        r.handle(ReqEvent::Key(ReqKey::Tab));
+        r.handle(ReqEvent::Key(ReqKey::End));
+        r.handle(ReqEvent::Key(ReqKey::Backspace));
+        type_str(&mut r, "0");
+        assert_eq!(r.screen_size(), (640, 512));
+        assert_eq!(preset_ids(&r), "pal_hires_laced");
+    }
+
+    #[test]
+    fn new_row_fits_the_window_and_keeps_its_neighbours_apart() {
+        let win_bottom = geom::WIN_Y + geom::WIN_H;
+        let all = [
+            preset_rect(),
+            chipset_rect(),
+            button_rect(Button::Use),
+            button_rect(Button::Cancel),
+            check_rect(),
+            slider_rect(),
+            Rect::new(
+                geom::RIGHT_X,
+                geom::CREDITS_Y,
+                geom::RIGHT_W,
+                geom::CREDITS_H,
+            ),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(a.x >= geom::WIN_X + 4 && a.x + a.w <= geom::WIN_X + geom::WIN_W - 4);
+            assert!(a.y + a.h <= win_bottom - 4, "{a:?} inside the window");
+            for b in &all[i + 1..] {
+                let apart =
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                assert!(apart, "{a:?} and {b:?} overlap");
+            }
+        }
+        assert!(win_bottom <= geom::SCREEN_H);
+        // The longest preset label fits its gadget.
+        let font = Font::builtin();
+        let widest = PRESETS
+            .iter()
+            .map(|p| font.text_width(p.label))
+            .max()
+            .unwrap();
+        assert!(widest <= geom::PRESET_W - 22, "{widest}");
+        // The labels are drawn above the gadgets, the text inside them.
+        let img = req().render();
+        let pens = Pens::from_palette(&palette());
+        let p = preset_rect();
+        assert!(
+            (p.y - 10..p.y - 1)
+                .any(|y| (p.x..p.x + p.w).any(|x| img.get(x, y) == Some(pens.shine)))
+        );
+        assert!(
+            (p.y + 3..p.y + 11)
+                .any(|y| (p.x + 20..p.x + p.w).any(|x| img.get(x, y) == Some(pens.dark)))
+        );
     }
 }

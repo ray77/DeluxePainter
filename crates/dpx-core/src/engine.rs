@@ -42,6 +42,10 @@ pub struct Outcome {
     pub format_changed: bool,
     pub undo_available: bool,
     pub redo_available: bool,
+    /// Kept palette entries the command rounds (or would round) to colours its chipset shows:
+    /// a SetFormat that makes an AGA picture OCS rounds 24-bit entries to 12 bits (ADR-46).
+    /// 0 for every other command and for undo; front-ends name a non-zero count.
+    pub rounded_colors: u16,
 }
 
 /// What an undo step restores.
@@ -221,17 +225,22 @@ impl Engine {
         }
         request.command.validate(&self.doc)?;
         let footprint = request.command.footprint(&self.doc);
+        let rounded_colors = request.command.rounded_colors(&self.doc);
+        let outcome = |engine: &Self| Outcome {
+            rounded_colors,
+            ..engine.outcome(footprint)
+        };
         if request.dry_run {
-            return Ok(self.outcome(footprint));
+            return Ok(outcome(self));
         }
         if footprint == Footprint::Setting {
             request.command.apply(&mut self.doc);
             self.doc.revision += 1;
-            return Ok(self.outcome(footprint));
+            return Ok(outcome(self));
         }
         self.redo.clear();
         self.commit(request.command, footprint);
-        Ok(self.outcome(footprint))
+        Ok(outcome(self))
     }
 
     /// Reverts the most recent step. A pixel step of another frame makes that frame current
@@ -286,8 +295,12 @@ impl Engine {
         self.doc.go_to(frame);
         command.validate(&self.doc)?;
         let footprint = command.footprint(&self.doc);
+        let rounded_colors = command.rounded_colors(&self.doc);
         self.commit(command, footprint);
-        Ok(self.outcome_on(footprint, switched))
+        Ok(Outcome {
+            rounded_colors,
+            ..self.outcome_on(footprint, switched)
+        })
     }
 
     /// Applies a validated command as a new undo step.
@@ -351,6 +364,7 @@ impl Engine {
             format_changed,
             undo_available: self.can_undo(),
             redo_available: self.can_redo(),
+            rounded_colors: 0,
         }
     }
 }
@@ -581,6 +595,7 @@ mod tests {
                 height: 256,
                 retain: true,
                 screen: None,
+                chipset: None,
             })
             .unwrap();
         assert!(out.format_changed && out.palette_changed);
@@ -602,6 +617,7 @@ mod tests {
                 height: 256,
                 retain: true,
                 screen: None,
+                chipset: None,
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
@@ -614,6 +630,7 @@ mod tests {
                 height: 50,
                 retain: false,
                 screen: None,
+                chipset: None,
             })
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -625,6 +642,7 @@ mod tests {
             height: 300,
             retain: false,
             screen: None,
+            chipset: None,
         })
         .unwrap();
         assert_eq!(e.document().page(), &IndexedImage::new(640, 300, 0));
@@ -655,6 +673,7 @@ mod tests {
             height: mode.size().1,
             retain: false,
             screen: None,
+            chipset: None,
         };
         let hires = DisplayMode::new(Video::Pal, Resolution::Hi, false);
         let shires = DisplayMode::new(Video::Pal, Resolution::SuperHi, false);
@@ -672,6 +691,203 @@ mod tests {
             ErrorCode::PaletteRangeInvalid,
             "not a power of two"
         );
+    }
+
+    /// ADR-46: SetFormat's chipset, validated against the resulting chipset; undo restores
+    /// the whole previous target.
+    #[test]
+    fn set_format_changes_the_chipset_and_undoes() {
+        use crate::{Chipset, DisplayMode, Resolution, Target, Video};
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[3] = Rgb8::new(0x10, 0x20, 0x31);
+        let aga = Target::default();
+        let mut page = IndexedImage::new(320, 256, 0);
+        page.set(1, 1, 3);
+        let mut e = Engine::new(Document::from_picture(
+            page,
+            Palette::new(colors).unwrap(),
+            aga,
+        ));
+        let fmt = |mode: DisplayMode, colors, screen, chipset| Command::SetFormat {
+            mode,
+            colors,
+            width: mode.size().0,
+            height: 256,
+            retain: true,
+            screen,
+            chipset,
+        };
+        let shi = DisplayMode::new(Video::Pal, Resolution::SuperHi, false);
+        let hi = DisplayMode::new(Video::Pal, Resolution::Hi, false);
+        // Checked against the new chipset, not the current one.
+        let err = e
+            .execute(fmt(shi, 32, None, Some(Chipset::Ocs)))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedMode);
+        assert_eq!(err.message, "PAL:Super-High Res is not available on Ocs");
+        let err = e
+            .execute(fmt(hi, 32, None, Some(Chipset::Ocs)))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        assert!(err.message.contains("2..=16"), "{}", err.message);
+        assert_eq!(e.document().target(), aga, "refusals change nothing");
+        // To OCS on the 320x240 custom screen: 32 colours, palette rounded to 12 bits.
+        e.execute(fmt(
+            DisplayMode::PAL_LORES,
+            32,
+            Some((320, 240)),
+            Some(Chipset::Ocs),
+        ))
+        .unwrap();
+        let d = e.document();
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        assert_eq!(d.target(), ocs);
+        assert_eq!(d.palette().get(3), Some(Rgb8::new(0x11, 0x22, 0x33)));
+        assert!(crate::hardware::check_palette(d.target(), d.palette()).is_ok());
+        assert_eq!(d.page().get(1, 1), Some(3), "picture retained");
+        // `None` keeps OCS: 64 colours are refused there, with a message that says why.
+        e.execute(Command::Clear { color: 31 }).unwrap();
+        let err = e
+            .execute(fmt(DisplayMode::PAL_LORES, 16, Some((320, 240)), None))
+            .unwrap_err();
+        assert_eq!(
+            err.message,
+            "the picture uses colour 31; keep at least 32 colours"
+        );
+        let err = e.execute(fmt(hi, 16, None, None)).unwrap_err();
+        assert_eq!(
+            err.message,
+            "the picture uses colour 31; PAL:High Res on Ocs has at most 16 colours (turn \
+             Retain Picture off)"
+        );
+        // Undo restores the AGA target and its 24-bit palette.
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.document().target(), aga);
+        assert_eq!(
+            e.document().palette().get(3),
+            Some(Rgb8::new(0x10, 0x20, 0x31))
+        );
+        // Back to AGA keeps the colours.
+        e.redo().unwrap();
+        e.execute(fmt(DisplayMode::PAL_LORES, 64, None, Some(Chipset::Aga)))
+            .unwrap();
+        assert_eq!(e.document().target(), aga);
+        assert_eq!(e.document().palette().len(), 64);
+        // JSON: chipset is optional and snake case.
+        let json = r#"{"op":"set_format","mode":{"video":"pal","resolution":"lo","interlace":false},"colors":32,"width":320,"height":240,"retain":false,"screen":[320,240],"chipset":"ocs"}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::SetFormat {
+                chipset: Some(Chipset::Ocs),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
+    }
+
+    /// ADR-46: the colours a SetFormat to OCS rounds are counted in the outcome (also for a
+    /// dry run and a redo), so MCP and the GUI can name them; only kept entries count.
+    #[test]
+    fn set_format_reports_the_colours_it_rounds() {
+        use crate::{Chipset, DisplayMode};
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        // #080808 rounds onto colour 0 (#000000): two entries become one colour.
+        colors[1] = Rgb8::new(0x08, 0x08, 0x08);
+        colors[2] = Rgb8::new(0x10, 0x10, 0x10);
+        colors[3] = Rgb8::new(0x10, 0x20, 0x31);
+        let mut e = Engine::new(Document::new(320, 256, Palette::new(colors).unwrap()));
+        let to = |colors, chipset| Command::SetFormat {
+            mode: DisplayMode::PAL_LORES,
+            colors,
+            width: 320,
+            height: 256,
+            retain: true,
+            screen: None,
+            chipset,
+        };
+        let dry = e
+            .execute(Request {
+                command: to(32, Some(Chipset::Ocs)),
+                expected_revision: None,
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!((dry.rounded_colors, dry.revision), (3, 0));
+        // Two colours keep entries 0 and 1: one rounded.
+        let dry = e
+            .execute(Request {
+                command: to(2, Some(Chipset::Ocs)),
+                expected_revision: None,
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(dry.rounded_colors, 1);
+        // Staying AGA rounds nothing.
+        assert_eq!(e.execute(to(32, None)).unwrap().rounded_colors, 0);
+        let out = e.execute(to(32, Some(Chipset::Ocs))).unwrap();
+        assert_eq!(out.rounded_colors, 3);
+        assert_eq!(e.document().palette().get(1), Some(Rgb8::new(0, 0, 0)));
+        assert_eq!(e.undo().unwrap().rounded_colors, 0);
+        assert_eq!(e.redo().unwrap().rounded_colors, 3);
+        // Already 12-bit, and new grey-ramp entries, are not rounded colours.
+        let out = e.execute(to(2, None)).unwrap();
+        assert_eq!(out.rounded_colors, 0);
+        assert_eq!(e.execute(to(32, None)).unwrap().rounded_colors, 0);
+        assert_eq!(
+            e.execute(Command::Clear { color: 1 })
+                .unwrap()
+                .rounded_colors,
+            0
+        );
+    }
+
+    /// ADR-46: on OCS the palette stays 12-bit: SetPalette refuses other colours, and
+    /// SetFormat's grey ramp for new entries is 12-bit.
+    #[test]
+    fn ocs_palettes_stay_12_bit() {
+        use crate::{Chipset, DisplayMode, Target};
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
+        let mut e = Engine::new(Document::from_picture(
+            IndexedImage::new(320, 256, 0),
+            Palette::new(vec![Rgb8::BLACK; 8]).unwrap(),
+            ocs,
+        ));
+        let mut colors = vec![Rgb8::new(0x11, 0x22, 0x33); 8];
+        e.execute(Command::SetPalette {
+            colors: colors.clone(),
+        })
+        .unwrap();
+        colors[2] = Rgb8::new(1, 2, 3);
+        let err = e.execute(Command::SetPalette { colors }).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        assert_eq!(
+            err.message,
+            "colour 2 #010203 is not a 12-bit OCS colour (each channel a multiple of 0x11, e.g. \
+             #000000)"
+        );
+        // 8 -> 32 colours: the 24 new grey entries are 12-bit (they were #0B0B0B etc.).
+        e.execute(Command::SetFormat {
+            mode: DisplayMode::PAL_LORES,
+            colors: 32,
+            width: 320,
+            height: 256,
+            retain: false,
+            screen: None,
+            chipset: None,
+        })
+        .unwrap();
+        let p = e.document().palette();
+        assert_eq!(p.len(), 32);
+        assert!(p.colors().iter().all(|&c| crate::hardware::is_12_bit(c)));
+        assert_eq!(p.get(8), Some(Rgb8::BLACK));
+        assert_eq!(p.get(31), Some(Rgb8::WHITE));
+        // AGA keeps any colour.
+        let mut aga = engine();
+        let mut colors = aga.document().palette().colors().to_vec();
+        colors[2] = Rgb8::new(1, 2, 3);
+        aga.execute(Command::SetPalette { colors }).unwrap();
     }
 
     #[test]
@@ -775,6 +991,7 @@ mod tests {
             height,
             retain: true,
             screen,
+            chipset: None,
         };
         e.execute(fmt(Some((368, 283)), 368, 283)).unwrap();
         assert_eq!(e.document().target().screen, (368, 283));
@@ -1150,6 +1367,7 @@ mod tests {
             height: 300,
             retain: true,
             screen: None,
+            chipset: None,
         };
         assert_eq!(
             e.execute(fewer).unwrap_err().code,

@@ -17,6 +17,8 @@ use crate::{PainterApp, files, note_requester};
 
 /// Title of the note requester after Palette ▸ Load.
 const PALETTE_LOADED: &str = "Palette loaded";
+/// Title of the note after Palette ▸ Restore Palette rounded colours (ADR-46).
+const RESTORE_PALETTE: &str = "Palette restored";
 
 /// The page that is not shown (Picture ▸ Spare) with what belongs to it. Both pages share one
 /// palette and screen format; each keeps its own undo history, scroll position, file name,
@@ -418,7 +420,8 @@ impl PainterApp {
     }
 
     /// Palette ▸ Restore Palette: back to the palette of the last loaded picture (the start
-    /// palette before any load); undoable.
+    /// palette before any load); undoable. On an OCS picture the colours are rounded to 12
+    /// bits, with a note (ADR-46: e.g. an AGA picture's palette after Screen Format to OCS).
     pub(crate) fn restore_palette(&mut self) {
         let base = self
             .menu_data
@@ -426,9 +429,13 @@ impl PainterApp {
             .clone()
             .unwrap_or_else(Palette::dpaint_default_32);
         let current = self.engine.document().palette();
-        let colors = fit_colors(base.colors(), current);
-        if colors != current.colors() {
+        let mut colors = fit_colors(base.colors(), current);
+        let rounded = self.chipset_colors(&mut colors);
+        if colors != self.engine.document().palette().colors() {
             self.run(Command::SetPalette { colors });
+        }
+        if let Some(note) = rounded {
+            self.ui.note_requester = note_requester(RESTORE_PALETTE, &[note]);
         }
     }
 
@@ -509,8 +516,10 @@ impl PainterApp {
                 want - 1
             ));
         }
-        let new = fit_colors(&colors, current);
-        if new != current.colors() {
+        let mut new = fit_colors(&colors, current);
+        // ADR-46: an OCS picture takes the file's colours as 12-bit values.
+        notes.extend(self.chipset_colors(&mut new));
+        if new != self.engine.document().palette().colors() {
             self.run(Command::SetPalette { colors: new });
         }
         if !ranges.is_empty() {
@@ -793,6 +802,7 @@ mod tests {
             height: 256,
             retain: false,
             screen: None,
+            chipset: None,
         });
         act(&mut app, "spare.swap");
         assert_eq!(app.page().width(), 640);
