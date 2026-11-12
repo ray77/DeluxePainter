@@ -39,6 +39,11 @@
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
+//! `deluxepainter mcp [--allow-dir DIR]...` headless MCP server on stdio (ADR-21, ADR-24)
+//! `deluxepainter mcp --http [--port N] [--allow-dir DIR]...` headless MCP server on
+//!                                       http://127.0.0.1:N/mcp; port and bearer token in the
+//!                                       endpoint file of the config directory (ADR-43)
+//! `deluxepainter mcp-bridge`            stdio MCP bridge to the running app (ADR-43)
 
 mod anim;
 mod anim_control;
@@ -229,6 +234,10 @@ fn main() -> eframe::Result {
                 .map(|notes| notes.iter().for_each(|n| eprintln!("note: {n}"))),
         ),
         (Some("mcp"), rest) => exit_with(dpx_mcp::run_cli(rest)),
+        (Some("mcp-bridge"), rest) => exit_with(dpx_mcp::bridge::run_cli(rest)),
+        // TODO(wave8-integration): `--mcp` (the bridge's launch flag, `dpx_mcp::endpoint::
+        // LAUNCH_ARGS`) starts the GUI with its MCP server on; the GUI writes `mcp-app.json`
+        // (`dpx_mcp::endpoint::write_app_file`) when its server starts.
         (Some("info" | "convert"), _) => {
             eprintln!("usage: deluxepainter info <file> | convert <in> <out>");
             std::process::exit(2);

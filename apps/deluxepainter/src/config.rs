@@ -304,24 +304,11 @@ impl Config {
 
 /// The directory for the settings file: `DPX_CONFIG_DIR` if set, else the platform's config
 /// directory (macOS `~/Library/Application Support`, Windows `%APPDATA%`, elsewhere
-/// `$XDG_CONFIG_HOME` or `~/.config`) plus `DeluxePainter`.
+/// `$XDG_CONFIG_HOME` or `~/.config`) plus `DeluxePainter`. The rule lives in
+/// `dpx_mcp::paths` (ADR-43) so the MCP endpoint files and the stdio bridge use the same
+/// directory.
 pub fn default_dir() -> Option<PathBuf> {
-    let env = |k: &str| {
-        std::env::var_os(k)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    if let Some(d) = env("DPX_CONFIG_DIR") {
-        return Some(d);
-    }
-    let base = if cfg!(target_os = "macos") {
-        env("HOME")?.join("Library/Application Support")
-    } else if cfg!(windows) {
-        env("APPDATA")?
-    } else {
-        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))?
-    };
-    Some(base.join("DeluxePainter"))
+    dpx_mcp::paths::config_dir()
 }
 
 /// The settings file and what was last written to it.
@@ -646,6 +633,18 @@ mod tests {
         if std::env::var_os("DPX_CONFIG_DIR").is_none() && std::env::var_os("HOME").is_some() {
             let d = default_dir().expect("a home directory");
             assert!(d.ends_with("DeluxePainter"));
+        }
+    }
+
+    #[test]
+    fn settings_and_mcp_endpoint_files_share_one_directory() {
+        // ADR-43: the bridge finds the endpoint file next to the settings file.
+        assert_eq!(default_dir(), dpx_mcp::paths::config_dir());
+        if let Some(d) = default_dir() {
+            assert_eq!(
+                dpx_mcp::endpoint::endpoint_path(&d).parent(),
+                Some(d.join(FILE).parent().unwrap())
+            );
         }
     }
 }
