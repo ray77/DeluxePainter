@@ -10,8 +10,17 @@
 //! reusing the palettes made so far (a dither change only maps again) and the indexed
 //! picture (a position change only places it again).
 //! [`thumbnail`] makes the requester's preview from the very page Ok will give.
+//!
+//! [`convert`] (ADR-45) is the one conversion for generated pictures (GUI and MCP): it frames
+//! a picture of any size on the page (crop-to-fill or fit with margins, never distorted),
+//! scales it with a chosen scaler (smooth, nearest or a pixel-art majority filter) to exactly
+//! the page size, checks the target's colour limits and reduces it with the same reduction.
 
+use serde::{Deserialize, Serialize};
+
+use crate::command::{Command, CommandError, ErrorCode};
 use crate::image::IndexedImage;
+use crate::mode::{Chipset, Target};
 use crate::palette::{Palette, Rgb8};
 use crate::quantize::{self, Dither, PaletteDepth, ReduceOptions, Reduction};
 use crate::resample;
@@ -28,7 +37,8 @@ pub enum Position {
 }
 
 /// Where the palette comes from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PaletteChoice {
     /// A new palette built from the picture (ADR-9).
     #[default]
@@ -361,6 +371,269 @@ impl Fitted {
 /// [`fit`] then [`reduce_fitted`]: the whole import in one call.
 pub fn import(img: &RgbaImage, opts: &ImportOptions, t: &ImportTarget) -> Imported {
     reduce_fitted(&fit(img, t.page, t.pixel_shape), opts, t)
+}
+
+// ---- ADR-45: converting generated pictures ([`convert`]).
+
+/// How a generated picture covers the page (ADR-45). Neither distorts it: both keep its
+/// proportions on the screen's pixel shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Framing {
+    /// The page is filled; what sticks out of the page's proportions is cut off evenly on
+    /// both sides ([`resample::crop_to_aspect`]).
+    #[default]
+    Crop,
+    /// The whole picture is shown, as large as fits, centred; the rest of the page is a
+    /// margin ([`Margins`]).
+    Fit,
+}
+
+/// How the picture is scaled to the page's pixels (ADR-45).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scaler {
+    /// Area averaging ([`resample::scale_area`]): smooth, may mix colours at edges.
+    #[default]
+    Smooth,
+    /// The source pixel under each page pixel's centre ([`resample::scale_nearest`]).
+    Nearest,
+    /// The most common colour of each page pixel's cell ([`resample::scale_majority`]):
+    /// crisp edges for pictures drawn as pixel art.
+    PixelArt,
+}
+
+/// What lies around a [`Framing::Fit`] picture (ADR-45).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Margins {
+    /// The BG colour, as the Import requester's margins (ADR-42).
+    #[default]
+    Bg,
+    /// Transparent: colour 0, reserved for transparency like transparent pixels.
+    Transparent,
+}
+
+/// The choices for [`convert`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvertOptions {
+    pub framing: Framing,
+    pub scaler: Scaler,
+    /// With [`Framing::Fit`] only.
+    pub margins: Margins,
+    pub palette: PaletteChoice,
+    /// Palette entries with [`PaletteChoice::New`]: a power of two from 2 up to the mode's
+    /// maximum on the chipset.
+    pub colors: u16,
+    pub dither: Dither,
+    /// Keep transparent pixels (alpha below [`quantize::ALPHA_THRESHOLD`]) as colour 0;
+    /// otherwise the picture is laid on the BG colour first and comes out opaque.
+    pub transparent_background: bool,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            framing: Framing::Crop,
+            scaler: Scaler::Smooth,
+            margins: Margins::Bg,
+            palette: PaletteChoice::New,
+            colors: 32,
+            dither: Dither::FloydSteinberg,
+            transparent_background: false,
+        }
+    }
+}
+
+/// The document a converted picture is made for.
+#[derive(Clone, Copy, Debug)]
+pub struct ConvertTarget<'a> {
+    /// Chipset, display mode and screen: the colour limits and the pixel shape.
+    pub target: Target,
+    /// The page size of the result (exactly); it must be a valid page of `target`.
+    pub page: (u32, u32),
+    /// The palette kept with [`PaletteChoice::Current`] (on OCS rounded to 12-bit values).
+    pub palette: &'a Palette,
+    /// The BG colour (an index into `palette`): margins, and what transparent pixels are
+    /// laid on without `transparent_background`.
+    pub bg: u8,
+    /// Colour 0 of a new palette when there are transparent pixels (ADR-9: pink).
+    pub transparent: Rgb8,
+}
+
+/// Converts a true-colour picture of any size (a generated picture, ADR-45) into a page of
+/// exactly `t.page` pixels with the target's colour limits: framed ([`Framing`]), scaled
+/// ([`Scaler`]), reduced as the Import requester does (ADR-42: a new palette of exactly
+/// `colors` entries, rounded to 12-bit on OCS, or the current palette; the dither; margins
+/// in the BG colour taking no part in dithering) and transparent pixels as colour 0.
+///
+/// Refuses, without converting, a mode the chipset cannot show (`UNSUPPORTED_MODE`), a colour
+/// count that is no power of two in 2..=the mode's maximum or a current palette larger than
+/// that (`PALETTE_RANGE_INVALID`), a page outside the target's page limits and an empty
+/// picture (`INVALID_ARGUMENT`). With the current palette on OCS its entries are rounded to
+/// 12-bit values first (a 12-bit palette stays identical), so the result always fits the
+/// chipset.
+pub fn convert(
+    img: &RgbaImage,
+    opts: &ConvertOptions,
+    t: &ConvertTarget,
+) -> Result<Imported, CommandError> {
+    let target = t.target;
+    let mode = target.mode;
+    let max = mode.max_colors(target.chipset).ok_or_else(|| {
+        CommandError::new(
+            ErrorCode::UnsupportedMode,
+            format!("{} is not available on {:?}", mode.name(), target.chipset),
+        )
+    })?;
+    match opts.palette {
+        PaletteChoice::New => {
+            let n = opts.colors;
+            if !n.is_power_of_two() || n < 2 || n > max {
+                return Err(CommandError::new(
+                    ErrorCode::PaletteRangeInvalid,
+                    format!(
+                        "{n} colours: {} on {:?} allows 2..={max} (powers of two)",
+                        mode.name(),
+                        target.chipset
+                    ),
+                ));
+            }
+        }
+        PaletteChoice::Current => {
+            if t.palette.len() > usize::from(max) {
+                return Err(CommandError::new(
+                    ErrorCode::PaletteRangeInvalid,
+                    format!(
+                        "the current palette has {} colours; {} on {:?} shows at most {max}",
+                        t.palette.len(),
+                        mode.name(),
+                        target.chipset
+                    ),
+                ));
+            }
+        }
+    }
+    let (pw, ph) = t.page;
+    if !target.page_fits(pw, ph) {
+        let ((a, b), (c, d)) = target.page_limits();
+        return Err(CommandError::new(
+            ErrorCode::InvalidArgument,
+            format!("page {pw}x{ph}: this target allows {a}x{b} to {c}x{d}"),
+        ));
+    }
+    if img.width() == 0 || img.height() == 0 {
+        return Err(CommandError::new(
+            ErrorCode::InvalidArgument,
+            "the picture is empty",
+        ));
+    }
+    let depth = match target.chipset {
+        Chipset::Ocs => PaletteDepth::Rgb4,
+        Chipset::Aga => PaletteDepth::Rgb8,
+    };
+    let current = match depth {
+        PaletteDepth::Rgb4 => Palette::new(
+            t.palette
+                .colors()
+                .iter()
+                .map(|&c| Rgb8::from_rgb4(c.to_rgb4()))
+                .collect(),
+        )
+        .expect("same number of entries"),
+        PaletteDepth::Rgb8 => t.palette.clone(),
+    };
+    let bg = t.bg.min((current.len() - 1) as u8);
+    let bg_rgb = current.get(bg).unwrap_or(Rgb8::BLACK);
+    let source = if opts.transparent_background {
+        img.clone()
+    } else {
+        flatten(img, bg_rgb)
+    };
+    let pixel_shape = mode.pixel_shape();
+    let scale = |img: &RgbaImage, w: u32, h: u32| match opts.scaler {
+        Scaler::Smooth => resample::scale_area(img, w, h),
+        Scaler::Nearest => resample::scale_nearest(img, w, h),
+        Scaler::PixelArt => resample::scale_majority(img, w, h),
+    };
+    let import_opts = ImportOptions {
+        position: Position::Centre,
+        palette: opts.palette,
+        colors: opts.colors,
+        dither: opts.dither,
+    };
+    let it = ImportTarget {
+        page: t.page,
+        pixel_shape,
+        depth,
+        palette: &current,
+        bg,
+        transparent: t.transparent,
+    };
+    let result = match opts.framing {
+        Framing::Crop => {
+            let aspect = resample::display_aspect(t.page, pixel_shape);
+            let (x, y, w, h) = resample::crop_to_aspect(source.width(), source.height(), aspect);
+            let scaled = scale(&source.crop(x, y, w, h), pw, ph);
+            reduce_fitted(&scaled, &import_opts, &it)
+        }
+        Framing::Fit => {
+            let (w, h) = fitted_size(source.width(), source.height(), t.page, pixel_shape);
+            let scaled = scale(&source, w, h);
+            match opts.margins {
+                Margins::Bg => reduce_fitted(&scaled, &import_opts, &it),
+                Margins::Transparent => {
+                    // The margins are transparent pixels of a page-sized picture.
+                    let at = place((w, h), t.page, Position::Centre);
+                    let mut canvas = RgbaImage::new(pw, ph, Rgba8::new(0, 0, 0, 0));
+                    for (row, y) in (at.1..at.1 + h).enumerate() {
+                        for (col, x) in (at.0..at.0 + w).enumerate() {
+                            if let Some(p) = scaled.get(col as u32, row as u32) {
+                                canvas.set(x, y, p);
+                            }
+                        }
+                    }
+                    let mut r = reduce_fitted(&canvas, &import_opts, &it);
+                    r.at = at;
+                    r.size = (w, h);
+                    r
+                }
+            }
+        }
+    };
+    debug_assert_eq!((result.page.width(), result.page.height()), t.page);
+    Ok(result)
+}
+
+/// `img` laid on `bg`: every pixel opaque, mixed with `bg` by its alpha.
+fn flatten(img: &RgbaImage, bg: Rgb8) -> RgbaImage {
+    let mix = |c: u8, b: u8, a: u8| {
+        let (c, b, a) = (u32::from(c), u32::from(b), u32::from(a));
+        ((c * a + b * (255 - a) + 127) / 255) as u8
+    };
+    let pixels = img
+        .pixels()
+        .iter()
+        .map(|&p| match p.a {
+            255 => p,
+            a => Rgba8::opaque(mix(p.r, bg.r, a), mix(p.g, bg.g, a), mix(p.b, bg.b, a)),
+        })
+        .collect();
+    RgbaImage::from_pixels(img.width(), img.height(), pixels).expect("same size")
+}
+
+impl Imported {
+    /// The undoable command that makes this page the whole picture of a document for
+    /// `target` (ADR-45: one undo step; [`Command::ReplacePicture`]).
+    pub fn replace_command(&self, target: Target) -> Command {
+        Command::ReplacePicture {
+            target,
+            palette: self.palette.colors().to_vec(),
+            width: self.page.width(),
+            height: self.page.height(),
+            pixels: self.page.pixels().to_vec(),
+        }
+    }
 }
 
 /// An indexed picture in its palette's colours (opaque).
@@ -877,5 +1150,376 @@ mod tests {
         assert_eq!(count_colors(&img, 256), None);
         let few = image(5, 5, |x, _| Rgba8::opaque(x as u8, 0, 0));
         assert_eq!(count_colors(&few, 256), Some(5));
+    }
+
+    // ---- ADR-45: convert.
+
+    use crate::mode::{DisplayMode, Resolution, Video};
+
+    fn ocs_320x240() -> Target {
+        Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240)
+    }
+
+    fn ctarget(target: Target, page: (u32, u32), palette: &Palette) -> ConvertTarget<'_> {
+        ConvertTarget {
+            target,
+            page,
+            palette,
+            bg: 0,
+            transparent: PINK,
+        }
+    }
+
+    fn copts(scaler: Scaler, colors: u16, dither: Dither) -> ConvertOptions {
+        ConvertOptions {
+            scaler,
+            colors,
+            dither,
+            ..ConvertOptions::default()
+        }
+    }
+
+    fn is_12_bit(c: Rgb8) -> bool {
+        Rgb8::from_rgb4(c.to_rgb4()) == c
+    }
+
+    #[test]
+    fn convert_gives_the_exact_page_and_at_most_the_colour_count() {
+        let pal = Palette::dpaint_default_32();
+        let img = photo(1024, 768);
+        let hires = Target::new(
+            Chipset::Ocs,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        );
+        let aga = Target::new(Chipset::Aga, DisplayMode::PAL_LORES);
+        for (target, page, colors) in [
+            (ocs_320x240(), (320, 240), 32),
+            (hires, (640, 256), 16),
+            (aga, (320, 256), 256),
+            (aga, (400, 300), 64),
+        ] {
+            for scaler in [Scaler::Smooth, Scaler::Nearest, Scaler::PixelArt] {
+                for dither in [Dither::None, Dither::FloydSteinberg, Dither::Ordered] {
+                    let r = convert(
+                        &img,
+                        &copts(scaler, colors, dither),
+                        &ctarget(target, page, &pal),
+                    )
+                    .unwrap();
+                    let what = format!("{target:?} {page:?} {scaler:?} {dither:?}");
+                    assert_eq!((r.page.width(), r.page.height()), page, "{what}");
+                    assert_eq!(r.palette.len(), usize::from(colors), "{what}");
+                    let max = r.page.pixels().iter().copied().max().unwrap();
+                    assert!(u16::from(max) < colors, "{what}");
+                    if target.chipset == Chipset::Ocs {
+                        assert!(r.palette.colors().iter().all(|&c| is_12_bit(c)), "{what}");
+                    }
+                    // The command takes the result as it is.
+                    let doc = crate::Document::new(320, 256, Palette::dpaint_default_32());
+                    r.replace_command(target).validate(&doc).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn convert_refuses_what_the_target_cannot_show() {
+        let pal = Palette::dpaint_default_32();
+        let img = photo(64, 48);
+        let code = |target: Target, page, opts: ConvertOptions, pal: &Palette| {
+            convert(&img, &opts, &ctarget(target, page, pal))
+                .unwrap_err()
+                .code
+        };
+        let hires = Target::new(
+            Chipset::Ocs,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        );
+        let superhi = Target::new(
+            Chipset::Ocs,
+            DisplayMode::new(Video::Pal, Resolution::SuperHi, false),
+        );
+        let d = ConvertOptions::default();
+        assert_eq!(
+            code(hires, (640, 256), d, &pal),
+            ErrorCode::PaletteRangeInvalid
+        );
+        assert_eq!(
+            code(superhi, (1280, 256), d, &pal),
+            ErrorCode::UnsupportedMode
+        );
+        let twelve = ConvertOptions { colors: 12, ..d };
+        assert_eq!(
+            code(ocs_320x240(), (320, 240), twelve, &pal),
+            ErrorCode::PaletteRangeInvalid
+        );
+        // A page smaller than the screen.
+        assert_eq!(
+            code(ocs_320x240(), (320, 200), d, &pal),
+            ErrorCode::InvalidArgument
+        );
+        // A current palette larger than the mode shows.
+        let big = Palette::new(vec![Rgb8::BLACK; 64]).unwrap();
+        let current = ConvertOptions {
+            palette: PaletteChoice::Current,
+            ..d
+        };
+        assert_eq!(
+            code(ocs_320x240(), (320, 240), current, &big),
+            ErrorCode::PaletteRangeInvalid
+        );
+        let empty = RgbaImage::new(0, 0, Rgba8::default());
+        assert_eq!(
+            convert(&empty, &d, &ctarget(ocs_320x240(), (320, 240), &pal))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    const GREEN: Rgba8 = Rgba8::opaque(0, 255, 0);
+    const RED: Rgba8 = Rgba8::opaque(255, 0, 0);
+    const YELLOW: Rgba8 = Rgba8::opaque(255, 255, 0);
+    const BLUE: Rgba8 = Rgba8::opaque(0, 0, 255);
+
+    /// 1024x1024: green above row 102, blue from row 921, red left and yellow right between.
+    fn bands() -> RgbaImage {
+        image(1024, 1024, |x, y| match (x, y) {
+            (_, 0..102) => GREEN,
+            (_, 921..) => BLUE,
+            (0..512, _) => RED,
+            _ => YELLOW,
+        })
+    }
+
+    fn shown_rgba(r: &Imported, x: u32, y: u32) -> Rgba8 {
+        let c = shown(r, x, y);
+        Rgba8::opaque(c.r, c.g, c.b)
+    }
+
+    #[test]
+    fn crop_fills_the_page_and_cuts_evenly() {
+        let pal = Palette::dpaint_default_32();
+        // 5:4 on LoRes and on HiRes (pixels twice as tall).
+        let hires = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        );
+        let lores = Target::new(Chipset::Aga, DisplayMode::PAL_LORES);
+        for (target, page) in [(lores, (320, 256)), (hires, (640, 256))] {
+            let r = convert(
+                &bands(),
+                &copts(Scaler::Nearest, 32, Dither::None),
+                &ctarget(target, page, &pal),
+            )
+            .unwrap();
+            assert_eq!(r.at, (0, 0));
+            assert_eq!(r.size, page);
+            let (w, h) = page;
+            for y in 0..h {
+                for x in 0..w {
+                    let want = if x < w / 2 { RED } else { YELLOW };
+                    assert_eq!(shown_rgba(&r, x, y), want, "{page:?} {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_shows_everything_with_bg_or_transparent_margins() {
+        let pal = Palette::dpaint_default_32();
+        let quads = image(1024, 1024, |x, y| match (x < 512, y < 512) {
+            (true, true) => RED,
+            (false, true) => YELLOW,
+            (true, false) => GREEN,
+            (false, false) => BLUE,
+        });
+        let target = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
+        let mut t = ctarget(target, (320, 256), &pal);
+        // BG = colour 3, white in the default palette.
+        t.bg = 3;
+        let fit = ConvertOptions {
+            framing: Framing::Fit,
+            ..copts(Scaler::Nearest, 32, Dither::FloydSteinberg)
+        };
+        let r = convert(&quads, &fit, &t).unwrap();
+        assert_eq!((r.at, r.size), ((32, 0), (256, 256)));
+        assert_eq!(r.transparent_color, None);
+        let white = Rgba8::opaque(255, 255, 255);
+        for y in [0, 100, 255] {
+            assert_eq!(shown_rgba(&r, 0, y), white);
+            assert_eq!(shown_rgba(&r, 31, y), white);
+            assert_eq!(shown_rgba(&r, 288, y), white);
+            assert_eq!(shown_rgba(&r, 319, y), white);
+        }
+        assert_eq!(shown_rgba(&r, 32, 0), RED);
+        assert_eq!(shown_rgba(&r, 287, 0), YELLOW);
+        assert_eq!(shown_rgba(&r, 32, 255), GREEN);
+        assert_eq!(shown_rgba(&r, 287, 255), BLUE);
+        // Transparent margins are colour 0, reserved (pink); the picture avoids it.
+        let clear = ConvertOptions {
+            margins: Margins::Transparent,
+            ..fit
+        };
+        let r = convert(&quads, &clear, &t).unwrap();
+        assert_eq!((r.at, r.size), ((32, 0), (256, 256)));
+        assert_eq!(r.transparent_color, Some(0));
+        assert_eq!(r.palette.get(0), Some(Rgb8::from_rgb4(PINK.to_rgb4())));
+        for y in 0..256 {
+            for x in 0..320 {
+                let margin = !(32..288).contains(&x);
+                assert_eq!(r.page.get(x, y) == Some(0), margin, "{x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_background_is_colour_0_or_laid_on_the_bg() {
+        let pal = Palette::new(vec![
+            Rgb8::BLACK,
+            Rgb8::WHITE,
+            Rgb8::new(255, 0, 0),
+            BLUE_RGB,
+        ])
+        .unwrap();
+        // Left half transparent, right half red.
+        let img = image(
+            64,
+            48,
+            |x, _| {
+                if x < 32 { Rgba8::new(0, 0, 0, 0) } else { RED }
+            },
+        );
+        let target = Target::new(Chipset::Aga, DisplayMode::PAL_LORES);
+        let mut t = ctarget(target, (320, 256), &pal);
+        t.bg = 1;
+        let keep = ConvertOptions {
+            transparent_background: true,
+            ..copts(Scaler::Nearest, 4, Dither::None)
+        };
+        let r = convert(&img, &keep, &t).unwrap();
+        assert_eq!(r.transparent_color, Some(0));
+        assert_eq!(r.palette.get(0), Some(PINK));
+        assert_eq!(r.page.get(10, 100), Some(0));
+        assert_eq!(shown_rgba(&r, 300, 100), RED);
+        // Without it the transparent half is laid on the BG colour (white) and opaque.
+        let flat = ConvertOptions {
+            transparent_background: false,
+            ..keep
+        };
+        let r = convert(&img, &flat, &t).unwrap();
+        assert_eq!(r.transparent_color, None);
+        assert_eq!(shown_rgba(&r, 10, 100), Rgba8::opaque(255, 255, 255));
+        assert_eq!(shown_rgba(&r, 300, 100), RED);
+        // The current palette: transparent pixels are its colour 0 too.
+        let current = ConvertOptions {
+            palette: PaletteChoice::Current,
+            ..keep
+        };
+        let r = convert(&img, &current, &t).unwrap();
+        assert_eq!(r.palette, pal);
+        assert_eq!(r.transparent_color, Some(0));
+        assert_eq!(r.page.get(10, 100), Some(0));
+        assert_eq!(r.page.get(300, 100), Some(2));
+    }
+
+    const BLUE_RGB: Rgb8 = Rgb8::new(0, 0, 255);
+
+    #[test]
+    fn ocs_rounds_the_current_palette_to_12_bit_and_aga_keeps_it() {
+        let pal = Palette::new(vec![
+            Rgb8::new(1, 2, 3),
+            Rgb8::new(250, 120, 7),
+            Rgb8::new(17, 34, 51),
+            Rgb8::new(200, 200, 201),
+        ])
+        .unwrap();
+        let img = photo(100, 80);
+        let opts = ConvertOptions {
+            palette: PaletteChoice::Current,
+            ..ConvertOptions::default()
+        };
+        let r = convert(&img, &opts, &ctarget(ocs_320x240(), (320, 240), &pal)).unwrap();
+        assert_eq!(r.palette.len(), 4);
+        assert!(r.palette.colors().iter().all(|&c| is_12_bit(c)));
+        // Entry 2 is 12-bit already and stays.
+        assert_eq!(r.palette.get(2), Some(Rgb8::new(17, 34, 51)));
+        let aga = Target::new(Chipset::Aga, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let r = convert(&img, &opts, &ctarget(aga, (320, 240), &pal)).unwrap();
+        assert_eq!(r.palette, pal);
+    }
+
+    /// 320x240 pixel art in 8 colours whose channels sit in the middle of the majority
+    /// filter's buckets, blown up to 1024x768 (3.2x) by nearest pixel, with or without +-3
+    /// noise.
+    fn pixel_art(noisy: bool) -> (IndexedImage, RgbaImage) {
+        let colours: [Rgb8; 8] = std::array::from_fn(|i| {
+            let v = |bit: usize, hi: u8| if i >> bit & 1 == 1 { hi } else { 28 };
+            Rgb8::new(v(0, 228), v(1, 196), v(2, 164))
+        });
+        let art = IndexedImage::from_pixels(
+            320,
+            240,
+            (0..320 * 240)
+                .map(|i| ((i % 320 / 7 + i / 320 / 5 * 3) % 8) as u8)
+                .collect(),
+        )
+        .unwrap();
+        let pal = Palette::new(colours.to_vec()).unwrap();
+        let big = resample::scale_nearest(&rgba_of(&art, &pal), 1024, 768);
+        // Deterministic noise in -3..=3 from the position and the channel.
+        let noise = |x: u32, y: u32, c: u32| {
+            let h = (x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663))
+                .wrapping_add(c.wrapping_mul(83_492_791));
+            (h.wrapping_mul(2_654_435_761) >> 16) % 7
+        };
+        let noisy = image(1024, 768, |x, y| {
+            let p = big.get(x, y).unwrap();
+            let d = |c: u32| if noisy { noise(x, y, c) as i32 - 3 } else { 0 };
+            let q = |v: u8, c: u32| (i32::from(v) + d(c)) as u8;
+            Rgba8::opaque(q(p.r, 0), q(p.g, 1), q(p.b, 2))
+        });
+        (art, noisy)
+    }
+
+    /// Page pixels whose colour does not follow the art's colour one to one.
+    fn mismatches(art: &IndexedImage, page: &IndexedImage) -> usize {
+        let mut map: std::collections::HashMap<u8, std::collections::HashMap<u8, usize>> =
+            Default::default();
+        for (&a, &p) in art.pixels().iter().zip(page.pixels()) {
+            *map.entry(a).or_default().entry(p).or_default() += 1;
+        }
+        // Each art colour's most common page colour counts as right; the rest are wrong.
+        let wrong: usize = map
+            .values()
+            .map(|m| m.values().sum::<usize>() - m.values().max().unwrap())
+            .sum();
+        let mut firsts: Vec<u8> = map
+            .values()
+            .map(|m| *m.iter().max_by_key(|(_, n)| **n).unwrap().0)
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        assert_eq!(firsts.len(), map.len(), "two art colours became one");
+        wrong
+    }
+
+    #[test]
+    fn the_pixel_art_scaler_keeps_every_cell_crisp() {
+        let pal = Palette::dpaint_default_32();
+        let t = ctarget(ocs_320x240(), (320, 240), &pal);
+        let (art, noisy) = pixel_art(true);
+        let r = convert(&noisy, &copts(Scaler::PixelArt, 8, Dither::None), &t).unwrap();
+        assert_eq!(mismatches(&art, &r.page), 0);
+        // Without noise the cells keep the art's very colours: none is mixed, so the 8
+        // colours fit exactly (rounded to 12-bit on OCS).
+        let (art, clean) = pixel_art(false);
+        let r = convert(&clean, &copts(Scaler::PixelArt, 8, Dither::None), &t).unwrap();
+        assert_eq!(mismatches(&art, &r.page), 0);
+        assert_eq!(r.reduction, Reduction::Rounded);
+        // Area averaging mixes neighbouring cells along the edges: new colours, which push
+        // the picture into quantizing.
+        let smooth = convert(&clean, &copts(Scaler::Smooth, 8, Dither::None), &t).unwrap();
+        assert_eq!(smooth.reduction, Reduction::Quantized);
     }
 }
