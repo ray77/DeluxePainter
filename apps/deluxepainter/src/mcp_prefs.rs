@@ -8,10 +8,13 @@
 //!   connection to watch) or the error a start gave.
 //! - **Permissions** are the settings' three flags and apply to the next call; changing
 //!   needs reading, overwriting needs both (the boxes are ghosted otherwise).
-//! - **Connect Claude Code** finds `claude`, asks `claude mcp get deluxe-painter`, then
-//!   shows the exact `claude mcp add …` command in the choice requester and runs it only
-//!   after Run (or offers to replace an existing entry). Without `claude` the command goes
-//!   to the clipboard and a note offers "Get Claude Code".
+//! - **Connect Claude Code** finds `claude`, asks `claude mcp get deluxe-painter` (exit
+//!   code 0: registered, 1: not; anything else is shown as Claude Code's error), then shows
+//!   the exact `claude mcp add …` command in the choice requester and runs it only after
+//!   Run (or offers to replace an existing entry, showing both commands). These questions
+//!   may use up to `MAX_LINES_TALL` lines, so the whole command is on screen; one that
+//!   would still be cut is not asked. Without `claude` the command goes to the clipboard
+//!   and a note offers "Get Claude Code".
 //! - **Connect Claude Desktop** opens this platform's `.mcpb` with the OS, so Claude
 //!   Desktop asks the user to install it; without Claude Desktop a note offers "Get
 //!   Claude". A connect that worked turns MCP control on.
@@ -196,33 +199,40 @@ fn shown(args: &[String]) -> String {
     connect::command_line(Platform::current(), args)
 }
 
+/// A connect question that shows whole commands: up to `MAX_LINES_TALL` lines.
+fn command_question(text: &[String], labels: [&str; 2]) -> ChoiceRequester {
+    ChoiceRequester::with_max_lines(
+        "Connect Claude Code",
+        text,
+        labels,
+        0,
+        1,
+        dpx_ui::choice_requester::MAX_LINES_TALL,
+    )
+}
+
 /// "Connect Claude Code": the exact command DeluxePainter runs after Run.
 pub fn add_requester(command: &str) -> ChoiceRequester {
-    ChoiceRequester::new(
-        "Connect Claude Code",
+    command_question(
         &[
             "DeluxePainter will run this command:".into(),
             command.into(),
         ],
         ["Run", "Cancel"],
-        0,
-        1,
     )
 }
 
-fn replace_requester(command: &str) -> ChoiceRequester {
-    ChoiceRequester::new(
-        "Connect Claude Code",
+/// Claude Code has an entry: both commands Replace runs.
+pub fn replace_requester(command: &str) -> ChoiceRequester {
+    command_question(
         &[
-            "Claude Code already knows DeluxePainter. Replace its entry with this app? \
+            "Claude Code already knows DeluxePainter. To replace its entry with this app, \
              DeluxePainter will run:"
                 .into(),
             shown(&connect::remove_args()),
             command.into(),
         ],
         ["Replace", "Keep"],
-        0,
-        1,
     )
 }
 
@@ -547,14 +557,29 @@ impl PainterApp {
                 if self.ui.mcp_requester.is_none() {
                     return;
                 }
-                if o.ok() {
-                    self.mcp_prefs_ask(
+                // 0: registered, 1: not registered. Anything else (127 from a `node` the
+                // app's PATH lacks, a crash) is Claude Code's own trouble: say so instead
+                // of offering a command that would fail the same way.
+                let (req, confirm) = match o.code {
+                    Some(0) => (
                         replace_requester(&command),
                         Confirm::Replace { claude, exe },
+                    ),
+                    Some(1) => (add_requester(&command), Confirm::Add { claude, exe }),
+                    _ => {
+                        return self.mcp_prefs_say(match o.first_line() {
+                            Some(line) => format!("Claude Code: {line}"),
+                            None => format!("Claude Code ended with {:?}.", o.code),
+                        });
+                    }
+                };
+                if req.truncated() {
+                    // Run must never run a command the user could not read.
+                    return self.mcp_prefs_say(
+                        "The command is too long to show here (DeluxePainter's path), so it is not run.",
                     );
-                } else {
-                    self.mcp_prefs_ask(add_requester(&command), Confirm::Add { claude, exe });
                 }
+                self.mcp_prefs_ask(req, confirm);
             }
             (Step::Check { .. }, Err(e)) => self.mcp_prefs_say(format!("Claude Code: {e}")),
             (Step::Add, Ok(o)) if o.ok() => {
@@ -591,9 +616,10 @@ pub const SNAPSHOT_EXE: &str = "/Applications/DeluxePainter.app/Contents/MacOS/d
 /// Snapshot options (ADR-43): `--mcp-prefs STATE` shows the AI & MCP requester; STATE is
 /// `off`, `ready`, `connected` (with the calls of `--mcp-calls` in its activity and a
 /// Claude client), `fallback` (port 8766 instead of 8765), `error` (a start that really
-/// failed: the token directory is under `/dev/null`), `code-confirm`, `code-missing`,
-/// `desktop-missing` or `disconnect` (the question over a ready requester). Without the flag
-/// only `--mcp-calls` runs, as before. Returns the document to show.
+/// failed: the token directory is under `/dev/null`), `code-confirm`, `code-replace`,
+/// `code-missing`, `desktop-missing` or `disconnect` (the question over a ready
+/// requester). Without the flag only `--mcp-calls` runs, as before. Returns the document
+/// to show.
 pub fn snapshot(
     args: &[String],
     doc: &Document,
@@ -613,7 +639,8 @@ pub fn snapshot(
     let exe = Path::new(SNAPSHOT_EXE);
     let status = match state.as_str() {
         "off" => Status::Off,
-        "ready" | "code-confirm" | "code-missing" | "desktop-missing" | "disconnect" => {
+        "ready" | "code-confirm" | "code-replace" | "code-missing" | "desktop-missing"
+        | "disconnect" => {
             app.mcp.settings.enabled = true;
             ready(8765)
         }
@@ -642,13 +669,14 @@ pub fn snapshot(
         _ => {
             return Err(format!(
                 "--mcp-prefs expects off, ready, connected, fallback, error, code-confirm, \
-                 code-missing, desktop-missing or disconnect, not '{state}'"
+                 code-replace, code-missing, desktop-missing or disconnect, not '{state}'"
             ));
         }
     };
     let command = shown(&connect::add_args(exe));
     match state.as_str() {
         "code-confirm" => app.ui.choice_requester = Some(add_requester(&command)),
+        "code-replace" => app.ui.choice_requester = Some(replace_requester(&command)),
         "code-missing" => {
             app.mcp_prefs.message = Some("Claude Code not found: the command was copied.".into());
             app.ui.choice_requester = Some(code_missing_requester());

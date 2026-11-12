@@ -41,8 +41,20 @@ struct Bridge {
 
 impl Bridge {
     fn start(dir: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dpx-mcp-bridge"))
-            .env("DPX_CONFIG_DIR", dir)
+        Self::start_with(dir, &[])
+    }
+
+    /// With these environment variables set (and the proxy exceptions removed).
+    fn start_with(dir: &Path, env: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_dpx-mcp-bridge"));
+        cmd.env("DPX_CONFIG_DIR", dir);
+        if !env.is_empty() {
+            cmd.env_remove("NO_PROXY").env_remove("no_proxy");
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -208,19 +220,95 @@ fn without_the_app_lists_locally_and_calls_fail_clearly() {
     );
 }
 
+/// Nothing connected to `l` (it never called accept: a connection would wait there).
+fn untouched(l: &std::net::TcpListener) -> bool {
+    l.set_nonblocking(true).unwrap();
+    matches!(l.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
 #[test]
-fn a_stale_endpoint_file_counts_as_not_running() {
+fn a_stale_endpoint_file_counts_as_not_running_and_its_port_gets_nothing() {
     let dir = scratch("stale");
-    // A port nothing listens on.
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // A dead server's file; something else listens on its port now (another user could).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
     let e = dpx_mcp::endpoint::Endpoint::new(port, "x".repeat(64));
     dpx_mcp::endpoint::write_endpoint(&dir, &e).unwrap();
     let mut b = Bridge::start(&dir);
     let r = b.call("get_app_status", json!({}));
     assert_eq!(r["structuredContent"]["code"], "APP_NOT_RUNNING", "{r}");
+    assert!(
+        untouched(&listener),
+        "no request, no token reached that port"
+    );
+    assert!(
+        !dir.join("mcp-endpoint.json").exists(),
+        "the stale file is removed"
+    );
+}
+
+#[test]
+fn the_token_never_goes_through_a_proxy() {
+    let dir = scratch("proxy");
+    let (srv, _) = server(&dir);
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
+    let env: Vec<(&str, &str)> = ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"]
+        .into_iter()
+        .map(|k| (k, url.as_str()))
+        .collect();
+    let mut b = Bridge::start_with(&dir, &env);
+    let s = b.ok("get_app_status", json!({}));
+    assert_eq!(s["transport"], "http", "straight to the app");
+    assert!(untouched(&proxy), "nothing went to the proxy");
+    drop(b);
+    srv.stop();
+}
+
+/// An `mcp-app.json` naming a script that leaves `marker` when started.
+#[cfg(unix)]
+fn launch_record(dir: &Path, marker: &Path, enabled: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("fake-app.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        dir.join("mcp-app.json"),
+        serde_json::to_vec(&json!({"version": 1, "app_path": script, "args": ["--mcp"],
+            "enabled": enabled}))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn with_mcp_control_off_the_app_is_not_started() {
+    let dir = scratch("off");
+    let marker = dir.join("launched");
+    launch_record(&dir, &marker, false);
+    let mut b = Bridge::start(&dir);
+    let r = b.call("draw_pixel", json!({"x": 0, "y": 0, "color": 1}));
+    assert_eq!(r["structuredContent"]["code"], "APP_NOT_RUNNING", "{r}");
+    assert_eq!(
+        r["structuredContent"]["message"],
+        dpx_mcp::bridge::OFF_NOT_RUNNING
+    );
+    // A running app with MCP control off is never started a second time.
+    let claim = dpx_mcp::endpoint::claim_app(&dir).unwrap().unwrap();
+    let r = b.call("get_app_status", json!({}));
+    assert_eq!(r["structuredContent"]["code"], "APP_UNAVAILABLE", "{r}");
+    assert_eq!(
+        r["structuredContent"]["message"],
+        dpx_mcp::bridge::TURNED_OFF
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!marker.exists(), "nothing was started");
+    drop(claim);
 }
 
 #[test]

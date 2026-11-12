@@ -32,7 +32,7 @@ use crate::access::FileAccess;
 use crate::error::{ToolError, error_result, image_result, success_result};
 use crate::jobs::Executor;
 use crate::pictures;
-use crate::state::{Overwrite, ServerState};
+use crate::state::ServerState;
 use crate::view::{self, PixelEncoding, RectArg};
 use crate::workspace::{Brush, PictureInfo, Question, Slot, Workspace};
 
@@ -1022,7 +1022,7 @@ async fn app_status(ctx: &ToolCtx, _: NoArgs) -> Result<CallToolResult, ToolErro
         permissions: Permissions {
             read: s.read,
             edit: s.edit,
-            overwrite_without_asking: s.overwrite == Overwrite::Allowed,
+            overwrite_without_asking: s.overwrite_without_asking(),
         },
         file_access: file_access_info(&s.access),
         document,
@@ -1775,28 +1775,23 @@ pub fn overwrite_question(client: Option<&str>, file: &str) -> Question {
 /// With `overwrite` and an existing file: allowed, or asked (a "no", no answer in time or a
 /// question that could not be asked fails the call; the file is kept).
 async fn confirm_overwrite(ctx: &ToolCtx, target: &Path, overwrite: bool) -> Result<(), ToolError> {
-    if !overwrite || !target.exists() {
+    if !overwrite || !target.exists() || ctx.state.settings().overwrite_without_asking() {
         return Ok(());
     }
-    match ctx.state.settings().overwrite {
-        Overwrite::Allowed => Ok(()),
-        Overwrite::Ask => {
-            let name = file_name(target);
-            let client = ctx.state.activity().snapshot().client;
-            let declined = |why: String| Err(ToolError::new("OVERWRITE_DECLINED", why));
-            match ctx
-                .exec
-                .ask(overwrite_question(client.as_deref(), &name))
-                .await
-            {
-                Ok(true) => Ok(()),
-                Ok(false) => declined(format!("the user kept the existing file {name}")),
-                Err(e) if e.code == crate::jobs::NO_ANSWER => {
-                    declined(format!("{}; the existing file {name} was kept", e.message))
-                }
-                Err(e) => Err(e),
-            }
+    let name = file_name(target);
+    let client = ctx.state.activity().snapshot().client;
+    let declined = |why: String| Err(ToolError::new("OVERWRITE_DECLINED", why));
+    match ctx
+        .exec
+        .ask(overwrite_question(client.as_deref(), &name))
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => declined(format!("the user kept the existing file {name}")),
+        Err(e) if e.code == crate::jobs::NO_ANSWER => {
+            declined(format!("{}; the existing file {name} was kept", e.message))
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -1829,7 +1824,7 @@ async fn save_project(ctx: &ToolCtx, a: SaveArgs) -> Result<CallToolResult, Tool
     let access = ctx.state.settings().access;
     let target = access.resolve_write(&a.path, a.overwrite)?;
     confirm_overwrite(ctx, &target, a.overwrite).await?;
-    let (doc, extras, spare, slot) = ctx
+    let (doc, extras, spare, slot, engine) = ctx
         .exec
         .run(|ws| {
             (
@@ -1837,6 +1832,7 @@ async fn save_project(ctx: &ToolCtx, a: SaveArgs) -> Result<CallToolResult, Tool
                 ws.project_extras(),
                 ws.spare().map(|d| d.page().clone()),
                 ws.shown(),
+                ws.engine().id(),
             )
         })
         .await?;
@@ -1850,21 +1846,34 @@ async fn save_project(ctx: &ToolCtx, a: SaveArgs) -> Result<CallToolResult, Tool
     })
     .await??;
     let t = target.clone();
-    ctx.exec
+    let marked = ctx
+        .exec
         .run(move |ws| {
-            if ws.shown() == slot {
+            // Only the picture that was saved gets the file's name: the user may have loaded
+            // or swapped in another one meanwhile (also at revision 0).
+            let same = ws.shown() == slot && ws.engine().id() == engine;
+            if same {
                 ws.mark_saved(&t, revision);
             }
             ws.log(&format!("save_project {}", file_name(&t)));
+            same
         })
         .await?;
+    let notes = if marked {
+        Vec::new()
+    } else {
+        vec![
+            "the shown picture was replaced while the project was written: the file holds the picture as it was, and the new picture is not marked saved"
+                .into(),
+        ]
+    };
     Ok(success_result(&Written {
         document_id: slot.id(),
         revision,
         path: target.display().to_string(),
         format: "dpxproj",
         bytes,
-        notes: Vec::new(),
+        notes,
     }))
 }
 
@@ -2009,6 +2018,9 @@ pub const TRANSPARENT_PINK: Rgb8 = Rgb8::new(255, 0, 255);
 struct ImportContext {
     revision: u64,
     slot: Slot,
+    /// The shown page's engine ([`dpx_core::Engine::id`]): a picture loaded meanwhile is
+    /// another document even at the same revision.
+    engine: u64,
     target: Target,
     page: (u32, u32),
     palette: Palette,
@@ -2082,6 +2094,7 @@ async fn import_image(ctx: &ToolCtx, a: ImportImageArgs) -> Result<CallToolResul
             ImportContext {
                 revision: doc.revision(),
                 slot: ws.shown(),
+                engine: ws.engine().id(),
                 target: doc.target(),
                 page: (doc.page().width(), doc.page().height()),
                 palette: doc.palette().clone(),
@@ -2154,10 +2167,13 @@ async fn import_image(ctx: &ToolCtx, a: ImportImageArgs) -> Result<CallToolResul
     let (slot, revision) = ctx
         .exec
         .run(move |ws| -> Result<_, ToolError> {
-            if ws.engine().document().revision() != ic.revision || ws.shown() != ic.slot {
+            if ws.engine().document().revision() != ic.revision
+                || ws.shown() != ic.slot
+                || ws.engine().id() != ic.engine
+            {
                 return Err(ToolError::new(
                     "REVISION_CONFLICT",
-                    "the picture changed while the image was converted; call import_image again",
+                    "the picture changed (it was edited, replaced or swapped) while the image was converted; call import_image again",
                 ));
             }
             match kind {

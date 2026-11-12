@@ -16,6 +16,10 @@ use crate::tests::{key_event, menu_item_path, pick, pointer_button, ui_point};
 /// The computer as the flows see it; records every process and opened file.
 #[derive(Default)]
 struct Fake {
+    /// This executable (default [`EXE`]).
+    exe: Option<PathBuf>,
+    /// `claude mcp get` ends with this code and stderr line instead of 0 or 1.
+    get_fails: Option<(i32, &'static str)>,
     claude: Option<PathBuf>,
     mcpb: Option<PathBuf>,
     desktop: bool,
@@ -46,7 +50,7 @@ impl Fake {
 
 impl System for Fake {
     fn exe(&self) -> Option<PathBuf> {
-        Some(PathBuf::from(EXE))
+        Some(self.exe.clone().unwrap_or_else(|| PathBuf::from(EXE)))
     }
 
     fn find_claude(&self) -> Option<PathBuf> {
@@ -72,6 +76,14 @@ impl System for Fake {
             ..RunOutput::default()
         };
         Ok(match args.get(1).map(String::as_str) {
+            Some("get") if self.get_fails.is_some() => {
+                let (c, line) = self.get_fails.unwrap();
+                RunOutput {
+                    code: Some(c),
+                    stdout: String::new(),
+                    stderr: format!("{line}\n"),
+                }
+            }
             Some("get") => code(if *registered { 0 } else { 1 }),
             Some("add") if self.add_fails => RunOutput {
                 code: Some(1),
@@ -315,6 +327,60 @@ fn permissions_follow_the_boxes_and_reach_the_running_server_at_once() {
     assert!(!rig.req().enabled(McpControl::Overwrite));
     let v = rig.view();
     assert!(v.read && !v.edit && v.overwrite);
+    // The ghosted box stays ticked (and saved) but does not count: overwriting asks.
+    assert!(rig.app.mcp.settings.overwrite_without_asking);
+    assert_eq!(state.settings().overwrite, Overwrite::Ask);
+    assert!(!state.settings().overwrite_without_asking());
+    rig.click(McpControl::Edit);
+    assert_eq!(
+        state.settings().overwrite,
+        Overwrite::Allowed,
+        "both on again"
+    );
+}
+
+#[test]
+fn a_ghosted_overwrite_box_still_asks_before_replacing_a_file() {
+    let dir = std::env::temp_dir().join(format!("dpx-mcp-ghost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let (mut rig, tools) = serving(Some(&dir));
+    rig.click(McpControl::Overwrite);
+    assert_eq!(tools.state.settings().overwrite, Overwrite::Allowed);
+    let v = call(&mut rig, &tools, "export_image", json!({"path": "a.iff"}));
+    assert_eq!(v["success"], true, "{v}");
+    // Read on, Edit off, Overwrite ticked under the ghosting.
+    rig.click(McpControl::Edit);
+    assert!(!rig.req().enabled(McpControl::Overwrite));
+    assert!(rig.view().overwrite);
+    let st = call(&mut rig, &tools, "get_app_status", json!({}));
+    assert_eq!(st["permissions"]["overwrite_without_asking"], false, "{st}");
+    let before = std::fs::read(dir.join("a.iff")).unwrap();
+    let rx = dpx_mcp::tools::spawn_calls(
+        tools.clone(),
+        vec![(
+            "export_image".into(),
+            json!({"path": "a.iff", "overwrite": true})
+                .as_object()
+                .cloned(),
+        )],
+    );
+    let until = Instant::now() + Duration::from_secs(5);
+    while rig.app.ui.choice_requester.is_none() {
+        assert!(Instant::now() < until, "the user is asked");
+        std::thread::sleep(Duration::from_millis(2));
+        rig.pass(vec![]);
+    }
+    assert_eq!(rig.choice().title(), "Replace File?");
+    rig.pass(vec![key_event(egui::Key::Enter, true)]);
+    let (_, r) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        r.unwrap().structured_content.unwrap()["code"],
+        "OVERWRITE_DECLINED"
+    );
+    assert_eq!(std::fs::read(dir.join("a.iff")).unwrap(), before, "kept");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A rig whose app serves a fake job sender (the tools' executor, no transport).
@@ -532,6 +598,96 @@ fn cancel_runs_nothing_and_a_failed_add_says_why() {
     assert!(!rig.app.mcp.settings.enabled);
 }
 
+/// The question's lines joined without the breaks the wrapping put into long words.
+fn squeezed(lines: &[String]) -> String {
+    lines.concat().split_whitespace().collect()
+}
+
+/// A long but real path (a download unpacked in place) and the question for it.
+const LONG_EXE: &str = "/Users/someone/Downloads/DeluxePainter-0.1.0-macos-aarch64 (1)/DeluxePainter.app/Contents/MacOS/deluxepainter";
+
+#[test]
+fn the_connect_questions_show_the_whole_command_even_for_a_long_path() {
+    for registered in [true, false] {
+        let mut rig = Rig::new(Fake {
+            exe: Some(PathBuf::from(LONG_EXE)),
+            ..Fake::with_claude(registered)
+        });
+        rig.click(McpControl::ConnectCode);
+        rig.settle();
+        let lines = rig.choice().lines().to_vec();
+        assert!(!rig.choice().truncated(), "{lines:?}");
+        assert!(lines.iter().all(|l| l != "..."), "{lines:?}");
+        if registered {
+            // More than an ordinary question shows (it was cut there before).
+            assert!(
+                lines.len() > dpx_ui::choice_requester::MAX_LINES,
+                "{lines:?}"
+            );
+        }
+        let text = squeezed(&lines);
+        let exe: String = LONG_EXE.split_whitespace().collect();
+        assert!(text.contains(&exe), "{text}");
+        assert!(text.contains("mcp-bridge"), "{text}");
+        assert!(
+            text.contains("claudemcpadd--scopeuserdeluxe-painter--"),
+            "{text}"
+        );
+        if registered {
+            assert!(
+                text.contains("claudemcpremovedeluxe-painter-suser"),
+                "{text}"
+            );
+        }
+        // It fits the smallest UI screen.
+        assert!(rig.choice().height() <= 200);
+    }
+}
+
+#[test]
+fn a_command_too_long_to_show_is_not_offered() {
+    let exe = format!("/{}/deluxepainter", "x".repeat(700));
+    let mut rig = Rig::new(Fake {
+        exe: Some(PathBuf::from(&exe)),
+        ..Fake::with_claude(false)
+    });
+    rig.click(McpControl::ConnectCode);
+    rig.settle();
+    assert!(rig.app.ui.choice_requester.is_none(), "nothing to click");
+    assert!(
+        rig.message().contains("too long to show"),
+        "{}",
+        rig.message()
+    );
+    assert_eq!(rig.fake.runs(), [connect::get_args()], "nothing else ran");
+}
+
+#[test]
+fn claude_code_failing_to_answer_is_reported_not_taken_for_a_missing_entry() {
+    // An npm `claude` whose `node` is not on the app's PATH ends with 127.
+    let mut rig = Rig::new(Fake {
+        get_fails: Some((127, "env: node: No such file or directory")),
+        ..Fake::with_claude(false)
+    });
+    rig.click(McpControl::ConnectCode);
+    rig.settle();
+    assert!(rig.app.ui.choice_requester.is_none(), "no Run is offered");
+    assert_eq!(
+        rig.message(),
+        "Claude Code: env: node: No such file or directory"
+    );
+    assert_eq!(rig.fake.runs(), [connect::get_args()]);
+    assert!(!rig.app.mcp.settings.enabled);
+    // Without a word it says how it ended.
+    let mut rig = Rig::new(Fake {
+        get_fails: Some((2, "")),
+        ..Fake::with_claude(false)
+    });
+    rig.click(McpControl::ConnectCode);
+    rig.settle();
+    assert_eq!(rig.message(), "Claude Code ended with Some(2).");
+}
+
 #[test]
 fn an_existing_claude_code_entry_is_replaced_only_on_request() {
     let mut rig = Rig::new(Fake::with_claude(true));
@@ -542,6 +698,10 @@ fn an_existing_claude_code_entry_is_replaced_only_on_request() {
         rig.choice_text()
             .contains("claude mcp remove deluxe-painter -s user")
     );
+    let text = squeezed(rig.choice().lines());
+    let exe: String = EXE.split_whitespace().collect();
+    assert!(text.contains(&exe) && text.contains("mcp-bridge"), "{text}");
+    assert!(rig.choice().lines().iter().all(|l| l != "..."));
     rig.answer(1);
     rig.settle();
     assert_eq!(rig.message(), "Claude Code already has DeluxePainter.");
@@ -707,6 +867,157 @@ fn the_buttons_wait_while_a_step_runs() {
     }
     rig.settle();
     assert!(!rig.view().busy);
+}
+
+fn scratch_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("dpx-mcp-prefs-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d.canonicalize().unwrap()
+}
+
+#[test]
+fn a_failed_start_shows_off_after_off_and_on_tries_again() {
+    let mut rig = Rig::new(Fake::default());
+    // A real failure: the token cannot be written under /dev/null.
+    rig.app.mcp.config_dir = Some(PathBuf::from("/dev/null/DeluxePainter"));
+    rig.click(McpControl::On);
+    assert!(matches!(rig.app.mcp.status(), Status::Failed(_)));
+    let status = rig.view().status;
+    assert!(
+        status.starts_with("Error: cannot keep the token"),
+        "{status}"
+    );
+    rig.click(McpControl::Off);
+    assert_eq!(rig.app.mcp.status(), Status::Off);
+    assert_eq!(rig.view().status, "Off", "Off is off, not an old error");
+    // The cause is gone; On tries again.
+    let config = scratch_dir("retry");
+    rig.app.mcp.config_dir = Some(config.clone());
+    rig.click(McpControl::On);
+    let Status::Running { port, .. } = rig.app.mcp.status() else {
+        panic!("started again: {:?}", rig.app.mcp.status());
+    };
+    assert_eq!(rig.view().status, format!("Ready on 127.0.0.1:{port}"));
+    rig.click(McpControl::Off);
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+/// Points `mcp-app.json` at a script that leaves `marker` behind when it is started, with
+/// `enabled` as given.
+#[cfg(unix)]
+fn launch_marker(config: &Path, marker: &Path, enabled: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = config.join("fake-app.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut launch = dpx_mcp::endpoint::read_app_file(config).expect("the launch record");
+    launch.app_path = script.display().to_string();
+    launch.enabled = enabled;
+    dpx_mcp::endpoint::write_app_file(config, &launch).unwrap();
+}
+
+/// What a bridge call does first, with short waits.
+fn bridge_reach(config: &Path) -> Result<(), dpx_mcp::ToolError> {
+    dpx_mcp::bridge::Bridge::with_launch_wait(
+        Some(config.to_path_buf()),
+        Duration::from_millis(500),
+    )
+    .reach_blocking()
+}
+
+#[cfg(unix)]
+#[test]
+fn turning_mcp_off_keeps_the_bridge_from_starting_the_app() {
+    let config = scratch_dir("off-sticks");
+    let marker = config.join("launched");
+    let mut rig = Rig::new(Fake::default());
+    rig.app.mcp.config_dir = Some(config.clone());
+    rig.app.mcp.instance = crate::mcp::claim_instance(Some(&config), false).unwrap();
+    assert!(
+        rig.app.mcp.instance.is_some(),
+        "this GUI holds the app lock"
+    );
+    rig.click(McpControl::On);
+    assert!(matches!(rig.app.mcp.status(), Status::Running { .. }));
+    assert!(bridge_reach(&config).is_ok(), "the bridge reaches the app");
+    assert!(dpx_mcp::endpoint::read_app_file(&config).unwrap().enabled);
+
+    // Off: the server stops and the launch record says off.
+    rig.click(McpControl::Off);
+    assert!(!dpx_mcp::endpoint::read_app_file(&config).unwrap().enabled);
+    launch_marker(&config, &marker, false);
+    let e = bridge_reach(&config).unwrap_err();
+    assert_eq!(e.code, "APP_UNAVAILABLE", "{e}");
+    assert_eq!(e.message, dpx_mcp::bridge::TURNED_OFF);
+    // Even a record that allows a start does not start a second app while this one runs.
+    launch_marker(&config, &marker, true);
+    let e = bridge_reach(&config).unwrap_err();
+    assert_eq!(e.message, dpx_mcp::bridge::NOT_ANSWERING, "{e}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "nothing was started");
+
+    // Disconnect > Turn off does the same.
+    rig.click(McpControl::On);
+    assert!(dpx_mcp::endpoint::read_app_file(&config).unwrap().enabled);
+    rig.click(McpControl::Disconnect);
+    assert_eq!(rig.choice().labels(), ["Turn off", "Cancel"]);
+    rig.answer(0);
+    assert_eq!(rig.app.mcp.status(), Status::Off);
+    assert!(!dpx_mcp::endpoint::read_app_file(&config).unwrap().enabled);
+    launch_marker(&config, &marker, false);
+    assert_eq!(bridge_reach(&config).unwrap_err().code, "APP_UNAVAILABLE");
+
+    // Quit with MCP control off: the bridge does not start the app either.
+    eframe::App::on_exit(&mut rig.app);
+    assert!(rig.app.mcp.instance.is_none());
+    assert!(!dpx_mcp::endpoint::app_running(&config));
+    launch_marker(&config, &marker, false);
+    let e = bridge_reach(&config).unwrap_err();
+    assert_eq!(e.code, "APP_NOT_RUNNING");
+    assert_eq!(e.message, dpx_mcp::bridge::OFF_NOT_RUNNING);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "nothing was started");
+
+    // The control: with MCP control on and no app running the bridge does start it.
+    launch_marker(&config, &marker, true);
+    let _ = bridge_reach(&config);
+    let until = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < until,
+            "the app named in the record was started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+#[test]
+fn a_second_gui_with_mcp_ends_and_a_plain_one_runs_without_the_claim() {
+    let config = scratch_dir("instance");
+    let first = crate::mcp::claim_instance(Some(&config), true).unwrap();
+    assert!(first.is_some());
+    let e = crate::mcp::claim_instance(Some(&config), true).unwrap_err();
+    assert!(e.contains("already running"), "{e}");
+    assert!(
+        crate::mcp::claim_instance(Some(&config), false)
+            .unwrap()
+            .is_none(),
+        "a second window opened by the user runs, without the claim"
+    );
+    assert!(crate::mcp::claim_instance(None, true).unwrap().is_none());
+    drop(first);
+    assert!(
+        crate::mcp::claim_instance(Some(&config), true)
+            .unwrap()
+            .is_some()
+    );
+    let _ = std::fs::remove_dir_all(&config);
 }
 
 #[test]

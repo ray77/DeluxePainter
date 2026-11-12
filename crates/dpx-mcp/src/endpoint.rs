@@ -1,21 +1,39 @@
 //! Endpoint discovery (ADR-43). A running HTTP server writes `<config dir>/mcp-endpoint.json`
 //! (`{version, port, token, pid, app_path, url}`, atomically, owner-only on Unix) and removes
 //! it when it stops; the bridge reads it on every (re)connect, so the user never types a port
-//! or a token. `<config dir>/mcp-app.json` (`{version, app_path, args}`) stays and tells the
-//! bridge how to start the app when it is not running.
+//! or a token. The token in it is made for that start of the server only, so a file left
+//! behind by a crash names no token that still works.
+//!
+//! While it serves, the server holds an exclusive lock on `mcp-endpoint.lock`; the bridge
+//! trusts an endpoint file only while that lock is held ([`read_live_endpoint`]) and removes
+//! one nobody holds, so it never sends a request to whatever listens on a dead server's
+//! port. The OS releases a lock when its process ends, so a crash leaves no stale lock and a
+//! reused process id fools nothing. A running GUI holds `mcp-app.lock` the same way
+//! ([`claim_app`], [`app_running`]).
+//!
+//! `<config dir>/mcp-app.json` (`{version, app_path, args, enabled}`) stays when the app
+//! stops. It tells the bridge how to start the app, and `enabled` whether it may: the GUI
+//! writes `false` when the user turns MCP control off, so the bridge never starts the app
+//! (or a second one) against that choice.
 //!
 //! The GUI keeps its bearer token in `<config dir>/mcp-token` (owner-only on Unix), so a
 //! client configured once still connects after a restart of the app; revoking access
 //! writes a new one ([`rotate_token`]).
 
+use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 pub const ENDPOINT_FILE: &str = "mcp-endpoint.json";
 pub const APP_FILE: &str = "mcp-app.json";
 pub const TOKEN_FILE: &str = "mcp-token";
+/// Held by the server that wrote the endpoint file, while it serves.
+pub const ENDPOINT_LOCK: &str = "mcp-endpoint.lock";
+/// Held by a running GUI.
+pub const APP_LOCK: &str = "mcp-app.lock";
 pub const VERSION: u32 = 1;
 /// The arguments the bridge starts the app with (GUI with the MCP server on).
 pub const LAUNCH_ARGS: &[&str] = &["--mcp"];
@@ -51,6 +69,10 @@ pub struct AppLaunch {
     pub app_path: String,
     #[serde(default = "default_args")]
     pub args: Vec<String>,
+    /// MCP control is on (as the app last wrote it): the bridge may start the app. A record
+    /// without it counts as off.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_args() -> Vec<String> {
@@ -115,24 +137,28 @@ pub fn token_path(dir: &Path) -> PathBuf {
 }
 
 /// The persistent token in `dir`: the one stored there, else a new one written there. A file
-/// readable by others is made owner-only again (Unix).
+/// that others could read (Unix: any group or other permission bit) may have given the
+/// token away, so it is replaced by a new owner-only one.
 pub fn load_or_create_token(dir: &Path) -> std::io::Result<String> {
     let path = token_path(dir);
     if let Ok(text) = std::fs::read_to_string(&path) {
         let t = text.trim();
-        if valid_token(t) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&path)?.permissions().mode();
-                if mode & 0o077 != 0 {
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-                }
-            }
+        if valid_token(t) && !readable_by_others(&path)? {
             return Ok(t.to_string());
         }
     }
     rotate_token(dir)
+}
+
+#[cfg(unix)]
+fn readable_by_others(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn readable_by_others(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// Writes a new random token to `dir` and returns it; the old one stops working wherever
@@ -165,6 +191,24 @@ pub fn read_endpoint(dir: &Path) -> Option<Endpoint> {
         .filter(|e| e.version == VERSION && e.port != 0 && !e.token.is_empty())
 }
 
+/// The endpoint file, if the server that wrote it still serves (it holds
+/// [`ENDPOINT_LOCK`]). A file nobody serves was left by a crashed or killed server: it is
+/// removed (under the lock, so a server starting now cannot lose its new file) and `None`
+/// returned, so nothing is sent to whatever listens on its port now.
+pub fn read_live_endpoint(dir: &Path) -> Option<Endpoint> {
+    let e = read_endpoint(dir)?;
+    let lock = dir.join(ENDPOINT_LOCK);
+    if held(&lock) {
+        return Some(e);
+    }
+    if let Ok(Some(_claim)) = try_claim(&lock)
+        && read_endpoint(dir).as_ref() == Some(&e)
+    {
+        let _ = std::fs::remove_file(endpoint_path(dir));
+    }
+    None
+}
+
 /// Removes the endpoint file if it still names this process (another instance may have
 /// replaced it).
 pub fn remove_endpoint(dir: &Path, port: u16) {
@@ -176,18 +220,21 @@ pub fn remove_endpoint(dir: &Path, port: u16) {
     }
 }
 
-/// Records how to start the app (the GUI writes this when its server starts).
+/// Records how to start the app and whether the bridge may (the GUI writes it when MCP
+/// control is turned on or off and when it quits).
 pub fn write_app_file(dir: &Path, launch: &AppLaunch) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(launch).expect("serialisable");
     write_private(&app_path(dir), &json)
 }
 
-/// The app's own launch record: this executable with [`LAUNCH_ARGS`].
-pub fn this_app() -> Option<AppLaunch> {
+/// The app's own launch record: this executable with [`LAUNCH_ARGS`], MCP control
+/// `enabled` or not.
+pub fn this_app(enabled: bool) -> Option<AppLaunch> {
     Some(AppLaunch {
         version: VERSION,
         app_path: current_exe()?,
         args: default_args(),
+        enabled,
     })
 }
 
@@ -196,6 +243,86 @@ pub fn read_app_file(dir: &Path) -> Option<AppLaunch> {
     serde_json::from_slice::<AppLaunch>(&bytes)
         .ok()
         .filter(|a| a.version == VERSION && !a.app_path.is_empty())
+}
+
+/// An exclusive lock on a file of the config directory, held until it is dropped. The OS
+/// releases it when the process ends, so a crash leaves no stale lock behind.
+#[derive(Debug)]
+pub struct Claim {
+    _file: File,
+}
+
+fn open_lock(path: &Path) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Owner-only: another user who could open it could hold it and fake a running app.
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    if readable_by_others(path)? {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Takes the lock at `path`; `Ok(None)` while another process (or another open handle of
+/// this one) holds it.
+pub fn try_claim(path: &Path) -> std::io::Result<Option<Claim>> {
+    let file = open_lock(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(Claim { _file: file })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// [`try_claim`], tried again for up to `wait`: [`held`] holds a lock for a moment.
+pub fn claim_within(path: &Path, wait: Duration) -> std::io::Result<Option<Claim>> {
+    let until = Instant::now() + wait;
+    loop {
+        if let Some(c) = try_claim(path)? {
+            return Ok(Some(c));
+        }
+        if Instant::now() >= until {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Somebody holds the lock at `path` (a missing file: nobody). The probe takes a shared
+/// lock and releases it at once.
+pub fn held(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
+}
+
+/// How long a starting app or server waits for a lock a probe holds.
+pub const CLAIM_WAIT: Duration = Duration::from_secs(1);
+
+/// The running GUI's claim on `dir` (`Ok(None)`: another DeluxePainter runs).
+pub fn claim_app(dir: &Path) -> std::io::Result<Option<Claim>> {
+    claim_within(&dir.join(APP_LOCK), CLAIM_WAIT)
+}
+
+/// A DeluxePainter GUI runs with this config directory.
+pub fn app_running(dir: &Path) -> bool {
+    held(&dir.join(APP_LOCK))
+}
+
+/// The claim of the server that writes the endpoint file (`Ok(None)`: another one serves).
+pub fn claim_endpoint(dir: &Path) -> std::io::Result<Option<Claim>> {
+    claim_within(&dir.join(ENDPOINT_LOCK), CLAIM_WAIT)
 }
 
 #[cfg(test)]
@@ -260,13 +387,16 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            // A file opened up by someone is made private again.
+            // A file others could read may have given the token away: a new private one.
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert_eq!(load_or_create_token(&dir).unwrap(), a);
+            let fresh = load_or_create_token(&dir).unwrap();
+            assert_ne!(fresh, a, "the exposed token is replaced");
+            assert_eq!(fresh.len(), 64);
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            assert_eq!(load_or_create_token(&dir).unwrap(), fresh, "and kept");
         }
         let b = rotate_token(&dir).unwrap();
         assert_ne!(a, b);
@@ -278,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn app_file_defaults_to_the_mcp_flag() {
+    fn app_file_defaults_to_the_mcp_flag_and_off() {
         let dir = crate::access::tests::scratch("appfile");
         std::fs::write(
             app_path(&dir),
@@ -287,7 +417,50 @@ mod tests {
         .unwrap();
         let a = read_app_file(&dir).unwrap();
         assert_eq!(a.args, vec!["--mcp".to_string()]);
-        write_app_file(&dir, &this_app().unwrap()).unwrap();
-        assert!(read_app_file(&dir).unwrap().app_path.len() > 1);
+        assert!(
+            !a.enabled,
+            "a record that does not say so does not allow a start"
+        );
+        write_app_file(&dir, &this_app(true).unwrap()).unwrap();
+        let a = read_app_file(&dir).unwrap();
+        assert!(a.app_path.len() > 1 && a.enabled);
+    }
+
+    #[test]
+    fn locks_are_exclusive_probed_without_taking_them_and_released_on_drop() {
+        let dir = crate::access::tests::scratch("locks");
+        assert!(!app_running(&dir), "no lock file: nobody");
+        let a = claim_app(&dir).unwrap().expect("the first claim");
+        assert!(app_running(&dir));
+        assert!(
+            try_claim(&dir.join(APP_LOCK)).unwrap().is_none(),
+            "exclusive"
+        );
+        assert!(app_running(&dir), "a probe does not take it");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(APP_LOCK))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(a);
+        assert!(!app_running(&dir));
+        assert!(claim_app(&dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_endpoint_nobody_serves_is_ignored_and_removed() {
+        let dir = crate::access::tests::scratch("live");
+        let e = Endpoint::new(8765, "t".repeat(64));
+        write_endpoint(&dir, &e).unwrap();
+        let claim = claim_endpoint(&dir).unwrap().unwrap();
+        assert_eq!(read_live_endpoint(&dir), Some(e.clone()), "served");
+        assert!(endpoint_path(&dir).exists());
+        drop(claim);
+        assert_eq!(read_live_endpoint(&dir), None, "the server is gone");
+        assert!(!endpoint_path(&dir).exists(), "the stale file is removed");
     }
 }

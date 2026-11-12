@@ -267,11 +267,13 @@ fn a_held_mouse_button_makes_changes_wait_a_bounded_time() {
 fn permissions_follow_the_settings_live() {
     let mut rig = Rig::new(None);
     rig.app.mcp.settings.allow_edit = false;
+    rig.pass(); // the server gets settings in a pass
     let (code, msg) = rig.code("draw_pixel", json!({"x": 1, "y": 1, "color": 1}));
     assert_eq!(code, "PERMISSION_DENIED");
     assert!(msg.contains("Prefs > AI & MCP"), "{msg}");
     rig.ok("get_palette", json!({}));
     rig.app.mcp.settings.allow_read = false;
+    rig.pass(); // the server gets settings in a pass
     for (tool, args) in [
         ("get_palette", json!({})),
         ("list_documents", json!({})),
@@ -282,6 +284,7 @@ fn permissions_follow_the_settings_live() {
     }
     // Reading off: changing tools are refused too, even with editing on.
     rig.app.mcp.settings.allow_edit = true;
+    rig.pass(); // the server gets settings in a pass
     assert_eq!(
         rig.code("draw_pixel", json!({"x": 1, "y": 1, "color": 1}))
             .0,
@@ -292,6 +295,7 @@ fn permissions_follow_the_settings_live() {
     assert!(st["document"].is_null());
     assert_eq!(rig.pixel(1, 1), 0);
     rig.app.mcp.settings.allow_read = true;
+    rig.pass(); // the server gets settings in a pass
     rig.ok("draw_pixel", json!({"x": 1, "y": 1, "color": 1}));
 }
 
@@ -396,8 +400,11 @@ fn replacing_a_file_asks_the_user_first() {
     assert_eq!(code, "EDITOR_BUSY");
     rig.app.ui.note_requester = None;
 
-    // "Overwrite without asking": no question.
+    // "Overwrite without asking": no question. The server gets the setting in the next
+    // pass (Prefs > AI & MCP syncs at once); before it, a call could still see Ask.
     rig.app.mcp.settings.overwrite_without_asking = true;
+    rig.pass();
+    assert_eq!(rig.tools.state.settings().overwrite, Overwrite::Allowed);
     rig.ok(
         "export_image",
         json!({"path": "castle.iff", "overwrite": true}),
@@ -456,6 +463,100 @@ fn saving_uses_the_app_file_code_and_marks_the_picture_saved() {
     assert_eq!(code, "HARDWARE_LIMIT");
     assert!(msg.contains("12-bit"), "{msg}");
     assert!(!dir.join("castle.iff").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs the next queued job alone (waiting up to 5 s for one), as `logic` would, and stops
+/// there: the test can act like the user before the call's next job.
+fn run_next_job(app: &mut PainterApp) {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(job) = app.mcp.running.as_mut().unwrap().queue.take() {
+            job.run(&mut GuiWorkspace(app));
+            return;
+        }
+        assert!(Instant::now() < until, "no job came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Picture > Load of a blank `colour` picture, as the user does it.
+fn gui_load(app: &mut PainterApp, path: &Path, colour: u8) {
+    let doc = Document::from_picture(
+        IndexedImage::new(320, 256, colour),
+        dpx_core::Palette::dpaint_default_32(),
+        app.engine.document().target(),
+    );
+    app.set_picture(doc, files::PictureExtras::default(), path.to_path_buf());
+}
+
+#[test]
+fn an_import_converted_while_the_user_loaded_another_picture_is_refused() {
+    let dir = scratch("import-race");
+    let png = dir.join("in.png");
+    let rgba: Vec<u8> = (0..16 * 16).flat_map(|_| [255, 0, 0, 255]).collect();
+    crate::write_png(png.to_str().unwrap(), 16, 16, &rgba).unwrap();
+    let mut rig = Rig::new(Some(&dir));
+    assert_eq!(rig.app.engine.document().revision(), 0);
+    let rx = rig.start(
+        "import_image",
+        json!({"path": "in.png", "target": "spare", "colors": 2}),
+    );
+    // The job that reads the picture's format and palette runs; the conversion follows
+    // off the UI thread, and meanwhile the user loads another picture (also revision 0).
+    run_next_job(&mut rig.app);
+    gui_load(&mut rig.app, &dir.join("other.iff"), 9);
+    assert_eq!(rig.app.engine.document().revision(), 0, "the same revision");
+    let v = rig.wait(&rx);
+    assert_eq!(v["code"], "REVISION_CONFLICT", "{v}");
+    assert!(
+        rig.app.menu_data.spare.is_none(),
+        "nothing was made for the old picture"
+    );
+    assert_eq!(rig.pixel(0, 0), 9, "the loaded picture stays");
+    // Without a change in between it works.
+    let v = rig.ok(
+        "import_image",
+        json!({"path": "in.png", "target": "spare", "colors": 2}),
+    );
+    assert_eq!(v["target"], "spare");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_project_saved_while_the_user_loaded_another_picture_names_only_the_saved_one() {
+    let dir = scratch("save-race");
+    let mut rig = Rig::new(Some(&dir));
+    let rx = rig.start("save_project", json!({"path": "mcp.dpxproj"}));
+    // The job that copies the picture runs; while the file is written the user loads
+    // another picture (a new document at the same revision 0, the same page slot).
+    run_next_job(&mut rig.app);
+    let elsewhere = dir.join("elsewhere");
+    let loaded = elsewhere.join("loaded.iff");
+    gui_load(&mut rig.app, &loaded, 4);
+    let v = rig.wait(&rx);
+    assert_eq!(v["success"], true, "{v}");
+    assert!(
+        v["notes"][0].as_str().unwrap().contains("not marked saved"),
+        "{v}"
+    );
+    assert!(
+        dir.join("mcp.dpxproj").exists(),
+        "the old picture was written"
+    );
+    assert_eq!(
+        rig.app.picture_path.as_deref(),
+        Some(loaded.as_path()),
+        "the loaded picture keeps its own name"
+    );
+    assert_eq!(
+        rig.app.last_drawer.as_deref(),
+        Some(elsewhere.to_str().unwrap()),
+        "and its drawer"
+    );
+    assert!(!rig.app.unsaved(), "it is clean as loaded");
+    let info = rig.ok("get_document_info", json!({}));
+    assert_ne!(info["name"], "mcp.dpxproj", "{info}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -562,7 +663,18 @@ fn the_server_starts_and_stops_with_the_setting() {
     let e = endpoint::read_endpoint(&config).expect("the endpoint file");
     assert_eq!(e.port, port);
     let token = std::fs::read_to_string(endpoint::token_path(&config)).unwrap();
-    assert_eq!(e.token, token, "the stored token");
+    assert_eq!(
+        rig.app.mcp.token(),
+        Some(token.as_str()),
+        "the stored token"
+    );
+    // The endpoint file names a token for this start only: a file a crash leaves behind
+    // gives nothing away.
+    assert_ne!(e.token, token);
+    assert!(
+        endpoint::read_live_endpoint(&config).is_some(),
+        "its lock is held"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -578,9 +690,11 @@ fn the_server_starts_and_stops_with_the_setting() {
     }
     let launch = endpoint::read_app_file(&config).expect("the launch file");
     assert_eq!(launch.args, ["--mcp"]);
+    assert!(launch.enabled, "the bridge may start the app");
 
-    // A call over HTTP lands in the window.
-    let (status, v) = post_live(&mut rig, port, &token, "draw_rectangle", rect(2, 2, 7));
+    // A call over HTTP lands in the window (with the endpoint file's token, as the bridge
+    // sends it; the stored token works as well).
+    let (status, v) = post_live(&mut rig, port, &e.token, "draw_rectangle", rect(2, 2, 7));
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["result"]["structuredContent"]["success"], true, "{v}");
     assert_eq!(rig.pixel(2, 2), 7);
@@ -598,23 +712,34 @@ fn the_server_starts_and_stops_with_the_setting() {
         Some("draw_rectangle")
     );
 
-    // Off: stopped, the endpoint file is gone, calls get no answer.
+    // Off: stopped, the endpoint file is gone, calls get no answer, and the launch record
+    // says off.
     rig.app.mcp.settings.enabled = false;
     rig.pass();
     assert_eq!(rig.app.mcp.status(), Status::Off);
     assert!(endpoint::read_endpoint(&config).is_none());
     assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    assert!(!endpoint::read_app_file(&config).unwrap().enabled);
 
-    // On again (also for one session with --mcp): the same token, so clients reconnect.
+    // On again (also for one session with --mcp): the same stored token, so clients
+    // configured with it reconnect; the endpoint file has a new one of its own.
     rig.app.mcp.session = true;
     rig.pass();
     let Status::Running { port, .. } = rig.app.mcp.status() else {
         panic!("running again");
     };
-    assert_eq!(endpoint::read_endpoint(&config).unwrap().token, token);
+    assert!(endpoint::read_app_file(&config).unwrap().enabled);
+    assert_eq!(rig.app.mcp.token(), Some(token.as_str()));
+    let again = endpoint::read_endpoint(&config).unwrap().token;
+    assert!(again != e.token && again != token);
     assert_eq!(
         post_live(&mut rig, port, &token, "get_palette", json!({})).0,
         200
+    );
+    assert_eq!(
+        post_live(&mut rig, port, &e.token, "get_palette", json!({})).0,
+        401,
+        "the last start's endpoint token is dead"
     );
 
     // Revoke: a new token, the old one is refused at once.
@@ -630,11 +755,22 @@ fn the_server_starts_and_stops_with_the_setting() {
         post_live(&mut rig, port, &new, "get_palette", json!({})).0,
         200
     );
-    assert_eq!(endpoint::read_endpoint(&config).unwrap().token, new);
+    let revoked = endpoint::read_endpoint(&config).unwrap().token;
+    assert_ne!(revoked, again, "the endpoint file gets a new token too");
+    assert_eq!(
+        post_live(&mut rig, port, &again, "get_palette", json!({})).0,
+        401
+    );
+    assert_eq!(
+        post_live(&mut rig, port, &revoked, "get_palette", json!({})).0,
+        200
+    );
 
-    // Exit stops it.
+    // Exit stops it; the launch record keeps the saved setting (off: the session's `--mcp`
+    // is not saved).
     eframe::App::on_exit(&mut rig.app);
     assert!(endpoint::read_endpoint(&config).is_none());
+    assert!(!endpoint::read_app_file(&config).unwrap().enabled);
     let _ = std::fs::remove_dir_all(&config);
     let _ = std::fs::remove_dir_all(&pictures);
 }

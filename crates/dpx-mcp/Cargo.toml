@@ -19,6 +19,9 @@ dpx-formats.workspace = true
 dpx-iff.workspace = true
 getrandom = "0.3"
 png.workspace = true
+# The bridge's own HTTP client (no proxy): the version and features rmcp's
+# transport-streamable-http-client-reqwest already uses, so no crate is added.
+reqwest = { version = "0.13", default-features = false }
 rmcp = { version = "3.9", features = [
     "server",
     "macros",

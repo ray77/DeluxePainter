@@ -5,7 +5,8 @@
 //!
 //! It finds the app through `mcp-endpoint.json` in the DeluxePainter config directory
 //! (`DPX_CONFIG_DIR` overrides it) and starts the app named in `mcp-app.json` when it is not
-//! running. stdout carries protocol messages only.
+//! running and its MCP control is on (never a second one, never against Off). stdout
+//! carries protocol messages only.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

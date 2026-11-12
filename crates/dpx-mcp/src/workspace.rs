@@ -109,7 +109,9 @@ pub trait Workspace {
     fn set_picture_name(&mut self, name: Option<String>);
     /// True if the shown page changed since it was last opened or saved.
     fn modified(&self) -> bool;
-    /// The shown page was saved as a project at `path` when it was at `revision`.
+    /// The shown page was saved as a project at `path` when it was at `revision`. Only
+    /// called while the shown page is still the document that was saved (same slot and
+    /// [`dpx_core::Engine::id`]).
     fn mark_saved(&mut self, path: &Path, revision: u64);
     /// What a project of the shown page keeps besides the document.
     fn project_extras(&self) -> ProjectExtras {

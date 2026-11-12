@@ -978,6 +978,7 @@ dependencies = [
  "dpx-iff",
  "getrandom 0.3.4",
  "png",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

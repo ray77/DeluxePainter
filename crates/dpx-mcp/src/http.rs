@@ -7,6 +7,11 @@
 //! compare), a body over [`MAX_BODY`] gets 413. Tool calls and resource reads get their
 //! arrival-order ticket there. The server is stateless (no MCP sessions) and answers with
 //! plain JSON, so every POST is one request and its answer.
+//!
+//! With an endpoint directory the server first takes [`endpoint::ENDPOINT_LOCK`] (another
+//! server holding it makes the start fail: one server per config directory), then writes
+//! the endpoint file with a token made for this start only, which it accepts besides the
+//! configured one; on stop it removes the file and releases the lock.
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -41,23 +46,44 @@ pub struct HttpOptions {
     /// The port to try first: `0` takes any free port, otherwise the next
     /// [`FALLBACK_PORTS`] ports and then any free port are tried when it is busy.
     pub port: u16,
-    /// The bearer token; `None` makes a random one.
+    /// The bearer token; `None` makes a random one. With an endpoint directory the endpoint
+    /// file names another token, made for this start, which is accepted as well.
     pub token: Option<String>,
     /// Where to write the endpoint file (the config directory), if anywhere.
     pub endpoint_dir: Option<PathBuf>,
 }
 
-/// The bearer token the guard checks; replaced by [`HttpServer::set_token`].
-type SharedToken = Arc<RwLock<Arc<[u8]>>>;
+/// The bearer tokens the guard accepts: the configured one and, with an endpoint file, the
+/// one that file names (made for this start). Replaced by [`HttpServer::set_token`].
+#[derive(Clone)]
+struct Tokens {
+    configured: Arc<[u8]>,
+    endpoint: Option<Arc<[u8]>>,
+}
+
+impl Tokens {
+    /// `t` is one of them; both are compared in constant time over their whole length.
+    fn accept(&self, t: &[u8]) -> bool {
+        let a = same_secret(t, &self.configured);
+        let b = self.endpoint.as_ref().is_some_and(|e| same_secret(t, e));
+        a | b
+    }
+}
+
+type SharedToken = Arc<RwLock<Tokens>>;
 
 /// A running server; stopped by [`HttpServer::stop`] or when dropped.
 pub struct HttpServer {
     port: u16,
     token: String,
+    /// The token in the endpoint file (this start's), if one is written.
+    endpoint_token: Option<String>,
     shared_token: SharedToken,
     cancel: CancellationToken,
     thread: Option<std::thread::JoinHandle<()>>,
     endpoint_dir: Option<PathBuf>,
+    /// [`endpoint::ENDPOINT_LOCK`], held while the endpoint file names this server.
+    claim: Option<endpoint::Claim>,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -148,8 +174,8 @@ async fn guard(State(g): State<Gate>, req: Request<Body>, next: Next) -> Respons
     if req.headers().contains_key(header::ORIGIN) {
         return refuse(StatusCode::FORBIDDEN, "browser requests are not allowed");
     }
-    let token = g.token.read().unwrap_or_else(|e| e.into_inner()).clone();
-    if !bearer(&req).is_some_and(|t| same_secret(t.as_bytes(), &token)) {
+    let tokens = g.token.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if !bearer(&req).is_some_and(|t| tokens.accept(t.as_bytes())) {
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong bearer token");
     }
     g.state.activity().request();
@@ -201,7 +227,8 @@ fn router(service: McpService, gate: Gate, cancel: &CancellationToken, port: u16
 
 impl HttpServer {
     /// Binds and starts serving the tools of `exec`. Writes the endpoint file when
-    /// `opts.endpoint_dir` is set (a failure to write it stops the server again).
+    /// `opts.endpoint_dir` is set (a failure to write it stops the server again); another
+    /// server that serves that directory makes the start fail.
     pub fn start(
         exec: Executor,
         state: Arc<ServerState>,
@@ -211,12 +238,28 @@ impl HttpServer {
             Some(t) => t,
             None => endpoint::new_token()?,
         };
+        let claim = match &opts.endpoint_dir {
+            Some(dir) => Some(endpoint::claim_endpoint(dir)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "another DeluxePainter is already serving MCP clients",
+                )
+            })?),
+            None => None,
+        };
+        let endpoint_token = match claim {
+            Some(_) => Some(endpoint::new_token()?),
+            None => None,
+        };
         let listener = bind(opts.port)?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let seq = Sequencer::new();
         let service = McpService::new(exec, state.clone(), seq.clone(), "http");
-        let shared_token: SharedToken = Arc::new(RwLock::new(Arc::from(token.as_bytes())));
+        let shared_token: SharedToken = Arc::new(RwLock::new(Tokens {
+            configured: Arc::from(token.as_bytes()),
+            endpoint: endpoint_token.as_deref().map(|t| Arc::from(t.as_bytes())),
+        }));
         let gate = Gate {
             token: shared_token.clone(),
             hosts: allowed_hosts(port).into(),
@@ -256,14 +299,16 @@ impl HttpServer {
         let mut server = HttpServer {
             port,
             token,
+            endpoint_token,
             shared_token,
             cancel,
             thread: Some(thread),
             endpoint_dir: None,
+            claim,
         };
         ready?;
-        if let Some(dir) = opts.endpoint_dir {
-            endpoint::write_endpoint(&dir, &Endpoint::new(port, server.token.clone()))?;
+        if let (Some(dir), Some(t)) = (opts.endpoint_dir, &server.endpoint_token) {
+            endpoint::write_endpoint(&dir, &Endpoint::new(port, t.clone()))?;
             server.endpoint_dir = Some(dir);
         }
         Ok(server)
@@ -277,18 +322,32 @@ impl HttpServer {
         endpoint::url_for(self.port)
     }
 
-    /// The bearer token. Never show it in the UI or write it to project files.
+    /// The configured bearer token. Never show it in the UI or write it to project files.
     pub fn token(&self) -> &str {
         &self.token
     }
 
+    /// The token the endpoint file names (made for this start), if one is written.
+    pub fn endpoint_token(&self) -> Option<&str> {
+        self.endpoint_token.as_deref()
+    }
+
     /// Replaces the bearer token while the server runs (revoking access): requests with the
-    /// old one get 401 from now on; the endpoint file names the new one.
+    /// old one, and with the endpoint file's old token, get 401 from now on; the endpoint
+    /// file names a new token for this start.
     pub fn set_token(&mut self, token: String) -> std::io::Result<()> {
-        *self.shared_token.write().unwrap_or_else(|e| e.into_inner()) = Arc::from(token.as_bytes());
+        let endpoint_token = match self.endpoint_token {
+            Some(_) => Some(endpoint::new_token()?),
+            None => None,
+        };
+        *self.shared_token.write().unwrap_or_else(|e| e.into_inner()) = Tokens {
+            configured: Arc::from(token.as_bytes()),
+            endpoint: endpoint_token.as_deref().map(|t| Arc::from(t.as_bytes())),
+        };
         self.token = token;
-        if let Some(dir) = &self.endpoint_dir {
-            endpoint::write_endpoint(dir, &Endpoint::new(self.port, self.token.clone()))?;
+        self.endpoint_token = endpoint_token;
+        if let (Some(dir), Some(t)) = (&self.endpoint_dir, &self.endpoint_token) {
+            endpoint::write_endpoint(dir, &Endpoint::new(self.port, t.clone()))?;
         }
         Ok(())
     }
@@ -317,6 +376,8 @@ impl HttpServer {
         if let Some(dir) = self.endpoint_dir.take() {
             endpoint::remove_endpoint(&dir, self.port);
         }
+        // Only now may another server take over the endpoint file.
+        self.claim = None;
     }
 }
 
@@ -387,13 +448,53 @@ mod tests {
         .unwrap();
         let port = server.port();
         assert_eq!(status_with(port, &old), 200);
+        // The endpoint file names this start's own token, not the configured one.
+        let first = endpoint::read_endpoint(&dir).unwrap().token;
+        assert_ne!(first, old);
+        assert_eq!(server.endpoint_token(), Some(first.as_str()));
+        assert_eq!(status_with(port, &first), 200);
         let new = "n".repeat(32);
         server.set_token(new.clone()).unwrap();
         assert_eq!(status_with(port, &old), 401);
+        assert_eq!(status_with(port, &first), 401, "the old endpoint token too");
         assert_eq!(status_with(port, &new), 200);
-        assert_eq!(endpoint::read_endpoint(&dir).unwrap().token, new);
+        let second = endpoint::read_endpoint(&dir).unwrap().token;
+        assert!(second != first && second != new);
+        assert_eq!(status_with(port, &second), 200);
         server.stop();
         assert!(endpoint::read_endpoint(&dir).is_none());
+    }
+
+    #[test]
+    fn one_server_per_endpoint_directory() {
+        let dir = crate::access::tests::scratch("http-one");
+        let start = || {
+            let (exec, _queue) = crate::jobs::channel(|| {});
+            let state = ServerState::new(crate::state::Settings::headless(Default::default()));
+            HttpServer::start(
+                exec,
+                state,
+                HttpOptions {
+                    port: 0,
+                    token: None,
+                    endpoint_dir: Some(dir.clone()),
+                },
+            )
+        };
+        let a = start().unwrap();
+        assert!(endpoint::read_live_endpoint(&dir).is_some(), "served");
+        let e = start().unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+        assert_eq!(
+            endpoint::read_endpoint(&dir).unwrap().port,
+            a.port(),
+            "the first server keeps its file"
+        );
+        a.stop();
+        assert!(endpoint::read_live_endpoint(&dir).is_none());
+        let b = start().unwrap();
+        assert!(endpoint::read_live_endpoint(&dir).is_some());
+        b.stop();
     }
 
     #[test]

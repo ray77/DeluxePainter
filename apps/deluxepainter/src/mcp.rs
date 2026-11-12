@@ -5,6 +5,10 @@
 //!   with the app, stops when it is turned off and on exit (the endpoint file goes with
 //!   it). The bearer token lives in `<config dir>/mcp-token` (0600 on Unix), so a client
 //!   configured once reconnects after a restart; [`PainterApp::mcp_revoke`] rotates it.
+//! - **Off sticks:** the app keeps `mcp-app.json`'s `enabled` equal to MCP control (and on
+//!   exit to the saved setting), and the first GUI holds `mcp-app.lock` while it runs
+//!   ([`claim_instance`]). So the bridge never starts the app while MCP control is off, and
+//!   never starts a second one; a `--mcp` start while another GUI runs ends at once.
 //! - **Jobs:** the server queues jobs and wakes the window (`request_repaint`);
 //!   [`PainterApp::mcp_logic`] runs them on the UI thread from `App::logic`, before the
 //!   pass handles input, also while the window is hidden. Reading jobs always run. A
@@ -120,12 +124,14 @@ impl McpSettings {
         })
     }
 
-    /// The server's permissions for these settings with `access`.
+    /// The server's permissions for these settings with `access`. Overwriting without
+    /// asking needs both permissions, as the requester ghosts that box otherwise (a ticked
+    /// box under the ghosting stays saved, but asks).
     fn server_settings(&self, access: FileAccess) -> Settings {
         Settings {
             read: self.allow_read,
             edit: self.allow_edit,
-            overwrite: if self.overwrite_without_asking {
+            overwrite: if self.allow_read && self.allow_edit && self.overwrite_without_asking {
                 Overwrite::Allowed
             } else {
                 Overwrite::Ask
@@ -194,7 +200,8 @@ pub enum Status {
         url: String,
         port: u16,
     },
-    /// It could not start (the reason); it tries again when the settings change.
+    /// It could not start (the reason); it tries again when the settings change or MCP
+    /// control is turned off and on.
     Failed(String),
 }
 
@@ -237,6 +244,11 @@ pub struct Host {
     pub swapped: bool,
     pub hold_limit: Duration,
     pub ask_timeout: Duration,
+    /// This GUI's claim on `mcp-app.lock` ([`claim_instance`]): the bridge sees the app
+    /// running and never starts another one.
+    pub instance: Option<endpoint::Claim>,
+    /// What `mcp-app.json` says now about MCP control (`None`: not written yet).
+    recorded: Option<bool>,
 }
 
 impl Default for Host {
@@ -253,11 +265,42 @@ impl Default for Host {
             swapped: false,
             hold_limit: HOLD_LIMIT,
             ask_timeout: jobs::ASK_TIMEOUT,
+            instance: None,
+            recorded: None,
+        }
+    }
+}
+
+/// The GUI's claim on `dir` (`mcp-app.lock`). `Ok(None)`: no config directory, or another
+/// DeluxePainter holds it and this one is a second window (it runs without the claim);
+/// `Err`: another one holds it and this start is a `--mcp` one, which must not open a
+/// second window for an MCP client.
+pub fn claim_instance(
+    dir: Option<&Path>,
+    mcp_flag: bool,
+) -> Result<Option<endpoint::Claim>, String> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    match endpoint::claim_app(dir) {
+        Ok(Some(c)) => Ok(Some(c)),
+        Ok(None) if mcp_flag => Err(
+            "DeluxePainter is already running: --mcp does not start a second one (turn on MCP control in its Prefs > AI & MCP)".into(),
+        ),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            eprintln!("mcp: cannot claim {}: {e}", endpoint::APP_LOCK);
+            Ok(None)
         }
     }
 }
 
 impl Host {
+    /// MCP control is on: the setting, or `--mcp` for this session.
+    pub fn wanted(&self) -> bool {
+        self.settings.enabled || self.session
+    }
+
     pub fn status(&self) -> Status {
         match (&self.running, &self.failed) {
             (Some(r), _) => match &r.server {
@@ -267,8 +310,9 @@ impl Host {
                 },
                 None => Status::Off,
             },
-            (None, Some((_, e))) => Status::Failed(e.clone()),
-            (None, None) => Status::Off,
+            // A failed start is only news while MCP control is on.
+            (None, Some((_, e))) if self.wanted() => Status::Failed(e.clone()),
+            (None, _) => Status::Off,
         }
     }
 
@@ -426,12 +470,6 @@ fn start_server(
         },
     )
     .map_err(|e| format!("cannot start the MCP server: {e}"))?;
-    if let Some(d) = &dir
-        && let Some(launch) = endpoint::this_app()
-        && let Err(e) = endpoint::write_app_file(d, &launch)
-    {
-        eprintln!("mcp: cannot write {}: {e}", endpoint::app_path(d).display());
-    }
     Ok(Running {
         server: Some(server),
         state,
@@ -457,16 +495,22 @@ impl PainterApp {
     }
 
     /// The server follows the settings: on, off, another port, new permissions or
-    /// directories (live, without a restart).
+    /// directories (live, without a restart). `mcp-app.json` follows MCP control.
     pub(crate) fn mcp_sync(&mut self) {
-        let want = self.mcp.settings.enabled || self.mcp.session;
+        let want = self.mcp.wanted();
+        self.mcp_record(want);
         let Some(r) = &self.mcp.running else {
+            if !want {
+                // Off forgets a failed start: the status says Off, and On tries again.
+                self.mcp.failed = None;
+                return;
+            }
             let failed_before = self
                 .mcp
                 .failed
                 .as_ref()
                 .is_some_and(|(s, _)| *s == self.mcp.settings);
-            if want && !failed_before {
+            if !failed_before {
                 self.mcp_start();
             }
             return;
@@ -506,6 +550,41 @@ impl PainterApp {
                 self.mcp.failed = Some((s, e));
             }
         }
+    }
+
+    /// Writes `mcp-app.json` when MCP control changed: on records this executable and that
+    /// the bridge may start it; off is written over an existing record only (an app whose
+    /// MCP control was never on leaves no file), so the bridge never starts the app, or a
+    /// second one, while it is off.
+    fn mcp_record(&mut self, enabled: bool) {
+        if self.mcp.recorded == Some(enabled) {
+            return;
+        }
+        self.mcp.recorded = Some(enabled);
+        let Some(dir) = &self.mcp.config_dir else {
+            return;
+        };
+        if !enabled && !endpoint::app_path(dir).exists() {
+            return;
+        }
+        let Some(launch) = endpoint::this_app(enabled) else {
+            return;
+        };
+        if let Err(e) = endpoint::write_app_file(dir, &launch) {
+            eprintln!(
+                "mcp: cannot write {}: {e}",
+                endpoint::app_path(dir).display()
+            );
+        }
+    }
+
+    /// On exit: the server stops, and `mcp-app.json` keeps the saved setting (what the next
+    /// start does; a `--mcp` session is not saved).
+    pub(crate) fn mcp_exit(&mut self) {
+        self.mcp_stop();
+        let saved = self.mcp.settings.enabled;
+        self.mcp_record(saved);
+        self.mcp.instance = None;
     }
 
     /// Stops the server: queued calls and an open question fail, the endpoint file is

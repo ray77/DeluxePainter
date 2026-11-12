@@ -13,14 +13,18 @@
 //!   Desktop shows its own install dialog. Nothing is installed without the user.
 //!
 //! Every process runs without a shell, off the UI thread ([`spawn`]), from the home
-//! directory, at most [`RUN_TIMEOUT`]. [`System`] is the seam the ui-loop tests replace.
+//! directory, at most [`RUN_TIMEOUT`] (its output too: a process that leaves a child holding
+//! its pipes is not waited for beyond [`AFTER_EXIT`]). `claude` gets its own directory (and
+//! its symlink target's) in front of `PATH`: an npm-installed `claude` is a
+//! `#!/usr/bin/env node` script, and a GUI app started from the Finder or Dock has only
+//! `/usr/bin:/bin:/usr/sbin:/sbin`. [`System`] is the seam the ui-loop tests replace.
 
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dpx_mcp::bundle;
@@ -33,6 +37,9 @@ pub const CLAUDE_CODE_SETUP_URL: &str = "https://code.claude.com/docs/en/setup";
 pub const CLAUDE_DOWNLOAD_URL: &str = "https://claude.ai/download";
 /// A `claude` (or opener) process that has not ended by then is stopped.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the output of a process that has ended is still read: a child it left running
+/// may hold its pipes open (an opener that starts the app it opens with).
+pub const AFTER_EXIT: Duration = Duration::from_secs(2);
 
 /// How a process ended.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -117,13 +124,14 @@ impl System for OsSystem {
     }
 
     fn run(&self, program: &Path, args: &[String]) -> Result<RunOutput, String> {
-        run_with_timeout(program, args, RUN_TIMEOUT)
+        let path = child_path(program, env("PATH"));
+        run_with_timeout(program, args, RUN_TIMEOUT, path)
     }
 
     fn open_file(&self, path: &Path) -> Result<(), String> {
         let platform = Platform::current();
         let (program, args) = open_command(platform, path);
-        let out = run_with_timeout(Path::new(&program), &args, RUN_TIMEOUT)?;
+        let out = run_with_timeout(Path::new(&program), &args, RUN_TIMEOUT, None)?;
         // explorer.exe answers 1 even when it opened the file.
         if out.ok() || platform == Platform::Windows {
             Ok(())
@@ -344,18 +352,76 @@ fn run_task(system: &dyn System, task: &Task) -> Result<RunOutput, String> {
     }
 }
 
-/// Runs `program` without a shell from the home directory, with no input, and stops it
-/// after `timeout`. On Windows no console window opens (unverified).
+/// `PATH` for running `program`: its own directory and, for a symlink, its target's, in
+/// front of `inherited` (so `#!/usr/bin/env node` finds the `node` installed with it).
+pub fn child_path(program: &Path, inherited: Option<OsString>) -> Option<OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut add = |d: Option<&Path>| {
+        if let Some(d) = d.filter(|d| !d.as_os_str().is_empty())
+            && !dirs.iter().any(|x| x == d)
+        {
+            dirs.push(d.to_path_buf());
+        }
+    };
+    add(program.parent());
+    if let Ok(target) = std::fs::canonicalize(program) {
+        add(target.parent());
+    }
+    if let Some(p) = &inherited {
+        for d in std::env::split_paths(p) {
+            add(Some(&d));
+        }
+    }
+    std::env::join_paths(dirs).ok().or(inherited)
+}
+
+/// Reads `pipe` to its end on a thread of its own, into a buffer the caller can take
+/// whenever it stops waiting; the receiver hears when the end came.
+fn read_pipe(pipe: Option<Box<dyn Read + Send>>) -> (Arc<Mutex<Vec<u8>>>, Receiver<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let b = buf.clone();
+    std::thread::spawn(move || {
+        if let Some(mut p) = pipe {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = p.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                b.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&chunk[..n]);
+            }
+        }
+        let _ = tx.send(());
+    });
+    (buf, rx)
+}
+
+/// What `buf` holds once its reader ended or `until` passed.
+fn read_until(buf: &Mutex<Vec<u8>>, done: &Receiver<()>, until: Instant) -> String {
+    let _ = done.recv_timeout(until.saturating_duration_since(Instant::now()));
+    String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned()
+}
+
+/// Runs `program` without a shell from the home directory, with no input (and `PATH` when
+/// given), and stops it after `timeout`; its output is read until it ends, at most
+/// [`AFTER_EXIT`] more and never beyond `timeout`. On Windows no console window opens
+/// (unverified).
 fn run_with_timeout(
     program: &Path,
     args: &[String],
     timeout: Duration,
+    path: Option<OsString>,
 ) -> Result<RunOutput, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
     // `claude mcp get` runs health checks of the servers a working directory's `.mcp.json`
     // names: run it from the home directory, never from wherever the app was started.
     if let Some(home) = env("HOME").or_else(|| env("USERPROFILE")) {
@@ -368,29 +434,20 @@ fn run_with_timeout(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let name = program.display().to_string();
+    let deadline = Instant::now() + timeout;
     let mut child = cmd.spawn().map_err(|e| format!("cannot run {name}: {e}"))?;
-    let read = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut s = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut s);
-            }
-            String::from_utf8_lossy(&s).into_owned()
-        })
-    };
-    let out = read(
+    let (out, out_done) = read_pipe(
         child
             .stdout
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
-    let err = read(
+    let (err, err_done) = read_pipe(
         child
             .stderr
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
-    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -406,10 +463,11 @@ fn run_with_timeout(
             Err(e) => return Err(format!("{name}: {e}")),
         }
     };
+    let until = deadline.min(Instant::now() + AFTER_EXIT);
     Ok(RunOutput {
         code: status.code(),
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+        stdout: read_until(&out, &out_done, until),
+        stderr: read_until(&err, &err_done, until),
     })
 }
 
@@ -579,6 +637,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c".into(), "echo out; echo err >&2; exit 3".into()],
             Duration::from_secs(10),
+            None,
         )
         .unwrap();
         assert_eq!(out.code, Some(3));
@@ -589,12 +648,79 @@ mod tests {
             Path::new("/bin/sleep"),
             &["5".into()],
             Duration::from_millis(200),
+            None,
         )
         .unwrap_err();
         assert!(e.contains("did not finish"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(3));
-        let e = run_with_timeout(Path::new("/no/such/claude"), &[], Duration::from_secs(1))
-            .unwrap_err();
+        let e = run_with_timeout(
+            Path::new("/no/such/claude"),
+            &[],
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err();
         assert!(e.starts_with("cannot run /no/such/claude"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_left_holding_the_pipes_is_not_waited_for() {
+        // The process ends at once; the `sleep` it leaves keeps stdout open for 6 s.
+        let started = Instant::now();
+        let out = run_with_timeout(
+            Path::new("/bin/sh"),
+            &["-c".into(), "echo early; sleep 6 & exit 0".into()],
+            Duration::from_secs(20),
+            None,
+        )
+        .unwrap();
+        assert!(out.ok());
+        assert_eq!(out.stdout.trim(), "early");
+        let took = started.elapsed();
+        assert!(took < AFTER_EXIT + Duration::from_secs(2), "{took:?}");
+    }
+
+    #[cfg(unix)]
+    fn script(path: &Path, text: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_finds_the_interpreter_installed_next_to_it() {
+        // Like npm's `claude` (`#!/usr/bin/env node`, node in the same bin directory), run
+        // with the PATH of an app started from the Finder.
+        let dir = std::env::temp_dir().join(format!("dpx-connect-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        script(
+            &dir.join("bin/dpxnode"),
+            "#!/bin/sh\necho \"node ran $2 $3\"\n",
+        );
+        script(&dir.join("lib/cli.js"), "#!/usr/bin/env dpxnode\n");
+        std::os::unix::fs::symlink(dir.join("lib/cli.js"), dir.join("bin/claude")).unwrap();
+        let claude = dir.join("bin/claude");
+        let finder = Some(OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"));
+        let args = ["mcp".to_string(), "get".to_string()];
+        let bare =
+            run_with_timeout(&claude, &args, Duration::from_secs(10), finder.clone()).unwrap();
+        assert!(
+            !bare.ok(),
+            "without its directory env cannot find the interpreter"
+        );
+        let path = child_path(&claude, finder);
+        let p = path.clone().unwrap();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&p).collect();
+        assert_eq!(dirs[0], dir.join("bin"));
+        assert_eq!(dirs[1], dir.join("lib").canonicalize().unwrap());
+        assert_eq!(dirs[2], PathBuf::from("/usr/bin"));
+        let out = run_with_timeout(&claude, &args, Duration::from_secs(10), path).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(out.stdout.trim(), "node ran mcp get");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

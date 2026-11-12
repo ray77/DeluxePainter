@@ -39,13 +39,14 @@
 //!     [--mcp-question NAME]             the question before an MCP client replaces file NAME
 //!     [--mcp-prefs STATE]               Prefs ▸ AI & MCP: off, ready, connected (with the
 //!                                       --mcp-calls in its activity), fallback, error,
-//!                                       code-confirm, code-missing, desktop-missing or
-//!                                       disconnect (ADR-43)
+//!                                       code-confirm, code-replace, code-missing,
+//!                                       desktop-missing or disconnect (ADR-43)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
 //! `deluxepainter --mcp`                 start the GUI with its MCP server on for this session
-//!                                       (Streamable HTTP on 127.0.0.1, ADR-43)
+//!                                       (Streamable HTTP on 127.0.0.1, ADR-43); ends at once
+//!                                       while another DeluxePainter runs
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 //! `deluxepainter mcp [--allow-dir DIR]...` headless MCP server on stdio (ADR-21, ADR-24)
@@ -614,6 +615,15 @@ fn main() -> eframe::Result {
         }
     };
     let mcp_flag = args.iter().any(|a| a == "--mcp");
+    // ADR-43: the first GUI holds `mcp-app.lock`, so the bridge never starts a second one;
+    // a `--mcp` start (the bridge's) while another GUI runs ends here.
+    let instance = match mcp::claim_instance(config::default_dir().as_deref(), mcp_flag) {
+        Ok(claim) => claim,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
     let start = if settings.pixel_size == PixelSize::default().0 {
         egui::vec2(START_W, START_H)
     } else {
@@ -650,6 +660,7 @@ fn main() -> eframe::Result {
             app.mcp.config_dir = config::default_dir();
             app.mcp.wake = Some(cc.egui_ctx.clone());
             app.mcp.session = mcp_flag;
+            app.mcp.instance = instance;
             if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
                 app.ui.note_requester = note_requester(LOADED, &notes);
@@ -1695,8 +1706,9 @@ impl eframe::App for PainterApp {
         if let Some(mut store) = self.config.take() {
             store.flush(config::Config::capture(self));
         }
-        // ADR-43: the server stops with the app and removes its endpoint file.
-        self.mcp_stop();
+        // ADR-43: the server stops with the app and removes its endpoint file;
+        // `mcp-app.json` keeps the saved MCP control setting.
+        self.mcp_exit();
     }
 
     /// Runs before every `ui` pass and while the window is hidden: MCP calls are served

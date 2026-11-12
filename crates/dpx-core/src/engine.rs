@@ -3,6 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::command::{Command, CommandError, ErrorCode, Footprint};
 use crate::document::Document;
@@ -140,8 +141,13 @@ struct Step {
     bytes: u64,
 }
 
+/// The next [`Engine::id`].
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Debug)]
 pub struct Engine {
+    /// See [`Engine::id`].
+    id: u64,
     doc: Document,
     undo: VecDeque<Step>,
     /// Undone commands with their frame, most recent last; redo replays them (commands are
@@ -176,6 +182,7 @@ impl Engine {
     /// recent step always stays, so the last command can be undone.
     pub fn with_undo_budget(doc: Document, steps: usize, bytes: u64) -> Self {
         Self {
+            id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
             doc,
             undo: VecDeque::new(),
             redo: Vec::new(),
@@ -187,6 +194,14 @@ impl Engine {
 
     pub fn document(&self) -> &Document {
         &self.doc
+    }
+
+    /// Tells documents apart (ADR-43): every engine made in this process gets a number no
+    /// other one got, so a document that replaced another (loaded, opened, recovered) is
+    /// never taken for the one before it, even when both are at the same revision. The
+    /// engine's own commands keep the number and raise the revision; a clone keeps it.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn can_undo(&self) -> bool {
@@ -389,6 +404,24 @@ mod tests {
 
     fn engine() -> Engine {
         Engine::new(Document::new(16, 8, Palette::dpaint_default_32()))
+    }
+
+    #[test]
+    fn every_engine_has_its_own_id_and_commands_keep_it() {
+        let mut a = engine();
+        let b = engine();
+        assert_ne!(
+            a.id(),
+            b.id(),
+            "both are at revision 0, yet different documents"
+        );
+        assert_eq!(a.document().revision(), b.document().revision());
+        let id = a.id();
+        a.execute(Command::Clear { color: 1 }).unwrap();
+        a.undo().unwrap();
+        assert_eq!(a.id(), id);
+        assert_eq!(a.clone().id(), id);
+        assert_ne!(Engine::new(a.document().clone()).id(), id);
     }
 
     fn stroke(color: u8, points: &[(i32, i32)]) -> Command {

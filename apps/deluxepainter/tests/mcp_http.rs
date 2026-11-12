@@ -304,7 +304,7 @@ fn the_bridge_starts_the_app_named_in_mcp_app_json() {
     std::fs::write(
         dir.join("mcp-app.json"),
         serde_json::to_vec(&json!({"version": 1, "app_path": EXE,
-            "args": ["mcp", "--http", "--port", "0"]}))
+            "args": ["mcp", "--http", "--port", "0"], "enabled": true}))
         .unwrap(),
     )
     .unwrap();

@@ -35,6 +35,12 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// `overwrite: true` replaces an existing file without asking: overwriting changes a
+    /// file, so it also needs both permissions (the GUI ghosts the box otherwise).
+    pub fn overwrite_without_asking(&self) -> bool {
+        self.read && self.edit && self.overwrite == Overwrite::Allowed
+    }
+
     /// The headless server (`deluxepainter mcp`): everything allowed; overwrite only with
     /// `overwrite: true` (ADR-24).
     pub fn headless(access: FileAccess) -> Self {

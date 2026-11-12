@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::jobs::spawn_headless;
-use crate::state::Settings;
+use crate::state::{Overwrite, Settings};
 use crate::workspace::HeadlessWorkspace;
 use serde_json::{Value, json};
 
@@ -793,6 +793,21 @@ fn files_save_open_export_and_overwrite_rules() {
         "export_image",
         json!({"path": "new.png", "overwrite": true}),
     );
+    // "Without asking" needs both permissions: with editing off the user is asked (the
+    // headless workspace answers no), as the GUI ghosts that box then.
+    let mut s = t.ctx.state.settings();
+    s.overwrite = Overwrite::Allowed;
+    s.edit = false;
+    t.ctx.state.set_settings(s.clone());
+    let (code, _) = t.err("export_image", json!({"path": "c.png", "overwrite": true}));
+    assert_eq!(code, "OVERWRITE_DECLINED");
+    assert_eq!(std::fs::read(dir.join("c.png")).unwrap(), before);
+    let st = t.ok("get_app_status", json!({}));
+    assert_eq!(st["permissions"]["overwrite_without_asking"], false);
+    s.edit = true;
+    t.ctx.state.set_settings(s);
+    let st = t.ok("get_app_status", json!({}));
+    assert_eq!(st["permissions"]["overwrite_without_asking"], true);
 
     // Import from a path.
     std::fs::write(dir.join("in.png"), rgba_png(32, 32, false)).unwrap();
