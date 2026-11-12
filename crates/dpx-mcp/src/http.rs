@@ -10,7 +10,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -47,10 +47,14 @@ pub struct HttpOptions {
     pub endpoint_dir: Option<PathBuf>,
 }
 
+/// The bearer token the guard checks; replaced by [`HttpServer::set_token`].
+type SharedToken = Arc<RwLock<Arc<[u8]>>>;
+
 /// A running server; stopped by [`HttpServer::stop`] or when dropped.
 pub struct HttpServer {
     port: u16,
     token: String,
+    shared_token: SharedToken,
     cancel: CancellationToken,
     thread: Option<std::thread::JoinHandle<()>>,
     endpoint_dir: Option<PathBuf>,
@@ -99,7 +103,7 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
 
 #[derive(Clone)]
 struct Gate {
-    token: Arc<[u8]>,
+    token: SharedToken,
     hosts: Arc<[String]>,
     seq: Arc<Sequencer>,
     state: Arc<ServerState>,
@@ -144,7 +148,8 @@ async fn guard(State(g): State<Gate>, req: Request<Body>, next: Next) -> Respons
     if req.headers().contains_key(header::ORIGIN) {
         return refuse(StatusCode::FORBIDDEN, "browser requests are not allowed");
     }
-    if !bearer(&req).is_some_and(|t| same_secret(t.as_bytes(), &g.token)) {
+    let token = g.token.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if !bearer(&req).is_some_and(|t| same_secret(t.as_bytes(), &token)) {
         return refuse(StatusCode::UNAUTHORIZED, "missing or wrong bearer token");
     }
     g.state.activity().request();
@@ -211,8 +216,9 @@ impl HttpServer {
         let port = listener.local_addr()?.port();
         let seq = Sequencer::new();
         let service = McpService::new(exec, state.clone(), seq.clone(), "http");
+        let shared_token: SharedToken = Arc::new(RwLock::new(Arc::from(token.as_bytes())));
         let gate = Gate {
-            token: Arc::from(token.as_bytes()),
+            token: shared_token.clone(),
             hosts: allowed_hosts(port).into(),
             seq,
             state,
@@ -250,6 +256,7 @@ impl HttpServer {
         let mut server = HttpServer {
             port,
             token,
+            shared_token,
             cancel,
             thread: Some(thread),
             endpoint_dir: None,
@@ -273,6 +280,17 @@ impl HttpServer {
     /// The bearer token. Never show it in the UI or write it to project files.
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    /// Replaces the bearer token while the server runs (revoking access): requests with the
+    /// old one get 401 from now on; the endpoint file names the new one.
+    pub fn set_token(&mut self, token: String) -> std::io::Result<()> {
+        *self.shared_token.write().unwrap_or_else(|e| e.into_inner()) = Arc::from(token.as_bytes());
+        self.token = token;
+        if let Some(dir) = &self.endpoint_dir {
+            endpoint::write_endpoint(dir, &Endpoint::new(self.port, self.token.clone()))?;
+        }
+        Ok(())
     }
 
     pub fn endpoint_file(&self) -> Option<PathBuf> {
@@ -328,6 +346,54 @@ mod tests {
         let p = b.local_addr().unwrap().port();
         assert_ne!(p, busy);
         assert!(b.local_addr().unwrap().ip().is_loopback());
+    }
+
+    /// The status code of a `tools/list` POST with `token`.
+    pub(crate) fn status_with(port: u16, token: &str) -> u16 {
+        use std::io::{Read, Write};
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            s,
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: 2025-06-18\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out.split(' ')
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_new_token_revokes_the_old_one_at_once() {
+        let dir = crate::access::tests::scratch("http-token");
+        let (exec, _queue) = crate::jobs::channel(|| {});
+        let state = ServerState::new(crate::state::Settings::headless(Default::default()));
+        let old = "o".repeat(32);
+        let mut server = HttpServer::start(
+            exec,
+            state,
+            HttpOptions {
+                port: 0,
+                token: Some(old.clone()),
+                endpoint_dir: Some(dir.clone()),
+            },
+        )
+        .unwrap();
+        let port = server.port();
+        assert_eq!(status_with(port, &old), 200);
+        let new = "n".repeat(32);
+        server.set_token(new.clone()).unwrap();
+        assert_eq!(status_with(port, &old), 401);
+        assert_eq!(status_with(port, &new), 200);
+        assert_eq!(endpoint::read_endpoint(&dir).unwrap().token, new);
+        server.stop();
+        assert!(endpoint::read_endpoint(&dir).is_none());
     }
 
     #[test]

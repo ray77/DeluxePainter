@@ -721,6 +721,16 @@ pub fn encode_document(
     extras: &PictureExtras,
     path: &Path,
 ) -> Result<(Vec<u8>, Vec<String>), String> {
+    encode_as(doc, extras, save_format(path)?)
+}
+
+/// [`encode_document`] in a format chosen by the caller (MCP's `export_image` names it,
+/// ADR-43).
+pub fn encode_as(
+    doc: &Document,
+    extras: &PictureExtras,
+    format: SaveFormat,
+) -> Result<(Vec<u8>, Vec<String>), String> {
     let colors = doc.palette().len();
     let (ranges, dropped): (Vec<ColorRange>, Vec<ColorRange>) = extras
         .ranges
@@ -739,14 +749,14 @@ pub fn encode_document(
         .transparent_color
         .filter(|&c| usize::from(c) < colors);
     let frames = doc.frame_count();
-    if frames > 1 && !matches!(save_format(path)?, SaveFormat::Project | SaveFormat::Anim) {
+    if frames > 1 && !matches!(format, SaveFormat::Project | SaveFormat::Anim) {
         // ADR-28: a picture format holds one frame; .anim writes all of them (ADR-32).
         notes.push(format!(
             "frame {} of {frames} exported as a picture (save as .anim for all frames)",
             doc.current_frame() + 1
         ));
     }
-    match save_format(path)? {
+    match format {
         SaveFormat::Ilbm => {
             let mode = doc.target().mode;
             let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());

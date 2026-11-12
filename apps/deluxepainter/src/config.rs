@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::PainterApp;
 use crate::import::{self, ImportSettings};
+use crate::mcp::McpSettings;
 
 /// Version written to the file. Newer files are read as far as their fields are known.
 pub const VERSION: u64 = 1;
@@ -46,6 +47,8 @@ pub struct Config {
     pub light: LightTable,
     /// The Import requester's last choices (ADR-42).
     pub import: ImportSettings,
+    /// The MCP server of the running app (ADR-43).
+    pub mcp: McpSettings,
 }
 
 impl Default for Config {
@@ -69,6 +72,7 @@ impl Default for Config {
             light_on: anim.light_on,
             light: anim.light,
             import: ImportSettings::default(),
+            mcp: McpSettings::default(),
         }
     }
 }
@@ -199,6 +203,7 @@ impl Config {
                 .and_then(import::parse_dither)
                 .unwrap_or(d.import.dither),
         };
+        c.mcp = McpSettings::from_json(&section(o, "mcp"), &d.mcp);
         Some(c)
     }
 
@@ -251,6 +256,7 @@ impl Config {
                 "spare": self.light.spare,
                 "dim": self.light.dim,
             },
+            "mcp": self.mcp.to_json(),
         })
     }
 
@@ -275,6 +281,7 @@ impl Config {
             light_on: app.anim.light_on,
             light: app.anim.light,
             import: app.import.settings,
+            mcp: app.mcp.settings.clone(),
         }
     }
 
@@ -299,6 +306,7 @@ impl Config {
         app.anim.light_on = self.light_on;
         app.anim.light = self.light;
         app.import.settings = self.import;
+        app.mcp.settings = self.mcp.clone();
     }
 }
 

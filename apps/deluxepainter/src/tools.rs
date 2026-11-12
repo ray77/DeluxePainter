@@ -1648,6 +1648,17 @@ impl PainterApp {
         self.dirty = true;
     }
 
+    /// A mouse button that started a gesture on the picture (a stroke, a shape, a brush
+    /// being moved) is still held: MCP changes wait for its release (ADR-43).
+    pub(crate) fn gesture_held(&self) -> bool {
+        self.stroke.as_ref().is_some_and(|s| s.held)
+            || self
+                .tools
+                .xform
+                .as_ref()
+                .is_some_and(|x| x.origin.is_some())
+    }
+
     /// Commits the gesture in progress as one command (what it shows, without a polygon's
     /// rubber band).
     pub(crate) fn finish_stroke(&mut self) {

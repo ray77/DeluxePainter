@@ -77,8 +77,10 @@ pub struct PictureInfo {
 ///
 /// Rules for implementations:
 /// - Every method runs on the owning thread and returns quickly.
-/// - `execute`, `undo` and `redo` act on the shown page exactly as the GUI's own commands
-///   (the GUI may refuse with `BUSY` while a requester is open or a mouse button is held).
+/// - `execute`, `undo` and `redo` act on the shown page exactly as the GUI's own commands.
+///   The GUI refuses changing calls with `EDITOR_BUSY` while a requester is open and holds
+///   them while a mouse button is held on the picture ([`crate::jobs::JobKind`]); that
+///   happens before a job runs, so implementations need not check it again.
 /// - `swap_spare` swaps the pages *and* their slots, so `shown()` changes with it.
 pub trait Workspace {
     /// `headless` or `gui`.
@@ -118,8 +120,11 @@ pub trait Workspace {
         0
     }
     /// Asks the user; `answer` is called once with the reply (possibly later, from the
-    /// owning thread). A workspace that cannot ask answers `false` at once.
-    fn ask(&mut self, question: Question, answer: Box<dyn FnOnce(bool) + Send>);
+    /// owning thread): `Ok(true)` for `yes`, `Ok(false)` for `no`, or an error when the
+    /// question could not be asked or was not answered (`EDITOR_BUSY`,
+    /// [`crate::jobs::NO_ANSWER`], `APP_UNAVAILABLE`). A workspace without a user answers
+    /// `Ok(false)` at once.
+    fn ask(&mut self, question: Question, answer: Box<dyn FnOnce(Result<bool, ToolError>) + Send>);
     /// One line for the activity log ("what the client did").
     fn log(&mut self, entry: &str);
 }
@@ -314,9 +319,13 @@ impl Workspace for HeadlessWorkspace {
         self.shown.name = None;
     }
 
-    fn ask(&mut self, _question: Question, answer: Box<dyn FnOnce(bool) + Send>) {
+    fn ask(
+        &mut self,
+        _question: Question,
+        answer: Box<dyn FnOnce(Result<bool, ToolError>) + Send>,
+    ) {
         // Nobody to ask.
-        answer(false);
+        answer(Ok(false));
     }
 
     fn log(&mut self, entry: &str) {

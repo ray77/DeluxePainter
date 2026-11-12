@@ -410,6 +410,25 @@ impl PainterApp {
         Ok(out)
     }
 
+    /// [`Self::execute_frames`] for a whole request (MCP, ADR-43): an expected revision and
+    /// a dry run (which moves nothing) pass through to the engine.
+    pub(crate) fn execute_request(
+        &mut self,
+        request: dpx_core::Request,
+    ) -> Result<Outcome, CommandError> {
+        let doc = self.engine.document();
+        let moves = if request.dry_run {
+            None
+        } else {
+            anim::frame_moves(&request.command, doc.frame_count(), doc.current_frame())
+        };
+        let out = self.engine.execute(request)?;
+        if let Some(moves) = moves {
+            self.follow_frames(|f| moves.get(f).copied().flatten());
+        }
+        Ok(out)
+    }
+
     /// Undo (`redo`: Redo) in the engine; a frame step moves the area stencil and Stencil ▸
     /// Paint back (forth) with their picture. A stencil gone with its frame stays gone (it is
     /// not part of the history).

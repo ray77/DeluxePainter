@@ -34,9 +34,14 @@
 //!     [--import-requester FILE]         the Import requester for a PNG or JPEG (ADR-42)
 //!     [--import SPEC] [--import-apply]  … with position=centre|top_left;palette=new|current;
 //!                                       colors=N;dither=none|fs|ordered, or the page after Ok
+//!     [--mcp-calls FILE.json]           run a JSON array of {"tool", "arguments"} MCP tool
+//!                                       calls on the GUI workspace first (ADR-43)
+//!     [--mcp-question NAME]             the question before an MCP client replaces file NAME
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
+//! `deluxepainter --mcp`                 start the GUI with its MCP server on for this session
+//!                                       (Streamable HTTP on 127.0.0.1, ADR-43)
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
 //! `deluxepainter mcp [--allow-dir DIR]...` headless MCP server on stdio (ADR-21, ADR-24)
@@ -55,6 +60,7 @@ mod config;
 mod effects;
 mod files;
 mod import;
+mod mcp;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -235,9 +241,6 @@ fn main() -> eframe::Result {
         ),
         (Some("mcp"), rest) => exit_with(dpx_mcp::run_cli(rest)),
         (Some("mcp-bridge"), rest) => exit_with(dpx_mcp::bridge::run_cli(rest)),
-        // TODO(wave8-integration): `--mcp` (the bridge's launch flag, `dpx_mcp::endpoint::
-        // LAUNCH_ARGS`) starts the GUI with its MCP server on; the GUI writes `mcp-app.json`
-        // (`dpx_mcp::endpoint::write_app_file`) when its server starts.
         (Some("info" | "convert"), _) => {
             eprintln!("usage: deluxepainter info <file> | convert <in> <out>");
             std::process::exit(2);
@@ -513,10 +516,24 @@ fn main() -> eframe::Result {
             eprintln!("{e}");
             std::process::exit(code);
         });
+        // ADR-43: MCP tool calls on the GUI workspace.
+        let doc = match mcp::snapshot_calls(&args, &doc) {
+            Ok(Some(changed)) => changed,
+            Ok(None) => doc,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
             ui.note_requester = note_requester(LOADED, notes);
+        }
+        // ADR-43: the question before an MCP client replaces a file.
+        if let Some(name) = arg_value(&args, "--mcp-question") {
+            let q = dpx_mcp::tools::overwrite_question(Some("claude-code"), &name);
+            ui.choice_requester = Some(mcp::question_requester(&q));
         }
         if args.iter().any(|a| a == "--recover-requester") {
             ui.choice_requester = Some(autosave::recover_requester(
@@ -589,6 +606,7 @@ fn main() -> eframe::Result {
             None => (None, config::Config::default()),
         }
     };
+    let mcp_flag = args.iter().any(|a| a == "--mcp");
     let start = if settings.pixel_size == PixelSize::default().0 {
         egui::vec2(START_W, START_H)
     } else {
@@ -620,6 +638,11 @@ fn main() -> eframe::Result {
             let mut app = PainterApp::new();
             settings.apply(&mut app);
             app.config = store;
+            // ADR-43: the MCP server keeps its token and endpoint next to the settings and
+            // wakes the window when a call arrives.
+            app.mcp.config_dir = config::default_dir();
+            app.mcp.wake = Some(cc.egui_ctx.clone());
+            app.mcp.session = mcp_flag;
             if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
                 app.ui.note_requester = note_requester(LOADED, &notes);
@@ -931,6 +954,8 @@ struct PainterApp {
     tooltip: tooltip::State,
     /// Picture ▸ Load's Import requester for PNG and JPEG (ADR-42, import.rs).
     import: import::ImportState,
+    /// The MCP server and its jobs on the UI thread (ADR-43, mcp.rs).
+    mcp: mcp::Host,
 }
 
 impl PainterApp {
@@ -971,6 +996,7 @@ impl PainterApp {
             perspective: perspective::PerspectiveState::default(),
             tooltip: tooltip::State::default(),
             import: import::ImportState::default(),
+            mcp: mcp::Host::default(),
         }
     }
 
@@ -1002,6 +1028,7 @@ impl PainterApp {
         self.anim.playing = None;
         self.engine = Engine::new(doc);
         self.extras = extras;
+        self.mcp.name = None;
         self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
         self.picture_path = Some(path);
         self.clamp_colors();
@@ -1655,6 +1682,14 @@ impl eframe::App for PainterApp {
         if let Some(mut store) = self.config.take() {
             store.flush(config::Config::capture(self));
         }
+        // ADR-43: the server stops with the app and removes its endpoint file.
+        self.mcp_stop();
+    }
+
+    /// Runs before every `ui` pass and while the window is hidden: MCP calls are served
+    /// even when the window is minimised (ADR-43).
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.mcp_logic(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -2554,7 +2589,11 @@ mod tests {
             ..Default::default()
         };
         let mut frame = eframe::Frame::_new_kittest();
-        let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+        // As eframe: `logic` (MCP jobs, ADR-43) before `ui` in every pass.
+        let mut out = ctx.run_ui(raw, |ui| {
+            eframe::App::logic(app, ui.ctx(), &mut frame);
+            eframe::App::ui(app, ui, &mut frame)
+        });
         // The font atlas and screen uploads are not needed in a test.
         out.textures_delta.clear();
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay

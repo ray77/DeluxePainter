@@ -1,0 +1,19 @@
+[
+{"tool": "create_document", "arguments": {"width": 320, "height": 240, "chipset": "ocs", "colors": 32, "name": "Castle"}},
+{"tool": "set_palette_color", "arguments": {"index": 20, "color": "#2255AA"}},
+{"tool": "set_palette_color", "arguments": {"index": 21, "color": "#336622"}},
+{"tool": "set_palette_color", "arguments": {"index": 22, "color": "#777788"}},
+{"tool": "set_palette_color", "arguments": {"index": 23, "color": "#555566"}},
+{"tool": "draw_rectangle", "arguments": {"x": 0, "y": 0, "width": 320, "height": 170, "color": 20, "filled": true}},
+{"tool": "draw_rectangle", "arguments": {"x": 0, "y": 170, "width": 320, "height": 70, "color": 21, "filled": true}},
+{"tool": "draw_ellipse", "arguments": {"cx": 262, "cy": 46, "rx": 22, "ry": 22, "color": 5, "filled": true}},
+{"tool": "draw_rectangle", "arguments": {"x": 90, "y": 100, "width": 120, "height": 72, "color": 22, "filled": true}},
+{"tool": "draw_rectangle", "arguments": {"x": 70, "y": 70, "width": 30, "height": 102, "color": 23, "filled": true}},
+{"tool": "draw_rectangle", "arguments": {"x": 200, "y": 70, "width": 30, "height": 102, "color": 23, "filled": true}},
+{"tool": "draw_rectangle", "arguments": {"x": 136, "y": 130, "width": 28, "height": 42, "color": 0, "filled": true}},
+{"tool": "draw_line", "arguments": {"x1": 0, "y1": 170, "x2": 319, "y2": 170, "color": 0}},
+{"tool": "draw_pixel", "arguments": {"x": 150, "y": 150, "color": 5}},
+{"tool": "draw_rectangle", "arguments": {"x": 60, "y": 200, "width": 10, "height": 10, "color": 2, "filled": false}},
+{"tool": "undo", "arguments": {}},
+{"tool": "get_document_info", "arguments": {}}
+]

@@ -49,7 +49,7 @@ impl FileAccess {
         } else {
             Err(ToolError::new(
                 "FILE_ACCESS_OFF",
-                "file access is off: start the server with `deluxepainter mcp --allow-dir DIR` to approve a directory",
+                "file access is off: no approved directory (Prefs > AI & MCP in the app, `--allow-dir DIR` for `deluxepainter mcp`)",
             ))
         }
     }

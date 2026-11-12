@@ -266,7 +266,7 @@ impl PainterApp {
     /// The spare page made to match the shown page: a spare of another screen format is
     /// dropped (DeluxePaint discards the spare on a format change, AGA p.241), one with an
     /// older palette takes the current palette (its undo history starts over then).
-    fn take_spare(&mut self) -> OtherPage {
+    pub(crate) fn take_spare(&mut self) -> OtherPage {
         let doc = self.engine.document();
         let (target, palette) = (doc.target(), doc.palette().clone());
         match self.menu_data.spare.take() {
@@ -298,6 +298,8 @@ impl PainterApp {
         std::mem::swap(&mut self.menu_data.background, &mut other.background);
         std::mem::swap(&mut self.ui.bg, &mut other.bg);
         self.menu_data.spare = Some(other);
+        // ADR-43: the MCP ids page1/page2 stay with their pages.
+        self.mcp.swapped = !self.mcp.swapped;
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;

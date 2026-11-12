@@ -512,6 +512,33 @@ fn permissions_are_enforced() {
     t.ok("set_palette_color", json!({"index": 1, "color": "#000"}));
 }
 
+#[test]
+fn reading_off_refuses_changes_too_and_every_call_is_logged() {
+    let mut s = Settings::headless(FileAccess::off());
+    s.read = false;
+    let t = T::with(s);
+    let (code, msg) = t.err("draw_pixel", json!({"x": 1, "y": 1, "color": 1}));
+    assert_eq!(code, "PERMISSION_DENIED");
+    assert!(msg.starts_with("reading the document"), "{msg}");
+    t.ok("get_app_status", json!({}));
+    let log = t.ctx.state.activity().log();
+    assert_eq!(log.len(), 2);
+    assert_eq!(
+        (log[0].tool.as_str(), log[0].ok, log[0].code.as_deref()),
+        ("draw_pixel", false, Some("PERMISSION_DENIED"))
+    );
+    assert!(log[1].ok && log[1].tool == "get_app_status");
+}
+
+#[test]
+fn the_overwrite_question_names_the_client() {
+    let q = overwrite_question(Some("claude-ai"), "castle.iff");
+    assert_eq!(q.text, "Claude wants to replace castle.iff. Replace?");
+    assert_eq!((q.yes.as_str(), q.no.as_str()), ("Replace", "Keep"));
+    let q = overwrite_question(None, "a.png");
+    assert!(q.text.starts_with("An AI client wants"));
+}
+
 fn decode_png(png: &[u8]) -> (u32, u32, Vec<u8>) {
     let mut reader = png::Decoder::new(std::io::Cursor::new(png))
         .read_info()

@@ -257,6 +257,10 @@ impl PainterApp {
             return;
         };
         self.ui.choice_requester = None;
+        // ADR-43: "Replace file?" asked for an MCP client.
+        if self.mcp_answer(button) {
+            return;
+        }
         match self.autosave.pending.take() {
             Some(Pending::Recover) if button == 0 => self.recover(),
             Some(Pending::Recover) => {

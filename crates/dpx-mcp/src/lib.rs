@@ -14,6 +14,7 @@
 
 pub mod access;
 pub mod bridge;
+pub mod codec;
 pub mod endpoint;
 pub mod error;
 pub mod http;
@@ -33,11 +34,14 @@ use rmcp::ServiceExt;
 use rmcp::transport::async_rw::AsyncRwTransport;
 
 pub use access::FileAccess;
+pub use codec::{BuiltinCodec, Codec};
 pub use error::ToolError;
 pub use http::{HttpOptions, HttpServer};
-pub use jobs::{Executor, JobQueue};
+pub use jobs::{Executor, Job, JobKind, JobQueue};
+/// The result type of [`tools::call`] (rmcp's).
+pub use rmcp::model::CallToolResult;
 pub use server::McpService;
-pub use state::{Overwrite, ServerState, Settings};
+pub use state::{LogEntry, Overwrite, ServerState, Settings};
 pub use tools::SERVER_NAME;
 pub use workspace::{Brush, HeadlessWorkspace, PictureInfo, Question, Slot, Workspace};
 

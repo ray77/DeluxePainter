@@ -56,6 +56,17 @@ pub struct ToolCtx {
     pub transport: &'static str,
 }
 
+impl ToolCtx {
+    /// The context of a changing call: its jobs are marked [`crate::jobs::JobKind::Edit`], so
+    /// the GUI can hold or refuse them before they run.
+    pub fn editing(&self) -> ToolCtx {
+        ToolCtx {
+            exec: self.exec.editing(),
+            ..self.clone()
+        }
+    }
+}
+
 /// The picture the tools look at (previews, pixels, exports): today the shown page.
 // TODO(wave8-integration): return the visible layer composite (ADR-44) here.
 pub fn visible_picture(ws: &dyn Workspace) -> Cow<'_, Document> {
@@ -668,6 +679,8 @@ pub fn is_read_only(name: &str) -> bool {
     find(name).is_some_and(|s| s.read_only)
 }
 
+/// Reading gates every tool but `get_app_status` (a changing tool reports the document it
+/// changed); changing needs both.
 fn permission(needs: Needs, ctx: &ToolCtx) -> Result<(), ToolError> {
     let s = ctx.state.settings();
     let denied = |what: &str| {
@@ -677,7 +690,8 @@ fn permission(needs: Needs, ctx: &ToolCtx) -> Result<(), ToolError> {
         ))
     };
     match needs {
-        Needs::Read if !s.read => denied("reading the document"),
+        Needs::Nothing => Ok(()),
+        _ if !s.read => denied("reading the document"),
         Needs::Edit if !s.edit => denied("changing the document"),
         _ => Ok(()),
     }
@@ -689,14 +703,54 @@ fn parse<T: DeserializeOwned>(args: Option<JsonObject>) -> Result<T, ToolError> 
 }
 
 /// Runs tool `name`; `None` if there is no such tool.
+/// Every call ends with one entry in the activity log (tool, ok or the error code, what it
+/// did).
 pub async fn call(ctx: &ToolCtx, name: &str, args: Option<JsonObject>) -> Option<CallToolResult> {
     let spec = find(name)?;
-    ctx.state.activity().tool_call();
+    let activity = ctx.state.activity();
+    activity.tool_call();
     let result = match permission(spec.needs, ctx) {
+        Ok(()) if spec.needs == Needs::Edit => dispatch(&ctx.editing(), name, args).await,
         Ok(()) => dispatch(ctx, name, args).await,
         Err(e) => Err(e),
     };
+    match &result {
+        Ok(_) => activity.finish(name, None),
+        Err(e) => activity.finish(name, Some((&e.code, &e.message))),
+    }
     Some(result.unwrap_or_else(|e| error_result(&e)))
+}
+
+/// One tool call for [`spawn_calls`]: the tool's name and its arguments.
+pub type CallSpec = (String, Option<JsonObject>);
+
+/// Runs `calls` one after another on a thread with a runtime of its own and sends each
+/// result as it is ready (an unknown tool gives `None`). The owner keeps running its job
+/// queue meanwhile; the receiver disconnects after the last call. For in-process drivers
+/// without a transport: the GUI's `--mcp-calls` snapshot flag and its tests.
+pub fn spawn_calls(
+    ctx: ToolCtx,
+    calls: Vec<CallSpec>,
+) -> std::sync::mpsc::Receiver<(String, Option<CallToolResult>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("dpx-mcp-calls".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            for (name, args) in calls {
+                let result = rt.block_on(call(&ctx, &name, args));
+                if tx.send((name, result)).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn the call thread");
+    rx
 }
 
 async fn dispatch(
@@ -1698,7 +1752,28 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
-/// With `overwrite` and an existing file: allowed, or asked (a "no" fails the call).
+/// Who asks, for the overwrite question: "Claude" for Claude's clients (`claude-code`,
+/// `claude-ai`, ...), else the client's name, else "An AI client".
+pub fn asker(client: Option<&str>) -> String {
+    match client {
+        Some(c) if c.to_ascii_lowercase().contains("claude") => "Claude".into(),
+        Some(c) if !c.trim().is_empty() => c.trim().chars().take(24).collect(),
+        _ => "An AI client".into(),
+    }
+}
+
+/// The question before an existing file is replaced.
+pub fn overwrite_question(client: Option<&str>, file: &str) -> Question {
+    Question {
+        title: "Replace File?".into(),
+        text: format!("{} wants to replace {file}. Replace?", asker(client)),
+        yes: "Replace".into(),
+        no: "Keep".into(),
+    }
+}
+
+/// With `overwrite` and an existing file: allowed, or asked (a "no", no answer in time or a
+/// question that could not be asked fails the call; the file is kept).
 async fn confirm_overwrite(ctx: &ToolCtx, target: &Path, overwrite: bool) -> Result<(), ToolError> {
     if !overwrite || !target.exists() {
         return Ok(());
@@ -1707,22 +1782,19 @@ async fn confirm_overwrite(ctx: &ToolCtx, target: &Path, overwrite: bool) -> Res
         Overwrite::Allowed => Ok(()),
         Overwrite::Ask => {
             let name = file_name(target);
-            let yes = ctx
+            let client = ctx.state.activity().snapshot().client;
+            let declined = |why: String| Err(ToolError::new("OVERWRITE_DECLINED", why));
+            match ctx
                 .exec
-                .ask(Question {
-                    title: "Replace file?".into(),
-                    text: format!("An AI client wants to replace {name}."),
-                    yes: "Replace".into(),
-                    no: "Keep".into(),
-                })
-                .await?;
-            if yes {
-                Ok(())
-            } else {
-                Err(ToolError::new(
-                    "OVERWRITE_DECLINED",
-                    format!("the user kept the existing file {name}"),
-                ))
+                .ask(overwrite_question(client.as_deref(), &name))
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => declined(format!("the user kept the existing file {name}")),
+                Err(e) if e.code == crate::jobs::NO_ANSWER => {
+                    declined(format!("{}; the existing file {name} was kept", e.message))
+                }
+                Err(e) => Err(e),
             }
         }
     }
@@ -1770,8 +1842,9 @@ async fn save_project(ctx: &ToolCtx, a: SaveArgs) -> Result<CallToolResult, Tool
         .await?;
     let revision = doc.revision();
     let (t, overwrite) = (target.clone(), a.overwrite);
+    let codec = ctx.state.codec();
     let bytes = blocking(move || -> Result<usize, ToolError> {
-        let bytes = pictures::encode_project(&doc, extras, spare)?;
+        let bytes = codec.encode_project(&doc, &extras, spare.as_ref())?;
         FileAccess::write_file(&t, &bytes, overwrite)?;
         Ok(bytes.len())
     })
@@ -1835,14 +1908,23 @@ async fn export_image(ctx: &ToolCtx, a: ExportArgs) -> Result<CallToolResult, To
     let access = ctx.state.settings().access;
     let target = access.resolve_write(&a.path, a.overwrite)?;
     confirm_overwrite(ctx, &target, a.overwrite).await?;
-    let (doc, slot) = ctx
+    let (doc, extras, slot) = ctx
         .exec
-        .run(|ws| (visible_picture(ws).into_owned(), ws.shown()))
+        .run(|ws| {
+            (
+                visible_picture(ws).into_owned(),
+                ws.project_extras(),
+                ws.shown(),
+            )
+        })
         .await?;
     let revision = doc.revision();
     let (t, overwrite) = (target.clone(), a.overwrite);
+    let codec = ctx.state.codec();
     let (bytes, notes) = blocking(move || -> Result<_, ToolError> {
-        let (bytes, mut notes) = pictures::encode_document(&doc, format)?;
+        // Hardware limits first, whichever encoder writes the file (nothing reduced silently).
+        pictures::validate_hardware(&doc)?;
+        let (bytes, mut notes) = codec.encode_export(&doc, &extras, format)?;
         notes.extend(screen_notes(doc.target()));
         FileAccess::write_file(&t, &bytes, overwrite)?;
         Ok((bytes.len(), notes))

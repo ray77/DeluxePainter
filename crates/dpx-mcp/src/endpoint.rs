@@ -3,6 +3,10 @@
 //! it when it stops; the bridge reads it on every (re)connect, so the user never types a port
 //! or a token. `<config dir>/mcp-app.json` (`{version, app_path, args}`) stays and tells the
 //! bridge how to start the app when it is not running.
+//!
+//! The GUI keeps its bearer token in `<config dir>/mcp-token` (owner-only on Unix), so a
+//! client configured once still connects after a restart of the app; revoking access
+//! writes a new one ([`rotate_token`]).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub const ENDPOINT_FILE: &str = "mcp-endpoint.json";
 pub const APP_FILE: &str = "mcp-app.json";
+pub const TOKEN_FILE: &str = "mcp-token";
 pub const VERSION: u32 = 1;
 /// The arguments the bridge starts the app with (GUI with the MCP server on).
 pub const LAUNCH_ARGS: &[&str] = &["--mcp"];
@@ -98,6 +103,44 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// A token as read from a file: at least 16 visible ASCII characters, no spaces.
+fn valid_token(t: &str) -> bool {
+    t.len() >= 16 && t.len() <= 256 && t.bytes().all(|b| b.is_ascii_graphic())
+}
+
+pub fn token_path(dir: &Path) -> PathBuf {
+    dir.join(TOKEN_FILE)
+}
+
+/// The persistent token in `dir`: the one stored there, else a new one written there. A file
+/// readable by others is made owner-only again (Unix).
+pub fn load_or_create_token(dir: &Path) -> std::io::Result<String> {
+    let path = token_path(dir);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let t = text.trim();
+        if valid_token(t) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)?.permissions().mode();
+                if mode & 0o077 != 0 {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+            return Ok(t.to_string());
+        }
+    }
+    rotate_token(dir)
+}
+
+/// Writes a new random token to `dir` and returns it; the old one stops working wherever
+/// the server checks against the file's token (revoking every configured client).
+pub fn rotate_token(dir: &Path) -> std::io::Result<String> {
+    let token = new_token()?;
+    write_private(&token_path(dir), token.as_bytes())?;
+    Ok(token)
 }
 
 pub fn endpoint_path(dir: &Path) -> PathBuf {
@@ -197,6 +240,41 @@ mod tests {
         assert!(!path.exists());
         // No temporary files are left.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn tokens_persist_private_and_rotate() {
+        let dir = crate::access::tests::scratch("token");
+        let a = load_or_create_token(&dir).unwrap();
+        assert_eq!(a.len(), 64);
+        assert_eq!(
+            load_or_create_token(&dir).unwrap(),
+            a,
+            "kept across restarts"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = token_path(&dir);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            // A file opened up by someone is made private again.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(load_or_create_token(&dir).unwrap(), a);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let b = rotate_token(&dir).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(load_or_create_token(&dir).unwrap(), b);
+        // A damaged file gets a new token.
+        std::fs::write(token_path(&dir), "short").unwrap();
+        let c = load_or_create_token(&dir).unwrap();
+        assert!(c != b && c.len() == 64);
     }
 
     #[test]
