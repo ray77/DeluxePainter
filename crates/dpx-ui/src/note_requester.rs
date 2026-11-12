@@ -155,6 +155,22 @@ impl NoteRequester {
         &self.title
     }
 
+    /// The notes as shown: one string per note, its wrapped lines joined with spaces (the
+    /// first letter capitalised; past the line limit the last one ends "...and N more").
+    pub fn notes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for line in &self.lines {
+            match out.last_mut() {
+                Some(last) if !line.bullet => {
+                    last.push(' ');
+                    last.push_str(&line.text);
+                }
+                _ => out.push(line.text.clone()),
+            }
+        }
+        out
+    }
+
     /// Height in UI pixels (depends on the number of lines).
     pub fn height(&self) -> i32 {
         geom::TEXT_Y

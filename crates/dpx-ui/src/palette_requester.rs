@@ -815,6 +815,46 @@ mod tests {
         assert_eq!(r.pending, None);
     }
 
+    /// ADR-46: every edit on an OCS document keeps the palette 12-bit, so Ok's SetPalette is
+    /// never refused by the engine's OCS rule.
+    #[test]
+    fn ocs_edits_keep_every_entry_12_bit() {
+        let twelve = |r: &PaletteRequester| {
+            r.colors()
+                .iter()
+                .all(|c| Rgb8::from_rgb4(c.to_rgb4()) == *c)
+        };
+        let mut r = PaletteRequester::new(&Palette::dpaint_default_32(), 3, Chipset::Ocs);
+        assert!(twelve(&r));
+        // Spread between two odd levels, then Copy and Exchange, then RGB and HSV sliders.
+        button(&mut r, Button::Spread);
+        cell(&mut r, 17);
+        cell(&mut r, 6);
+        button(&mut r, Button::Copy);
+        cell(&mut r, 29);
+        button(&mut r, Button::Ex);
+        cell(&mut r, 1);
+        for ch in 0..3 {
+            let t = PaletteRequester::slider_rect(ch);
+            drag_knob(
+                &mut r,
+                ch,
+                t.x + 1 + PaletteRequester::free() * (ch as i32 + 1) / 7,
+            );
+        }
+        button(&mut r, Button::System);
+        for ch in 0..3 {
+            let t = PaletteRequester::slider_rect(ch);
+            drag_knob(
+                &mut r,
+                ch,
+                t.x + 1 + PaletteRequester::free() * (ch as i32 + 2) / 9,
+            );
+        }
+        assert!(twelve(&r), "{:?}", r.colors());
+        assert_ne!(r.colors(), Palette::dpaint_default_32().colors());
+    }
+
     #[test]
     fn undo_reverts_the_last_edit() {
         let def = Palette::dpaint_default_32();

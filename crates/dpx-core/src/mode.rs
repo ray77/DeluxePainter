@@ -346,6 +346,140 @@ impl Default for Target {
     }
 }
 
+/// A named screen format to start a picture from (ADR-46): a display mode with a screen
+/// size, or Custom. The Screen Format requester's Preset gadget offers them in this order;
+/// they are a DeluxePainter addition (DeluxePaint IV has only the mode list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preset {
+    /// Stable identifier, e.g. `pixel_art_320x240` (snapshot flags, MCP, settings).
+    pub id: &'static str,
+    /// The name shown, e.g. "PAL LoRes 320x256". A screen that is not the mode's standard
+    /// size says "(custom)": 320x240 is neither standard PAL nor standard NTSC.
+    pub label: &'static str,
+    /// The display mode and screen size; `None` for Custom (any mode and screen size the
+    /// chipset can show, checked like every format).
+    pub format: Option<(DisplayMode, (u32, u32))>,
+}
+
+const fn preset(
+    id: &'static str,
+    label: &'static str,
+    video: Video,
+    resolution: Resolution,
+    interlace: bool,
+    screen: (u32, u32),
+) -> Preset {
+    Preset {
+        id,
+        label,
+        format: Some((DisplayMode::new(video, resolution, interlace), screen)),
+    }
+}
+
+/// The presets, in the order the requester cycles through them; Custom is last.
+// TODO(wave8-integration): the image-generation branch (ADR-45) keeps a private copy of this
+// table for its Generate requester; switch it to this one.
+pub const PRESETS: [Preset; 8] = [
+    preset(
+        "ntsc_lores",
+        "NTSC LoRes 320x200",
+        Video::Ntsc,
+        Resolution::Lo,
+        false,
+        (320, 200),
+    ),
+    preset(
+        "pal_lores",
+        "PAL LoRes 320x256",
+        Video::Pal,
+        Resolution::Lo,
+        false,
+        (320, 256),
+    ),
+    // PAL:Low Res with a custom screen 16 lines shorter than standard: the variant that
+    // keeps its display mode when an OCS ILBM is read back (its CAMG has no monitor bits, so
+    // PAL/NTSC comes from the height; NTSC 320x240 would need vertical overscan and read
+    // back as PAL).
+    preset(
+        "pixel_art_320x240",
+        "Pixel art 320x240 (custom)",
+        Video::Pal,
+        Resolution::Lo,
+        false,
+        (320, 240),
+    ),
+    preset(
+        "ntsc_hires",
+        "NTSC HiRes 640x200",
+        Video::Ntsc,
+        Resolution::Hi,
+        false,
+        (640, 200),
+    ),
+    preset(
+        "pal_hires",
+        "PAL HiRes 640x256",
+        Video::Pal,
+        Resolution::Hi,
+        false,
+        (640, 256),
+    ),
+    preset(
+        "ntsc_hires_laced",
+        "NTSC HiRes Laced 640x400",
+        Video::Ntsc,
+        Resolution::Hi,
+        true,
+        (640, 400),
+    ),
+    preset(
+        "pal_hires_laced",
+        "PAL HiRes Laced 640x512",
+        Video::Pal,
+        Resolution::Hi,
+        true,
+        (640, 512),
+    ),
+    Preset {
+        id: "custom",
+        label: "Custom",
+        format: None,
+    },
+];
+
+impl Preset {
+    /// The Custom entry (the last one).
+    pub const CUSTOM: Preset = PRESETS[PRESETS.len() - 1];
+
+    /// The preset with this id.
+    pub fn by_id(id: &str) -> Option<&'static Preset> {
+        PRESETS.iter().find(|p| p.id == id)
+    }
+
+    /// The index in [`PRESETS`] of the preset with exactly this mode and screen, else of
+    /// Custom.
+    pub fn index_of(mode: DisplayMode, screen: (u32, u32)) -> usize {
+        PRESETS
+            .iter()
+            .position(|p| p.format == Some((mode, screen)))
+            .unwrap_or(PRESETS.len() - 1)
+    }
+
+    /// The preset's target on `chipset`, or `None` for Custom and for a mode the chipset
+    /// cannot show.
+    pub fn target(&self, chipset: Chipset) -> Option<Target> {
+        let (mode, (w, h)) = self.format?;
+        mode.max_colors(chipset)?;
+        Some(Target::new(chipset, mode).with_screen(w, h))
+    }
+
+    /// True if the screen is the mode's standard size (false for Custom).
+    pub fn is_standard(&self) -> bool {
+        self.format
+            .is_some_and(|(mode, screen)| screen == mode.size())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +631,89 @@ mod tests {
             assert!(!t.page_fits(w - 1, h));
             assert!(!t.page_fits(w, 1025));
         }
+    }
+
+    #[test]
+    fn presets_table() {
+        let ids: Vec<&str> = PRESETS.iter().map(|p| p.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "ntsc_lores",
+                "pal_lores",
+                "pixel_art_320x240",
+                "ntsc_hires",
+                "pal_hires",
+                "ntsc_hires_laced",
+                "pal_hires_laced",
+                "custom"
+            ]
+        );
+        let labels: Vec<&str> = PRESETS.iter().map(|p| p.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "NTSC LoRes 320x200",
+                "PAL LoRes 320x256",
+                "Pixel art 320x240 (custom)",
+                "NTSC HiRes 640x200",
+                "PAL HiRes 640x256",
+                "NTSC HiRes Laced 640x400",
+                "PAL HiRes Laced 640x512",
+                "Custom"
+            ]
+        );
+        assert_eq!(Preset::CUSTOM.format, None);
+        assert_eq!(Preset::by_id("nope"), None);
+        for (i, p) in PRESETS.iter().enumerate() {
+            assert_eq!(Preset::by_id(p.id), Some(p));
+            let Some((mode, (w, h))) = p.format else {
+                assert_eq!(i, PRESETS.len() - 1, "Custom is last");
+                continue;
+            };
+            assert!(mode.screen_fits(w, h), "{}", p.label);
+            assert_eq!(Preset::index_of(mode, (w, h)), i);
+            // Every size is in the label; standard screens are named by their mode.
+            assert!(p.label.ends_with(&format!("{w}x{h}")) || p.label.contains("(custom)"));
+            if p.is_standard() {
+                assert!(!p.label.contains("custom"));
+                assert!(p.label.starts_with(if mode.video == Video::Pal {
+                    "PAL"
+                } else {
+                    "NTSC"
+                }));
+            } else {
+                assert!(p.label.contains("(custom)"), "{}", p.label);
+            }
+            // LoRes and HiRes presets: OCS and AGA can show them all.
+            for chipset in [Chipset::Ocs, Chipset::Aga] {
+                let t = p.target(chipset).unwrap();
+                assert_eq!((t.chipset, t.mode, t.screen), (chipset, mode, (w, h)));
+            }
+        }
+        // 320x240 is never labelled standard PAL or NTSC.
+        let px = Preset::by_id("pixel_art_320x240").unwrap();
+        assert_eq!(px.format, Some((DisplayMode::PAL_LORES, (320, 240))));
+        assert!(!px.is_standard());
+        assert!(!px.label.contains("PAL") && !px.label.contains("NTSC"));
+        assert!(
+            DisplayMode::all().iter().all(|m| m.size() != (320, 240)),
+            "no mode has 320x240 as its standard size"
+        );
+        // It keeps its mode through an OCS ILBM: no monitor bits, 240 lines read as PAL.
+        let t = px.target(Chipset::Ocs).unwrap();
+        assert_eq!(
+            DisplayMode::guess(Some(t.camg()), 320, 240),
+            DisplayMode::PAL_LORES
+        );
+        // Anything else is Custom.
+        assert_eq!(
+            Preset::index_of(DisplayMode::PAL_LORES, (352, 272)),
+            PRESETS.len() - 1
+        );
+        let shi = DisplayMode::new(Video::Pal, Resolution::SuperHi, false);
+        assert_eq!(Preset::index_of(shi, shi.size()), PRESETS.len() - 1);
+        assert_eq!(Preset::CUSTOM.target(Chipset::Aga), None);
     }
 
     #[test]

@@ -376,6 +376,9 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
         return Err("a project is exported through the document: use convert".into());
     }
     let mut notes = Vec::new();
+    // ADR-46: the display mode the picture opens in (CAMG, page fields, size; AGA, as every
+    // loaded picture) must show what an IFF file holds; every export names a custom screen.
+    let target = picture_target(picture);
     let bytes = match kind {
         Kind::Project => match picture {
             Picture::Project(p) => project::write_project(p).map_err(|e| e.to_string())?,
@@ -385,16 +388,20 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
             return Err("an animation is written through the document: use convert".into());
         }
         Kind::Ilbm | Kind::Jpeg => {
+            let doc = Document::from_picture(image.clone(), palette.clone(), target);
+            check_hardware(&doc, SaveFormat::Ilbm).map_err(|e| refused(&e))?;
             let ilbm = match picture {
                 Picture::Ilbm(i) => (**i).clone(),
                 _ => Ilbm::from_indexed(image.clone(), palette.clone()),
             };
+            notes.extend(dpx_core::hardware::format_notes(&target));
             ilbm::write(&ilbm, Compression::ByteRun1).map_err(|e| e.to_string())?
         }
         Kind::Png => {
             if let Picture::Ilbm(i) = picture {
                 notes.extend(png_drops(i));
             }
+            notes.extend(dpx_core::hardware::format_notes(&target));
             dpx_formats::write_png(image, palette).map_err(|e| e.to_string())?
         }
     };
@@ -540,6 +547,28 @@ pub fn is_quiet_note(note: &str) -> bool {
     })
 }
 
+/// The target an indexed picture opens with: AGA (files store no chipset, ADR-46), the mode
+/// guessed from CAMG and size, and the screen from the ILBM's page fields (DeluxePaint writes
+/// its screen size there) if they are a valid screen for the mode, else from the picture
+/// size (ADR-11). A project keeps its own target.
+pub fn picture_target(picture: &Picture) -> Target {
+    if let Picture::Project(p) = picture {
+        return p.document.target();
+    }
+    let (w, h) = picture
+        .indexed()
+        .map_or((0, 0), |(i, _)| (i.width(), i.height()));
+    let mode = DisplayMode::guess(picture.camg(), w, h);
+    let page_fields = match picture {
+        Picture::Ilbm(i) => Some((i.page_width.max(0) as u32, i.page_height.max(0) as u32)),
+        _ => None,
+    };
+    let (sw, sh) = page_fields
+        .filter(|&(pw, ph)| mode.screen_fits(pw, ph))
+        .unwrap_or_else(|| mode.screen_for_picture(w, h));
+    Target::new(Target::default().chipset, mode).with_screen(sw, sh)
+}
+
 /// Turns a loaded picture into a document. Indexed pictures get the display mode guessed from
 /// CAMG and size; true-colour ones are reduced ([`reduce_true_color`], which scales pictures
 /// too big for any screen to `current`). Returns notes about everything that is not kept.
@@ -568,20 +597,7 @@ pub fn open_picture(picture: Picture, current: Target) -> (Document, PictureExtr
             r.notes,
         );
     }
-    let (w, h) = picture
-        .indexed()
-        .map_or((0, 0), |(i, _)| (i.width(), i.height()));
-    let mode = DisplayMode::guess(picture.camg(), w, h);
-    // The screen: the ILBM's page fields (DeluxePaint writes its screen size there) if they
-    // are a valid screen for the mode, else from the picture size (ADR-11).
-    let page_fields = match &picture {
-        Picture::Ilbm(i) => Some((i.page_width.max(0) as u32, i.page_height.max(0) as u32)),
-        _ => None,
-    };
-    let (sw, sh) = page_fields
-        .filter(|&(pw, ph)| mode.screen_fits(pw, ph))
-        .unwrap_or_else(|| mode.screen_for_picture(w, h));
-    let target = Target::new(Target::default().chipset, mode).with_screen(sw, sh);
+    let target = picture_target(&picture);
     let mut extras = PictureExtras::default();
     let mut notes = Vec::new();
     let (image, palette) = match picture {
@@ -714,13 +730,50 @@ pub fn save_format(path: &Path) -> Result<SaveFormat, String> {
     }
 }
 
+/// ADR-46: an IFF ILBM or ANIM export must be a picture its display mode can show on its
+/// chipset (`dpx_core::hardware::validate_picture`: mode, colour count, largest page, 12-bit
+/// OCS colours, pixels in the palette). PNG is a free exchange format and the `.dpxproj`
+/// project is lossless, so neither is checked. The error is the broken rule.
+pub fn check_hardware(doc: &Document, format: SaveFormat) -> Result<(), String> {
+    match format {
+        SaveFormat::Ilbm | SaveFormat::Anim => {
+            dpx_core::hardware::validate_picture(doc).map_err(|e| e.message)
+        }
+        SaveFormat::Png | SaveFormat::Project => Ok(()),
+    }
+}
+
+/// The error of a refused IFF export ([`check_hardware`]), as the CLI prints it.
+pub fn refused(rule: &str) -> String {
+    format!("not written as IFF: {rule}")
+}
+
+/// What the GUI's note says after the broken rule of a refused IFF export.
+pub const REFUSED_HINT: &str = "an IFF picture must fit its display mode: change it with Picture > Screen Format, or export PNG";
+
+/// The notes every export (IFF ILBM, ANIM, PNG) gives about the target (ADR-46): a custom or
+/// overscan screen size, and for IFF what the file cannot carry (the chipset; a display mode
+/// it reads back differently).
+fn export_notes(doc: &Document, format: SaveFormat) -> Vec<String> {
+    let t = doc.target();
+    let mut notes = dpx_core::hardware::format_notes(&t);
+    if matches!(format, SaveFormat::Ilbm | SaveFormat::Anim) {
+        let page = (doc.page().width(), doc.page().height());
+        notes.extend(dpx_core::hardware::iff_notes(&t, page));
+    }
+    notes
+}
+
 /// Encodes the document for `path`: ILBM with the display mode's CAMG, pixel aspect and page
 /// size plus the kept extras, or indexed PNG. Notes name what the chosen format cannot hold.
+/// IFF exports the display mode cannot show are refused ([`check_hardware`]).
 pub fn encode_document(
     doc: &Document,
     extras: &PictureExtras,
     path: &Path,
 ) -> Result<(Vec<u8>, Vec<String>), String> {
+    let format = save_format(path)?;
+    check_hardware(doc, format).map_err(|e| refused(&e))?;
     let colors = doc.palette().len();
     let (ranges, dropped): (Vec<ColorRange>, Vec<ColorRange>) = extras
         .ranges
@@ -739,14 +792,14 @@ pub fn encode_document(
         .transparent_color
         .filter(|&c| usize::from(c) < colors);
     let frames = doc.frame_count();
-    if frames > 1 && !matches!(save_format(path)?, SaveFormat::Project | SaveFormat::Anim) {
+    if frames > 1 && !matches!(format, SaveFormat::Project | SaveFormat::Anim) {
         // ADR-28: a picture format holds one frame; .anim writes all of them (ADR-32).
         notes.push(format!(
             "frame {} of {frames} exported as a picture (save as .anim for all frames)",
             doc.current_frame() + 1
         ));
     }
-    match save_format(path)? {
+    match format {
         SaveFormat::Ilbm => {
             let mode = doc.target().mode;
             let mut out = Ilbm::from_indexed(doc.page().clone(), doc.palette().clone());
@@ -762,6 +815,7 @@ pub fn encode_document(
                 out.transparent_color = c;
             }
             let bytes = ilbm::write(&out, Compression::ByteRun1).map_err(|e| e.to_string())?;
+            notes.extend(export_notes(doc, format));
             Ok((bytes, notes))
         }
         SaveFormat::Anim => {
@@ -789,6 +843,7 @@ pub fn encode_document(
             }
             let bytes =
                 dpx_iff::anim::encode(&images, doc.palette(), &opts).map_err(|e| e.to_string())?;
+            notes.extend(export_notes(doc, format));
             Ok((bytes, notes))
         }
         SaveFormat::Project => {
@@ -808,6 +863,7 @@ pub fn encode_document(
             notes.extend(drops.into_iter().map(|d| format!("PNG cannot store: {d}")));
             let bytes =
                 dpx_formats::write_png(doc.page(), doc.palette()).map_err(|e| e.to_string())?;
+            notes.extend(export_notes(doc, format));
             Ok((bytes, notes))
         }
     }
@@ -1626,6 +1682,186 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dpx-files-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A 320x240 OCS 32-colour picture made like the GUI makes it (ADR-46): Screen Format with
+    /// the "Pixel art 320x240 (custom)" preset on OCS, then a page using all 32 colours.
+    fn pixel_art_ocs() -> Document {
+        use dpx_core::mode::Preset;
+        let preset = Preset::by_id("pixel_art_320x240").unwrap();
+        let (mode, (w, h)) = preset.format.unwrap();
+        let mut e = dpx_core::Engine::new(Document::new(320, 256, Palette::dpaint_default_32()));
+        e.execute(dpx_core::Command::SetFormat {
+            mode,
+            colors: 32,
+            width: w,
+            height: h,
+            retain: false,
+            screen: Some((w, h)),
+            chipset: Some(Chipset::Ocs),
+        })
+        .unwrap();
+        let pixels = (0..w * h).map(|i| ((i * 7 + i / w) % 32) as u8).collect();
+        e.execute(dpx_core::Command::SetPage {
+            width: w,
+            height: h,
+            pixels,
+        })
+        .unwrap();
+        let doc = e.document().clone();
+        assert_eq!(doc.target(), preset.target(Chipset::Ocs).unwrap());
+        doc
+    }
+
+    /// ADR-46 (spec acceptance test 7): the 320x240 OCS 32-colour picture saved as IFF ILBM
+    /// and as `.dpxproj` and opened again keeps size, mode, palette and pixels. ILBM has no
+    /// chipset field: it comes back as AGA (the program follows DeluxePaint IV AGA); the
+    /// project keeps OCS.
+    #[test]
+    fn pixel_art_ocs_round_trips_through_ilbm_and_project() {
+        let dir = own_dir("adr46-roundtrip");
+        let doc = pixel_art_ocs();
+        let extras = PictureExtras::for_new_picture(doc.palette());
+        assert!(dpx_core::hardware::validate(&doc).is_ok());
+        let iff = dir.join("px.iff");
+        let (bytes, notes) = encode_document(&doc, &extras, &iff).unwrap();
+        assert_eq!(
+            notes,
+            [
+                "320x240 is a custom screen size on PAL:Low Res (standard 320x256); exact \
+                 hardware compatibility is not guaranteed",
+                "IFF files store no chipset: this OCS picture reopens as AGA"
+            ]
+        );
+        write_atomic(&iff, &bytes).unwrap();
+        let loaded = load(&iff).unwrap();
+        let Picture::Ilbm(raw) = &loaded.picture else {
+            panic!("an ILBM");
+        };
+        assert_eq!(raw.camg, Some(0), "OCS LoRes: no monitor bits");
+        assert_eq!((raw.page_width, raw.page_height), (320, 240));
+        assert_eq!(raw.image.width(), 320);
+        let (back, back_extras, opened) = open_picture(loaded.picture, Target::default());
+        let (back, grown) = page_at_least_screen(back);
+        assert!(opened.is_empty() && grown.is_none(), "{opened:?} {grown:?}");
+        let t = back.target();
+        assert_eq!((t.mode, t.screen), (DisplayMode::PAL_LORES, (320, 240)));
+        assert_eq!(t.chipset, Chipset::Aga, "ILBM stores no chipset");
+        assert_eq!(back.page(), doc.page());
+        assert_eq!(back.palette(), doc.palette());
+        assert_eq!(back_extras.ranges, extras.ranges);
+        // The project keeps everything, the OCS chipset included.
+        let proj = dir.join("px.dpxproj");
+        let (bytes, notes) = encode_document(&doc, &extras, &proj).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        write_atomic(&proj, &bytes).unwrap();
+        let (back, back_extras, _) = open_picture(load(&proj).unwrap().picture, Target::default());
+        assert_eq!(back.target(), doc.target());
+        assert_eq!(back.page(), doc.page());
+        assert_eq!(back.palette(), doc.palette());
+        assert_eq!(back_extras, extras);
+        // Through the CLI: project -> ILBM gives the same bytes as the export, with the notes.
+        let cli = dir.join("cli.iff");
+        let notes = convert(&proj, &cli).unwrap();
+        assert_eq!(std::fs::read(&cli).unwrap(), std::fs::read(&iff).unwrap());
+        assert!(
+            notes.iter().any(|n| n.contains("custom screen size")),
+            "{notes:?}"
+        );
+        // ILBM -> ILBM (copied as it is) still names the custom screen.
+        let notes = convert(&iff, &dir.join("copy.iff")).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("320x240 is a custom screen size on PAL:Low Res"));
+        // PNG is a free export, and says so too.
+        let notes = convert(&proj, &dir.join("px.png")).unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("custom screen size")),
+            "{notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-46 (spec acceptance test 8): OCS HiRes with 32 colours is refused when it is made,
+    /// and an IFF export of such a document (made around the engine) is refused with a clear
+    /// message; PNG and the project stay free.
+    #[test]
+    fn iff_exports_refuse_what_the_mode_cannot_show() {
+        let dir = own_dir("adr46-refuse");
+        let hi = DisplayMode::new(dpx_core::Video::Pal, dpx_core::Resolution::Hi, false);
+        let mut e = dpx_core::Engine::new(pixel_art_ocs());
+        let err = e
+            .execute(dpx_core::Command::SetFormat {
+                mode: hi,
+                colors: 32,
+                width: 640,
+                height: 256,
+                retain: false,
+                screen: None,
+                chipset: None,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, dpx_core::ErrorCode::PaletteRangeInvalid);
+        assert_eq!(
+            err.message,
+            "32 colours: PAL:High Res allows 2..=16 (powers of two)"
+        );
+        let doc = Document::from_picture(
+            IndexedImage::new(640, 256, 0),
+            Palette::dpaint_default_32(),
+            Target::new(Chipset::Ocs, hi),
+        );
+        let extras = PictureExtras::default();
+        for name in ["hi.iff", "hi.anim", "hi"] {
+            let path = dir.join(name);
+            assert_eq!(
+                encode_document(&doc, &extras, &path).unwrap_err(),
+                "not written as IFF: 32 colours exceed the 16 of PAL:High Res on Ocs",
+                "{name}"
+            );
+        }
+        assert!(encode_document(&doc, &extras, &dir.join("hi.png")).is_ok());
+        assert!(encode_document(&doc, &extras, &dir.join("hi.dpxproj")).is_ok());
+        // A 12-bit rule: an OCS palette entry that is not 12-bit.
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[7] = Rgb8::new(1, 2, 3);
+        let odd = Document::from_picture(
+            IndexedImage::new(320, 256, 0),
+            Palette::new(colors).unwrap(),
+            Target::new(Chipset::Ocs, DisplayMode::PAL_LORES),
+        );
+        assert_eq!(
+            encode_document(&odd, &extras, &dir.join("odd.iff")).unwrap_err(),
+            "not written as IFF: palette entry 7 is not a 12-bit OCS colour"
+        );
+        // CLI: a picture larger than any page its mode allows is not converted to IFF.
+        let big = IndexedImage::new(1600, 1100, 1);
+        let png = dir.join("big.png");
+        std::fs::write(
+            &png,
+            dpx_formats::write_png(&big, &Palette::dpaint_default_32()).unwrap(),
+        )
+        .unwrap();
+        let out = dir.join("big.iff");
+        assert_eq!(
+            convert(&png, &out).unwrap_err(),
+            "not written as IFF: page 1600x1100 is outside the 1x1..1472x1024 limits of \
+             PAL:Super-High Res Laced"
+        );
+        assert!(!out.exists());
+        assert!(
+            convert(&png, &dir.join("big2.png")).is_ok(),
+            "PNG stays free"
+        );
+        // A brush-sized picture is fine: picture files may be smaller than the screen.
+        let small = dir.join("small.png");
+        std::fs::write(
+            &small,
+            dpx_formats::write_png(&IndexedImage::new(40, 30, 1), &Palette::dpaint_default_32())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(convert(&small, &dir.join("small.iff")).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

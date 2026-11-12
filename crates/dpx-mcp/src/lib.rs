@@ -342,6 +342,9 @@ impl Painter {
             height: args.height.unwrap_or(sh),
             retain: false,
             screen: None,
+            // TODO(wave8-integration): the live-MCP branch's create_document passes the chipset
+            // (and a preset's screen, dpx_core::mode::PRESETS) here instead of a seed (ADR-46).
+            chipset: None,
         })?;
         // Fresh engine: revision 0, empty undo history.
         let d = scratch.document();

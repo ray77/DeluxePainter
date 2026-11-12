@@ -2264,6 +2264,7 @@ mod tests {
                 height: 256,
                 retain: false,
                 screen: None,
+                chipset: None,
             })
             .unwrap();
         let radius = |app: &mut PainterApp| {

@@ -78,6 +78,25 @@ fn depth(chipset: Chipset) -> PaletteDepth {
     }
 }
 
+/// ADR-46: the note when Use Brush Palette took a brush palette as it is (not `reduced`) into
+/// an OCS picture of `n` colours and rounded some of its colours to 12 bits.
+fn rounded_brush_colors(
+    depth: PaletteDepth,
+    own: &[dpx_core::Rgb8],
+    n: usize,
+    reduced: bool,
+) -> Option<String> {
+    if reduced || depth != PaletteDepth::Rgb4 {
+        return None;
+    }
+    let k = own
+        .iter()
+        .take(n)
+        .filter(|&&c| !dpx_core::hardware::is_12_bit(c))
+        .count();
+    (k > 0).then(|| dpx_core::hardware::rounded_note(k))
+}
+
 /// Whether `cmd` paints with the left button (adds to a painted stencil): strokes and shapes
 /// say so, a fill in the BG colour (and not FG) frees, CLR frees.
 fn adds(cmd: &Command, fg: u8, bg: u8) -> bool {
@@ -230,7 +249,8 @@ impl PainterApp {
             brush,
             reduced,
         } = brush_palette::use_brush_palette(&own_brush, own.colors(), &current, depth);
-        let notes = self.adopt_brush_ranges(reduced, own.len(), ranges.map(Vec::as_slice), n);
+        let mut notes = self.adopt_brush_ranges(reduced, own.len(), ranges.map(Vec::as_slice), n);
+        notes.extend(rounded_brush_colors(depth, own.colors(), n, reduced));
         // The brush Brush ▸ Restore gives back, in the new palette's numbers too: the loaded
         // brush in the file's numbers, a picked-up one in the pick-up palette's; their own
         // numbers where the palette was taken as it is, else the nearest new colours.
@@ -348,7 +368,8 @@ impl PainterApp {
             cels,
             reduced,
         } = brush_palette::use_cels_palette(&own_cels, own.colors(), &current, depth);
-        let notes = self.adopt_brush_ranges(reduced, own.len(), ranges.as_deref(), n);
+        let mut notes = self.adopt_brush_ranges(reduced, own.len(), ranges.as_deref(), n);
+        notes.extend(rounded_brush_colors(depth, own.colors(), n, reduced));
         if colors != current.colors() {
             self.run(Command::SetPalette { colors });
         }
@@ -1277,6 +1298,43 @@ mod tests {
         );
     }
 
+    /// ADR-46: on an OCS picture the brush file's colours come in as 12-bit values, with a
+    /// note, so the palette change is not refused by the engine's OCS rule.
+    #[test]
+    fn use_brush_palette_rounds_brush_colours_on_ocs() {
+        let mut app = PainterApp::new();
+        app.engine
+            .execute(Command::SetFormat {
+                mode: dpx_core::DisplayMode::PAL_LORES,
+                colors: 32,
+                width: 320,
+                height: 256,
+                retain: false,
+                screen: None,
+                chipset: Some(Chipset::Ocs),
+            })
+            .unwrap();
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[4] = Rgb8::new(10, 200, 30);
+        colors[5] = Rgb8::new(250, 120, 0);
+        load_brush_file(&mut app, "ocs", &Palette::new(colors.clone()).unwrap(), &[]);
+        let revision = app.engine.document().revision();
+        act(&mut app, "palette.use_brush");
+        assert_eq!(app.engine.document().revision(), revision + 1, "one change");
+        let pal = app.engine.document().palette();
+        assert_eq!(pal.get(4), Some(Rgb8::new(0x11, 0xCC, 0x22)));
+        assert_eq!(pal.get(5), Some(Rgb8::new(0xFF, 0x77, 0x00)));
+        assert!(
+            pal.colors()
+                .iter()
+                .all(|&c| dpx_core::hardware::is_12_bit(c))
+        );
+        assert_eq!(app.custom_brush.as_ref().unwrap().pixels, [0, 4, 5]);
+        let note = app.ui.note_requester.as_ref().expect("a note");
+        assert_eq!(note.title(), USE_BRUSH_PALETTE);
+        assert_eq!(note.notes(), ["2 colours rounded to 12-bit OCS values"]);
+    }
+
     #[test]
     fn use_brush_palette_recomputes_a_bigger_palette() {
         let mut app = PainterApp::new();
@@ -1289,6 +1347,7 @@ mod tests {
                 height: 256,
                 retain: false,
                 screen: None,
+                chipset: None,
             })
             .unwrap();
         let mut colors = Palette::dpaint_default_32().colors().to_vec();
@@ -1577,6 +1636,7 @@ mod tests {
                 height: 256,
                 retain: false,
                 screen: None,
+                chipset: None,
             })
             .unwrap();
         act(&mut app, "palette.use_brush");

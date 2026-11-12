@@ -34,6 +34,11 @@
 //!     [--import-requester FILE]         the Import requester for a PNG or JPEG (ADR-42)
 //!     [--import SPEC] [--import-apply]  … with position=centre|top_left;palette=new|current;
 //!                                       colors=N;dither=none|fs|ordered, or the page after Ok
+//!     [--chipset ocs|aga]               the picture's chipset (before `--page`; ADR-46)
+//!     [--preset ID]                     a screen preset, e.g. pixel_art_320x240 (ADR-46)
+//!     [--requester-keys K,K..]          keys for `--requester` first: up, down, tab, enter,
+//!                                       or a letter (h Chipset, p Preset) (ADR-46)
+//!     [--export-note NAME]              the note Picture > Export.. shows for NAME (ADR-46)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -54,6 +59,8 @@ mod menu_actions;
 mod palette_stencil;
 mod perspective;
 mod recovery;
+// Chipset, presets and hardware rules in the app (ADR-46).
+mod screen_format;
 mod settings;
 mod tools;
 mod tooltip;
@@ -278,6 +285,11 @@ fn main() -> eframe::Result {
             }
         };
         let mut engine = Engine::new(doc);
+        // ADR-46: the picture's chipset and a screen preset.
+        if let Err(e) = screen_format::snapshot_format(&args, &mut engine) {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
         if let Some(spec) = arg_value(&args, "--page") {
             let size = spec
                 .split_once('x')
@@ -542,9 +554,23 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
+        // ADR-46: the note Picture ▸ Export.. would show under a name (nothing is written).
+        if let Some(name) = arg_value(&args, "--export-note") {
+            let extras = opened.as_ref().map(|o| o.2.clone()).unwrap_or_default();
+            match screen_format::snapshot_export_note(&name, &doc, &extras) {
+                Ok(note) => ui.note_requester = note,
+                Err(e) => {
+                    eprintln!("--export-note {name}: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         if args.iter().any(|a| a == "--requester") {
-            let page = (doc.page().width(), doc.page().height());
-            let req = ScreenFormatRequester::new(doc.target(), page, doc.palette().len());
+            // ADR-46: `--requester-keys` drives it first.
+            let req = screen_format::snapshot_requester(&args, &doc).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2);
+            });
             let screen = req.render();
             let view = View::of(requester::SCREEN);
             let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
@@ -1226,6 +1252,10 @@ impl PainterApp {
         if export && matches!(files::save_format(&path), Ok(files::SaveFormat::Project)) {
             return self.requester_message("Use Save.. for projects".into());
         }
+        // ADR-46: an IFF export its display mode cannot show is refused with a note.
+        if self.refuse_unshowable(&path) {
+            return;
+        }
         if path.exists() && !overwrite {
             if let Some(req) = &mut self.ui.file_requester {
                 req.ask_overwrite();
@@ -1383,15 +1413,20 @@ impl PainterApp {
         match req.handle(event) {
             ReqResponse::Continue => {}
             ReqResponse::Cancel => self.requester = None,
-            ReqResponse::Use(command) => match self.engine.execute(command) {
-                Ok(_) => {
-                    self.requester = None;
-                    // Colours beyond the new palette would be invalid.
-                    self.clamp_colors();
-                    self.clamp_scroll();
+            ReqResponse::Use(command) => {
+                // ADR-46: palette colours a change to OCS rounds to 12 bits are named.
+                let rounded = screen_format::rounded_by(&command, self.engine.document());
+                match self.engine.execute(command) {
+                    Ok(_) => {
+                        self.requester = None;
+                        // Colours beyond the new palette would be invalid.
+                        self.clamp_colors();
+                        self.clamp_scroll();
+                        self.ui.note_requester = screen_format::rounded_note(rounded);
+                    }
+                    Err(e) => req.set_message(e.message),
                 }
-                Err(e) => req.set_message(e.message),
-            },
+            }
         }
         self.dirty = true;
     }
@@ -3494,6 +3529,7 @@ mod tests {
             height: 283,
             retain: false,
             screen: Some(hi.screen),
+            chipset: None,
         });
         assert_eq!(app.engine.document().target().screen, (736, 283));
         let got = app.snap_window(v(1280.0, 1024.0), 3.0);

@@ -70,6 +70,12 @@ pub fn use_cels_palette(
 ) -> AdoptedCels {
     let n = current.len();
     let fits = |c: u8| usize::from(c) < n;
+    // The palette precision: an OCS picture takes the brush colours as 12-bit values
+    // (ADR-46), also when the palette is taken as it is.
+    let snap = |c: Rgb8| match depth {
+        PaletteDepth::Rgb4 => Rgb8::from_rgb4(c.to_rgb4()),
+        PaletteDepth::Rgb8 => c,
+    };
     if cels
         .iter()
         .all(|b| b.pixels.iter().all(|&p| fits(p)) && b.transparent.is_none_or(fits))
@@ -78,7 +84,7 @@ pub fn use_cels_palette(
             .colors()
             .iter()
             .enumerate()
-            .map(|(i, &c)| own.get(i).copied().unwrap_or(c))
+            .map(|(i, &c)| own.get(i).copied().map_or(c, snap))
             .collect();
         return AdoptedCels {
             colors,
@@ -121,10 +127,6 @@ pub fn use_cels_palette(
     );
     let used = reduced.colors + usize::from(reduced.transparent_index.is_some());
     let mut colors = reduced.palette.colors()[..used].to_vec();
-    let snap = |c: Rgb8| match depth {
-        PaletteDepth::Rgb4 => Rgb8::from_rgb4(c.to_rgb4()),
-        PaletteDepth::Rgb8 => c,
-    };
     for &c in own {
         if colors.len() >= n {
             break;
@@ -272,6 +274,18 @@ mod tests {
                 .iter()
                 .all(|c| Rgb8::from_rgb4(c.to_rgb4()) == *c)
         );
+        // Also when the palette is taken as it is (ADR-46): the brush fits, the brush
+        // palette's colours come in rounded to 12 bits, the brush keeps its numbers.
+        let fits = brush(vec![1, 2, 3], None);
+        let taken = use_brush_palette(&fits, &own, &current, PaletteDepth::Rgb4);
+        assert!(!taken.reduced);
+        assert_eq!(taken.brush, fits);
+        assert_ne!(taken.colors[1], own[1], "#1000EF is not 12-bit");
+        for (i, c) in taken.colors.iter().enumerate() {
+            assert_eq!(*c, Rgb8::from_rgb4(own[i].to_rgb4()), "entry {i}");
+        }
+        let aga = use_brush_palette(&fits, &own, &current, PaletteDepth::Rgb8);
+        assert_eq!(aga.colors, own[..4].to_vec(), "AGA takes them exactly");
     }
 
     #[test]
