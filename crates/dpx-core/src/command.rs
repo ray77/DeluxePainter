@@ -137,7 +137,8 @@ pub enum Command {
     /// unused when `retain` is set. Mode, colours and screen are checked against the
     /// resulting chipset. On OCS every palette entry becomes a 12-bit colour: the grey ramp,
     /// and kept entries of an AGA palette when the chipset changes to OCS, are rounded to the
-    /// nearest 12-bit value (ADR-46). Undo restores the whole previous target.
+    /// nearest 12-bit value (ADR-46), and the outcome counts the kept entries rounded
+    /// (`Outcome::rounded_colors`). Undo restores the whole previous target.
     SetFormat {
         mode: DisplayMode,
         colors: u16,
@@ -653,6 +654,27 @@ impl Command {
         }
     }
 
+    /// How many kept palette entries this command rounds to colours its chipset shows
+    /// (ADR-46): a SetFormat to OCS rounds the entries of an AGA palette that are not 12-bit
+    /// (a change of the colours, reported in `Outcome::rounded_colors`, never silent). New
+    /// grey-ramp entries are not counted; every other command rounds nothing. Call only after
+    /// [`Self::validate`], before [`Self::apply`].
+    pub(crate) fn rounded_colors(&self, doc: &Document) -> u16 {
+        let Command::SetFormat {
+            colors, chipset, ..
+        } = self
+        else {
+            return 0;
+        };
+        let chipset = chipset.unwrap_or(doc.target.chipset);
+        let kept = usize::from(*colors).min(doc.palette.len());
+        let rounded = doc.palette.colors()[..kept]
+            .iter()
+            .filter(|&&c| crate::hardware::snap(chipset, c) != c)
+            .count();
+        rounded as u16
+    }
+
     /// Applies the command. Call only after [`Self::validate`].
     pub(crate) fn apply(&self, doc: &mut Document) {
         if self.is_frame_command() {
@@ -703,8 +725,8 @@ impl Command {
                     *frame = new_page;
                 });
                 let chipset = chipset.unwrap_or(doc.target.chipset);
-                // TODO(wave8-integration): MCP's set_format/create_document result could name
-                // the entries this rounds to 12 bits (the GUI notes them, ADR-46).
+                // The kept entries this rounds are counted in `Outcome::rounded_colors`
+                // ([`Self::rounded_colors`]), so no front-end changes colours silently.
                 doc.palette = resized_palette(&doc.palette, usize::from(*colors), chipset);
                 doc.target.chipset = chipset;
                 doc.target.mode = *mode;

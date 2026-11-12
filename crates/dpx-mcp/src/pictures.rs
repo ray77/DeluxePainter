@@ -188,6 +188,8 @@ pub fn validate_hardware(doc: &Document) -> Result<(), ToolError> {
 
 /// Encodes the document after validating its hardware limits. ILBM carries the display
 /// mode's CAMG, pixel aspect and screen size; PNG cannot store the display mode (noted).
+/// Every format names a custom or overscan screen, and IFF what the file cannot carry of the
+/// target (`dpx_core::hardware::export_notes`, as the app's exports, ADR-46).
 pub fn encode_document(
     doc: &Document,
     format: Format,
@@ -212,6 +214,7 @@ pub fn encode_document(
             out.page_height = sh as i16;
             let bytes = ilbm::write(&out, ilbm::Compression::ByteRun1)
                 .map_err(|e| hardware(e.to_string()))?;
+            notes.extend(dpx_core::hardware::export_notes(doc, true));
             Ok((bytes, notes))
         }
         Format::Anim => {
@@ -230,6 +233,7 @@ pub fn encode_document(
             };
             let bytes = dpx_iff::anim::encode(&images, doc.palette(), &opts)
                 .map_err(|e| hardware(e.to_string()))?;
+            notes.extend(dpx_core::hardware::export_notes(doc, true));
             Ok((bytes, notes))
         }
         Format::Png => {
@@ -239,6 +243,7 @@ pub fn encode_document(
                 "PNG cannot store: display mode {}",
                 doc.target().mode.name()
             ));
+            notes.extend(dpx_core::hardware::export_notes(doc, false));
             Ok((bytes, notes))
         }
     }
@@ -363,6 +368,33 @@ mod tests {
                 .message
                 .contains("limits")
         );
+    }
+
+    /// ADR-46: save_picture names a custom screen in every format and, for IFF, the chipset
+    /// the file cannot carry, as the app's exports do.
+    #[test]
+    fn saved_pictures_name_custom_screens_and_the_lost_chipset() {
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let d = Document::from_picture(
+            IndexedImage::new(320, 240, 0),
+            Palette::dpaint_default_32(),
+            ocs,
+        );
+        let custom = "320x240 is a custom screen size on PAL:Low Res (standard 320x256); exact \
+                      hardware compatibility is not guaranteed";
+        let chipset = "IFF files store no chipset: this OCS picture reopens as AGA";
+        for f in [Format::Ilbm, Format::Anim] {
+            let (_, notes) = encode_document(&d, f).unwrap();
+            assert_eq!(notes, [custom, chipset], "{f:?}");
+        }
+        let (_, notes) = encode_document(&d, Format::Png).unwrap();
+        assert_eq!(
+            notes,
+            ["PNG cannot store: display mode PAL:Low Res", custom]
+        );
+        // A standard AGA screen says nothing more.
+        let (_, notes) = encode_document(&doc(), Format::Ilbm).unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]

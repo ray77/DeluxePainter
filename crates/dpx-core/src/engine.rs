@@ -42,6 +42,10 @@ pub struct Outcome {
     pub format_changed: bool,
     pub undo_available: bool,
     pub redo_available: bool,
+    /// Kept palette entries the command rounds (or would round) to colours its chipset shows:
+    /// a SetFormat that makes an AGA picture OCS rounds 24-bit entries to 12 bits (ADR-46).
+    /// 0 for every other command and for undo; front-ends name a non-zero count.
+    pub rounded_colors: u16,
 }
 
 /// What an undo step restores.
@@ -221,17 +225,22 @@ impl Engine {
         }
         request.command.validate(&self.doc)?;
         let footprint = request.command.footprint(&self.doc);
+        let rounded_colors = request.command.rounded_colors(&self.doc);
+        let outcome = |engine: &Self| Outcome {
+            rounded_colors,
+            ..engine.outcome(footprint)
+        };
         if request.dry_run {
-            return Ok(self.outcome(footprint));
+            return Ok(outcome(self));
         }
         if footprint == Footprint::Setting {
             request.command.apply(&mut self.doc);
             self.doc.revision += 1;
-            return Ok(self.outcome(footprint));
+            return Ok(outcome(self));
         }
         self.redo.clear();
         self.commit(request.command, footprint);
-        Ok(self.outcome(footprint))
+        Ok(outcome(self))
     }
 
     /// Reverts the most recent step. A pixel step of another frame makes that frame current
@@ -286,8 +295,12 @@ impl Engine {
         self.doc.go_to(frame);
         command.validate(&self.doc)?;
         let footprint = command.footprint(&self.doc);
+        let rounded_colors = command.rounded_colors(&self.doc);
         self.commit(command, footprint);
-        Ok(self.outcome_on(footprint, switched))
+        Ok(Outcome {
+            rounded_colors,
+            ..self.outcome_on(footprint, switched)
+        })
     }
 
     /// Applies a validated command as a new undo step.
@@ -351,6 +364,7 @@ impl Engine {
             format_changed,
             undo_available: self.can_undo(),
             redo_available: self.can_redo(),
+            rounded_colors: 0,
         }
     }
 }
@@ -771,6 +785,62 @@ mod tests {
             }
         ));
         assert_eq!(serde_json::to_string(&cmd).unwrap(), json);
+    }
+
+    /// ADR-46: the colours a SetFormat to OCS rounds are counted in the outcome (also for a
+    /// dry run and a redo), so MCP and the GUI can name them; only kept entries count.
+    #[test]
+    fn set_format_reports_the_colours_it_rounds() {
+        use crate::{Chipset, DisplayMode};
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        // #080808 rounds onto colour 0 (#000000): two entries become one colour.
+        colors[1] = Rgb8::new(0x08, 0x08, 0x08);
+        colors[2] = Rgb8::new(0x10, 0x10, 0x10);
+        colors[3] = Rgb8::new(0x10, 0x20, 0x31);
+        let mut e = Engine::new(Document::new(320, 256, Palette::new(colors).unwrap()));
+        let to = |colors, chipset| Command::SetFormat {
+            mode: DisplayMode::PAL_LORES,
+            colors,
+            width: 320,
+            height: 256,
+            retain: true,
+            screen: None,
+            chipset,
+        };
+        let dry = e
+            .execute(Request {
+                command: to(32, Some(Chipset::Ocs)),
+                expected_revision: None,
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!((dry.rounded_colors, dry.revision), (3, 0));
+        // Two colours keep entries 0 and 1: one rounded.
+        let dry = e
+            .execute(Request {
+                command: to(2, Some(Chipset::Ocs)),
+                expected_revision: None,
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(dry.rounded_colors, 1);
+        // Staying AGA rounds nothing.
+        assert_eq!(e.execute(to(32, None)).unwrap().rounded_colors, 0);
+        let out = e.execute(to(32, Some(Chipset::Ocs))).unwrap();
+        assert_eq!(out.rounded_colors, 3);
+        assert_eq!(e.document().palette().get(1), Some(Rgb8::new(0, 0, 0)));
+        assert_eq!(e.undo().unwrap().rounded_colors, 0);
+        assert_eq!(e.redo().unwrap().rounded_colors, 3);
+        // Already 12-bit, and new grey-ramp entries, are not rounded colours.
+        let out = e.execute(to(2, None)).unwrap();
+        assert_eq!(out.rounded_colors, 0);
+        assert_eq!(e.execute(to(32, None)).unwrap().rounded_colors, 0);
+        assert_eq!(
+            e.execute(Command::Clear { color: 1 })
+                .unwrap()
+                .rounded_colors,
+            0
+        );
     }
 
     /// ADR-46: on OCS the palette stays 12-bit: SetPalette refuses other colours, and

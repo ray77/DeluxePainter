@@ -12,7 +12,8 @@
 //! 5. every pixel of every frame is a palette colour.
 //!
 //! [`format_notes`] and [`iff_notes`] are the honest notes an export gives about screen sizes
-//! that are not standard and about what an IFF file cannot carry of the target.
+//! that are not standard and about what an IFF file cannot carry of the target;
+//! [`export_notes`] gives the ones of an export format.
 
 use std::fmt;
 
@@ -257,6 +258,18 @@ pub fn iff_notes(target: &Target, page: (u32, u32)) -> Vec<String> {
     notes
 }
 
+/// The notes an export of `doc` gives about its target: [`format_notes`] for every export
+/// format, plus [`iff_notes`] (with the page size) for an IFF ILBM or ANIM file (`iff`). The
+/// GUI's and the CLI's exports and MCP's `save_picture` all give these (ADR-46).
+pub fn export_notes(doc: &Document, iff: bool) -> Vec<String> {
+    let t = doc.target();
+    let mut notes = format_notes(&t);
+    if iff {
+        notes.extend(iff_notes(&t, (doc.page().width(), doc.page().height())));
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +423,20 @@ mod tests {
             ..ntsc
         };
         assert!(iff_notes(&aga_ntsc, (320, 240)).is_empty());
+    }
+
+    #[test]
+    fn export_notes_add_the_iff_notes_for_iff_files_only() {
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let d = doc(320, 240, Palette::dpaint_default_32(), ocs);
+        let png = export_notes(&d, false);
+        assert_eq!(png, format_notes(&ocs));
+        assert_eq!(png.len(), 1);
+        let iff = export_notes(&d, true);
+        assert_eq!(iff[..1], png[..]);
+        assert_eq!(iff[1..], iff_notes(&ocs, (320, 240))[..]);
+        assert_eq!(iff.len(), 2);
+        let standard = doc(320, 256, Palette::dpaint_default_32(), Target::default());
+        assert!(export_notes(&standard, true).is_empty());
     }
 }

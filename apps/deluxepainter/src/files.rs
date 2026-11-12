@@ -376,9 +376,6 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
         return Err("a project is exported through the document: use convert".into());
     }
     let mut notes = Vec::new();
-    // ADR-46: the display mode the picture opens in (CAMG, page fields, size; AGA, as every
-    // loaded picture) must show what an IFF file holds; every export names a custom screen.
-    let target = picture_target(picture);
     let bytes = match kind {
         Kind::Project => match picture {
             Picture::Project(p) => project::write_project(p).map_err(|e| e.to_string())?,
@@ -388,20 +385,28 @@ pub fn save(picture: &Picture, path: &Path) -> Result<Vec<String>, String> {
             return Err("an animation is written through the document: use convert".into());
         }
         Kind::Ilbm | Kind::Jpeg => {
-            let doc = Document::from_picture(image.clone(), palette.clone(), target);
-            check_hardware(&doc, SaveFormat::Ilbm).map_err(|e| refused(&e))?;
             let ilbm = match picture {
                 Picture::Ilbm(i) => (**i).clone(),
+                // Page fields of the picture's own size, no CAMG.
                 _ => Ilbm::from_indexed(image.clone(), palette.clone()),
             };
+            // ADR-46: the file as written is checked and named: the target it reopens with
+            // (CAMG, page fields, size; AGA, as every loaded picture) must show it, and a
+            // custom screen in its page fields gets the note. That target is read from the
+            // file, so the IFF notes on chipset and display mode have nothing to add.
+            let target = ilbm_target(&ilbm);
+            let doc = Document::from_picture(image.clone(), palette.clone(), target);
+            check_hardware(&doc, SaveFormat::Ilbm).map_err(|e| refused(&e))?;
             notes.extend(dpx_core::hardware::format_notes(&target));
             ilbm::write(&ilbm, Compression::ByteRun1).map_err(|e| e.to_string())?
         }
         Kind::Png => {
+            // An ILBM's screen (its page fields) is lost in the PNG: a custom one is named. A
+            // PNG source holds no screen, nor does the PNG written, so there is none to name.
             if let Picture::Ilbm(i) = picture {
                 notes.extend(png_drops(i));
+                notes.extend(dpx_core::hardware::format_notes(&ilbm_target(i)));
             }
-            notes.extend(dpx_core::hardware::format_notes(&target));
             dpx_formats::write_png(image, palette).map_err(|e| e.to_string())?
         }
     };
@@ -552,17 +557,31 @@ pub fn is_quiet_note(note: &str) -> bool {
 /// its screen size there) if they are a valid screen for the mode, else from the picture
 /// size (ADR-11). A project keeps its own target.
 pub fn picture_target(picture: &Picture) -> Target {
-    if let Picture::Project(p) = picture {
-        return p.document.target();
+    match picture {
+        Picture::Project(p) => p.document.target(),
+        Picture::Ilbm(i) => ilbm_target(i),
+        _ => {
+            let (w, h) = picture
+                .indexed()
+                .map_or((0, 0), |(i, _)| (i.width(), i.height()));
+            target_for(picture.camg(), (w, h), None)
+        }
     }
-    let (w, h) = picture
-        .indexed()
-        .map_or((0, 0), |(i, _)| (i.width(), i.height()));
-    let mode = DisplayMode::guess(picture.camg(), w, h);
-    let page_fields = match picture {
-        Picture::Ilbm(i) => Some((i.page_width.max(0) as u32, i.page_height.max(0) as u32)),
-        _ => None,
-    };
+}
+
+/// [`picture_target`] of an ILBM: CAMG, picture size and page fields.
+fn ilbm_target(i: &Ilbm) -> Target {
+    let page_fields = (i.page_width.max(0) as u32, i.page_height.max(0) as u32);
+    target_for(
+        i.camg,
+        (i.image.width(), i.image.height()),
+        Some(page_fields),
+    )
+}
+
+/// The target of a `size` picture with this CAMG and page fields (see [`picture_target`]).
+fn target_for(camg: Option<u32>, (w, h): (u32, u32), page_fields: Option<(u32, u32)>) -> Target {
+    let mode = DisplayMode::guess(camg, w, h);
     let (sw, sh) = page_fields
         .filter(|&(pw, ph)| mode.screen_fits(pw, ph))
         .unwrap_or_else(|| mode.screen_for_picture(w, h));
@@ -755,13 +774,8 @@ pub const REFUSED_HINT: &str = "an IFF picture must fit its display mode: change
 /// overscan screen size, and for IFF what the file cannot carry (the chipset; a display mode
 /// it reads back differently).
 fn export_notes(doc: &Document, format: SaveFormat) -> Vec<String> {
-    let t = doc.target();
-    let mut notes = dpx_core::hardware::format_notes(&t);
-    if matches!(format, SaveFormat::Ilbm | SaveFormat::Anim) {
-        let page = (doc.page().width(), doc.page().height());
-        notes.extend(dpx_core::hardware::iff_notes(&t, page));
-    }
-    notes
+    let iff = matches!(format, SaveFormat::Ilbm | SaveFormat::Anim);
+    dpx_core::hardware::export_notes(doc, iff)
 }
 
 /// Encodes the document for `path`: ILBM with the display mode's CAMG, pixel aspect and page
@@ -1772,12 +1786,74 @@ mod tests {
         let notes = convert(&iff, &dir.join("copy.iff")).unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].starts_with("320x240 is a custom screen size on PAL:Low Res"));
-        // PNG is a free export, and says so too.
+        // PNG is a free export, and says so too: from the project (through the document)
+        // and from the ILBM directly, whose page fields hold the custom screen.
+        let custom = "320x240 is a custom screen size on PAL:Low Res (standard 320x256); exact \
+                      hardware compatibility is not guaranteed";
         let notes = convert(&proj, &dir.join("px.png")).unwrap();
-        assert!(
-            notes.iter().any(|n| n.contains("custom screen size")),
-            "{notes:?}"
-        );
+        assert!(notes.iter().any(|n| n == custom), "{notes:?}");
+        let notes = convert(&iff, &dir.join("direct.png")).unwrap();
+        let screens: Vec<&String> = notes.iter().filter(|n| n.contains("screen")).collect();
+        assert_eq!(screens, [custom], "{notes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-46: `convert` of a PNG to IFF checks and names the file it writes. Its page fields
+    /// hold the picture's own size, so a 320x240 PNG becomes a 320x240 custom-screen ILBM,
+    /// named as the ILBM -> ILBM copy of that file names it; a PNG written from a PNG holds
+    /// no screen and gets no screen note.
+    #[test]
+    fn convert_names_the_custom_screen_of_the_iff_it_writes() {
+        let dir = own_dir("adr46-png-iff");
+        let custom = |size: &str| {
+            format!(
+                "{size} is a custom screen size on PAL:Low Res (standard 320x256); exact \
+                 hardware compatibility is not guaranteed"
+            )
+        };
+        for (w, h) in [(320, 240), (320, 210)] {
+            let png = dir.join(format!("p{w}x{h}.png"));
+            let palette = Palette::new(Palette::dpaint_default_32().colors()[..4].to_vec());
+            std::fs::write(
+                &png,
+                dpx_formats::write_png(&IndexedImage::new(w, h, 3), &palette.unwrap()).unwrap(),
+            )
+            .unwrap();
+            let iff = dir.join(format!("a{w}x{h}.iff"));
+            let notes = convert(&png, &iff).unwrap();
+            assert_eq!(notes, [custom(&format!("{w}x{h}"))]);
+            // The file holds that screen: it reopens with it, and a copy names it the same.
+            let Picture::Ilbm(raw) = load(&iff).unwrap().picture else {
+                panic!("an ILBM");
+            };
+            assert_eq!(
+                (raw.page_width, raw.page_height, raw.camg),
+                (w as i16, h as i16, None)
+            );
+            let t = picture_target(&Picture::Ilbm(raw));
+            assert_eq!((t.mode, t.screen), (DisplayMode::PAL_LORES, (w, h)));
+            assert_eq!(
+                convert(&iff, &dir.join(format!("b{w}x{h}.iff"))).unwrap(),
+                notes
+            );
+            assert!(
+                convert(&png, &dir.join(format!("c{w}x{h}.png")))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        // A standard-size PNG says nothing.
+        let png = dir.join("std.png");
+        std::fs::write(
+            &png,
+            dpx_formats::write_png(
+                &IndexedImage::new(320, 256, 1),
+                &Palette::dpaint_default_32(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(convert(&png, &dir.join("std.iff")).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

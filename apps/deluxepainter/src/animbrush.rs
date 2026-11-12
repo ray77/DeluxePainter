@@ -2296,4 +2296,77 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// ADR-46: on an OCS picture a loaded AnimBrush's palette, taken as it is, comes in
+    /// rounded to 12-bit colours, with a note, in one undo step; the cels keep their numbers.
+    #[test]
+    fn use_brush_palette_rounds_an_animbrushs_colours_on_ocs() {
+        use dpx_core::{Chipset, Rgb8, hardware};
+        let ctx = egui::Context::default();
+        let mut app = PainterApp::new();
+        app.engine
+            .execute(Command::SetFormat {
+                mode: dpx_core::DisplayMode::PAL_LORES,
+                colors: 32,
+                width: 320,
+                height: 256,
+                retain: false,
+                screen: None,
+                chipset: Some(Chipset::Ocs),
+            })
+            .unwrap();
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        // The picture's 12-bit palette with three 24-bit colours.
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[4] = Rgb8::new(10, 200, 30);
+        colors[5] = Rgb8::new(250, 120, 0);
+        colors[6] = Rgb8::new(0x10, 0x20, 0x31);
+        let own = Palette::new(colors).unwrap();
+        let cel = |c: u8| BrushImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0, c],
+            handle: (0, 0),
+            transparent: Some(0),
+        };
+        let file = AnimBrush::new(vec![cel(4), cel(5), cel(6)]);
+        let opts = EncodeOptions {
+            loop_frames: false,
+            transparent: Some(0),
+            grab: Some((0, 0)),
+            ..EncodeOptions::default()
+        };
+        let frames: Vec<IndexedImage> = file.cels.iter().map(BrushImage::to_image).collect();
+        let dir = temp_dir("ocs-palette");
+        let path = dir.join("ocs.anbr");
+        std::fs::write(&path, iff_anim::encode(&frames, &own, &opts).unwrap()).unwrap();
+        app.menu_file_accept(FileKind::LoadAnimBrush, &path, false);
+        app.ui.note_requester = None;
+        assert!(app.anim_brush_in_use());
+        ui_pass(&mut app, &ctx, 0.05, vec![]);
+        let revision = app.engine.document().revision();
+        let t = menu_pick(&mut app, &ctx, 0.1, "palette.use_brush");
+        ui_pass(&mut app, &ctx, t, vec![]);
+        assert_eq!(app.engine.document().revision(), revision + 1, "one change");
+        let pal = app.engine.document().palette().clone();
+        assert!(pal.colors().iter().all(|&c| hardware::is_12_bit(c)));
+        for i in [4, 5, 6] {
+            assert_eq!(
+                pal.get(i),
+                Some(hardware::snap(Chipset::Ocs, own.get(i).unwrap()))
+            );
+        }
+        assert_eq!(pal.get(6), Some(Rgb8::new(0x11, 0x22, 0x33)));
+        assert!(app.anim_brush_in_use());
+        assert_eq!(app.animbrush.brush.as_ref().unwrap().cels, file.cels);
+        let note = app.ui.note_requester.as_ref().expect("a note");
+        assert_eq!(note.title(), "Use Brush Palette");
+        assert_eq!(note.notes(), ["3 colours rounded to 12-bit OCS values"]);
+        app.undo();
+        assert_eq!(
+            app.engine.document().palette(),
+            &Palette::dpaint_default_32()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

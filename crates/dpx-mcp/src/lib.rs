@@ -148,7 +148,8 @@ pub struct ExecuteArgs {
     /// brush, color, filled, symmetry}, `flood_fill` {x, y, color}, `clear` {color}, `flip`
     /// {axis: horizontal|vertical}, `replace_color` {from, to}, `swap_colors` {a, b},
     /// `set_palette` {colors:[{r,g,b}]}, `set_format` {mode, colors, width, height, retain,
-    /// screen}, `set_page_size` {width, height, fill}, `set_page` {width, height, pixels},
+    /// screen, chipset: ocs|aga (optional, default: keep); to OCS the kept 24-bit colours are
+    /// rounded to 12 bits and counted in the result's rounded_colors}, `set_page_size` {width, height, fill}, `set_page` {width, height, pixels},
     /// `merge_page` {width, height, pixels, front, transparent}; frames (ADR-28, numbered
     /// from 0, page ops act on the current frame): `set_frame_count` {count}, `add_frames`
     /// {count}, `copy_frame` {first, last}, `insert_frame_copies` {first, last, before},
@@ -176,6 +177,15 @@ pub struct OutcomeInfo {
     pub can_undo: bool,
     pub can_redo: bool,
     pub dry_run: bool,
+    /// Palette entries the command rounded (or would round) to 12-bit OCS colours: a
+    /// `set_format` to OCS rounds the kept 24-bit entries, so two entries can become one
+    /// colour (ADR-46). Omitted when nothing was rounded.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rounded_colors: u16,
+}
+
+fn is_zero(n: &u16) -> bool {
+    *n == 0
 }
 
 fn outcome_info(o: &dpx_core::Outcome, dry_run: bool) -> OutcomeInfo {
@@ -192,6 +202,7 @@ fn outcome_info(o: &dpx_core::Outcome, dry_run: bool) -> OutcomeInfo {
         can_undo: o.undo_available,
         can_redo: o.redo_available,
         dry_run,
+        rounded_colors: o.rounded_colors,
     }
 }
 
@@ -733,6 +744,50 @@ mod tests {
         p.redo().unwrap();
         assert_eq!(pixel(&p, 12, 12), 5);
         assert_eq!(p.redo().unwrap_err().code, "NOTHING_TO_REDO");
+    }
+
+    /// ADR-46: a set_format to OCS rounds kept 24-bit colours to 12 bits, and the result says
+    /// how many (a dry run too); the field is left out when nothing was rounded.
+    #[test]
+    fn set_format_to_ocs_reports_the_rounded_colours() {
+        let p = Painter::new();
+        let mut colors: Vec<serde_json::Value> = Palette::dpaint_default_32()
+            .colors()
+            .iter()
+            .map(|c| serde_json::json!({"r": c.r, "g": c.g, "b": c.b}))
+            .collect();
+        colors[1] = serde_json::json!({"r": 8, "g": 8, "b": 8});
+        colors[2] = serde_json::json!({"r": 16, "g": 16, "b": 16});
+        colors[3] = serde_json::json!({"r": 16, "g": 32, "b": 49});
+        let run = |command: serde_json::Value, dry_run| {
+            p.execute(&ExecuteArgs {
+                command,
+                expected_revision: None,
+                dry_run,
+            })
+        };
+        let set = run(
+            serde_json::json!({"op": "set_palette", "colors": colors}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(set.rounded_colors, 0);
+        let json = serde_json::to_value(&set).unwrap();
+        assert!(json.get("rounded_colors").is_none(), "{json}");
+        let format = serde_json::json!({
+            "op": "set_format",
+            "mode": {"video": "pal", "resolution": "lo", "interlace": false},
+            "colors": 32, "width": 320, "height": 256, "retain": true, "chipset": "ocs"
+        });
+        let dry = run(format.clone(), true).unwrap();
+        assert_eq!((dry.rounded_colors, dry.revision), (3, 1));
+        let done = run(format, false).unwrap();
+        assert_eq!(done.rounded_colors, 3);
+        assert_eq!(serde_json::to_value(&done).unwrap()["rounded_colors"], 3);
+        let pal = p.palette();
+        assert_eq!(pal.colors[1..4], ["#000000", "#111111", "#112233"]);
+        assert_eq!(p.undo().unwrap().rounded_colors, 0);
+        assert_eq!(p.redo().unwrap().rounded_colors, 3);
     }
 
     #[test]

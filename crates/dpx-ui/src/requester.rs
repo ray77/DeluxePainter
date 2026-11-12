@@ -35,6 +35,10 @@ const VERSION: &str = concat!("Version ", env!("CARGO_PKG_VERSION"));
 
 /// Most lines of a message ("Use" refused) in the information panel.
 const MESSAGE_LINES: usize = 4;
+/// Line pitch of the information panel's lines.
+const INFO_LINE_H: i32 = 9;
+/// Line pitch of a message's lines in its bar.
+const MESSAGE_LINE_H: i32 = 11;
 
 mod geom {
     pub const SCREEN_W: i32 = 640;
@@ -416,8 +420,15 @@ impl ScreenFormatRequester {
         self.scroll = self.scroll.min(self.modes.len().saturating_sub(rows));
     }
 
+    /// Selects the mode in row `i` of the list. Selecting the selected mode again (Up on the
+    /// first row, a click on the selected one) changes nothing, so a Custom preset stays.
     fn select(&mut self, i: usize) {
-        self.selected = i.min(self.modes.len() - 1);
+        let i = i.min(self.modes.len() - 1);
+        if i == self.selected {
+            self.reveal_selected();
+            return;
+        }
+        self.selected = i;
         self.clamp_colors();
         self.reveal_selected();
         self.message = None;
@@ -459,7 +470,18 @@ impl ScreenFormatRequester {
         self.message = Some(text.into());
     }
 
+    /// Feeds one event. A refusal message describes the command it refused: whatever changes
+    /// the command "Use" sends (a gadget, a key, a typed size) clears it.
     pub fn handle(&mut self, event: ReqEvent) -> ReqResponse {
+        let before = self.command();
+        let response = self.handle_event(event);
+        if self.command() != before {
+            self.message = None;
+        }
+        response
+    }
+
+    fn handle_event(&mut self, event: ReqEvent) -> ReqResponse {
         match event {
             ReqEvent::Press(x, y) => {
                 self.pointer = (x, y);
@@ -538,17 +560,24 @@ impl ScreenFormatRequester {
         }
     }
 
+    /// A key for the active number box. Only a change of its text clears the message and
+    /// shows the preset the new size matches: a cursor key, or a key with no box active,
+    /// leaves the Preset gadget as it is (Custom stays Custom).
     fn edit(&mut self, k: ReqKey) {
         if self.screen_choice != ScreenChoice::Custom {
             return;
         }
-        match self.active {
-            Some(0) => self.field_w.key(k),
-            Some(1) => self.field_h.key(k),
-            _ => {}
+        let field = match self.active {
+            Some(0) => &mut self.field_w,
+            Some(1) => &mut self.field_h,
+            _ => return,
+        };
+        let before = field.text().to_string();
+        field.key(k);
+        if field.text() != before {
+            self.message = None;
+            self.sync_preset();
         }
-        self.message = None;
-        self.sync_preset();
     }
 
     fn activate(&self, b: Button) -> ReqResponse {
@@ -877,27 +906,31 @@ impl ScreenFormatRequester {
             format!("Pixel Shape = {fx}:{fy}"),
             format!("Aspect = {ax}:{ay}"),
         ];
-        for (i, line) in lines.iter().enumerate() {
-            font.draw(
-                &mut img,
-                info.x + 6,
-                info.y + 2 + i as i32 * 9,
-                line,
-                pens.dark,
-            );
-        }
-        if let Some(msg) = &self.message {
-            // Wrapped to the panel (up to MESSAGE_LINES lines, from its bottom up), so a long
-            // refusal such as ADR-46's colour rules stays inside it.
+        // A message ("Use" refused) is a bar at the panel's bottom (wrapped, up to
+        // MESSAGE_LINES lines, so a long refusal such as ADR-46's colour rules stays inside);
+        // the information lines it would cut into are left out, never shown in part.
+        let message = self.message.as_ref().map(|msg| {
             let lines = crate::note_requester::wrap(msg, info.w - 12);
-            let shown = lines.len().clamp(1, MESSAGE_LINES) as i32;
-            let top = info.y + info.h - 1 - 11 * shown;
-            img.fill_rect(info.x + 1, top, info.w - 2, 11 * shown, pens.select);
+            let top = message_top(info, lines.len());
+            (lines, top)
+        });
+        let bar_top = message.as_ref().map_or(info.y + info.h, |(_, top)| *top);
+        for (i, line) in lines.iter().enumerate() {
+            let y = info_line_y(info, i);
+            if y + crate::font::GLYPH_H > bar_top {
+                break;
+            }
+            font.draw(&mut img, info.x + 6, y, line, pens.dark);
+        }
+        if let Some((lines, top)) = message {
+            // Inside the bevel (its vertical edges are two pixels wide).
+            let bottom = info.y + info.h - 1;
+            img.fill_rect(info.x + 2, top, info.w - 4, bottom - top, pens.select);
             for (i, line) in lines.iter().take(MESSAGE_LINES).enumerate() {
                 font.draw(
                     &mut img,
                     info.x + 6,
-                    top + 1 + 11 * i as i32,
+                    top + 1 + MESSAGE_LINE_H * i as i32,
                     line,
                     pens.shine,
                 );
@@ -1036,6 +1069,19 @@ fn slider_rect() -> Rect {
         geom::SLIDER_W,
         geom::FIELD_H,
     )
+}
+
+/// Top of the information panel's `i`-th line.
+fn info_line_y(info: Rect, i: usize) -> i32 {
+    info.y + 2 + INFO_LINE_H * i as i32
+}
+
+/// Top of the message bar for a message of `lines` wrapped lines (at most MESSAGE_LINES are
+/// shown): one row above and below each line of text, the bar ending on the panel's last
+/// inner row.
+fn message_top(info: Rect, lines: usize) -> i32 {
+    let shown = lines.clamp(1, MESSAGE_LINES) as i32;
+    info.y + info.h - 1 - (MESSAGE_LINE_H * shown - 1)
 }
 
 fn check_rect() -> Rect {
@@ -1659,6 +1705,136 @@ mod tests {
             .filter(|&y| img.get(info.x + 2, y) == Some(pens.select))
             .count();
         assert!(bar_rows >= 33, "three or more lines: {bar_rows}");
+    }
+
+    /// The message bar covers whole information lines only: the lines above it are drawn
+    /// as without a message, the rows between them and the bar are plain panel, so no line
+    /// shows in part (1 to 4 message lines; one line keeps all six information lines).
+    #[test]
+    fn the_message_bar_never_cuts_an_information_line() {
+        let pens = Pens::from_palette(&palette());
+        let info = Rect::new(geom::RIGHT_X, geom::INFO_Y, geom::RIGHT_W, geom::INFO_H);
+        let plain = req().render();
+        let words = |n: usize| vec!["Retain"; n].join(" ");
+        // Messages of 1 to 4 wrapped lines (6 show as 4), and the information lines left
+        // whole above them.
+        for (message_lines, info_lines) in [(1, 6), (2, 4), (3, 3), (4, 2), (6, 2)] {
+            let text = (1..200)
+                .map(words)
+                .find(|t| crate::note_requester::wrap(t, info.w - 12).len() == message_lines)
+                .expect("a message of that many lines");
+            let mut r = req();
+            r.set_message(text);
+            let img = r.render();
+            let inner = info.x + 2..info.x + info.w - 2;
+            let row_is = |y: i32, pen: u8| inner.clone().all(|x| img.get(x, y) == Some(pen));
+            let top = (info.y..info.y + info.h)
+                .find(|&y| row_is(y, pens.select))
+                .expect("the bar");
+            let last_line_end = info.y + 2 + 9 * (info_lines - 1) + crate::font::GLYPH_H;
+            for y in info.y + 1..last_line_end {
+                for x in inner.clone() {
+                    assert_eq!(
+                        img.get(x, y),
+                        plain.get(x, y),
+                        "{message_lines}: ({x}, {y})"
+                    );
+                }
+            }
+            assert!(
+                last_line_end <= top,
+                "{message_lines}: {last_line_end} {top}"
+            );
+            for y in last_line_end..top {
+                assert!(
+                    row_is(y, pens.face),
+                    "{message_lines}: row {y} is plain panel"
+                );
+            }
+            // The bar reaches the panel's last inner row; its text has a row above and below.
+            let bottom = info.y + info.h - 2;
+            assert!((top..=bottom).all(|y| img.get(info.x + 2, y) == Some(pens.select)));
+            assert_eq!(bottom + 1 - top, 11 * message_lines.min(4) as i32 - 1);
+            assert!(row_is(top, pens.select) && row_is(bottom, pens.select));
+        }
+    }
+
+    /// A refusal describes the command it refused: Retain Picture (key or click), Page Size
+    /// and the other gadgets that change what Use sends clear it; keys that change nothing
+    /// keep it.
+    #[test]
+    fn a_change_to_what_use_sends_clears_the_message() {
+        let refusal = "the picture uses colour 31; turn Retain Picture off";
+        // A page larger than the screen, so Keep Same changes the page Use sends.
+        let mut r = ScreenFormatRequester::new(Target::default(), (640, 400), 32);
+        r.set_message(refusal);
+        r.handle(ReqEvent::Key(ReqKey::Char('r')));
+        assert!(!r.retain);
+        assert_eq!(r.message, None, "key r");
+        for at in [check_rect(), retain_label_rect()] {
+            r.set_message(refusal);
+            r.handle(ReqEvent::Press(at.x + 4, at.y + at.h / 2));
+            r.handle(ReqEvent::Release);
+            assert_eq!(r.message, None, "click on {at:?}");
+        }
+        r.set_message(refusal);
+        r.handle(ReqEvent::Press(geom::CYCLE_X + 50, geom::PAGE_SIZE_Y + 5));
+        assert_eq!((r.page, r.page_size()), (PageChoice::KeepSame, (640, 400)));
+        assert_eq!(r.message, None, "Page Size");
+        // Nothing changes: the message stays.
+        r.set_message(refusal);
+        for k in [
+            ReqKey::Left,
+            ReqKey::Home,
+            ReqKey::Backspace,
+            ReqKey::Char('x'),
+        ] {
+            r.handle(ReqEvent::Key(k));
+        }
+        r.handle(ReqEvent::Scroll(1));
+        assert_eq!(r.message.as_deref(), Some(refusal));
+    }
+
+    /// Custom, picked with the Preset gadget, stays until the mode or the size changes: keys
+    /// that change nothing do not flip it back to the preset of the same format, so the next
+    /// press goes on to the first preset.
+    #[test]
+    fn custom_stays_until_something_changes() {
+        let to_custom = || {
+            let mut r = req();
+            while preset_ids(&r) != "custom" {
+                r.handle(ReqEvent::Key(ReqKey::Char('p')));
+            }
+            assert_eq!(r.mode().name(), "PAL:High Res Laced");
+            r
+        };
+        let mut r = to_custom();
+        for k in [
+            ReqKey::Left,
+            ReqKey::Home,
+            ReqKey::End,
+            ReqKey::Backspace,
+            ReqKey::Tab,
+            ReqKey::Right,
+        ] {
+            r.handle(ReqEvent::Key(k));
+            assert_eq!(preset_ids(&r), "custom", "{k:?}");
+        }
+        // A click on the selected mode, too.
+        let row = (r.selected - r.scroll) as i32;
+        r.handle(ReqEvent::Press(list_rect().x + 20, row_y(row)));
+        r.handle(ReqEvent::Release);
+        assert_eq!(preset_ids(&r), "custom");
+        r.handle(ReqEvent::Key(ReqKey::Char('p')));
+        assert_eq!(preset_ids(&r), "ntsc_lores");
+        // A real change of the size shows the preset it matches.
+        let mut r = to_custom();
+        r.handle(ReqEvent::Key(ReqKey::Tab));
+        r.handle(ReqEvent::Key(ReqKey::End));
+        r.handle(ReqEvent::Key(ReqKey::Backspace));
+        type_str(&mut r, "0");
+        assert_eq!(r.screen_size(), (640, 512));
+        assert_eq!(preset_ids(&r), "pal_hires_laced");
     }
 
     #[test]

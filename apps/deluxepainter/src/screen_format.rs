@@ -5,7 +5,8 @@
 //!   `dpx_core::hardware`'s, the check is `files::check_hardware`.
 //! - Palette colours that come from elsewhere (Palette ▸ Load.., Restore Palette) are rounded
 //!   to 12 bits on an OCS picture, with a note ([`PainterApp::chipset_colors`]); the Screen
-//!   Format requester names the colours a change to OCS rounds ([`rounded_by`]).
+//!   Format requester names the colours a change to OCS rounds ([`rounded_note`], counted
+//!   by the engine in `Outcome::rounded_colors`).
 //! - `--chipset` and `--preset` set up the picture of a `--snapshot` ([`snapshot_format`]);
 //!   `--requester-keys` drives the Screen Format requester ([`snapshot_requester`]) and
 //!   `--export-note` shows what Picture ▸ Export.. would say ([`snapshot_export_note`]).
@@ -26,26 +27,10 @@ pub(crate) const FORMAT_CHANGED: &str = "Screen format changed";
 pub(crate) const NOT_EXPORTED: &str = "Picture not exported";
 pub(crate) const ANIM_NOT_SAVED: &str = "Animation not saved";
 
-/// How many kept palette entries `command` rounds to 12 bits: a SetFormat that makes the
-/// picture OCS rounds the entries of an AGA palette (ADR-46); 0 for anything else.
-pub(crate) fn rounded_by(command: &Command, doc: &Document) -> usize {
-    let Command::SetFormat {
-        colors, chipset, ..
-    } = command
-    else {
-        return 0;
-    };
-    let chipset = chipset.unwrap_or(doc.target().chipset);
-    let kept = usize::from(*colors).min(doc.palette().len());
-    doc.palette().colors()[..kept]
-        .iter()
-        .filter(|&&c| hardware::snap(chipset, c) != c)
-        .count()
-}
-
-/// The note after a Screen Format change that rounded `n` palette colours, if any.
-pub(crate) fn rounded_note(n: usize) -> Option<NoteRequester> {
-    (n > 0).then(|| NoteRequester::new(FORMAT_CHANGED, &[hardware::rounded_note(n)]))
+/// The note after a Screen Format change that rounded `n` palette colours, if any (the
+/// engine counts them: `Outcome::rounded_colors`).
+pub(crate) fn rounded_note(n: u16) -> Option<NoteRequester> {
+    (n > 0).then(|| NoteRequester::new(FORMAT_CHANGED, &[hardware::rounded_note(n.into())]))
 }
 
 /// `--chipset ocs|aga` and `--preset ID` of a `--snapshot`: one SetFormat that keeps the
@@ -366,13 +351,26 @@ mod tests {
         let mut app = PainterApp::new();
         app.engine = Engine::new(bad);
         app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        // Files of those names exist: the refusal comes before the overwrite question, and
+        // they are left as they are.
+        let old = b"not a picture".to_vec();
+        for name in ["Hi.iff", "Hi.anim"] {
+            std::fs::write(dir.join(name), &old).unwrap();
+        }
         ui_pass(&mut app, &ctx, 0.0, vec![]);
         pick(&mut app, &ctx, 0.1, "picture.export");
         assert!(app.ui.file_requester.is_some());
         typed(&mut app, &ctx, 0.2, "Hi.iff");
         enter(&mut app, &ctx, 0.3);
-        assert!(app.ui.file_requester.is_none(), "closed");
-        assert!(!dir.join("Hi.iff").exists(), "nothing written");
+        assert!(
+            app.ui.file_requester.is_none(),
+            "closed, no overwrite question"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("Hi.iff")).unwrap(),
+            old,
+            "nothing written"
+        );
         let note = app.ui.note_requester.take().expect("the refusal");
         assert_eq!(note.title(), NOT_EXPORTED);
         assert_eq!(
@@ -393,7 +391,11 @@ mod tests {
         app.open_file_requester(dpx_ui::FileKind::SaveAnim);
         typed(&mut app, &ctx, 0.9, "Hi");
         enter(&mut app, &ctx, 1.0);
-        assert!(!dir.join("Hi.anim").exists());
+        assert!(
+            app.ui.file_requester.is_none(),
+            "closed, no overwrite question"
+        );
+        assert_eq!(std::fs::read(dir.join("Hi.anim")).unwrap(), old);
         assert_eq!(
             app.ui.note_requester.as_ref().unwrap().title(),
             ANIM_NOT_SAVED
@@ -493,29 +495,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The engine counts the rounded kept entries (dpx-core tests); the note names them.
     #[test]
-    fn rounded_by_counts_kept_entries_only() {
-        let mut colors = Palette::dpaint_default_32().colors().to_vec();
-        colors[3] = Rgb8::new(1, 2, 3);
-        colors[20] = Rgb8::new(1, 2, 3);
-        let doc = Document::from_picture(
-            IndexedImage::new(320, 256, 0),
-            Palette::new(colors).unwrap(),
-            Target::default(),
-        );
-        let fmt = |colors, chipset| Command::SetFormat {
-            mode: DisplayMode::PAL_LORES,
-            colors,
-            width: 320,
-            height: 256,
-            retain: false,
-            screen: None,
-            chipset,
-        };
-        assert_eq!(rounded_by(&fmt(32, Some(Chipset::Ocs)), &doc), 2);
-        assert_eq!(rounded_by(&fmt(16, Some(Chipset::Ocs)), &doc), 1);
-        assert_eq!(rounded_by(&fmt(32, None), &doc), 0, "stays AGA");
-        assert_eq!(rounded_by(&Command::Clear { color: 0 }, &doc), 0);
+    fn rounded_note_names_the_engines_count() {
         assert!(rounded_note(0).is_none());
+        let note = rounded_note(1).unwrap();
+        assert_eq!(note.title(), FORMAT_CHANGED);
+        assert_eq!(note.notes(), ["1 colour rounded to a 12-bit OCS value"]);
     }
 }

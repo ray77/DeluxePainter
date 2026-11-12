@@ -1414,15 +1414,15 @@ impl PainterApp {
             ReqResponse::Continue => {}
             ReqResponse::Cancel => self.requester = None,
             ReqResponse::Use(command) => {
-                // ADR-46: palette colours a change to OCS rounds to 12 bits are named.
-                let rounded = screen_format::rounded_by(&command, self.engine.document());
                 match self.engine.execute(command) {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         self.requester = None;
                         // Colours beyond the new palette would be invalid.
                         self.clamp_colors();
                         self.clamp_scroll();
-                        self.ui.note_requester = screen_format::rounded_note(rounded);
+                        // ADR-46: palette colours a change to OCS rounds to 12 bits are named.
+                        self.ui.note_requester =
+                            screen_format::rounded_note(outcome.rounded_colors);
                     }
                     Err(e) => req.set_message(e.message),
                 }
