@@ -693,6 +693,11 @@ impl PainterApp {
 }
 
 /// The GUI's editor state for the tools, borrowed for one job.
+// TODO(wave8-integration): layers (ADR-44): changes go to the active layer, and
+// list_layers / create_layer / select_layer map onto the layer panel's state here.
+// TODO(wave8-integration): generation (ADR-45): generated pictures reach the editor through
+// `replace_picture` (Picture), `set_spare_page` (Spare page) and `set_brush` (Brush), as
+// `import_image` does; "New layer" comes with ADR-44.
 struct GuiWorkspace<'a>(&'a mut PainterApp);
 
 impl Workspace for GuiWorkspace<'_> {
