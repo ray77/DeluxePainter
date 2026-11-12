@@ -1,11 +1,15 @@
-//! Opening and encoding indexed pictures (IFF ILBM, indexed PNG) for the file tools.
+//! Opening and encoding pictures for the file tools: indexed IFF ILBM / ANIM / PNG and
+//! `.dpxproj` projects for `open_picture`, PNG and JPEG as RGBA for `import_image` (ADR-43),
+//! and the export encoders with their hardware validation.
 //!
 //! This mirrors the indexed paths of the app's `files.rs` (`open_picture`, `encode_document`)
-//! because the app crate depends on this one. True-colour PNG and JPEG need the app's colour
-//! reduction (ADR-9) and are not supported here (ADR-24).
+//! because the app crate depends on this one. `open_picture` keeps refusing true-colour PNG
+//! and JPEG (ADR-24): they go through `import_image`, which converts them with
+//! `dpx_core::import` into the current document's format (ADR-42).
 
 use dpx_core::quantize::PaletteDepth;
-use dpx_core::{DisplayMode, Document, IndexedImage, Palette, Rgb8, Target};
+use dpx_core::{DisplayMode, Document, IndexedImage, Palette, Rgb8, RgbaImage, Target};
+use dpx_formats::project::{self, Project, ProjectExtras};
 use dpx_iff::{Ilbm, Masking, SpecialMode, ilbm};
 
 use crate::error::ToolError;
@@ -21,8 +25,8 @@ pub enum Format {
     Anim,
 }
 
-/// Output format by extension: `.iff`, `.ilbm`, `.lbm` (IFF ILBM) or `.png`. Unlike the GUI,
-/// unknown extensions are refused instead of defaulting to ILBM.
+/// Export format by extension: `.iff`, `.ilbm`, `.lbm` (IFF ILBM), `.png` or `.anim`. Unlike
+/// the GUI, unknown extensions are refused instead of defaulting to ILBM.
 pub fn format_for_save(path: &str) -> Result<Format, ToolError> {
     let ext = std::path::Path::new(path)
         .extension()
@@ -34,11 +38,15 @@ pub fn format_for_save(path: &str) -> Result<Format, ToolError> {
         Some("anim") => Ok(Format::Anim),
         Some("jpg" | "jpeg") => Err(ToolError::new(
             "UNSUPPORTED_FILE_TYPE",
-            "JPEG is import-only: save as .iff or .png",
+            "JPEG is import-only: export as .iff or .png",
+        )),
+        Some("dpxproj") => Err(ToolError::new(
+            "UNSUPPORTED_FILE_TYPE",
+            ".dpxproj is the project format: use save_project",
         )),
         _ => Err(ToolError::new(
             "UNSUPPORTED_FILE_TYPE",
-            "save_picture writes .iff/.ilbm/.lbm (IFF ILBM), .png (indexed PNG) and .anim (IFF ANIM)",
+            "export_image writes .iff/.ilbm/.lbm (IFF ILBM), .png (indexed PNG) and .anim (IFF ANIM)",
         )),
     }
 }
@@ -84,7 +92,7 @@ pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>
         match i.special {
             Some(SpecialMode::Ham6 | SpecialMode::Ham8) => {
                 return Err(unsupported(format!(
-                    "{name}: HAM pictures cannot be opened over MCP (HAM is decoded to true colour and reduced by the app); open an indexed ILBM or PNG"
+                    "{name}: HAM pictures cannot be opened over MCP (HAM is decoded to true colour and reduced by the app); open it in the app, or open an indexed ILBM or PNG"
                 )));
             }
             Some(SpecialMode::Ehb) => ehb_to_indexed(&mut i, &mut notes),
@@ -119,13 +127,13 @@ pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>
             }
             dpx_formats::PngImage::TrueColor(_) => {
                 return Err(unsupported(format!(
-                    "{name}: true-colour PNG cannot be opened over MCP (colour reduction is app-level); open an indexed PNG or an IFF ILBM"
+                    "{name}: true-colour PNG: open_picture opens indexed pictures; use import_image to convert it into the document"
                 )));
             }
         }
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Err(unsupported(format!(
-            "{name}: JPEG is true colour and cannot be opened over MCP; open an indexed PNG or an IFF ILBM"
+            "{name}: JPEG is true colour: use import_image to convert it into the document"
         )));
     } else {
         return Err(unsupported(format!(
@@ -153,6 +161,71 @@ pub fn decode_picture(name: &str, bytes: &[u8]) -> Result<(Document, Vec<String>
         page
     };
     Ok((Document::from_picture(image, palette, target), notes))
+}
+
+/// A `.dpxproj` project (ADR-23): the document, its extras and the spare page.
+pub fn decode_project(
+    name: &str,
+    bytes: &[u8],
+) -> Result<(Document, ProjectExtras, Option<IndexedImage>), ToolError> {
+    let p = project::read_project(bytes).map_err(|e| bad_file(name, e.details()))?;
+    Ok((p.document, p.extras, p.spare))
+}
+
+/// The project bytes of `doc` with its extras and spare page.
+pub fn encode_project(
+    doc: &Document,
+    extras: ProjectExtras,
+    spare: Option<IndexedImage>,
+) -> Result<Vec<u8>, ToolError> {
+    let mut p = Project::new(doc.clone(), extras);
+    p.spare = spare;
+    project::write_project(&p).map_err(|e| ToolError::new("IO_ERROR", e.details()))
+}
+
+/// Largest picture `import_image` decodes, in pixels (as for PNG and JPEG import).
+pub const MAX_IMPORT_PIXELS: u64 = 64 * 1024 * 1024;
+
+/// A PNG (indexed or true colour) or JPEG as RGBA for `import_image`, with its number of
+/// colours (`None` above 256) and notes. Other files are refused.
+pub fn decode_rgba(
+    name: &str,
+    bytes: &[u8],
+) -> Result<(RgbaImage, Option<usize>, Vec<String>), ToolError> {
+    let mut notes = Vec::new();
+    let image = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        match dpx_formats::read_png(bytes).map_err(|e| bad_file(name, e.details()))? {
+            dpx_formats::PngImage::Indexed(p) => {
+                if !p.transparent_entries.is_empty() {
+                    notes.push(format!(
+                        "PNG transparency of {} palette entries is ignored",
+                        p.transparent_entries.len()
+                    ));
+                }
+                dpx_core::import::rgba_of(&p.image, &p.palette)
+            }
+            dpx_formats::PngImage::TrueColor(img) => img,
+        }
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        dpx_formats::read_jpeg(bytes).map_err(|e| bad_file(name, e.details()))?
+    } else if bytes.starts_with(b"FORM") {
+        return Err(unsupported(format!(
+            "{name}: IFF pictures are opened with open_picture, not imported"
+        )));
+    } else {
+        return Err(unsupported(format!(
+            "{name}: import_image reads PNG and JPEG pictures"
+        )));
+    };
+    if u64::from(image.width()) * u64::from(image.height()) > MAX_IMPORT_PIXELS {
+        return Err(ToolError::invalid(format!(
+            "{name}: {}x{} pixels exceed the {MAX_IMPORT_PIXELS} pixel limit",
+            image.width(),
+            image.height()
+        )));
+    }
+    let colors = dpx_core::import::count_colors(&image, 256);
+    Ok((image, colors, notes))
 }
 
 /// An IFF ANIM as a multi-frame document, like the app's Load (ADR-32).

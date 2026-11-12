@@ -19,6 +19,7 @@ pub mod imagegen_setup;
 pub mod import_requester;
 // The layer panel (ADR-44).
 pub mod layer_panel;
+pub mod mcp_requester;
 pub mod menu;
 pub mod note_requester;
 pub mod page_size_requester;
@@ -59,6 +60,7 @@ pub use import_requester::{
     ImportControl, ImportInfo, ImportRequester, ImportResponse, ImportRow, overlay_rgb,
 };
 pub use layer_panel::{LayerButton, LayerHit, LayerPanel, LayerRow, RenameStep};
+pub use mcp_requester::{McpControl, McpRequester, McpResponse, McpView};
 pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};
 pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};

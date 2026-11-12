@@ -562,6 +562,8 @@ pub static MENUS: [Menu; 7] = [
             pref("FastAdjust", Pref::FastAdjust),
             // ADR-44: the layer panel (DeluxePainter addition).
             pref_key("Layers", plain("L"), Pref::LayerPanel),
+            // ADR-43: a DeluxePainter addition; Pixel Size stays the last item.
+            cmd("AI & MCP..", "app.ai_mcp"),
             sub(
                 "Pixel Size",
                 &[
@@ -725,6 +727,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "translucency.settings",
     // Prefs
     "view.largest_pixel_size",
+    "app.ai_mcp",
     // Anim > Frames and Control, Effect > LightTable (ADR-28); AnimBrush, Move, Panel, Set
     // Range and Method stay ghosted.
     "anim.set_frame_count",
@@ -1295,6 +1298,21 @@ mod tests {
         // Leaving all boxes clears the selection.
         st.pointer(320, 256, 300, 250);
         assert_eq!(st.hovered_action(&ctx()), None);
+    }
+
+    #[test]
+    fn ai_and_mcp_comes_right_before_pixel_size() {
+        // ADR-43: Prefs > AI & MCP.. opens the MCP requester; it is implemented.
+        let items = MENUS.last().unwrap().items;
+        let item = &items[items.len() - 2];
+        assert_eq!(item.label, "AI & MCP..");
+        assert!(matches!(
+            item.entry,
+            Entry::Action(Action::Command("app.ai_mcp"))
+        ));
+        assert!(IMPLEMENTED.contains(&"app.ai_mcp"));
+        // The font has every character of the label.
+        assert!(item.label.chars().all(|c| (' '..='~').contains(&c)));
     }
 
     #[test]

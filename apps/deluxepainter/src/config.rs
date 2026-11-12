@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::PainterApp;
 use crate::import::{self, ImportSettings};
+use crate::mcp::McpSettings;
 
 /// Version written to the file. Newer files are read as far as their fields are known.
 pub const VERSION: u64 = 1;
@@ -48,6 +49,8 @@ pub struct Config {
     pub import: ImportSettings,
     /// The image generator, its model and quality (ADR-45; the API key is never here).
     pub image_generator: crate::generate::ImageGenSettings,
+    /// The MCP server of the running app (ADR-43).
+    pub mcp: McpSettings,
 }
 
 impl Default for Config {
@@ -72,6 +75,7 @@ impl Default for Config {
             light: anim.light,
             import: ImportSettings::default(),
             image_generator: crate::generate::ImageGenSettings::default(),
+            mcp: McpSettings::default(),
         }
     }
 }
@@ -204,6 +208,7 @@ impl Config {
         };
         c.image_generator =
             crate::generate::ImageGenSettings::from_json(&section(o, "image_generator"));
+        c.mcp = McpSettings::from_json(&section(o, "mcp"), &d.mcp);
         Some(c)
     }
 
@@ -257,6 +262,7 @@ impl Config {
                 "spare": self.light.spare,
                 "dim": self.light.dim,
             },
+            "mcp": self.mcp.to_json(),
         })
     }
 
@@ -282,6 +288,7 @@ impl Config {
             light: app.anim.light,
             import: app.import.settings,
             image_generator: app.imagegen.settings.clone(),
+            mcp: app.mcp.settings.clone(),
         }
     }
 
@@ -307,29 +314,17 @@ impl Config {
         app.anim.light = self.light;
         app.import.settings = self.import;
         app.imagegen.settings = self.image_generator.clone();
+        app.mcp.settings = self.mcp.clone();
     }
 }
 
 /// The directory for the settings file: `DPX_CONFIG_DIR` if set, else the platform's config
 /// directory (macOS `~/Library/Application Support`, Windows `%APPDATA%`, elsewhere
-/// `$XDG_CONFIG_HOME` or `~/.config`) plus `DeluxePainter`.
+/// `$XDG_CONFIG_HOME` or `~/.config`) plus `DeluxePainter`. The rule lives in
+/// `dpx_mcp::paths` (ADR-43) so the MCP endpoint files and the stdio bridge use the same
+/// directory.
 pub fn default_dir() -> Option<PathBuf> {
-    let env = |k: &str| {
-        std::env::var_os(k)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    if let Some(d) = env("DPX_CONFIG_DIR") {
-        return Some(d);
-    }
-    let base = if cfg!(target_os = "macos") {
-        env("HOME")?.join("Library/Application Support")
-    } else if cfg!(windows) {
-        env("APPDATA")?
-    } else {
-        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))?
-    };
-    Some(base.join("DeluxePainter"))
+    dpx_mcp::paths::config_dir()
 }
 
 /// The settings file and what was last written to it.
@@ -654,6 +649,18 @@ mod tests {
         if std::env::var_os("DPX_CONFIG_DIR").is_none() && std::env::var_os("HOME").is_some() {
             let d = default_dir().expect("a home directory");
             assert!(d.ends_with("DeluxePainter"));
+        }
+    }
+
+    #[test]
+    fn settings_and_mcp_endpoint_files_share_one_directory() {
+        // ADR-43: the bridge finds the endpoint file next to the settings file.
+        assert_eq!(default_dir(), dpx_mcp::paths::config_dir());
+        if let Some(d) = default_dir() {
+            assert_eq!(
+                dpx_mcp::endpoint::endpoint_path(&d).parent(),
+                Some(d.join(FILE).parent().unwrap())
+            );
         }
     }
 }

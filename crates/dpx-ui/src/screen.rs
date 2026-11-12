@@ -98,6 +98,9 @@ pub struct UiState {
     pub generate_requester: Option<crate::generate_requester::GenerateRequester>,
     /// The Image Generator setup (ADR-45), drawn over the Generate requester.
     pub imagegen_setup: Option<crate::imagegen_setup::ImageGenSetupRequester>,
+    /// Prefs ▸ AI & MCP.. while it is open (ADR-43); drawn under the choice requester, which
+    /// asks its questions.
+    pub mcp_requester: Option<crate::mcp_requester::McpRequester>,
     /// Notes after Load/Save while shown (drawn over everything else).
     pub note_requester: Option<NoteRequester>,
     /// Recover Picture and Quit without saving? (ADR-34).
@@ -187,6 +190,7 @@ impl Default for UiState {
             import_requester: None,
             generate_requester: None,
             imagegen_setup: None,
+            mcp_requester: None,
             note_requester: None,
             choice_requester: None,
             palette_requester: None,
@@ -388,6 +392,9 @@ impl Screen {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.import_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.mcp_requester {
             req.draw(img, pens);
         }
         // ADR-45: Picture ▸ Generate.. and its setup on top.

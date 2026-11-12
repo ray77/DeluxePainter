@@ -41,11 +41,26 @@
 //!     [--export-note NAME]              the note Picture > Export.. shows for NAME (ADR-46)
 //!     [--layers-panel [docked]]         show the layer panel (ADR-44) over the screen's right
 //!                                       edge, or docked in the work area right of the screen
+//!     [--mcp-calls FILE.json]           run a JSON array of {"tool", "arguments"} MCP tool
+//!                                       calls on the GUI workspace first (ADR-43)
+//!     [--mcp-question NAME]             the question before an MCP client replaces file NAME
+//!     [--mcp-prefs STATE]               Prefs ▸ AI & MCP: off, ready, connected (with the
+//!                                       --mcp-calls in its activity), fallback, error,
+//!                                       code-confirm, code-replace, code-missing,
+//!                                       desktop-missing or disconnect (ADR-43)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
+//! `deluxepainter --mcp`                 start the GUI with its MCP server on for this session
+//!                                       (Streamable HTTP on 127.0.0.1, ADR-43); ends at once
+//!                                       while another DeluxePainter runs
 //! `deluxepainter info <file>`           describe an IFF ILBM, PNG, JPEG or .dpxproj file
 //! `deluxepainter convert <in> <out>`    convert to IFF ILBM, PNG or .dpxproj
+//! `deluxepainter mcp [--allow-dir DIR]...` headless MCP server on stdio (ADR-21, ADR-24)
+//! `deluxepainter mcp --http [--port N] [--allow-dir DIR]...` headless MCP server on
+//!                                       http://127.0.0.1:N/mcp; port and bearer token in the
+//!                                       endpoint file of the config directory (ADR-43)
+//! `deluxepainter mcp-bridge`            stdio MCP bridge to the running app (ADR-43)
 
 mod anim;
 mod anim_control;
@@ -57,12 +72,15 @@ mod brush_menu;
 #[cfg(test)]
 mod composite_tests;
 mod config;
+mod connect;
 mod effects;
 mod files;
 mod generate;
 mod import;
 // The layer panel (ADR-44).
 mod layers;
+mod mcp;
+mod mcp_prefs;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -245,6 +263,7 @@ fn main() -> eframe::Result {
                 .map(|notes| notes.iter().for_each(|n| eprintln!("note: {n}"))),
         ),
         (Some("mcp"), rest) => exit_with(dpx_mcp::run_cli(rest)),
+        (Some("mcp-bridge"), rest) => exit_with(dpx_mcp::bridge::run_cli(rest)),
         (Some("info" | "convert"), _) => {
             eprintln!("usage: deluxepainter info <file> | convert <in> <out>");
             std::process::exit(2);
@@ -532,12 +551,25 @@ fn main() -> eframe::Result {
             eprintln!("{e}");
             std::process::exit(code);
         });
-        // After Apply the picture may have a screen of its own.
+        // ADR-43: MCP tool calls on the GUI workspace, and Prefs ▸ AI & MCP showing them.
+        let doc = match mcp_prefs::snapshot(&args, &doc, &mut ui) {
+            Ok(changed) => changed,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+        // Apply or a call may have made a picture of another screen or display mode.
         let view = View::of_target(doc.target());
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
             ui.note_requester = note_requester(LOADED, notes);
+        }
+        // ADR-43: the question before an MCP client replaces a file.
+        if let Some(name) = arg_value(&args, "--mcp-question") {
+            let q = dpx_mcp::tools::overwrite_question(Some("claude-code"), &name);
+            ui.choice_requester = Some(mcp::question_requester(&q));
         }
         if args.iter().any(|a| a == "--recover-requester") {
             ui.choice_requester = Some(autosave::recover_requester(
@@ -626,6 +658,16 @@ fn main() -> eframe::Result {
             None => (None, config::Config::default()),
         }
     };
+    let mcp_flag = args.iter().any(|a| a == "--mcp");
+    // ADR-43: the first GUI holds `mcp-app.lock`, so the bridge never starts a second one;
+    // a `--mcp` start (the bridge's) while another GUI runs ends here.
+    let instance = match mcp::claim_instance(config::default_dir().as_deref(), mcp_flag) {
+        Ok(claim) => claim,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
     let start = if settings.pixel_size == PixelSize::default().0 {
         egui::vec2(START_W, START_H)
     } else {
@@ -660,6 +702,12 @@ fn main() -> eframe::Result {
             // ADR-45: API keys in the system keychain, opened on first use (tests and
             // snapshots keep them in memory).
             app.imagegen.system_keys = true;
+            // ADR-43: the MCP server keeps its token and endpoint next to the settings and
+            // wakes the window when a call arrives.
+            app.mcp.config_dir = config::default_dir();
+            app.mcp.wake = Some(cc.egui_ctx.clone());
+            app.mcp.session = mcp_flag;
+            app.mcp.instance = instance;
             if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
                 app.ui.note_requester = note_requester(LOADED, &notes);
@@ -986,6 +1034,10 @@ struct PainterApp {
     layers: layers::State,
     /// Picture ▸ Generate.., its jobs, keys and settings (ADR-45, generate.rs).
     imagegen: generate::ImageGenState,
+    /// The MCP server and its jobs on the UI thread (ADR-43, mcp.rs).
+    mcp: mcp::Host,
+    /// Prefs ▸ AI & MCP's connect flows (ADR-43, mcp_prefs.rs).
+    mcp_prefs: mcp_prefs::PrefsState,
 }
 
 impl PainterApp {
@@ -1028,6 +1080,8 @@ impl PainterApp {
             import: import::ImportState::default(),
             layers: layers::State::default(),
             imagegen: generate::ImageGenState::default(),
+            mcp: mcp::Host::default(),
+            mcp_prefs: mcp_prefs::PrefsState::default(),
         }
     }
 
@@ -1048,6 +1102,7 @@ impl PainterApp {
             || ui.import_requester.is_some()
             || ui.generate_requester.is_some()
             || ui.imagegen_setup.is_some()
+            || ui.mcp_requester.is_some()
             || self.show_page.is_some()
             || ui.anim_control.is_some()
             || self.anim_control.preview.is_some()
@@ -1063,6 +1118,7 @@ impl PainterApp {
         self.extras = extras;
         // ADR-45: a new engine, so the page's own history of details starts over.
         self.menu_data.page_history.shown = Default::default();
+        self.mcp.name = None;
         self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
         self.picture_path = Some(path);
         self.clamp_colors();
@@ -1675,6 +1731,8 @@ impl PainterApp {
                 "spare.delete" => self.delete_page(),
                 "picture.delete" => self.open_file_requester(FileKind::DeleteFile),
                 "app.about" => self.show_about(),
+                // ADR-43 (mcp_prefs.rs).
+                "app.ai_mcp" => self.open_mcp_prefs(),
                 "color.cycle" => {
                     self.toggle_cycling(ctx.input(|i| i.time));
                     // This pass's clock tick has run already; the next one keeps it going.
@@ -1744,6 +1802,15 @@ impl eframe::App for PainterApp {
         if let Some(mut store) = self.config.take() {
             store.flush(config::Config::capture(self));
         }
+        // ADR-43: the server stops with the app and removes its endpoint file;
+        // `mcp-app.json` keeps the saved MCP control setting.
+        self.mcp_exit();
+    }
+
+    /// Runs before every `ui` pass and while the window is hidden: MCP calls are served
+    /// even when the window is minimised (ADR-43).
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.mcp_logic(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1828,6 +1895,12 @@ impl eframe::App for PainterApp {
         // ADR-45: Picture ▸ Generate.. and the Image Generator setup.
         if self.ui.generate_requester.is_some() || self.ui.imagegen_setup.is_some() {
             self.generate_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-43: Prefs ▸ AI & MCP.. (its questions use the choice requester above).
+        if self.ui.mcp_requester.is_some() {
+            self.mcp_prefs_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -2680,7 +2753,11 @@ mod tests {
             ..Default::default()
         };
         let mut frame = eframe::Frame::_new_kittest();
-        let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+        // As eframe: `logic` (MCP jobs, ADR-43) before `ui` in every pass.
+        let mut out = ctx.run_ui(raw, |ui| {
+            eframe::App::logic(app, ui.ctx(), &mut frame);
+            eframe::App::ui(app, ui, &mut frame)
+        });
         // The font atlas and screen uploads are not needed in a test.
         out.textures_delta.clear();
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay

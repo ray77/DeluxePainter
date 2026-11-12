@@ -1,6 +1,6 @@
 [package]
 name = "dpx-mcp"
-description = "DeluxePainter MCP server (rmcp, stdio): thin tools over the dpx-core command engine"
+description = "DeluxePainter MCP server (rmcp; stdio, Streamable HTTP and the stdio bridge): tools over the dpx-core command engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,13 +12,34 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 base64 = "0.23"
 dpx-core.workspace = true
 dpx-formats.workspace = true
 dpx-iff.workspace = true
+getrandom = "0.3"
 png.workspace = true
-rmcp = { version = "3.9", features = ["server", "macros", "transport-io"] }
+# The bridge's own HTTP client (no proxy): the version and features rmcp's
+# transport-streamable-http-client-reqwest already uses, so no crate is added.
+reqwest = { version = "0.13", default-features = false }
+rmcp = { version = "3.9", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 schemars = "1"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+tokio-util = "0.7"

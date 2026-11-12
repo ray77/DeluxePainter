@@ -1,0 +1,9 @@
+[
+{"tool": "create_document", "arguments": {"preset": "ntsc_lores", "chipset": "ocs", "colors": 32, "name": "Sunset"}},
+{"tool": "set_palette_color", "arguments": {"index": 20, "color": "#FF8844"}},
+{"tool": "draw_rectangle", "arguments": {"x": 0, "y": 0, "width": 320, "height": 140, "color": 20, "filled": true}},
+{"tool": "draw_ellipse", "arguments": {"cx": 160, "cy": 140, "rx": 40, "ry": 40, "color": 5, "filled": true}},
+{"tool": "draw_line", "arguments": {"x1": 0, "y1": 140, "x2": 319, "y2": 140, "color": 0}},
+{"tool": "export_image", "arguments": {"path": "sunset.iff"}},
+{"tool": "get_preview", "arguments": {}}
+]

@@ -793,7 +793,16 @@ pub fn encode_document(
     extras: &PictureExtras,
     path: &Path,
 ) -> Result<(Vec<u8>, Vec<String>), String> {
-    let format = save_format(path)?;
+    encode_as(doc, extras, save_format(path)?)
+}
+
+/// [`encode_document`] in a format chosen by the caller (MCP's `export_image` names it,
+/// ADR-43).
+pub fn encode_as(
+    doc: &Document,
+    extras: &PictureExtras,
+    format: SaveFormat,
+) -> Result<(Vec<u8>, Vec<String>), String> {
     check_hardware(doc, format).map_err(|e| refused(&e))?;
     let colors = doc.palette().len();
     let (ranges, dropped): (Vec<ColorRange>, Vec<ColorRange>) = extras

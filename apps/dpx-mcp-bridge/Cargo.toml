@@ -1,0 +1,18 @@
+[package]
+name = "dpx-mcp-bridge"
+description = "DeluxePainter's stdio MCP bridge: forwards a stdio MCP client (Claude Desktop, Claude Code) to the running app over local Streamable HTTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dpx-mcp.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

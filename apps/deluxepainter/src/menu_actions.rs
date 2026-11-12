@@ -302,7 +302,7 @@ impl PainterApp {
     /// The spare page made to match the shown page: a spare of another screen format is
     /// dropped (DeluxePaint discards the spare on a format change, AGA p.241), one with an
     /// older palette takes the current palette (its undo history starts over then).
-    fn take_spare(&mut self) -> OtherPage {
+    pub(crate) fn take_spare(&mut self) -> OtherPage {
         // ADR-45: a generated spare page keeps its own format and palette.
         if self.menu_data.spare_own.is_some()
             && let Some(s) = self.menu_data.spare.take()
@@ -350,6 +350,8 @@ impl PainterApp {
         }
         self.menu_data.page_history.swap();
         self.menu_data.spare = Some(other);
+        // ADR-43: the MCP ids page1/page2 stay with their pages.
+        self.mcp.swapped = !self.mcp.swapped;
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;

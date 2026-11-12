@@ -49,3 +49,32 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # ADR-43: the Claude Desktop extension (`.mcpb`) with the release dpx-mcp-bridge, for the
+  # platforms Claude Desktop extensions support.
+  mcpb:
+    name: mcpb ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the extension
+        run: cargo run -p xtask -- mcpb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deluxepainter-mcpb-${{ runner.os }}
+          path: target/mcpb/*.mcpb
+          if-no-files-found: error
