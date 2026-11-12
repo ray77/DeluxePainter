@@ -94,6 +94,9 @@ pub struct UiState {
     pub page_size_requester: Option<PageSizeRequester>,
     /// Picture ▸ Load's Import Picture requester for PNG and JPEG files (ADR-42).
     pub import_requester: Option<crate::import_requester::ImportRequester>,
+    /// Prefs ▸ AI & MCP.. while it is open (ADR-43); drawn under the choice requester, which
+    /// asks its questions.
+    pub mcp_requester: Option<crate::mcp_requester::McpRequester>,
     /// Notes after Load/Save while shown (drawn over everything else).
     pub note_requester: Option<NoteRequester>,
     /// Recover Picture and Quit without saving? (ADR-34).
@@ -175,6 +178,7 @@ impl Default for UiState {
             file_requester: None,
             page_size_requester: None,
             import_requester: None,
+            mcp_requester: None,
             note_requester: None,
             choice_requester: None,
             palette_requester: None,
@@ -365,6 +369,9 @@ impl Screen {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.import_requester {
+            req.draw(img, pens);
+        }
+        if let Some(req) = &ui.mcp_requester {
             req.draw(img, pens);
         }
         if let Some(req) = &ui.note_requester {

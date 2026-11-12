@@ -104,11 +104,31 @@ impl ChoiceRequester {
         )
     }
 
+    /// The buttons are 72 pixels wide, or wider for a longer label (ADR-43: "Get Claude
+    /// Code"), as long as both fit.
+    fn button_widths(&self) -> (i32, i32) {
+        let room = WIDTH - 8 - geom::BUTTON_SPACE;
+        let want =
+            |i: usize| (Font::builtin().text_width(&self.labels[i]) + 12).max(geom::BUTTON_W);
+        let (w0, w1) = (want(0), want(1));
+        if w0 + w1 <= room {
+            (w0, w1)
+        } else {
+            (room / 2, room / 2)
+        }
+    }
+
     fn button_rect(&self, i: usize) -> Rect {
         let y = geom::TEXT_Y + self.lines.len() as i32 * geom::LINE_STEP + geom::BUTTON_GAP;
-        let total = 2 * geom::BUTTON_W + geom::BUTTON_SPACE;
-        let x = (WIDTH - total) / 2 + i as i32 * (geom::BUTTON_W + geom::BUTTON_SPACE);
-        Rect::new(x, y, geom::BUTTON_W, geom::BUTTON_H)
+        let (w0, w1) = self.button_widths();
+        let total = w0 + w1 + geom::BUTTON_SPACE;
+        let x0 = (WIDTH - total) / 2;
+        let (x, w) = if i == 0 {
+            (x0, w0)
+        } else {
+            (x0 + w0 + geom::BUTTON_SPACE, w1)
+        };
+        Rect::new(x, y, w, geom::BUTTON_H)
     }
 
     /// Centre of button `i` in requester coordinates (for tests and snapshots).
@@ -222,6 +242,18 @@ mod tests {
         let a = r.button_rect(0);
         r.handle(ReqEvent::Press(a.x + 2, a.y + 2));
         assert_eq!(r.handle(ReqEvent::Release), ChoiceResponse::Pick(0));
+    }
+
+    #[test]
+    fn a_long_label_gets_a_wider_button_inside_the_requester() {
+        let short = req();
+        assert_eq!(short.button_rect(0).w, geom::BUTTON_W);
+        assert_eq!(short.button_rect(1).w, geom::BUTTON_W);
+        let r = ChoiceRequester::new("T", &[], ["Get Claude Code", "Close"], 1, 1);
+        let (a, b) = (r.button_rect(0), r.button_rect(1));
+        assert!(a.w >= Font::builtin().text_width("Get Claude Code") + 8);
+        assert_eq!(b.w, geom::BUTTON_W);
+        assert!(a.x > 0 && a.x + a.w + geom::BUTTON_SPACE <= b.x && b.x + b.w < WIDTH);
     }
 
     #[test]

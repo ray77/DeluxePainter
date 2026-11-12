@@ -18,10 +18,9 @@
 //!   Save / Export write), inside the approved directories; replacing a file asks with
 //!   the choice requester unless "overwrite without asking" is set.
 //!
-//! The Prefs > AI & MCP requester that shows the status and activity log is built on
-//! [`Host`]'s accessors.
-// TODO(wave8-integration): Prefs > "AI & MCP.." (part 3) shows `Host::status`,
-// `Host::activity`, `Host::log` and calls `mcp_revoke`; it edits `Host::settings`.
+//! Prefs > AI & MCP.. (`mcp_prefs.rs`, part 3) shows [`Host`]'s status and activity log and
+//! edits its settings. Its requester holds no copy of the document, so changing calls run
+//! under it ([`PainterApp::mcp_editor_busy`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -186,13 +185,12 @@ fn approve(dirs: &[PathBuf]) -> (FileAccess, Vec<PathBuf>) {
 }
 
 /// The server as the Prefs requester shows it.
-// TODO(wave8-integration): read by Prefs > AI & MCP (part 3); until then only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Off,
     /// Listening on this URL.
     Running {
+        #[cfg_attr(not(test), allow(dead_code))]
         url: String,
         port: u16,
     },
@@ -259,9 +257,6 @@ impl Default for Host {
     }
 }
 
-// TODO(wave8-integration): the accessors are for Prefs > AI & MCP (part 3); until then only
-// tests read them.
-#[cfg_attr(not(test), allow(dead_code))]
 impl Host {
     pub fn status(&self) -> Status {
         match (&self.running, &self.failed) {
@@ -295,8 +290,9 @@ impl Host {
         self.running.as_ref().map_or(&[], |r| &r.missing)
     }
 
-    /// The bearer token of the running server, for a "copy the connect command" button.
-    /// Never draw it on screen or write it into a project.
+    /// The bearer token of the running server (tests). Never draw it on screen, put it in
+    /// a command or write it into a project: the bridge reads it from the endpoint file.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn token(&self) -> Option<&str> {
         self.running
             .as_ref()?
@@ -306,8 +302,14 @@ impl Host {
     }
 
     /// A question for an MCP client is open.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn asking(&self) -> bool {
         self.question.is_some()
+    }
+
+    /// The running server's settings, encoders and activity.
+    pub(crate) fn server_state(&self) -> Option<&Arc<ServerState>> {
+        self.running.as_ref().map(|r| &r.state)
     }
 
     /// Serves `queue` with `state` without an HTTP server (tests, `--mcp-calls`).
@@ -447,7 +449,9 @@ impl PainterApp {
         self.mcp_sync();
         let asked = self.mcp_question_tick();
         let held = self.mcp_drain();
-        if let Some(wait) = [asked, held].into_iter().flatten().min() {
+        // Part 3: a connect step of Prefs > AI & MCP that has ended.
+        let step = self.mcp_prefs_poll();
+        if let Some(wait) = [asked, held, step].into_iter().flatten().min() {
             ctx.request_repaint_after(wait);
         }
     }
@@ -519,10 +523,8 @@ impl PainterApp {
         r.queue.refuse_all(&stopped());
     }
 
-    /// Revokes every client's access: a new token (stored for the next start); requests
-    /// with the old one get 401 at once.
-    // TODO(wave8-integration): the "Disconnect" button of Prefs > AI & MCP (part 3).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A new token (stored for the next start); requests with the old one get 401 at once.
+    /// Prefs > AI & MCP's Revoke access also turns the permissions off (`mcp_prefs.rs`).
     pub(crate) fn mcp_revoke(&mut self) -> Result<(), String> {
         let token = match &self.mcp.config_dir {
             Some(d) => endpoint::rotate_token(d),
@@ -545,7 +547,7 @@ impl PainterApp {
                 job.run(&mut GuiWorkspace(self));
                 continue;
             }
-            if self.modal_open() {
+            if self.mcp_editor_busy() {
                 job.refuse(busy_requester());
                 continue;
             }
@@ -561,6 +563,15 @@ impl PainterApp {
             }
             job.run(&mut GuiWorkspace(self));
         }
+    }
+
+    /// A requester is open that changing calls must not run under: any but Prefs > AI &
+    /// MCP, which holds no copy of the document (part 3: the user may watch the calls).
+    pub(crate) fn mcp_editor_busy(&mut self) -> bool {
+        let prefs = self.ui.mcp_requester.take();
+        let busy = self.modal_open();
+        self.ui.mcp_requester = prefs;
+        busy
     }
 
     /// An open question that timed out or lost its requester is answered.
@@ -842,7 +853,8 @@ impl Workspace for GuiWorkspace<'_> {
 
     fn ask(&mut self, question: Question, answer: Answer) {
         let app = &mut *self.0;
-        if app.modal_open() || app.mcp.question.is_some() {
+        // Over Prefs > AI & MCP the question shows (the choice requester is drawn on top).
+        if app.mcp_editor_busy() || app.mcp.question.is_some() {
             return answer(Err(busy_requester()));
         }
         // As any requester that opens: a gesture in progress is committed, the strip goes.
@@ -870,7 +882,27 @@ pub fn snapshot_calls(args: &[String], doc: &Document) -> Result<Option<Document
     let Some(file) = crate::arg_value(args, "--mcp-calls") else {
         return Ok(None);
     };
-    let text = std::fs::read_to_string(&file).map_err(|e| format!("--mcp-calls {file}: {e}"))?;
+    let app = calls_app(Some(&file), doc)?;
+    Ok(Some(app.engine.document().clone()))
+}
+
+/// An app holding `doc` that serves a job queue without an HTTP server (read and edit
+/// allowed, no file access), after running the calls of `file` ([`snapshot_calls`]); its
+/// activity log keeps them (Prefs > AI & MCP's snapshots).
+pub(crate) fn calls_app(file: Option<&str>, doc: &Document) -> Result<PainterApp, String> {
+    let mut app = PainterApp::new();
+    app.engine = Engine::new(doc.clone());
+    app.mcp.settings.approved_dirs.clear();
+    let (exec, queue) = jobs::channel(|| {});
+    let state = ServerState::with_codec(
+        app.mcp.settings.server_settings(FileAccess::off()),
+        Arc::new(AppCodec),
+    );
+    app.mcp.attach(queue, state.clone());
+    let Some(file) = file else {
+        return Ok(app);
+    };
+    let text = std::fs::read_to_string(file).map_err(|e| format!("--mcp-calls {file}: {e}"))?;
     let list: Vec<Value> =
         serde_json::from_str(&text).map_err(|e| format!("--mcp-calls {file}: {e}"))?;
     let mut calls = Vec::new();
@@ -882,15 +914,6 @@ pub fn snapshot_calls(args: &[String], doc: &Document) -> Result<Option<Document
         let arguments = v.get("arguments").and_then(Value::as_object).cloned();
         calls.push((tool.to_string(), arguments));
     }
-    let mut app = PainterApp::new();
-    app.engine = Engine::new(doc.clone());
-    app.mcp.settings.approved_dirs.clear();
-    let (exec, queue) = jobs::channel(|| {});
-    let state = ServerState::with_codec(
-        app.mcp.settings.server_settings(FileAccess::off()),
-        Arc::new(AppCodec),
-    );
-    app.mcp.attach(queue, state.clone());
     let ctx = dpx_mcp::tools::ToolCtx {
         exec,
         state,
@@ -918,7 +941,7 @@ pub fn snapshot_calls(args: &[String], doc: &Document) -> Result<Option<Document
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(Some(app.engine.document().clone()))
+    Ok(app)
 }
 
 #[cfg(test)]

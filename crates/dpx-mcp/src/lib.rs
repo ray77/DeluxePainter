@@ -6,7 +6,8 @@
 //! - [`server`]: the rmcp handler for both transports; [`seq`] keeps calls in arrival order.
 //! - [`http`]: Streamable HTTP on `127.0.0.1` with bearer token, Host and Origin checks;
 //!   [`endpoint`] writes the discovery files the [`bridge`] reads.
-//! - [`bridge`]: the stdio server for Claude Desktop / Claude Code that forwards to the app.
+//! - [`bridge`]: the stdio server for Claude Desktop / Claude Code that forwards to the app;
+//!   [`bundle`] names its Claude Desktop extension and the Claude Code registration.
 //!
 //! Every document change goes through [`dpx_core::Engine`] commands, exactly like the GUI.
 //! File tools only touch approved directories ([`FileAccess`]). stdout carries protocol
@@ -14,6 +15,7 @@
 
 pub mod access;
 pub mod bridge;
+pub mod bundle;
 pub mod codec;
 pub mod endpoint;
 pub mod error;

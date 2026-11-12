@@ -15,6 +15,7 @@ pub mod file_requester;
 pub mod font;
 pub(crate) mod form;
 pub mod import_requester;
+pub mod mcp_requester;
 pub mod menu;
 pub mod note_requester;
 pub mod page_size_requester;
@@ -47,6 +48,7 @@ pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, P
 pub use import_requester::{
     ImportControl, ImportInfo, ImportRequester, ImportResponse, ImportRow, overlay_rgb,
 };
+pub use mcp_requester::{McpControl, McpRequester, McpResponse, McpView};
 pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};
 pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};

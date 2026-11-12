@@ -261,6 +261,10 @@ impl PainterApp {
         if self.mcp_answer(button) {
             return;
         }
+        // ADR-43: a question of Prefs ▸ AI & MCP (connect, disconnect).
+        if self.mcp_prefs_answer(button, ctx) {
+            return;
+        }
         match self.autosave.pending.take() {
             Some(Pending::Recover) if button == 0 => self.recover(),
             Some(Pending::Recover) => {

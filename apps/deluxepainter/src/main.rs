@@ -37,6 +37,10 @@
 //!     [--mcp-calls FILE.json]           run a JSON array of {"tool", "arguments"} MCP tool
 //!                                       calls on the GUI workspace first (ADR-43)
 //!     [--mcp-question NAME]             the question before an MCP client replaces file NAME
+//!     [--mcp-prefs STATE]               Prefs ▸ AI & MCP: off, ready, connected (with the
+//!                                       --mcp-calls in its activity), fallback, error,
+//!                                       code-confirm, code-missing, desktop-missing or
+//!                                       disconnect (ADR-43)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -57,10 +61,12 @@ mod autosave;
 mod browse;
 mod brush_menu;
 mod config;
+mod connect;
 mod effects;
 mod files;
 mod import;
 mod mcp;
+mod mcp_prefs;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -516,15 +522,16 @@ fn main() -> eframe::Result {
             eprintln!("{e}");
             std::process::exit(code);
         });
-        // ADR-43: MCP tool calls on the GUI workspace.
-        let doc = match mcp::snapshot_calls(&args, &doc) {
-            Ok(Some(changed)) => changed,
-            Ok(None) => doc,
+        // ADR-43: MCP tool calls on the GUI workspace, and Prefs ▸ AI & MCP showing them.
+        let doc = match mcp_prefs::snapshot(&args, &doc, &mut ui) {
+            Ok(changed) => changed,
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(2);
             }
         };
+        // A call may have made a picture of another display mode (create_document).
+        let view = View::of_target(doc.target());
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
@@ -956,6 +963,8 @@ struct PainterApp {
     import: import::ImportState,
     /// The MCP server and its jobs on the UI thread (ADR-43, mcp.rs).
     mcp: mcp::Host,
+    /// Prefs ▸ AI & MCP's connect flows (ADR-43, mcp_prefs.rs).
+    mcp_prefs: mcp_prefs::PrefsState,
 }
 
 impl PainterApp {
@@ -997,6 +1006,7 @@ impl PainterApp {
             tooltip: tooltip::State::default(),
             import: import::ImportState::default(),
             mcp: mcp::Host::default(),
+            mcp_prefs: mcp_prefs::PrefsState::default(),
         }
     }
 
@@ -1015,6 +1025,7 @@ impl PainterApp {
             || ui.file_requester.is_some()
             || ui.page_size_requester.is_some()
             || ui.import_requester.is_some()
+            || ui.mcp_requester.is_some()
             || self.show_page.is_some()
             || ui.anim_control.is_some()
             || self.anim_control.preview.is_some()
@@ -1613,6 +1624,8 @@ impl PainterApp {
                 "spare.delete" => self.delete_page(),
                 "picture.delete" => self.open_file_requester(FileKind::DeleteFile),
                 "app.about" => self.show_about(),
+                // ADR-43 (mcp_prefs.rs).
+                "app.ai_mcp" => self.open_mcp_prefs(),
                 "color.cycle" => {
                     self.toggle_cycling(ctx.input(|i| i.time));
                     // This pass's clock tick has run already; the next one keeps it going.
@@ -1764,6 +1777,12 @@ impl eframe::App for PainterApp {
         // ADR-42: the Import requester after Picture ▸ Load.. of a PNG or JPEG.
         if self.ui.import_requester.is_some() {
             self.import_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-43: Prefs ▸ AI & MCP.. (its questions use the choice requester above).
+        if self.ui.mcp_requester.is_some() {
+            self.mcp_prefs_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -3934,7 +3953,7 @@ mod tests {
 
     /// Picks the menu item at the end of `path` (UI pixels, the menu title first) as on the
     /// Amiga: right button down on the title bar, along the path, up over the item.
-    fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
+    pub(crate) fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
         use egui::PointerButton::Secondary;
         let points: Vec<egui::Pos2> = path.iter().map(|&p| ui_point(app, p)).collect();
         ui_pass(
