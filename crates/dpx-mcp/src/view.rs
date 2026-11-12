@@ -143,7 +143,7 @@ pub fn preview_scale(w: u32, h: u32, scale: Option<u32>) -> Result<u32, ToolErro
     Ok(scale)
 }
 
-/// A rendered RGB PNG.
+/// A rendered PNG (RGB, or RGBA with a transparent colour).
 pub struct Rendered {
     pub png: Vec<u8>,
     pub scale: u32,
@@ -158,17 +158,30 @@ pub fn render_png(
     palette: &Palette,
     scale: u32,
 ) -> Result<Rendered, ToolError> {
+    render_png_with(crop, palette, scale, None)
+}
+
+/// [`render_png`], with the pixels of colour `transparent` left transparent (an RGBA PNG,
+/// alpha 0 there): a layer above the bottom one shown alone (ADR-44).
+pub fn render_png_with(
+    crop: &IndexedImage,
+    palette: &Palette,
+    scale: u32,
+    transparent: Option<u8>,
+) -> Result<Rendered, ToolError> {
     let (w, h) = (crop.width(), crop.height());
     let (ow, oh) = (w * scale, h * scale);
     let colors = palette.colors();
     let s = scale as usize;
-    let mut rgb = Vec::with_capacity(ow as usize * oh as usize * 3);
+    let channels = if transparent.is_some() { 4 } else { 3 };
+    let mut rgb = Vec::with_capacity(ow as usize * oh as usize * channels);
     for row in crop.pixels().chunks(w.max(1) as usize) {
         let start = rgb.len();
         for &p in row {
             let c = colors.get(usize::from(p)).copied().unwrap_or_default();
+            let px = [c.r, c.g, c.b, if Some(p) == transparent { 0 } else { 255 }];
             for _ in 0..s {
-                rgb.extend_from_slice(&[c.r, c.g, c.b]);
+                rgb.extend_from_slice(&px[..channels]);
             }
         }
         let line = rgb[start..].to_vec();
@@ -178,7 +191,11 @@ pub fn render_png(
     }
     let mut png_bytes = Vec::new();
     let mut enc = png::Encoder::new(&mut png_bytes, ow, oh);
-    enc.set_color(png::ColorType::Rgb);
+    enc.set_color(if transparent.is_some() {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    });
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header()
         .and_then(|mut w| w.write_image_data(&rgb))

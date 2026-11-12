@@ -954,6 +954,79 @@ mod tests {
         aga.execute(Command::SetPalette { colors }).unwrap();
     }
 
+    /// Wave-8 integration of ADR-46: an OCS palette with colours that are not 12-bit (a
+    /// project saved before ADR-46) stays editable: SetPalette needs only the entries it
+    /// changes to be 12-bit, and SetFormat on OCS rounds the rest and counts them.
+    #[test]
+    fn an_older_ocs_palette_stays_editable_entry_by_entry() {
+        use crate::{Chipset, DisplayMode, Target};
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
+        let mut old = vec![Rgb8::new(0x11, 0x22, 0x33); 8];
+        old[5] = Rgb8::new(0x0B, 0x0B, 0x0B);
+        old[6] = Rgb8::new(0x16, 0x16, 0x16);
+        let mut e = Engine::new(Document::from_picture(
+            IndexedImage::new(320, 256, 0),
+            Palette::new(old.clone()).unwrap(),
+            ocs,
+        ));
+        // One entry changed to a 12-bit colour: the others stay as stored.
+        let mut colors = old.clone();
+        colors[1] = Rgb8::new(0xFF, 0x00, 0x00);
+        e.execute(Command::SetPalette {
+            colors: colors.clone(),
+        })
+        .unwrap();
+        assert_eq!(e.document().palette().colors(), &colors[..]);
+        assert_eq!(e.document().palette().get(5), Some(Rgb8::new(11, 11, 11)));
+        // A changed entry must be 12-bit, also when it takes another entry's 24-bit colour.
+        let mut moved = colors.clone();
+        moved[2] = old[5];
+        let err = e
+            .execute(Command::SetPalette { colors: moved })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        assert!(
+            err.message
+                .starts_with("colour 2 #0B0B0B is not a 12-bit OCS colour")
+        );
+        // Fixing one old entry works and leaves the other.
+        colors[5] = Rgb8::new(0x11, 0x11, 0x11);
+        e.execute(Command::SetPalette {
+            colors: colors.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            crate::hardware::unshowable_entries(Chipset::Ocs, e.document().palette().colors()),
+            [6]
+        );
+        // Screen Format on OCS (same format) rounds what is left and says how many.
+        let out = e
+            .execute(Command::SetFormat {
+                mode: DisplayMode::PAL_LORES,
+                colors: 8,
+                width: 320,
+                height: 256,
+                retain: true,
+                screen: None,
+                chipset: None,
+            })
+            .unwrap();
+        assert_eq!(out.rounded_colors, 1);
+        assert!(
+            e.document()
+                .palette()
+                .colors()
+                .iter()
+                .all(|&c| crate::hardware::is_12_bit(c))
+        );
+        // Undo brings the stored colour back.
+        e.undo().unwrap();
+        assert_eq!(
+            e.document().palette().get(6),
+            Some(Rgb8::new(0x16, 0x16, 0x16))
+        );
+    }
+
     #[test]
     fn revision_check_and_dry_run() {
         let mut e = engine();

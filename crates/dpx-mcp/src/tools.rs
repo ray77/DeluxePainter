@@ -124,7 +124,9 @@ pub enum ResolutionArg {
     SuperHi,
 }
 
-/// Picture formats by name (owner's spec §3.1).
+/// Picture formats by name (owner's spec §3.1): the screen presets of
+/// `dpx_core::mode::PRESETS` (ADR-46), which the Screen Format and Generate requesters offer
+/// too. The MCP names stay as ADR-43 gave them; the presets' own ids are accepted as well.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PresetArg {
@@ -133,32 +135,50 @@ pub enum PresetArg {
     /// PAL Low Res, 320x256.
     PalLores,
     /// 320x240: PAL Low Res with a custom 320x240 screen (not a standard PAL or NTSC size).
-    #[serde(rename = "pixelart_320x240")]
+    #[serde(rename = "pixelart_320x240", alias = "pixel_art_320x240")]
     Pixelart320x240,
     /// NTSC High Res, 640x200.
     NtscHires,
     /// PAL High Res, 640x256.
     PalHires,
     /// NTSC High Res Laced, 640x400.
+    #[serde(alias = "ntsc_hires_laced")]
     NtscInterlace,
     /// PAL High Res Laced, 640x512.
+    #[serde(alias = "pal_hires_laced")]
     PalInterlace,
 }
 
 impl PresetArg {
-    // TODO(wave8-integration): take these from the shared preset table of ADR-46.
-    fn format(self) -> (DisplayMode, (u32, u32)) {
-        let m = |v, r, l| DisplayMode::new(v, r, l);
-        let (mode, screen) = match self {
-            Self::NtscLores => (m(Video::Ntsc, Resolution::Lo, false), None),
-            Self::PalLores => (m(Video::Pal, Resolution::Lo, false), None),
-            Self::Pixelart320x240 => (m(Video::Pal, Resolution::Lo, false), Some((320, 240))),
-            Self::NtscHires => (m(Video::Ntsc, Resolution::Hi, false), None),
-            Self::PalHires => (m(Video::Pal, Resolution::Hi, false), None),
-            Self::NtscInterlace => (m(Video::Ntsc, Resolution::Hi, true), None),
-            Self::PalInterlace => (m(Video::Pal, Resolution::Hi, true), None),
-        };
-        (mode, screen.unwrap_or(mode.size()))
+    /// Every preset, in the order of `dpx_core::mode::PRESETS`.
+    pub const ALL: [PresetArg; 7] = [
+        Self::NtscLores,
+        Self::PalLores,
+        Self::Pixelart320x240,
+        Self::NtscHires,
+        Self::PalHires,
+        Self::NtscInterlace,
+        Self::PalInterlace,
+    ];
+
+    /// The id of its entry in `dpx_core::mode::PRESETS`.
+    pub fn preset_id(self) -> &'static str {
+        match self {
+            Self::NtscLores => "ntsc_lores",
+            Self::PalLores => "pal_lores",
+            Self::Pixelart320x240 => "pixel_art_320x240",
+            Self::NtscHires => "ntsc_hires",
+            Self::PalHires => "pal_hires",
+            Self::NtscInterlace => "ntsc_hires_laced",
+            Self::PalInterlace => "pal_hires_laced",
+        }
+    }
+
+    /// The display mode and screen of the shared preset.
+    pub fn format(self) -> (DisplayMode, (u32, u32)) {
+        dpx_core::mode::Preset::by_id(self.preset_id())
+            .and_then(|p| p.format)
+            .expect("every MCP preset is a screen preset of dpx_core::mode::PRESETS")
     }
 }
 
@@ -293,7 +313,15 @@ pub struct ExecuteArgs {
     /// `merge_page` {width, height, pixels, front, transparent}; frames (numbered from 0, page
     /// ops act on the current frame): `set_frame_count` {count}, `add_frames` {count},
     /// `copy_frame` {first, last}, `insert_frame_copies` {first, last, before},
-    /// `delete_frames` {first, last, fill}, `goto_frame` {frame}, `set_frame_rate` {fps}.
+    /// `delete_frames` {first, last, fill}, `goto_frame` {frame}, `set_frame_rate` {fps};
+    /// layers (numbered from 0 = the bottom layer; page ops paint the active layer, and above
+    /// the bottom layer colour 0 is transparent): `add_layer` {name?}, `duplicate_layer`
+    /// {layer}, `delete_layer` {layer}, `move_layer` {from, to}, `select_layer` {layer},
+    /// `set_layer_visible` {layer, visible}, `rename_layer` {layer, name},
+    /// `merge_layer_down` {layer}, `flatten_layers`; colours: `arrange_palette` {order}
+    /// (order[new] = old, the picture looks the same), `remap_colors` {from:[{r,g,b}]}
+    /// (Color > Remap: every layer of every frame, drawn for the palette `from`, repainted
+    /// with the nearest colours of the current palette).
     /// Points and brush pixels are [x, y] pairs; a one-pixel brush is [[0, 0]]. Example:
     /// {"op":"shape","shape":{"kind":"rect","from":[10,10],"to":[50,40]},"brush":[[0,0]],
     /// "color":5,"filled":true}.
@@ -326,6 +354,10 @@ pub struct PreviewArgs {
     /// Integer nearest-neighbour zoom 1..8. Default: up to 4, keeping the longer side within
     /// 1024 pixels. The image may have at most 4194304 pixels.
     pub scale: Option<u32>,
+    /// Show only this layer of the current frame (0 = the bottom layer, see list_layers),
+    /// shown or hidden, instead of the picture as it shows. Above the bottom layer its colour
+    /// 0 is transparent and stays transparent (alpha 0) in the PNG.
+    pub layer: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -512,7 +544,7 @@ static SPECS: &[Spec] = &[
     read(
         "get_document_info",
         "Document info",
-        "Size, display mode, screen, chipset, palette size and maximum, frames, revision, undo/redo and unsaved changes of a document (default: the active one).",
+        "Size, display mode, screen, chipset, palette size and maximum, frames, layers (the stack and the active layer), revision, undo/redo and unsaved changes of a document (default: the active one).",
         schema::<DocumentIdArgs>,
     ),
     edit(
@@ -631,7 +663,7 @@ static SPECS: &[Spec] = &[
     read(
         "get_preview",
         "Preview",
-        "The picture (or a rectangle of it) as a PNG image with the palette applied, integer-scaled (default up to 4x, at most 1024 pixels on the longer side), so you can look at it.",
+        "The picture (or a rectangle of it) as a PNG image with the palette applied, integer-scaled (default up to 4x, at most 1024 pixels on the longer side), so you can look at it. With `layer`, one layer alone (its colour 0 transparent above the bottom layer).",
         schema::<PreviewArgs>,
     ),
     read(
@@ -643,20 +675,24 @@ static SPECS: &[Spec] = &[
     edit(
         "execute_command",
         "Execute command (advanced)",
-        "Run one raw dpx-core command (JSON tagged by op: stroke, shape, flood_fill, clear, flip, replace_color, swap_colors, set_palette, set_format, set_page_size, set_page, merge_page and the frame ops) as one undo step. Optional expected_revision and dry_run.",
+        "Run one raw dpx-core command (JSON tagged by op: stroke, shape, flood_fill, clear, flip, replace_color, swap_colors, set_palette, set_format, set_page_size, set_page, merge_page, the frame ops, the layer ops add_layer, duplicate_layer, delete_layer, move_layer, select_layer, set_layer_visible, rename_layer, merge_layer_down, flatten_layers, and arrange_palette, remap_colors) as one undo step (select_layer and goto_frame are settings). Page ops paint the active layer. Optional expected_revision and dry_run.",
         schema::<ExecuteArgs>,
         false,
     ),
 ];
 
+/// Every tool: the table above, then the layer tools (ADR-44).
+fn specs() -> impl Iterator<Item = &'static Spec> {
+    SPECS.iter().chain(layers::SPECS)
+}
+
 fn find(name: &str) -> Option<&'static Spec> {
-    SPECS.iter().find(|s| s.name == name)
+    specs().find(|s| s.name == name)
 }
 
 /// The tool definitions (also listed by the bridge without a running app).
 pub fn definitions() -> Vec<Tool> {
-    SPECS
-        .iter()
+    specs()
         .map(|s| {
             Tool::new(s.name, s.description, (s.schema)())
                 .with_title(s.title)
@@ -673,7 +709,7 @@ pub fn definitions() -> Vec<Tool> {
 
 /// The names of every tool.
 pub fn names() -> Vec<&'static str> {
-    SPECS.iter().map(|s| s.name).collect()
+    specs().map(|s| s.name).collect()
 }
 
 /// True for tools that change nothing (safe to retry).
@@ -856,6 +892,7 @@ async fn dispatch(
         "get_preview" => preview(ctx, parse(args)?).await,
         "get_pixels" => pixels(ctx, parse(args)?).await,
         "execute_command" => execute(ctx, parse(args)?).await,
+        name if layers::handles(name) => layers::dispatch(ctx, name, args).await,
         other => Err(ToolError::internal(format!("no handler for {other}"))),
     }
 }
@@ -888,6 +925,12 @@ pub struct DocumentInfo {
     pub frames: usize,
     /// Counted from 0.
     pub current_frame: usize,
+    /// Layers (ADR-44); every frame holds one picture per layer.
+    pub layer_count: usize,
+    /// The layer the drawing tools paint (0 = the bottom layer).
+    pub active_layer: usize,
+    /// The layer stack, bottom first (see list_layers).
+    pub layers: Vec<layers::LayerEntry>,
     pub revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub can_undo: Option<bool>,
@@ -923,6 +966,9 @@ fn describe_doc(doc: &Document, slot: Slot, active: bool) -> DocumentInfo {
         max_colors: t.mode.max_colors(t.chipset),
         frames: doc.frame_count(),
         current_frame: doc.current_frame(),
+        layer_count: doc.layer_count(),
+        active_layer: doc.active_layer(),
+        layers: layers::entries(doc),
         revision: doc.revision(),
         can_undo: None,
         can_redo: None,
@@ -1679,15 +1725,28 @@ struct PreviewInfo {
     page_width: u32,
     page_height: u32,
     mime_type: &'static str,
+    /// The layer shown alone (`layer` argument), and how its colour 0 is shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer_note: Option<String>,
 }
 
 /// The preview PNG (base64) and what it shows.
 async fn render_preview(ctx: &ToolCtx, a: PreviewArgs) -> Result<(String, PreviewInfo), ToolError> {
-    let (crop, palette, rect, scale, revision, slot, page) = ctx
+    let a_layer = a.layer;
+    let (crop, palette, rect, scale, revision, slot, page, alone) = ctx
         .exec
         .run(move |ws| -> Result<_, ToolError> {
             let doc = visible_picture(ws);
-            let shown = doc.composite();
+            // ADR-44: one layer alone, or the frame as it shows.
+            let (shown, alone) = match a.layer {
+                Some(l) => {
+                    let (picture, clear, note) = layers::preview_picture(&doc, l)?;
+                    (Cow::Borrowed(picture), Some((clear, note)))
+                }
+                None => (doc.composite(), None),
+            };
             let r = view::clip(shown.bounds(), a.rect)?;
             let scale = view::preview_scale(r.w as u32, r.h as u32, a.scale)?;
             Ok((
@@ -1698,10 +1757,12 @@ async fn render_preview(ctx: &ToolCtx, a: PreviewArgs) -> Result<(String, Previe
                 doc.revision(),
                 ws.shown(),
                 (doc.page().width(), doc.page().height()),
+                alone,
             ))
         })
         .await??;
-    let rendered = blocking(move || view::render_png(&crop, &palette, scale)).await??;
+    let clear = alone.as_ref().and_then(|(c, _)| *c);
+    let rendered = blocking(move || view::render_png_with(&crop, &palette, scale, clear)).await??;
     Ok((
         view::to_base64(&rendered.png),
         PreviewInfo {
@@ -1714,6 +1775,8 @@ async fn render_preview(ctx: &ToolCtx, a: PreviewArgs) -> Result<(String, Previe
             page_width: page.0,
             page_height: page.1,
             mime_type: "image/png",
+            layer: a_layer,
+            layer_note: alone.map(|(_, note)| note),
         },
     ))
 }
@@ -1968,6 +2031,21 @@ async fn export_image(ctx: &ToolCtx, a: ExportArgs) -> Result<CallToolResult, To
     }))
 }
 
+/// ADR-46, wave-8 integration: a project saved before ADR-46 may hold OCS colours that are
+/// not 12-bit; it opens with them as stored, and the result names them and how to fix them.
+fn old_palette_notes(doc: &Document) -> Vec<String> {
+    match dpx_core::hardware::stored_palette_note(doc.target(), doc.palette()) {
+        Some(note) => vec![
+            note,
+            "to fix them, set them with set_palette_color (12-bit colours), or run set_format \
+             on OCS through execute_command, which rounds every entry to 12 bits (rounded_colors \
+             counts them)"
+                .into(),
+        ],
+        None => Vec::new(),
+    }
+}
+
 async fn open_picture(ctx: &ToolCtx, a: OpenArgs) -> Result<CallToolResult, ToolError> {
     let access = ctx.state.settings().access;
     let (resolved, bytes) = read_file(&access, &a.path, pictures::MAX_FILE_BYTES).await?;
@@ -1975,7 +2053,8 @@ async fn open_picture(ctx: &ToolCtx, a: OpenArgs) -> Result<CallToolResult, Tool
     let (doc, extras, spare, notes) = blocking(move || -> Result<_, ToolError> {
         if dpx_formats::project::is_zip(&bytes) {
             let (doc, extras, spare) = pictures::decode_project(&name, &bytes)?;
-            Ok((doc, extras, spare, Vec::new()))
+            let notes = old_palette_notes(&doc);
+            Ok((doc, extras, spare, notes))
         } else {
             let (doc, notes) = pictures::decode_picture(&name, &bytes)?;
             Ok((doc, Default::default(), None, notes))
@@ -2300,6 +2379,9 @@ pub async fn read_resource(ctx: &ToolCtx, uri: &str) -> Result<ReadResourceResul
     };
     Ok(ReadResourceResult::new(vec![contents]))
 }
+
+#[path = "tools_layers.rs"]
+pub mod layers;
 
 #[cfg(test)]
 #[path = "tools_tests.rs"]

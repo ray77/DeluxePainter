@@ -577,7 +577,11 @@ fn main() -> eframe::Result {
                 recovery::format_utc(recovery::unix_now()),
             ));
         }
-        // ADR-44: the layer panel (`--layers-panel`) or the title bar's layer name.
+        // ADR-44: the layer panel (`--layers-panel`) or the title bar's layer name; after
+        // `--mcp-calls`, of the document the calls made.
+        if arg_value(&args, "--mcp-calls").is_some() {
+            engine = Engine::new(doc.clone());
+        }
         layers::snapshot_ui(&args, &mut engine, &mut ui, view);
         // ADR-41: the tooltip of a resting pointer.
         if let Err(e) =
@@ -2667,6 +2671,8 @@ impl PainterApp {
         // The shown cycling palette follows palette and range changes made earlier in this
         // pass (the clock at the top of `ui()` ran before them).
         self.cycle_tick(ctx.input(|i| i.time));
+        // ADR-44: a document changed elsewhere (MCP, generation) redraws the layer panel.
+        self.follow_document();
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
             self.prepare_perspective_view();

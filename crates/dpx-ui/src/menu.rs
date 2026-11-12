@@ -1245,26 +1245,41 @@ mod tests {
         assert_eq!(b.item_top(1), 23);
     }
 
+    /// Every menu and submenu lies on the screen, also on the smallest UI screen, NTSC's
+    /// 320x200 (wave-8 integration: Prefs holds Layers and AI & MCP.. besides Pixel Size).
     #[test]
     fn boxes_stay_on_screen() {
-        for (m, menu) in MENUS.iter().enumerate() {
-            let b = menu_box(m, 320, 256);
-            assert!(b.x >= 0 && b.x + b.w <= 320, "menu {m}");
-            for (i, it) in menu.items.iter().enumerate() {
-                if let Entry::Submenu(items) = it.entry {
-                    let s = submenu_box(&b, i, items, 320, 256);
-                    assert!(s.x >= 0 && s.x + s.w <= 320, "submenu {m}/{i}");
-                    assert!(s.y + s.h <= 256, "submenu {m}/{i}");
-                    // The submenu never hides its parent item's label.
-                    let label_end = b.x + b.text_dx + Font::builtin().text_width(it.label);
-                    let left = s.x + s.w <= b.x + geom::SUB_OVERLAP;
-                    assert!(
-                        left || s.x >= label_end,
-                        "submenu {m}/{i} covers its parent"
-                    );
+        for (sw, sh) in [(320, 256), (320, 200)] {
+            for (m, menu) in MENUS.iter().enumerate() {
+                let b = menu_box(m, sw, sh);
+                assert!(b.x >= 0 && b.x + b.w <= sw, "menu {m} on {sw}x{sh}");
+                assert!(
+                    b.y >= geom::BOX_TOP && b.y + b.h <= sh,
+                    "menu {m} on {sw}x{sh}"
+                );
+                for (i, it) in menu.items.iter().enumerate() {
+                    if let Entry::Submenu(items) = it.entry {
+                        let s = submenu_box(&b, i, items, sw, sh);
+                        let at = format!("submenu {m}/{i} on {sw}x{sh}");
+                        assert!(s.x >= 0 && s.x + s.w <= sw, "{at}");
+                        assert!(s.y >= 0 && s.y + s.h <= sh, "{at}");
+                        // The submenu never hides its parent item's label.
+                        let label_end = b.x + b.text_dx + Font::builtin().text_width(it.label);
+                        let left = s.x + s.w <= b.x + geom::SUB_OVERLAP;
+                        assert!(left || s.x >= label_end, "{at} covers its parent");
+                    }
                 }
             }
         }
+        // The Prefs menu with both additions, and the room it leaves on 320x200.
+        let prefs = MENUS.len() - 1;
+        let labels: Vec<&str> = MENUS[prefs].items.iter().map(|i| i.label).collect();
+        assert_eq!(
+            labels[labels.len() - 3..],
+            ["Layers", "AI & MCP..", "Pixel Size"]
+        );
+        let b = menu_box(prefs, 320, 200);
+        assert_eq!((b.y, b.h, b.items), (geom::BOX_TOP, 148, 14));
     }
 
     #[test]

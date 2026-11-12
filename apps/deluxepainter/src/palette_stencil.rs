@@ -111,23 +111,53 @@ fn adds(cmd: &Command, fg: u8, bg: u8) -> bool {
 }
 
 /// Whether `cmd` changes page pixels: while Stencil ▸ Paint is on such a command never
-/// reaches the picture (the mask takes it, or nothing does).
+/// reaches the picture (the mask takes it, or nothing does). Every command is named here
+/// (no catch-all), so a new one must be classified: painting, a whole picture put in
+/// (SetPage, SetPicture, ReplacePicture) and recolouring or merging pixels count; palette
+/// entries, the format and page size, frames and the layer stack's order, names, visibility
+/// and selection do not (menu items, panel buttons and MCP calls end Stencil ▸ Paint before
+/// they run them).
 fn paints_page(cmd: &Command) -> bool {
-    matches!(
-        cmd,
+    match cmd {
         Command::Stroke { .. }
-            | Command::Shape { .. }
-            | Command::AnimBrushPaint { .. }
-            | Command::FloodFill { .. }
-            | Command::Clear { .. }
-            | Command::Stenciled { .. }
-            | Command::SetPage { .. }
-            | Command::MergePage { .. }
-            | Command::Flip { .. }
-            | Command::ReplaceColor { .. }
-            | Command::SwapColors { .. }
-            | Command::MoveBrush { .. }
-    )
+        | Command::Shape { .. }
+        | Command::AnimBrushPaint { .. }
+        | Command::FloodFill { .. }
+        | Command::Clear { .. }
+        | Command::Stenciled { .. }
+        | Command::SetPage { .. }
+        | Command::MergePage { .. }
+        | Command::Flip { .. }
+        | Command::ReplaceColor { .. }
+        | Command::SwapColors { .. }
+        | Command::MoveBrush { .. }
+        // Wave-8 integration: the whole picture (Copy to Spare and Delete This Page of
+        // layered pages, a generated picture's Picture target), and pixels repainted or
+        // merged on every layer.
+        | Command::SetPicture { .. }
+        | Command::ReplacePicture { .. }
+        | Command::RemapColors { .. }
+        | Command::MergeLayerDown { .. }
+        | Command::FlattenLayers => true,
+        Command::SetPalette { .. }
+        | Command::ArrangePalette { .. }
+        | Command::SetFormat { .. }
+        | Command::SetPageSize { .. }
+        | Command::SetFrameCount { .. }
+        | Command::AddFrames { .. }
+        | Command::CopyFrame { .. }
+        | Command::InsertFrameCopies { .. }
+        | Command::DeleteFrames { .. }
+        | Command::GotoFrame { .. }
+        | Command::SetFrameRate { .. }
+        | Command::AddLayer { .. }
+        | Command::DuplicateLayer { .. }
+        | Command::DeleteLayer { .. }
+        | Command::MoveLayer { .. }
+        | Command::SelectLayer { .. }
+        | Command::SetLayerVisible { .. }
+        | Command::RenameLayer { .. } => false,
+    }
 }
 
 impl PainterApp {
@@ -1876,6 +1906,66 @@ mod tests {
         // Commands that do not paint still reach the document.
         app.execute(Command::SetFrameRate { fps: 10 });
         assert_eq!(app.engine.document().fps(), 10);
+    }
+
+    /// Wave-8 integration: the commands that put a whole picture in (SetPicture of layered
+    /// pages, ReplacePicture of a generated picture) count as painting the page, so during
+    /// Stencil ▸ Paint they never reach the picture behind the stencil view.
+    #[test]
+    fn whole_pictures_count_as_painting_the_page() {
+        let doc = PainterApp::new().engine.document().clone();
+        let set_picture = Command::set_picture(&doc);
+        let replace = Command::ReplacePicture {
+            target: doc.target(),
+            palette: doc.palette().colors().to_vec(),
+            width: 320,
+            height: 256,
+            pixels: vec![5; 320 * 256],
+        };
+        for cmd in [&set_picture, &replace] {
+            assert!(paints_page(cmd), "{cmd:?}");
+        }
+        for cmd in [
+            Command::RemapColors {
+                from: doc.palette().colors().to_vec(),
+            },
+            Command::MergeLayerDown { layer: 1 },
+            Command::FlattenLayers,
+        ] {
+            assert!(paints_page(&cmd), "{cmd:?}");
+        }
+        for cmd in [
+            Command::AddLayer { name: None },
+            Command::SelectLayer { layer: 0 },
+            Command::SetLayerVisible {
+                layer: 0,
+                visible: false,
+            },
+            Command::GotoFrame { frame: 0 },
+            Command::SetPalette {
+                colors: doc.palette().colors().to_vec(),
+            },
+        ] {
+            assert!(!paints_page(&cmd), "{cmd:?}");
+        }
+        // Through the app: neither changes the picture while Stencil ▸ Paint is on.
+        let mut app = PainterApp::new();
+        act(&mut app, "stencil.paint");
+        let revision = app.engine.document().revision();
+        app.execute(replace.clone());
+        let layered = {
+            let mut e = dpx_core::Engine::new(doc.clone());
+            e.execute(Command::AddLayer { name: None }).unwrap();
+            e.document().clone()
+        };
+        app.execute(Command::set_picture(&layered));
+        assert_eq!(app.engine.document().revision(), revision);
+        assert_eq!(app.engine.document().layer_count(), 1);
+        assert_eq!(page_px(&app, 0, 0), 0);
+        // Once it ends, they do.
+        act(&mut app, "stencil.paint");
+        app.execute(replace);
+        assert_eq!(page_px(&app, 0, 0), 5);
     }
 
     #[test]

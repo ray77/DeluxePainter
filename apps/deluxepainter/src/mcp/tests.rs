@@ -852,6 +852,116 @@ fn asker_names_claude_or_the_client() {
     assert_eq!(asker(None), "An AI client");
 }
 
+/// The layer panel's rows, bottom first.
+fn panel_rows(rig: &Rig) -> Vec<String> {
+    let panel = rig.app.ui.layer_panel.as_ref().expect("the panel shows");
+    panel.rows.iter().map(|r| r.name.clone()).collect()
+}
+
+fn shown_pixel(rig: &Rig, x: i32, y: i32) -> u8 {
+    rig.app.engine.document().composite().get(x, y).unwrap()
+}
+
+/// Wave-8 integration (ADR-44): the layer tools change the running GUI's document through
+/// the engine; the layer panel and the title-bar label follow in the pass that ran the call,
+/// and the GUI's own Undo, as MCP's, takes a layer change made over MCP back.
+#[test]
+fn layer_tools_reach_the_panel_and_undo() {
+    let mut rig = Rig::new(None);
+    rig.app.ui.prefs.set(dpx_ui::Pref::LayerPanel, true);
+    rig.app.dirty = true;
+    rig.pass();
+    assert_eq!(panel_rows(&rig), ["Background"]);
+    let l = rig.ok("list_layers", json!({}));
+    assert_eq!(l["layer_count"], 1);
+    let c = rig.ok("create_layer", json!({"name": "Sky"}));
+    assert_eq!(
+        (c["layer"].clone(), c["active_layer"].clone()),
+        (json!(1), json!(1))
+    );
+    // The pass that ran the call drew the panel with the new row, the new layer active.
+    assert!(!rig.app.dirty);
+    assert_eq!(panel_rows(&rig), ["Background", "Sky"]);
+    assert_eq!(rig.app.ui.layer_panel.as_ref().unwrap().active, 1);
+    // Drawing lands on the active layer.
+    rig.ok("draw_rectangle", rect(10, 20, 5));
+    assert_eq!(shown_pixel(&rig, 10, 20), 5);
+    assert_eq!(
+        rig.app.engine.document().layer(0).unwrap().get(10, 20),
+        Some(0)
+    );
+    // The GUI's `U` undoes the rectangle, then the new layer.
+    rig.pass_with(vec![crate::tests::key_event(egui::Key::U, true)]);
+    assert_eq!(shown_pixel(&rig, 10, 20), 0);
+    rig.pass_with(vec![crate::tests::key_event(egui::Key::U, true)]);
+    assert_eq!(panel_rows(&rig), ["Background"]);
+    // MCP's redo and undo do the same.
+    rig.ok("redo", json!({}));
+    assert_eq!(panel_rows(&rig), ["Background", "Sky"]);
+    let u = rig.ok("undo", json!({}));
+    assert_eq!(u["can_redo"], true);
+    assert_eq!(panel_rows(&rig), ["Background"]);
+    // With the panel off the title bar names the active layer, as MCP changes it.
+    rig.app.ui.prefs.set(dpx_ui::Pref::LayerPanel, false);
+    rig.app.dirty = true;
+    rig.pass();
+    assert_eq!(
+        rig.app.ui.layer_label, None,
+        "one Background layer: no label"
+    );
+    rig.ok("create_layer", json!({"name": "Moon"}));
+    assert_eq!(rig.app.ui.layer_label.as_deref(), Some("Moon"));
+    let s = rig.ok("select_layer", json!({"layer": 0}));
+    assert_eq!(s["undoable"], false);
+    assert_eq!(rig.app.ui.layer_label.as_deref(), Some("Background"));
+    rig.ok("rename_layer", json!({"layer": 0, "name": "Ground"}));
+    assert_eq!(rig.app.ui.layer_label.as_deref(), Some("Ground"));
+    rig.ok(
+        "set_layer_visibility",
+        json!({"layer": 1, "visible": false}),
+    );
+    assert!(!rig.app.engine.document().layers()[1].visible);
+    // A requester open: layer changes are busy, reading works.
+    rig.app.ui.note_requester = crate::note_requester("Note", &["x".to_string()]);
+    let (code, _) = rig.code("create_layer", json!({}));
+    assert_eq!(code, "EDITOR_BUSY");
+    assert_eq!(rig.ok("list_layers", json!({}))["layer_count"], 2);
+    rig.app.ui.note_requester = None;
+    // The activity log names what the layer calls did.
+    let log = rig.app.mcp.log();
+    let entry = log.iter().find(|e| e.tool == "create_layer").unwrap();
+    assert_eq!(
+        entry.detail.as_deref(),
+        Some("create_layer \"Sky\" (layer 1)")
+    );
+}
+
+/// A layer name being edited in the panel is taken (as a click elsewhere takes it) before an
+/// MCP change runs, so it renames the layer it was opened on even when the call renumbers
+/// the layers; the rename and the call are two undo steps.
+#[test]
+fn a_layer_name_being_edited_is_taken_before_an_mcp_change() {
+    let mut rig = Rig::new(None);
+    rig.app.ui.prefs.set(dpx_ui::Pref::LayerPanel, true);
+    rig.ok("create_layer", json!({"name": "Sky"}));
+    let panel = rig.app.ui.layer_panel.as_mut().unwrap();
+    panel.begin_rename(1);
+    panel.rename_key(dpx_ui::ReqKey::Char('!'));
+    assert_eq!(rig.app.renaming_layer(), Some(1));
+    rig.ok("move_layer", json!({"from": 1, "to": 0}));
+    assert_eq!(rig.app.renaming_layer(), None);
+    let names = |rig: &Rig| -> Vec<String> {
+        let doc = rig.app.engine.document();
+        doc.layers().iter().map(|l| l.name.clone()).collect()
+    };
+    assert_eq!(names(&rig), ["Sky!", "Background"]);
+    assert_eq!(panel_rows(&rig), ["Sky!", "Background"]);
+    rig.ok("undo", json!({}));
+    assert_eq!(names(&rig), ["Background", "Sky!"]);
+    rig.ok("undo", json!({}));
+    assert_eq!(names(&rig), ["Background", "Sky"]);
+}
+
 #[test]
 fn the_snapshot_flag_runs_calls_on_the_gui_workspace() {
     let file = concat!(

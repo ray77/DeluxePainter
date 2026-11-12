@@ -345,11 +345,26 @@ impl PaletteRequester {
         }
     }
 
+    /// `c` as an edit writes it: on OCS the 12-bit colour the sliders show. An older
+    /// project's palette may hold OCS colours that are not 12-bit (ADR-46, wave-8
+    /// integration); an entry the user edits becomes 12-bit, the others stay as they are.
+    fn written(&self, c: Rgb8) -> Rgb8 {
+        if self.max_level == 15 {
+            Rgb8::from_rgb4(c.to_rgb4())
+        } else {
+            c
+        }
+    }
+
     fn set_value(&mut self, ch: usize, v: i32) {
         let v = v.clamp(0, self.max(ch));
         let i = usize::from(self.selected);
         match self.system {
-            System::Rgb => set_channel(&mut self.colors[i], ch, from_level(v, self.max_level)),
+            System::Rgb => {
+                let mut c = self.written(self.colors[i]);
+                set_channel(&mut c, ch, from_level(v, self.max_level));
+                self.colors[i] = c;
+            }
             System::Hsv => {
                 self.hsv[ch] = v as u16;
                 let [r, g, b] = hsv_to_rgb(self.hsv);
@@ -412,8 +427,15 @@ impl PaletteRequester {
             self.checkpoint();
             match op {
                 Op::Spread => self.spread(a, b),
-                Op::Copy => self.colors[b] = self.colors[a],
-                Op::Ex => self.colors.swap(a, b),
+                Op::Copy => self.colors[b] = self.written(self.colors[a]),
+                Op::Ex => {
+                    self.colors.swap(a, b);
+                    // Both entries change: as every edit, 12-bit on OCS.
+                    if a != b {
+                        self.colors[a] = self.written(self.colors[a]);
+                        self.colors[b] = self.written(self.colors[b]);
+                    }
+                }
             }
             self.end_edit();
         }
@@ -853,6 +875,53 @@ mod tests {
         }
         assert!(twelve(&r), "{:?}", r.colors());
         assert_ne!(r.colors(), Palette::dpaint_default_32().colors());
+    }
+
+    /// Wave-8 integration of ADR-46: in an older project's OCS palette with colours that are
+    /// not 12-bit, an edit makes the entries it writes 12-bit and leaves every other entry as
+    /// stored, so Ok's SetPalette passes the engine's rule (only changed entries must be
+    /// 12-bit) and nothing else changes.
+    #[test]
+    fn ocs_edits_write_12_bit_entries_and_keep_the_others() {
+        let old: Vec<Rgb8> = (0..8u8)
+            .map(|i| Rgb8::new(i * 11, i * 11, i * 11))
+            .collect();
+        let twelve = |c: Rgb8| Rgb8::from_rgb4(c.to_rgb4()) == c;
+        let fresh = || PaletteRequester::new(&Palette::new(old.clone()).unwrap(), 2, Chipset::Ocs);
+        // A slider: the whole entry becomes 12-bit, the others stay.
+        let mut r = fresh();
+        let t = PaletteRequester::slider_rect(0);
+        drag_knob(&mut r, 0, t.x + t.w + 40);
+        let mut want = Rgb8::from_rgb4(old[2].to_rgb4());
+        want.r = 255;
+        assert_eq!(r.colors()[2], want);
+        assert!(twelve(r.colors()[2]) && !twelve(old[2]));
+        for i in (0..8).filter(|&i| i != 2) {
+            assert_eq!(r.colors()[i], old[i], "entry {i} untouched");
+        }
+        // Copy writes the 12-bit colour; Exchange both entries.
+        let mut r = fresh();
+        button(&mut r, Button::Copy);
+        cell(&mut r, 5);
+        assert_eq!(r.colors()[5], Rgb8::from_rgb4(old[2].to_rgb4()));
+        assert_eq!(r.colors()[2], old[2], "the source stays");
+        let mut r = fresh();
+        button(&mut r, Button::Ex);
+        cell(&mut r, 6);
+        assert_eq!(r.colors()[2], Rgb8::from_rgb4(old[6].to_rgb4()));
+        assert_eq!(r.colors()[6], Rgb8::from_rgb4(old[2].to_rgb4()));
+        assert_eq!(r.colors()[3], old[3]);
+        // Spread keeps its two ends and writes 12-bit colours between them.
+        let mut r = fresh();
+        button(&mut r, Button::Spread);
+        cell(&mut r, 7);
+        assert_eq!((r.colors()[2], r.colors()[7]), (old[2], old[7]));
+        assert!((3..7).all(|i| twelve(r.colors()[i])));
+        // AGA writes colours as they are.
+        let mut r = PaletteRequester::new(&Palette::new(old.clone()).unwrap(), 2, Chipset::Aga);
+        button(&mut r, Button::Copy);
+        cell(&mut r, 5);
+        assert_eq!(r.colors()[5], old[2]);
     }
 
     #[test]

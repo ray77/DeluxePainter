@@ -129,7 +129,9 @@ pub enum Command {
     ReplaceColor { from: u8, to: u8 },
     /// Exchanges two colours in every pixel (Color ▸ BG <-> FG).
     SwapColors { a: u8, b: u8 },
-    /// Replaces all palette entries; the number of colours must stay the same.
+    /// Replaces all palette entries; the number of colours must stay the same. On OCS every
+    /// entry it changes must be a 12-bit colour (ADR-46); an entry it keeps may stay as it is
+    /// (a project saved before ADR-46 can hold colours that are not 12-bit).
     SetPalette { colors: Vec<Rgb8> },
     /// Picture ▸ Screen Format: display mode, palette size and page size. With `retain` the
     /// picture is kept (top-left aligned, cut off if the page shrinks), otherwise the page is
@@ -650,8 +652,16 @@ impl Command {
                         new.len()
                     )));
                 }
-                // OCS colours are 12-bit, a document rule (ADR-46).
-                match crate::hardware::first_unshowable(doc.target.chipset, new) {
+                // OCS colours are 12-bit, a document rule (ADR-46). Only the entries this
+                // changes must be: an older project's colours that are not 12-bit stay
+                // editable entry by entry (wave-8 integration).
+                let old = doc.palette.colors();
+                let changed: Vec<Rgb8> = new
+                    .iter()
+                    .zip(old)
+                    .map(|(&c, &o)| if c == o { Rgb8::BLACK } else { c })
+                    .collect();
+                match crate::hardware::first_unshowable(doc.target.chipset, &changed) {
                     Some((i, c)) => Err(CommandError::new(
                         ErrorCode::PaletteRangeInvalid,
                         format!(

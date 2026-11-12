@@ -503,4 +503,91 @@ mod tests {
         assert_eq!(note.title(), FORMAT_CHANGED);
         assert_eq!(note.notes(), ["1 colour rounded to a 12-bit OCS value"]);
     }
+
+    /// Wave-8 integration: a project saved before ADR-46 whose OCS palette holds colours that
+    /// are not 12-bit opens through Picture ▸ Load.. with its palette as stored and a note;
+    /// IFF export refuses it; the Color Mixer edits one entry (made 12-bit) and keeps the
+    /// others; Screen Format on OCS rounds the rest with its note, and the IFF export works.
+    #[test]
+    fn an_old_ocs_project_opens_with_a_note_and_can_be_fixed() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("old-ocs");
+        std::fs::write(
+            dir.join("Old.dpxproj"),
+            include_bytes!("../../../crates/dpx-formats/tests/data/v1-ocs-not-12-bit.dpxproj"),
+        )
+        .unwrap();
+        let mut app = PainterApp::new();
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        pick(&mut app, &ctx, 0.1, "picture.load");
+        typed(&mut app, &ctx, 0.2, "Old.dpxproj");
+        enter(&mut app, &ctx, 0.3);
+        let doc = app.engine.document();
+        assert_eq!(doc.target().chipset, Chipset::Ocs);
+        assert_eq!(
+            doc.palette().get(9),
+            Some(Rgb8::new(11, 11, 11)),
+            "as stored"
+        );
+        let note = app.ui.note_requester.take().expect("the load note");
+        assert_eq!(note.title(), "Picture loaded");
+        assert_eq!(
+            note.notes(),
+            [
+                "Palette entries 9-27, 29, 30 are not 12-bit OCS colours (kept as stored); IFF \
+                 export refuses the picture until they are 12-bit",
+                "To fix them, use Picture > Screen Format.. with the OCS chipset (it rounds them \
+                 to 12-bit colours and says how many), or choose AGA there"
+            ]
+        );
+        // Picture ▸ Export.. as IFF is refused and writes nothing.
+        pick(&mut app, &ctx, 0.5, "picture.export");
+        typed(&mut app, &ctx, 0.6, "Old.iff");
+        enter(&mut app, &ctx, 0.7);
+        assert!(!dir.join("Old.iff").exists());
+        let note = app.ui.note_requester.take().expect("the refusal");
+        assert_eq!(note.title(), NOT_EXPORTED);
+        assert_eq!(
+            note.notes()[0],
+            "Palette entry 9 is not a 12-bit OCS colour"
+        );
+        // The Color Mixer edits entry 10 (one R level up): that entry becomes 12-bit, the
+        // others stay as stored, in one undo step.
+        app.ui.fg = 10;
+        app.run_action(dpx_ui::Action::Command("palette.mixer"), &ctx);
+        let r = dpx_ui::PaletteRequester::slider_rect(0);
+        app.palette_event(dpx_ui::ReqEvent::Press(r.x + r.w - 2, r.y + 4));
+        app.palette_event(dpx_ui::ReqEvent::Release);
+        app.palette_event(dpx_ui::ReqEvent::Key(dpx_ui::ReqKey::Enter));
+        assert!(app.ui.palette_requester.is_none());
+        let p = app.engine.document().palette().clone();
+        assert_eq!(p.get(10), Some(Rgb8::new(0x22, 0x11, 0x11)));
+        assert_eq!(p.get(11), Some(Rgb8::new(33, 33, 33)), "untouched");
+        let bad = hardware::unshowable_entries(Chipset::Ocs, p.colors());
+        assert_eq!(bad.len(), 20);
+        app.undo();
+        assert_eq!(
+            app.engine.document().palette().get(10),
+            Some(Rgb8::new(22, 22, 22))
+        );
+        app.redo();
+        // Screen Format, Use on the same OCS format: the rest is rounded, and said so.
+        app.open_screen_format();
+        app.requester_event(dpx_ui::ReqEvent::Key(dpx_ui::ReqKey::Enter));
+        assert!(app.requester.is_none());
+        let p = app.engine.document().palette();
+        assert!(p.colors().iter().all(|&c| hardware::is_12_bit(c)));
+        assert_eq!(p.get(10), Some(Rgb8::new(0x22, 0x11, 0x11)), "kept");
+        let note = app.ui.note_requester.take().expect("the rounding note");
+        assert_eq!(note.notes(), ["20 colours rounded to 12-bit OCS values"]);
+        assert_eq!(app.engine.document().page().get(240, 50), Some(3), "kept");
+        // Now the IFF export works (the requester still holds the name typed before).
+        pick(&mut app, &ctx, 0.9, "picture.export");
+        enter(&mut app, &ctx, 1.0);
+        let note = app.ui.note_requester.take().expect("the export note");
+        assert_eq!(note.title(), "Picture exported");
+        assert!(dir.join("Old.iff").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
