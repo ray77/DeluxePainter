@@ -7,6 +7,8 @@
 //! Custom brushes (ADR-18): the Brush Selector picks up part of the page; every drawing tool
 //! then stamps it, in the Mode menu's drawing mode, and it follows the pointer as a preview.
 
+use std::borrow::Cow;
+
 use dpx_core::AnimBrush;
 use dpx_core::brush_ops;
 use dpx_core::gradient::range_for;
@@ -220,6 +222,8 @@ pub struct Stroke {
     /// The button that started the gesture is still held.
     held: bool,
     kind: Kind,
+    /// Brush ▸ Handle ▸ Place: the handle's page pixel, marked over the picture as shown.
+    mark: Option<(i32, i32)>,
 }
 
 enum Kind {
@@ -457,18 +461,24 @@ fn rect_between(a: (i32, i32), b: (i32, i32)) -> Rect {
     )
 }
 
-/// The Brush Selector's frame: the outline of `r` in the complementary colour of each page
-/// pixel (XOR style, visible on any picture), clipped to `img`.
-fn draw_frame(img: &mut IndexedImage, page: &IndexedImage, r: Rect, colors: usize) {
+/// The pixel at (`x`, `y`) of `img` in its complementary colour (XOR style: with an odd
+/// number of colours it always differs), if it is inside.
+fn flip_pixel(img: &mut IndexedImage, x: i32, y: i32, colors: usize) {
     let top = (colors.clamp(1, 256) - 1) as u8;
-    let mut flip = |x: i32, y: i32| {
-        if let Some(p) = page.get(x, y) {
-            img.set(x, y, top.saturating_sub(p));
-        }
-    };
+    if let Some(p) = img.get(x, y) {
+        img.set(x, y, top.saturating_sub(p));
+    }
+}
+
+/// The Brush Selector's frame: the outline of `r` in the complementary colour of each pixel
+/// of `img` (XOR style, visible on any picture), clipped to `img`. `img` is the picture as
+/// it shows (ADR-44: all visible layers), so the frame differs from what lies under it.
+fn draw_frame(img: &mut IndexedImage, r: Rect, colors: usize) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let mut flip = |x: i32, y: i32| flip_pixel(img, x, y, colors);
     let (x1, y1) = (r.x + r.w - 1, r.y + r.h - 1);
-    let (cx0, cx1) = (r.x.max(0), x1.min(page.width() as i32 - 1));
-    let (cy0, cy1) = (r.y.max(0), y1.min(page.height() as i32 - 1));
+    let (cx0, cx1) = (r.x.max(0), x1.min(w - 1));
+    let (cy0, cy1) = (r.y.max(0), y1.min(h - 1));
     for x in cx0..=cx1 {
         flip(x, r.y);
         if y1 != r.y {
@@ -634,6 +644,29 @@ impl Stroke {
         self.candidate(false)
     }
 
+    /// The picture of `doc` as it shows during this gesture: its visible layers with the
+    /// preview in the active layer's place, and over all of them the Brush Selector's frame
+    /// or the Place handle mark, each pixel in the complement of what shows there (ADR-44;
+    /// on one layer the same as drawing them into the page). Without frame or mark the
+    /// preview of a single layer is shown as it is, not copied.
+    pub(crate) fn shown<'a>(&'a self, doc: &'a dpx_core::Document) -> Cow<'a, IndexedImage> {
+        let shown = doc.composite_with(&self.preview);
+        let colors = doc.palette().len();
+        match (&self.kind, self.mark) {
+            (Kind::Pick { from, to }, _) => {
+                let mut img = shown.into_owned();
+                draw_frame(&mut img, rect_between(*from, *to), colors);
+                Cow::Owned(img)
+            }
+            (_, Some((x, y))) => {
+                let mut img = shown.into_owned();
+                flip_pixel(&mut img, x, y, colors);
+                Cow::Owned(img)
+            }
+            _ => shown,
+        }
+    }
+
     /// [`Self::candidate`] without the area stencil.
     fn bare_candidate(&self, commit: bool) -> Option<Command> {
         self.plain_candidate(commit)
@@ -795,10 +828,8 @@ impl Stroke {
                 .blit(&page.crop(self.drawn), self.drawn.x, self.drawn.y);
         }
         self.drawn = Rect::default();
-        if let Kind::Pick { from, to } = self.kind {
-            let r = rect_between(from, to);
-            draw_frame(&mut self.preview, page, r, palette.len());
-            self.drawn = r.intersect(page.bounds());
+        if let Kind::Pick { .. } = self.kind {
+            // The frame goes over the picture as shown, not into the layer ([`Self::shown`]).
             return;
         }
         if let Some(cmd) = self.candidate(false)
@@ -1012,16 +1043,12 @@ impl PainterApp {
             aspect: (1, 1),
             held: false,
             kind: Kind::Hover { at },
+            mark: None,
         };
         s.redraw(doc.page(), doc.palette());
         if mark {
-            // The handle: its pixel in the complementary colour.
-            let (x, y) = (at.0 + handle.0, at.1 + handle.1);
-            let top = (doc.palette().len().clamp(1, 256) - 1) as u8;
-            if let Some(p) = s.preview.get(x, y) {
-                s.preview.set(x, y, top.saturating_sub(p));
-                s.drawn = s.drawn.union(Rect { x, y, w: 1, h: 1 });
-            }
+            // The handle: its pixel in the complementary colour of what shows there.
+            s.mark = Some((at.0 + handle.0, at.1 + handle.1));
         }
         self.stroke = Some(s);
         self.dirty = true;
@@ -1241,6 +1268,7 @@ impl PainterApp {
             }
             s.kind = Kind::Hover { at };
             s.ink = ink;
+            s.mark = None;
             s.redraw(doc.page(), doc.palette());
         } else {
             let mut s = Stroke {
@@ -1253,6 +1281,7 @@ impl PainterApp {
                 aspect: (1, 1),
                 held: false,
                 kind: Kind::Hover { at },
+                mark: None,
             };
             s.redraw(doc.page(), doc.palette());
             self.stroke = Some(s);
@@ -1460,6 +1489,7 @@ impl PainterApp {
             aspect: self.aspect(),
             held: true,
             kind,
+            mark: None,
         };
         s.ink.cels = self.animbrush_cels();
         match &s.kind {
@@ -2894,6 +2924,58 @@ mod tests {
         let b = app.custom_brush.clone().unwrap();
         assert_eq!(b.handle, (3, 2), "pointer minus the brush's top left");
         assert_eq!(b.pixels, original.pixels);
+    }
+
+    /// ADR-44: the Brush Selector's frame and the Place handle mark go over the picture as
+    /// it shows, in the complement of what shows there, whichever layer is active (on an
+    /// upper layer they used to be drawn into it, inverted from its own transparent pixels).
+    #[test]
+    fn frame_and_handle_mark_show_over_every_layer() {
+        // CLR 31 (the top colour of 32: its complement is 0).
+        let layered = |upper: bool| {
+            let mut app = app(Tool::BrushSelect, false);
+            app.engine.execute(Command::Clear { color: 31 }).unwrap();
+            if upper {
+                app.engine
+                    .execute(Command::AddLayer { name: None })
+                    .unwrap();
+            }
+            app
+        };
+        for upper in [false, true] {
+            let mut app = layered(upper);
+            let before: Vec<_> = app.engine.document().cels().cloned().collect();
+            press(&mut app, 10, 10);
+            app.handle_drag(60, 50);
+            let shown = app.page();
+            assert_eq!(shown.get(30, 50), Some(0), "bottom edge, upper {upper}");
+            assert_eq!(shown.get(10, 30), Some(0), "left edge, upper {upper}");
+            assert_eq!(shown.get(30, 30), Some(31), "inside");
+            drop(shown);
+            assert_eq!(app.compose_screen().get(30, 50), Some(0), "on the screen");
+            let during: Vec<_> = app.engine.document().cels().cloned().collect();
+            assert_eq!(before, during, "nothing goes into a layer");
+            assert!(
+                app.stroke.as_ref().unwrap().preview == *app.engine.document().page(),
+                "not into the active layer's preview either"
+            );
+        }
+        // Place on a layered page: the handle's pixel is the complement of what shows.
+        let mut app = with_brush();
+        app.engine
+            .execute(Command::AddLayer { name: None })
+            .unwrap();
+        app.brush_action("brush.handle_place");
+        app.handle_hover(100, 100);
+        let shown = app.page();
+        let doc = app.engine.document();
+        let under = doc.composite_with(&app.stroke.as_ref().unwrap().preview);
+        let top = (doc.palette().len() - 1) as u8;
+        assert_eq!(
+            shown.get(100, 100),
+            Some(top - under.get(100, 100).unwrap())
+        );
+        assert_ne!(shown.get(100, 100), under.get(100, 100));
     }
 
     #[test]

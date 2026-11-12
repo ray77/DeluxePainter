@@ -137,6 +137,29 @@ pub fn flatten(visible: &[&IndexedImage], width: u32, height: u32) -> IndexedIma
     out
 }
 
+/// `active` with the pixels of `after` wherever `after` differs from `before` (all three of
+/// one size): a change worked out on the picture as it shows (`before`, the composite) put
+/// into the active layer, e.g. LightTable ▸ Merge. Every other pixel of `active` stays.
+pub fn with_changes(
+    active: &IndexedImage,
+    before: &IndexedImage,
+    after: &IndexedImage,
+) -> IndexedImage {
+    debug_assert_eq!(
+        (active.width(), active.height()),
+        (after.width(), after.height()),
+        "one size"
+    );
+    let mut out = active.clone();
+    let changed = before.pixels().iter().zip(after.pixels());
+    for (p, (&b, &a)) in out.pixels_mut().iter_mut().zip(changed) {
+        if a != b {
+            *p = a;
+        }
+    }
+    out
+}
+
 // ---- Layer commands.
 
 impl Command {
@@ -153,7 +176,33 @@ impl Command {
                 | Command::RenameLayer { .. }
                 | Command::MergeLayerDown { .. }
                 | Command::FlattenLayers
+                | Command::SetPicture { .. }
         )
+    }
+
+    /// The [`Command::SetPicture`] that makes a document of `doc`'s palette and target show
+    /// and hold what `doc` does: every frame with every layer, the layer stack, the current
+    /// frame and the active layer (the rate is a setting and stays).
+    pub fn set_picture(doc: &Document) -> Command {
+        let layers = doc.layer_count();
+        let frames = (0..doc.frame_count())
+            .map(|f| {
+                (0..layers)
+                    .map(|l| {
+                        let cel = doc.cel(f, l).expect("an existing frame and layer");
+                        cel.pixels().to_vec()
+                    })
+                    .collect()
+            })
+            .collect();
+        Command::SetPicture {
+            width: doc.page.width(),
+            height: doc.page.height(),
+            layers: doc.layers.clone(),
+            frames,
+            current: doc.current_frame() as u32,
+            active: doc.active_layer() as u32,
+        }
     }
 }
 
@@ -224,8 +273,80 @@ pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError
             Ok(())
         }
         Command::FlattenLayers => Ok(()),
+        Command::SetPicture {
+            width,
+            height,
+            layers,
+            frames,
+            current,
+            active,
+        } => validate_picture(doc, (*width, *height), layers, frames, *current, *active),
         _ => unreachable!("not a layer command"),
     }
+}
+
+/// [`Command::SetPicture`]: a stack of 1 to [`MAX_LAYERS`] named layers, at least one frame
+/// with one picture per layer, every picture `width`×`height` in the palette, a size the
+/// target allows (or the page's own), frames times layers within the memory limit, and a
+/// current frame and active layer that exist.
+fn validate_picture(
+    doc: &Document,
+    (width, height): (u32, u32),
+    layers: &[Layer],
+    frames: &[Vec<Vec<u8>>],
+    current: u32,
+    active: u32,
+) -> Result<(), CommandError> {
+    if layers.is_empty() || layers.len() > MAX_LAYERS {
+        return Err(CommandError::invalid(format!(
+            "{} layers: 1 to {MAX_LAYERS} allowed",
+            layers.len()
+        )));
+    }
+    for l in layers {
+        check_name(&l.name)?;
+    }
+    if frames.is_empty() {
+        return Err(CommandError::invalid(
+            "a picture needs at least one frame".into(),
+        ));
+    }
+    let colors = doc.palette.len();
+    for (f, frame) in frames.iter().enumerate() {
+        if frame.len() != layers.len() {
+            return Err(CommandError::invalid(format!(
+                "frame {} holds {} pictures for {} layers",
+                f + 1,
+                frame.len(),
+                layers.len()
+            )));
+        }
+        for pixels in frame {
+            crate::command::other_page(width, height, pixels, colors)?;
+        }
+    }
+    let same = (width, height) == (doc.page.width(), doc.page.height());
+    if !same && !doc.target.page_fits(width, height) {
+        let ((min_w, min_h), (max_w, max_h)) = doc.target.page_limits();
+        return Err(CommandError::invalid(format!(
+            "Page must be {min_w}x{min_h} to {max_w}x{max_h}"
+        )));
+    }
+    check_frame_count(frames.len(), layers.len(), width, height)?;
+    if current as usize >= frames.len() {
+        return Err(CommandError::invalid(format!(
+            "current frame {} is outside 1..={}",
+            current + 1,
+            frames.len()
+        )));
+    }
+    if active as usize >= layers.len() {
+        return Err(CommandError::invalid(format!(
+            "active layer {active} is outside 0..{}",
+            layers.len()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
@@ -329,6 +450,27 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
                 ..doc.layers[0].clone()
             };
             doc.set_layered(frames, vec![bottom], current, 0);
+        }
+        Command::SetPicture {
+            width,
+            height,
+            layers,
+            frames,
+            current,
+            active,
+        } => {
+            let frames = frames
+                .iter()
+                .map(|f| {
+                    f.iter()
+                        .map(|p| {
+                            let picture = IndexedImage::from_pixels(*width, *height, p.clone());
+                            Arc::new(picture.expect("size checked by validate"))
+                        })
+                        .collect()
+                })
+                .collect();
+            doc.set_layered(frames, layers.clone(), *current as usize, *active as usize);
         }
         _ => unreachable!("not a layer command"),
     }
@@ -864,6 +1006,202 @@ mod tests {
             .map(|f| f.get(0, 0).unwrap())
             .collect();
         assert_eq!(shown, [1, 2, 3]);
+    }
+
+    #[test]
+    fn set_picture_replaces_every_frame_and_layer_as_one_step() {
+        // The source: 2 frames, 3 layers (the middle one hidden), frame 2 and layer 2 current.
+        let mut src = engine();
+        src.execute(Command::Clear { color: 1 }).unwrap();
+        src.execute(Command::AddLayer {
+            name: Some("Hills".into()),
+        })
+        .unwrap();
+        src.execute(dot(2, (1, 1))).unwrap();
+        src.execute(Command::SetLayerVisible {
+            layer: 1,
+            visible: false,
+        })
+        .unwrap();
+        src.execute(Command::AddLayer {
+            name: Some("Sun".into()),
+        })
+        .unwrap();
+        src.execute(Command::AddFrames { count: 1 }).unwrap();
+        src.execute(dot(3, (2, 0))).unwrap();
+        let command = Command::set_picture(src.document());
+        // The target: one plain frame and layer.
+        let mut e = engine();
+        e.execute(Command::Clear { color: 9 }).unwrap();
+        let before = e.document().clone();
+        e.execute(command.clone()).unwrap();
+        let (d, s) = (e.document(), src.document());
+        assert_eq!(d.layers(), s.layers());
+        assert_eq!((d.frame_count(), d.current_frame()), (2, 1));
+        assert_eq!(d.active_layer(), 2);
+        assert_eq!(d.cels().collect::<Vec<_>>(), s.cels().collect::<Vec<_>>());
+        assert_eq!(
+            d.composite_frames().collect::<Vec<_>>(),
+            s.composite_frames().collect::<Vec<_>>()
+        );
+        assert_eq!(d.palette(), before.palette());
+        // One step: undo gives the old picture back, redo the new one.
+        e.undo().unwrap();
+        assert_eq!(e.document().cels().collect::<Vec<_>>(), [before.page()]);
+        assert_eq!(e.document().layers(), before.layers());
+        e.redo().unwrap();
+        assert_eq!(e.document().layers(), src.document().layers());
+        assert_eq!(
+            e.document().cels().collect::<Vec<_>>(),
+            src.document().cels().collect::<Vec<_>>()
+        );
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert!(!e.can_undo(), "the Clear and the new picture: two steps");
+        // JSON.
+        let json = serde_json::to_value(&command).unwrap();
+        assert_eq!(json["op"], "set_picture");
+        assert_eq!(serde_json::from_value::<Command>(json).unwrap(), command);
+    }
+
+    #[test]
+    fn set_picture_is_checked() {
+        let e = engine();
+        let bad = |c: Command| {
+            let mut e = e.clone();
+            e.execute(c).unwrap_err().code
+        };
+        let picture = |layers: Vec<Layer>, frames: Vec<Vec<Vec<u8>>>, (w, h)| Command::SetPicture {
+            width: w,
+            height: h,
+            layers,
+            frames,
+            current: 0,
+            active: 0,
+        };
+        let one = || vec![Layer::background()];
+        assert_eq!(
+            bad(picture(vec![], vec![vec![]], (4, 2))),
+            ErrorCode::InvalidArgument,
+            "no layer"
+        );
+        assert_eq!(
+            bad(picture(one(), vec![], (4, 2))),
+            ErrorCode::InvalidArgument,
+            "no frame"
+        );
+        assert_eq!(
+            bad(picture(one(), vec![vec![vec![0; 8], vec![0; 8]]], (4, 2))),
+            ErrorCode::InvalidArgument,
+            "two pictures for one layer"
+        );
+        assert_eq!(
+            bad(picture(one(), vec![vec![vec![0; 7]]], (4, 2))),
+            ErrorCode::InvalidArgument,
+            "a short picture"
+        );
+        assert_eq!(
+            bad(picture(one(), vec![vec![vec![40; 8]]], (4, 2))),
+            ErrorCode::PaletteRangeInvalid
+        );
+        assert_eq!(
+            bad(picture(
+                vec![Layer::new("x".repeat(256))],
+                vec![vec![vec![0; 8]]],
+                (4, 2)
+            )),
+            ErrorCode::InvalidArgument
+        );
+        // Another size must be a page the target allows (the 4x2 page itself is not one).
+        assert_eq!(
+            bad(picture(one(), vec![vec![vec![0; 4]]], (2, 2))),
+            ErrorCode::InvalidArgument
+        );
+        let mut e = e.clone();
+        let big = vec![vec![vec![3; 320 * 256]]];
+        let out = e.execute(picture(one(), big, (320, 256))).unwrap();
+        assert!(out.format_changed, "the page size changed");
+        assert_eq!(e.document().page().width(), 320);
+        e.undo().unwrap();
+        assert_eq!(e.document().page().width(), 4);
+        // The current frame and the active layer must exist.
+        let mut c = picture(one(), vec![vec![vec![0; 8]]], (4, 2));
+        if let Command::SetPicture { current, .. } = &mut c {
+            *current = 1;
+        }
+        assert_eq!(bad(c), ErrorCode::InvalidArgument);
+        let mut c = picture(one(), vec![vec![vec![0; 8]]], (4, 2));
+        if let Command::SetPicture { active, .. } = &mut c {
+            *active = 1;
+        }
+        assert_eq!(bad(c), ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn merge_in_back_goes_behind_every_visible_layer() {
+        // Bottom: 1 1 0 0 / 0 0 0 0; the active upper layer: 0 2 0 0 / 0 0 0 5.
+        let mut e = engine();
+        e.execute(Command::SetPage {
+            width: 4,
+            height: 2,
+            pixels: vec![1, 1, 0, 0, 0, 0, 0, 0],
+        })
+        .unwrap();
+        e.execute(Command::AddLayer { name: None }).unwrap();
+        e.execute(Command::SetPage {
+            width: 4,
+            height: 2,
+            pixels: vec![0, 2, 0, 0, 0, 0, 0, 5],
+        })
+        .unwrap();
+        let merge = |front| Command::MergePage {
+            width: 4,
+            height: 2,
+            pixels: vec![7; 8],
+            front,
+            transparent: 0,
+        };
+        // In back: only where the picture shows colour 0, not where the bottom layer shows
+        // through the upper layer's transparent pixels.
+        e.execute(merge(false)).unwrap();
+        assert_eq!(e.document().page().pixels(), [0, 2, 7, 7, 7, 7, 7, 5]);
+        assert_eq!(e.document().composite().pixels(), [1, 2, 7, 7, 7, 7, 7, 5]);
+        assert_eq!(
+            e.document().layer(0).unwrap().pixels(),
+            [1, 1, 0, 0, 0, 0, 0, 0]
+        );
+        e.undo().unwrap();
+        // In front: the other page covers the active layer.
+        e.execute(merge(true)).unwrap();
+        assert_eq!(e.document().composite().pixels(), [7; 8]);
+        e.undo().unwrap();
+        // A hidden active layer keeps what it holds where the picture shows colour 0.
+        e.execute(Command::SetLayerVisible {
+            layer: 1,
+            visible: false,
+        })
+        .unwrap();
+        e.execute(merge(false)).unwrap();
+        assert_eq!(e.document().page().pixels(), [0, 2, 7, 7, 7, 7, 7, 5]);
+    }
+
+    #[test]
+    fn helpers_for_arranging_and_merging_changes() {
+        let pic = |p: &[u8]| IndexedImage::from_pixels(4, 1, p.to_vec()).unwrap();
+        // Arrange: entries 0 and 3 change places; above the bottom layer 0 stays 0.
+        let order = [3, 1, 2, 0];
+        let bottom = crate::remap::arranged_picture(&pic(&[0, 1, 2, 3]), &order, false);
+        assert_eq!(bottom.pixels(), [3, 1, 2, 0]);
+        let upper = crate::remap::arranged_picture(&pic(&[0, 1, 2, 1]), &order, true);
+        assert_eq!(upper.pixels(), [0, 1, 2, 1]);
+        // Changes found on the composite go into the active layer, nothing else does.
+        let active = pic(&[0, 5, 0, 0]);
+        let before = pic(&[4, 5, 0, 4]);
+        let after = pic(&[4, 5, 9, 6]);
+        assert_eq!(
+            with_changes(&active, &before, &after).pixels(),
+            [0, 5, 9, 6]
+        );
     }
 
     /// How long one composite takes (the screen makes one per redraw of a layered page).

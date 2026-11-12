@@ -256,6 +256,18 @@ impl Layout {
 struct Rename {
     layer: usize,
     field: TextField,
+    /// What the gadget opened with: the name with only the characters it can show. While
+    /// the text is still this, nothing was typed, and ending the gadget renames nothing (a
+    /// name the core took with other characters keeps them).
+    initial: String,
+}
+
+impl Rename {
+    /// The name typed, if it is another one than the gadget opened with.
+    fn typed(&self) -> Option<(usize, String)> {
+        let text = self.field.text();
+        (text != self.initial).then_some((self.layer, text))
+    }
 }
 
 /// What a key did to the rename gadget.
@@ -265,7 +277,7 @@ pub enum RenameStep {
     Editing,
     /// Return: the layer and the name typed (the gadget closed).
     Done(usize, String),
-    /// Esc: the gadget closed, the name stays.
+    /// Esc, or Return on the name as it opened: the gadget closed, the name stays.
     Cancelled,
 }
 
@@ -402,7 +414,11 @@ impl LayerPanel {
         let mut field = TextField::new(dpx_core::layer::MAX_NAME_CHARS);
         let name: String = row.name.chars().filter(|&c| name_char(c)).collect();
         field.set(&name);
-        self.rename = Some(Rename { layer, field });
+        self.rename = Some(Rename {
+            layer,
+            field,
+            initial: name,
+        });
     }
 
     /// The layer being renamed.
@@ -415,15 +431,18 @@ impl LayerPanel {
         self.rename.as_ref().map(|r| r.field.text())
     }
 
-    /// A key for the rename gadget: Return ends it with the name, Esc without; characters
-    /// outside [`name_char`] are left out.
+    /// A key for the rename gadget: Return ends it with the name (unless it is still the
+    /// one the gadget opened with), Esc without; characters outside [`name_char`] are left
+    /// out.
     pub fn rename_key(&mut self, key: ReqKey) -> RenameStep {
         let Some(r) = &mut self.rename else {
             return RenameStep::Cancelled;
         };
         match key {
             ReqKey::Enter => {
-                let done = RenameStep::Done(r.layer, r.field.text());
+                let done = r
+                    .typed()
+                    .map_or(RenameStep::Cancelled, |(l, name)| RenameStep::Done(l, name));
                 self.rename = None;
                 done
             }
@@ -439,9 +458,10 @@ impl LayerPanel {
         }
     }
 
-    /// Ends the rename gadget, returning the layer and the name typed (as Return does).
+    /// Ends the rename gadget, returning the layer and the name typed (as Return does):
+    /// nothing while the text is still the one the gadget opened with.
     pub fn finish_rename(&mut self) -> Option<(usize, String)> {
-        self.rename.take().map(|r| (r.layer, r.field.text()))
+        self.rename.take().and_then(|r| r.typed())
     }
 
     /// What lies at UI pixel (`x`, `y`), if it is on the panel.
@@ -811,6 +831,40 @@ mod tests {
         // A rename of a layer that went ends.
         p.update(rows(&["Background"]), 0, [true; 6], l.capacity);
         assert_eq!(p.renaming(), None);
+    }
+
+    #[test]
+    fn an_untouched_name_is_no_rename() {
+        let l = Layout::overlay(320, 256, true, true, false);
+        // The core takes any name; the gadget shows only the characters the font has.
+        let mut p = panel(&["Background", "Caf\u{e9} \u{2601}"], 1, l.capacity);
+        p.begin_rename(1);
+        assert_eq!(p.rename_text().as_deref(), Some("Caf "));
+        // Return or a click elsewhere without typing: no new name, so "Caf" never replaces it.
+        assert_eq!(p.rename_key(ReqKey::Enter), RenameStep::Cancelled);
+        assert_eq!(p.renaming(), None);
+        p.begin_rename(1);
+        assert_eq!(p.finish_rename(), None);
+        // Typed and taken back again: still the name it opened with.
+        p.begin_rename(1);
+        p.rename_key(ReqKey::Char('x'));
+        p.rename_key(ReqKey::Backspace);
+        assert_eq!(p.rename_key(ReqKey::Enter), RenameStep::Cancelled);
+        // A real change is one, also for a plain name; so is a cleared field (the app keeps
+        // the old name for an empty one).
+        p.begin_rename(0);
+        assert_eq!(p.rename_key(ReqKey::Enter), RenameStep::Cancelled);
+        p.begin_rename(1);
+        p.rename_key(ReqKey::Char('!'));
+        assert_eq!(p.finish_rename(), Some((1, "Caf !".into())));
+        p.begin_rename(0);
+        for _ in 0..10 {
+            p.rename_key(ReqKey::Backspace);
+        }
+        assert_eq!(
+            p.rename_key(ReqKey::Enter),
+            RenameStep::Done(0, String::new())
+        );
     }
 
     #[test]

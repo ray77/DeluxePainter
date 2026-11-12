@@ -278,6 +278,18 @@ impl Document {
             .expect("the current frame exists")
     }
 
+    /// [`Document::composite_with`] as a picture of its own, made from `active`: when that
+    /// is the only visible layer it comes back as it is, not copied (one layer, e.g. a
+    /// preview drawn on every redraw).
+    pub fn composite_owned(&self, active: IndexedImage) -> IndexedImage {
+        let flat = self.composite_with(&active);
+        if matches!(&flat, Cow::Borrowed(p) if std::ptr::eq(*p, &active)) {
+            drop(flat);
+            return active;
+        }
+        flat.into_owned()
+    }
+
     /// Frame `i` as it looks (see [`Document::composite`]).
     pub fn composite_frame(&self, i: usize) -> Option<Cow<'_, IndexedImage>> {
         self.composite_frame_with(i, None)
@@ -604,7 +616,34 @@ mod tests {
         let one = Document::new(4, 2, pal);
         assert!(matches!(one.composite(), Cow::Borrowed(p) if std::ptr::eq(p, one.page())));
         assert!(matches!(one.composite_frame(0), Some(Cow::Borrowed(_))));
+        // And a stroke preview in its place is shown as it is, not copied (the hot path of
+        // every redraw while painting, ADR-40).
+        let preview = IndexedImage::new(4, 2, 7);
+        assert!(matches!(
+            one.composite_with(&preview),
+            Cow::Borrowed(p) if std::ptr::eq(p, &preview)
+        ));
         assert!(one.composite_frame(1).is_none());
+        let at = preview.pixels().as_ptr();
+        let owned = one.composite_owned(preview);
+        assert_eq!(owned.pixels().as_ptr(), at, "its own pixels, not a copy");
+        assert_eq!(owned.pixels(), [7; 8]);
+    }
+
+    #[test]
+    fn an_owned_composite_is_what_shows() {
+        let pal = Palette::dpaint_default_32();
+        let t = Target::default();
+        let pic = |p: [u8; 3]| IndexedImage::from_pixels(3, 1, p.to_vec()).unwrap();
+        let frames = vec![vec![pic([1, 1, 1]), pic([0, 2, 0])]];
+        let mut layers = vec![Layer::background(), Layer::new("Top")];
+        let d = Document::from_layers(frames.clone(), layers.clone(), 0, 1, 30, pal.clone(), t)
+            .unwrap();
+        assert_eq!(d.composite_owned(pic([5, 0, 0])).pixels(), [5, 1, 1]);
+        // The active layer hidden: the one other visible layer shows, not the preview.
+        layers[1].visible = false;
+        let d = Document::from_layers(frames, layers, 0, 1, 30, pal, t).unwrap();
+        assert_eq!(d.composite_owned(pic([5, 0, 0])).pixels(), [1, 1, 1]);
     }
 
     #[test]

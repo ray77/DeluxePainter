@@ -770,8 +770,8 @@ impl PainterApp {
             }
         }
         // ADR-44: the stamp goes into the active layer; the frame shows all visible layers
-        // and the marks lie on top of them.
-        let mut shown = doc.composite_with(&stamped).into_owned();
+        // and the marks lie on top of them (one layer: the stamped copy itself).
+        let mut shown = doc.composite_owned(stamped);
         self.draw_perspective_marks(&mut shown);
         self.perspective.shown = Some(shown);
     }

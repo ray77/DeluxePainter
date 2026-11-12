@@ -41,8 +41,8 @@ A version-3 manifest adds the version-2 fields and the layer stack, for example 
 {
   "format_version": 3,
   "frames": [
-    { "layers": [ { "name": "Background", "image": "frames/0/layers/0.png" }, { "name": "Ink", "image": "frames/0/layers/1.png" } ] },
-    { "layers": [ { "name": "Background", "image": "frames/1/layers/0.png" }, { "name": "Ink", "image": "frames/1/layers/1.png" } ] }
+    { "layers": [ { "image": "frames/0/layers/0.png" }, { "image": "frames/0/layers/1.png" } ] },
+    { "layers": [ { "image": "frames/1/layers/0.png" }, { "image": "frames/1/layers/1.png" } ] }
   ],
   "current_frame": 1,
   "fps": 12,
@@ -58,7 +58,7 @@ A version-3 manifest adds the version-2 fields and the layer stack, for example 
 - `palette`: 1 to 256 `#RRGGBB` strings; the index is the colour number. 8 bits per channel are kept exactly.
 - `ranges`: colour-cycling ranges as ILBM CRNG stores them (`rate` 16384 = 60 steps/s, `flags` bit 0 active, bit 1 reverse, other bits kept). Ranges outside the palette are kept.
 - `grab`: brush grab point `[x, y]` or `null`. `transparent_color`: palette entry that is transparent in brushes, or `null`.
-- `frames`: the animation frames in order, each with its layers bottom first. Version 1 has exactly one frame; versions 2 and 3 one or more (the writer uses version 2 from two frames on). In versions 1 and 2 every frame has exactly one layer; in version 3 every frame has one entry per layer of `layers`, in the same order and with the same names. `layers[].name` is at most 255 characters; `image` is the relative path of the entry. All frames and layers have the page size.
+- `frames`: the animation frames in order, each with its layers bottom first. Version 1 has exactly one frame; versions 2 and 3 one or more (the writer uses version 2 from two frames on). In versions 1 and 2 every frame has exactly one layer, with its `name`; in version 3 every frame has one entry per layer of `layers`, in the same order, and the writer gives them no `name` (the stack names each layer once, so long names do not repeat for every frame); a `name` the reader finds there must be the stack's. `layers[].name` is at most 255 characters; `image` is the relative path of the entry. All frames and layers have the page size.
 - `current_frame` (versions 2 and 3, required): the frame shown when the project was saved, counted from 0.
 - `fps` (versions 2 and 3, required): the playback rate, 1 to 60 frames per second (Anim ▸ Control ▸ Set Rate).
 - `layers` (version 3 only, required): the layer stack shared by every frame, bottom first, 1 to 32 entries. `name`: at most 255 characters; `visible`: whether the layer shows (layers are shown or hidden, nothing in between). On every layer above the bottom one, colour 0 is transparent; the bottom layer is opaque. A version-1 or version-2 file has one visible layer named as its frames' layer (always "Background" from DeluxePainter).
@@ -80,9 +80,9 @@ The reader refuses, with a short summary line and details (ADR-17 style):
 - entry names that are empty, absolute, contain `\`, `:` or NUL, or have an empty, `.` or `..` component (path traversal), in the archive and in the manifest; directory entries; duplicate names;
 - a missing entry, or an entry that the manifest does not name (the entry set is exactly the manifest plus its images);
 - a PNG that is not 8-bit indexed, has another size or palette than the manifest, has `tRNS`, or is damaged;
-- limits (`Limits::default`): at most 31 970 entries (999 frames of 32 layers, the manifest and the spare page), 256 MiB uncompressed in total (declared sizes are checked first, and the bytes actually read are capped too), 1 MiB manifest, 64 megapixels per image;
+- limits (`Limits::default`): at most 31 970 entries (999 frames of 32 layers, the manifest and the spare page), 256 MiB uncompressed in total (declared sizes are checked first, and the bytes actually read are capped too), 1 MiB manifest (the largest the program writes, every picture a document may hold on the smallest page with 32 layer names of 255 escaped characters, stays under a quarter of it: test `the_largest_layered_documents_read_back`), 64 megapixels per image;
 - versions 2 and 3: no frames, a missing or out-of-range `current_frame` or `fps`;
-- versions 1 and 2: a frame without exactly one layer;
+- versions 1 and 2: a frame without exactly one layer, or a layer entry without a `name`;
 - version 3: a missing `layers` or `active_layer`, no layers or more than 32, an `active_layer` outside them, a frame without exactly one entry per layer, or an entry named otherwise than its layer;
 - more frames than the document limits allow: 999 frames, at most 128 MiB of pictures (frames times layers times page pixels: `dpx_core::anim::max_frames_for_layers`); checked before any image is decoded.
 

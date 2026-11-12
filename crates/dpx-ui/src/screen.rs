@@ -605,7 +605,9 @@ impl Screen {
     }
 
     pub fn hit_test(&self, palette_len: usize, ui: &UiState, x: i32, y: i32) -> Hit {
-        if ui.title_visible && y < geom::TITLE_H {
+        // The title bar spans the screen only: the docked layer panel right of it (x >=
+        // width) has its own title row there (ADR-44).
+        if ui.title_visible && y < geom::TITLE_H && x < self.width {
             return Hit::TitleBar;
         }
         if let Some(panel) = &ui.anim_panel {
@@ -972,6 +974,32 @@ mod tests {
             Hit::LayerPanel(LayerHit::Button(crate::layer_panel::LayerButton::New))
         );
         assert!(new.x >= 320);
+        // Its title row lies in line with the title bar but is the panel's: its label and,
+        // with more layers than rows, its scroll arrows.
+        assert_eq!(d.panel.y, 0);
+        assert_eq!(
+            screen.hit_test(32, &ui, 330, 5),
+            Hit::LayerPanel(LayerHit::Background)
+        );
+        let names: Vec<String> = (0..25).map(|i| format!("L{i}")).collect();
+        let rows = names.iter().map(|n| LayerRow {
+            name: n.clone(),
+            visible: true,
+        });
+        let panel = ui.layer_panel.as_mut().unwrap();
+        panel.update(rows.collect(), 24, [true; 6], d.capacity);
+        assert!(d.capacity < 25);
+        let down = d.scroll_down();
+        assert!(down.y < geom::TITLE_H);
+        assert_eq!(
+            screen.hit_test(32, &ui, down.x + 2, down.y + 4),
+            Hit::LayerPanel(LayerHit::ScrollDown)
+        );
+        assert_eq!(
+            screen.hit_test(32, &ui, 319, 5),
+            Hit::TitleBar,
+            "the screen's"
+        );
     }
 
     #[test]

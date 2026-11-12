@@ -1429,7 +1429,7 @@ impl PainterApp {
         }
         let doc = self.engine.document();
         match &self.stroke {
-            Some(s) => doc.composite_with(&s.preview),
+            Some(s) => s.shown(doc),
             None => doc.composite(),
         }
     }

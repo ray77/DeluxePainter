@@ -48,8 +48,8 @@ pub struct AnimState {
     pub shown: Option<IndexedImage>,
 }
 
-/// The Light Table picture of `doc` (ADR-28): `base` (the current frame as it shows, or the
-/// active layer for Merge) with the chosen other frames and the `spare` page showing
+/// The Light Table picture of `doc` (ADR-28): `base` (the current frame as it shows,
+/// perhaps with a stroke preview) with the chosen other frames and the `spare` page showing
 /// through its `empty` (BG colour) pixels, nearest first, dimmed if Dim is on. The other
 /// frames show as they look, all visible layers (ADR-44); `spare` is the spare page as it
 /// shows. Display only.
@@ -369,7 +369,9 @@ impl PainterApp {
 
     /// LightTable ▸ Merge: the images shown (not dimmed) become part of the current frame,
     /// and the Light Table switches off. DeluxePaint cannot undo this; here it is one undo
-    /// step (`SetPage`). They go into the active layer, through its BG pixels (ADR-44).
+    /// step (`SetPage`). ADR-44: the picture is worked out on the frame as it shows (as the
+    /// Light Table showed it), and only the pixels the other images fill in go into the
+    /// active layer; the rest of it stays as it is.
     fn merge_light_table(&mut self) {
         self.finish_stroke();
         if !self.anim.light_on {
@@ -382,7 +384,9 @@ impl PainterApp {
             .as_ref()
             .map(|s| s.engine.document().composite());
         let spare = spare.as_deref();
-        let merged = light_table_page(doc, doc.page(), self.anim.light, spare, self.ui.bg, false);
+        let shown = doc.composite();
+        let table = light_table_page(doc, &shown, self.anim.light, spare, self.ui.bg, false);
+        let merged = dpx_core::layer::with_changes(doc.page(), &shown, &table);
         self.anim.light_on = false;
         if &merged != doc.page() {
             let _ = self.frame_command(Command::SetPage {

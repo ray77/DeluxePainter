@@ -118,6 +118,11 @@ fn command_bytes(command: &Command) -> u64 {
             name.len() as u64
         }
         Command::ArrangePalette { order } => order.len() as u64,
+        Command::SetPicture { layers, frames, .. } => {
+            let names: u64 = layers.iter().map(|l| l.name.len() as u64).sum();
+            let pixels: u64 = frames.iter().flatten().map(|p| p.len() as u64).sum();
+            names + pixels
+        }
         Command::AnimBrushPaint { brush, paint } => brush.bytes() + command_bytes(paint),
         Command::MoveBrush {
             brush,

@@ -50,6 +50,21 @@ pub fn reindex(pixels: &[u8], order: &[u8]) -> Vec<u8> {
     pixels.iter().map(|&p| lut[usize::from(p)]).collect()
 }
 
+/// A picture renumbered for a palette arranged with `order` ([`reindex`]). On a layer above
+/// the bottom one (`upper`) colour 0 is transparent and stays 0 (ADR-44); the order must then
+/// not move another colour of the picture to entry 0.
+pub fn arranged_picture(picture: &IndexedImage, order: &[u8], upper: bool) -> IndexedImage {
+    let mut pixels = reindex(picture.pixels(), order);
+    if upper {
+        for (p, &old) in pixels.iter_mut().zip(picture.pixels()) {
+            if old == 0 {
+                *p = 0;
+            }
+        }
+    }
+    IndexedImage::from_pixels(picture.width(), picture.height(), pixels).expect("same size")
+}
+
 /// Moves the entry at position `from` to position `to`; the entries in between shift by one.
 pub fn move_entry(order: &mut [u8], from: usize, to: usize) {
     if from >= order.len() || to >= order.len() || from == to {

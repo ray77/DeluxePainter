@@ -219,7 +219,11 @@ struct FrameEntry {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LayerEntry {
-    name: String,
+    /// The layer's name: in every entry of versions 1 and 2. Version 3 names its layers once,
+    /// in the stack, and writes none here (so long names do not repeat for every frame and
+    /// the manifest stays small); a name read here must then be the stack's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     image: String,
 }
 
@@ -271,7 +275,7 @@ pub fn write_project(project: &Project) -> Result<Vec<u8>, ProjectError> {
                     .iter()
                     .enumerate()
                     .map(|(l, layer)| LayerEntry {
-                        name: layer.name.clone(),
+                        name: (!layered).then(|| layer.name.clone()),
                         image: layer_path(f, l),
                     })
                     .collect(),
@@ -513,7 +517,8 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
             .frames
             .first()
             .and_then(|f| f.layers.first())
-            .map_or_else(|| layer::BACKGROUND.to_string(), |l| l.name.clone());
+            .and_then(|l| l.name.clone())
+            .unwrap_or_else(|| layer::BACKGROUND.to_string());
         (vec![Layer::new(name)], 0)
     };
     let max_frames = anim::max_frames_for_layers(m.page.width, m.page.height, stack.len());
@@ -569,14 +574,24 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
             }));
         }
         for (l, entry) in frame.layers.iter().enumerate() {
-            if entry.name.chars().count() > layer::MAX_NAME_CHARS {
-                return Err(invalid("layer name is longer than 255 characters"));
-            }
-            if version >= 3 && entry.name != stack[l].name {
-                return Err(invalid(format!(
-                    "frame {f} layer {l} is called {:?}, the stack says {:?}",
-                    entry.name, stack[l].name
-                )));
+            match &entry.name {
+                None if version < 3 => {
+                    return Err(invalid(format!(
+                        "frame {f} layer {l} has no name (version {version} names every \
+                         frame's layer)"
+                    )));
+                }
+                None => {}
+                Some(name) if name.chars().count() > layer::MAX_NAME_CHARS => {
+                    return Err(invalid("layer name is longer than 255 characters"));
+                }
+                Some(name) if version >= 3 && *name != stack[l].name => {
+                    return Err(invalid(format!(
+                        "frame {f} layer {l} is called {name:?}, the stack says {:?}",
+                        stack[l].name
+                    )));
+                }
+                Some(_) => {}
             }
             check_name(&entry.image)?;
             layers.push(entry);
@@ -1277,10 +1292,11 @@ mod tests {
                 { "name": "Top", "visible": true }
             ])
         );
-        assert_eq!(m["frames"][1]["layers"][2]["name"], "Top");
+        assert_eq!(m["layers"][2]["name"], "Top");
         assert_eq!(
-            m["frames"][1]["layers"][2]["image"],
-            "frames/1/layers/2.png"
+            m["frames"][1]["layers"][2],
+            serde_json::json!({ "image": "frames/1/layers/2.png" }),
+            "the frames do not repeat the names"
         );
         let names: Vec<String> = entries(&bytes).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names.len(), 1 + 4 * 3);
@@ -1355,7 +1371,12 @@ mod tests {
         );
         assert!(err(&|m| m["active_layer"] = 3.into()).contains("active_layer"));
         assert!(err(&|m| m["layers"] = serde_json::json!([])).contains("1 to"));
-        assert!(err(&|m| m["layers"][1]["name"] = "Sea".into()).contains("the stack says"));
+        // A frame entry may name its layer, as the stack does.
+        assert!(changed(&|m| m["frames"][1]["layers"][1]["name"] = "Sky".into()).is_ok());
+        assert!(
+            err(&|m| m["frames"][1]["layers"][1]["name"] = "Sea".into()).contains("the stack says")
+        );
+        assert!(err(&|m| m["layers"][1]["name"] = "x".repeat(256).into()).contains("255"));
         assert!(err(&|m| m["layers"][1]["opacity"] = 50.into()).contains("unknown field"));
         // A frame without all layers, and a layer whose picture is missing.
         assert!(
@@ -1391,11 +1412,70 @@ mod tests {
         let bytes = with_manifest(|m| m["frames"][0]["layers"][0]["name"] = "Ink".into());
         let back = read_project(&bytes).unwrap();
         assert_eq!(back.document.layers(), [Layer::new("Ink")]);
+        // Versions 1 and 2 name every frame's layer.
+        let bytes = with_manifest(|m| {
+            m["frames"][0]["layers"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("name");
+        });
+        let e = read_project(&bytes).unwrap_err();
+        assert!(e.details().contains("has no name"), "{e}");
         let bytes = write_project(&project(8, 4, 4)).unwrap();
         assert_eq!(
             read_project(&bytes).unwrap().document.layers(),
             [Layer::background()]
         );
+    }
+
+    /// The largest manifests the program writes: every picture entry a document may hold on
+    /// the smallest page any mode allows (320x200; frames times layers within 128 MiB) and
+    /// layer names of 255 characters that JSON writes as six bytes each. They must stay
+    /// readable: before the frames stopped repeating the names, 21 frames of 32 such layers
+    /// already passed the 1 MiB the reader takes.
+    #[test]
+    fn the_largest_layered_documents_read_back() {
+        let screen = Target {
+            screen: (320, 200),
+            ..Target::default()
+        };
+        let worst = |layers: usize| {
+            let frames = anim::max_frames_for_layers(320, 200, layers);
+            let blank = IndexedImage::new(320, 200, 0);
+            let name = |l: usize| {
+                let mut n: String = "\u{1}".repeat(layer::MAX_NAME_CHARS - 3);
+                n.push_str(&format!("{l:03}"));
+                n
+            };
+            let stack = (0..layers).map(|l| Layer::new(name(l))).collect();
+            let pictures = vec![vec![blank; layers]; frames];
+            let doc = Document::from_layers(
+                pictures,
+                stack,
+                frames - 1,
+                layers - 1,
+                anim::MAX_FPS,
+                sample_palette(256),
+                screen,
+            )
+            .unwrap();
+            (Project::new(doc, ProjectExtras::default()), frames * layers)
+        };
+        // 3 layers give the most pictures (699 frames, 2097 pictures), 32 the longest stack.
+        for layers in [3, layer::MAX_LAYERS] {
+            let (p, pictures) = worst(layers);
+            assert!(pictures >= 2080, "{pictures}");
+            let bytes = write_project(&p).unwrap();
+            let manifest = &entries(&bytes)[0].1;
+            assert!(
+                (manifest.len() as u64) < Limits::default().max_manifest_bytes / 4,
+                "{} bytes",
+                manifest.len()
+            );
+            let back = read_project(&bytes).unwrap();
+            assert_eq!(back.document.layers(), p.document.layers());
+            assert_eq!(back.document.frame_count(), p.document.frame_count());
+        }
     }
 
     #[test]

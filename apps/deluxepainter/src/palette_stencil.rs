@@ -478,13 +478,16 @@ impl PainterApp {
     /// Effect ▸ Background ▸ Lock FG (AGA p.275, tutorial p.119): the pixels painted since
     /// Background ▸ Fix, whatever their colour, become an area stencil.
     fn lock_fg(&mut self) {
-        let Some(bg) = self.menu_data.background.clone() else {
+        // ADR-44: the layer the background was fixed on (a layer that went has none).
+        let doc = self.engine.document();
+        let fixed = self.menu_data.background.as_ref();
+        let Some((bg, layer)) = fixed.and_then(|b| Some((&b.image, doc.layer(b.layer)?))) else {
             return self.note(
                 LOCK_FG,
                 "Lock FG needs a fixed background: Effect ▸ Background ▸ Fix first".into(),
             );
         };
-        match AreaStencil::from_changes(self.engine.document().page(), &bg) {
+        match AreaStencil::from_changes(layer, bg) {
             None => self.note(
                 LOCK_FG,
                 "The page size changed since Background ▸ Fix".into(),
@@ -566,7 +569,7 @@ impl PainterApp {
 
     /// Ends Stencil ▸ Paint: the mask becomes the area stencil of the frame it was painted
     /// for.
-    fn leave_stencil_paint(&mut self) {
+    pub(crate) fn leave_stencil_paint(&mut self) {
         self.finish_stroke();
         let Some(p) = self.ps_mut().painting.take() else {
             return;
@@ -749,7 +752,7 @@ impl PainterApp {
                     let cmd = s.preview_command();
                     if cmd.is_none() {
                         // The Brush Selector's frame: shown as the tools draw it.
-                        base = doc.composite_with(&s.preview);
+                        base = s.shown(doc);
                     }
                     cmd
                 }

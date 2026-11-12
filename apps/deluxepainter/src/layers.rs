@@ -8,8 +8,9 @@
 //! docked there, in the work area beside the picture (a second texture, drawn right of the
 //! screen); otherwise it lies over the screen's right edge, left of the toolbox. While a
 //! requester, note, Show Page or playback is open it is hidden (the docked strip stays as an
-//! empty work area, so the screen does not jump) and takes no clicks. While the panel is off
-//! and the picture has layers, the title bar names the active layer.
+//! empty work area, so the screen does not jump) and takes no clicks. A click that changes the
+//! document ends Stencil ▸ Paint first, as a menu item does. While the panel is off and the
+//! picture has layers, the title bar names the active layer.
 //!
 //! The panel's look and hit areas live in `dpx_ui::layer_panel`; this module keeps it in step
 //! with the document, decides where it goes and turns its clicks and keys into commands.
@@ -222,10 +223,24 @@ impl PainterApp {
         self.layers.over = matches!(hit, Some(Hit::LayerPanel(_)));
     }
 
-    /// A press on the panel. The left button acts; the right one does nothing there.
+    /// A press on the panel. The left button acts; the right one does nothing there. A
+    /// press that can change the document (a button that works, an eye box, a row) ends
+    /// Stencil ▸ Paint first, as a menu item does, so the panel's command goes to the picture
+    /// and `U` undoes it, not a stroke of the mask.
     pub(crate) fn layer_panel_press(&mut self, hit: LayerHit, right: bool) {
         if right {
             return;
+        }
+        let Some(panel) = &self.ui.layer_panel else {
+            return;
+        };
+        let acts = match hit {
+            LayerHit::Button(b) => panel.enabled(b),
+            LayerHit::Eye(_) | LayerHit::Name(_) => true,
+            _ => false,
+        };
+        if acts && self.stencil_painting() {
+            self.leave_stencil_paint();
         }
         let Some(panel) = &self.ui.layer_panel else {
             return;
@@ -696,11 +711,18 @@ mod tests {
     fn clicking_a_row_selects_and_painting_lands_on_the_active_layer() {
         let ctx = egui::Context::default();
         let mut app = with_panel(&ctx);
-        let undo_steps = app.engine.can_undo();
+        let revision = app.engine.document().revision();
         row(&mut app, &ctx, 0.2, 2, false);
         assert_eq!(app.engine.document().active_layer(), 2, "Sky");
         assert_eq!(panel(&app).active, 2);
-        assert_eq!(app.engine.can_undo(), undo_steps);
+        // One setting (the revision counts it, ADR-28), no undo step: U undoes the last step
+        // before the click, Sky's square, and Shift-U brings it back.
+        assert_eq!(app.engine.document().revision(), revision + 1);
+        undo(&mut app, &ctx, 0.25);
+        assert_eq!(app.engine.document().layer(2).unwrap().get(30, 30), Some(0));
+        redo(&mut app, &ctx, 0.3);
+        assert_eq!(app.engine.document().layer(2).unwrap().get(30, 30), Some(1));
+        assert_eq!(app.engine.document().active_layer(), 2);
         // Paint on Sky with the freehand tool: only Sky changes.
         app.select_tool(Tool::ContinuousFreehand, false);
         app.ui.fg = 3;
@@ -983,9 +1005,59 @@ mod tests {
         assert_eq!(names(&app), ["Background!", "Hill", "Sun"]);
         let after: Vec<_> = app.engine.document().cels().cloned().collect();
         assert_eq!(cels, after, "the click only ended the rename");
-        // U undoes that rename (Esc and the unchanged names made no undo step).
-        undo(&mut app, &ctx, 5.6);
+        // Return on the untouched name, and on a cleared field, rename nothing: no undo step,
+        // so U then undoes the rename to "Background!".
+        let revision = app.engine.document().revision();
+        row(&mut app, &ctx, 6.0, 1, false);
+        row(&mut app, &ctx, 6.2, 1, false);
+        assert_eq!(app.renaming_layer(), Some(1));
+        ui_pass(&mut app, &ctx, 6.3, vec![key_event(egui::Key::Enter, true)]);
+        assert_eq!(app.renaming_layer(), None);
+        row(&mut app, &ctx, 7.0, 1, false);
+        row(&mut app, &ctx, 7.2, 1, false);
+        let clear = (0..4)
+            .map(|_| key_event(egui::Key::Backspace, true))
+            .collect();
+        ui_pass(&mut app, &ctx, 7.3, clear);
+        assert_eq!(panel(&app).rename_text().as_deref(), Some(""));
+        ui_pass(&mut app, &ctx, 7.4, vec![key_event(egui::Key::Enter, true)]);
+        assert_eq!(names(&app), ["Background!", "Hill", "Sun"]);
+        // The clicks selected Hill (a setting: the revision counts it, the undo list not).
+        assert_eq!(app.engine.document().revision(), revision + 1);
+        undo(&mut app, &ctx, 7.6);
         assert_eq!(names(&app), ["Background", "Hill", "Sun"]);
+    }
+
+    #[test]
+    fn opening_and_closing_the_gadget_keeps_a_name_the_font_cannot_show() {
+        let ctx = egui::Context::default();
+        let mut app = with_panel(&ctx);
+        // The core (and MCP, and a loaded project) take any name.
+        app.run(Command::RenameLayer {
+            layer: 2,
+            name: "Caf\u{e9} \u{2601}".into(),
+        });
+        app.dirty = true;
+        ui_pass(&mut app, &ctx, 0.1, vec![]);
+        let revision = app.engine.document().revision();
+        // Double-click, Return without typing: the name and the undo list stay.
+        row(&mut app, &ctx, 0.2, 2, false);
+        row(&mut app, &ctx, 0.3, 2, false);
+        assert_eq!(panel(&app).rename_text().as_deref(), Some("Caf "));
+        ui_pass(&mut app, &ctx, 0.4, vec![key_event(egui::Key::Enter, true)]);
+        assert_eq!(app.renaming_layer(), None);
+        assert_eq!(names(&app), ["Background", "Hill", "Caf\u{e9} \u{2601}"]);
+        // Double-click, then a click elsewhere: the same.
+        row(&mut app, &ctx, 1.0, 2, false);
+        row(&mut app, &ctx, 1.1, 2, false);
+        assert_eq!(app.renaming_layer(), Some(2));
+        click_ui(&mut app, &ctx, 1.2, (100, 100), Primary);
+        assert_eq!(app.renaming_layer(), None);
+        assert_eq!(names(&app)[2], "Caf\u{e9} \u{2601}");
+        // The first click selected Sky: one setting, no undo step; U undoes the rename.
+        assert_eq!(app.engine.document().revision(), revision + 1);
+        undo(&mut app, &ctx, 1.5);
+        assert_eq!(names(&app)[2], "Sky");
     }
 
     #[test]
@@ -1053,7 +1125,17 @@ mod tests {
         app.dirty = true;
         ui_pass(&mut app, &ctx, 0.3, vec![]);
         assert!(!panel(&app).hidden);
-        // Many layers: the wheel over the panel scrolls the list, not the page.
+        // Many layers on a page larger than the screen: the wheel over the panel scrolls the
+        // list, not the page.
+        app.engine
+            .execute(Command::SetPageSize {
+                width: 640,
+                height: 512,
+                fill: 6,
+            })
+            .unwrap();
+        let view = app.view();
+        assert_ne!(view.max_scroll(app.engine.document().page()), (0, 0));
         for _ in 0..20 {
             app.engine
                 .execute(Command::AddLayer { name: None })
@@ -1075,12 +1157,125 @@ mod tests {
             source: egui::MouseWheelSource::Wheel,
         };
         ui_pass(&mut app, &ctx, 0.5, vec![egui::Event::PointerMoved(over)]);
-        ui_pass(&mut app, &ctx, 0.6, vec![wheel]);
+        ui_pass(&mut app, &ctx, 0.6, vec![wheel.clone()]);
         assert_eq!(panel(&app).scroll, 2);
         assert_eq!(app.scroll, (0, 0), "the page stays");
         // The arrow scrolls back up.
         click_ui(&mut app, &ctx, 0.7, mid(l.scroll_up()), Primary);
         assert_eq!(panel(&app).scroll, 1);
+        // The same wheel over the picture scrolls the page (and not the list).
+        let picture = ui_point(&app, (100, 100));
+        ui_pass(
+            &mut app,
+            &ctx,
+            0.8,
+            vec![egui::Event::PointerMoved(picture)],
+        );
+        ui_pass(&mut app, &ctx, 0.9, vec![wheel]);
+        assert_ne!(app.scroll, (0, 0), "the page scrolls");
+        assert_eq!(panel(&app).scroll, 1);
+    }
+
+    #[test]
+    fn a_panel_command_ends_stencil_paint_so_u_undoes_it() {
+        let ctx = egui::Context::default();
+        let mut app = with_panel(&ctx);
+        app.toggle_stencil_paint();
+        assert!(app.stencil_painting());
+        // Del on the panel: the layer goes from the picture, Stencil ▸ Paint ends (as a menu
+        // item ends it), and U brings the layer back instead of undoing a mask stroke.
+        press(&mut app, &ctx, 0.2, LayerButton::Delete);
+        assert_eq!(names(&app), ["Background", "Sky"]);
+        assert!(!app.stencil_painting());
+        undo(&mut app, &ctx, 0.3);
+        assert_eq!(names(&app), ["Background", "Hill", "Sky"]);
+        // The eye and the rows end it too; the scroll arrows and a ghosted button do not.
+        app.toggle_stencil_paint();
+        row(&mut app, &ctx, 0.5, 2, true);
+        assert!(!app.stencil_painting());
+        assert!(!app.engine.document().layers()[2].visible);
+        app.toggle_stencil_paint();
+        row(&mut app, &ctx, 0.7, 0, false);
+        assert!(!app.stencil_painting());
+        assert_eq!(app.engine.document().active_layer(), 0);
+        app.toggle_stencil_paint();
+        assert!(!panel(&app).enabled(LayerButton::Down));
+        press(&mut app, &ctx, 0.9, LayerButton::Down);
+        assert!(app.stencil_painting(), "a ghosted button does nothing");
+    }
+
+    #[test]
+    fn the_docked_title_row_belongs_to_the_panel() {
+        let ctx = egui::Context::default();
+        let mut app = three_layers(&ctx);
+        for _ in 0..22 {
+            app.engine
+                .execute(Command::AddLayer { name: None })
+                .unwrap();
+        }
+        app.ui.prefs.set(Pref::LayerPanel, true);
+        app.dirty = true;
+        full_pass(&mut app, &ctx, 0.1, vec![]);
+        full_pass(&mut app, &ctx, 0.2, vec![]);
+        assert!(panel(&app).docked);
+        let l = panel_layout(&app);
+        assert!(l.capacity < 25 && panel(&app).more_below(l.capacity));
+        let scroll = panel(&app).scroll;
+        // The down arrow in the title row, in line with the screen's title bar.
+        let down = mid(l.scroll_down());
+        assert!(down.1 < 10);
+        let at = ui_point(&app, down);
+        full_pass(&mut app, &ctx, 0.3, vec![egui::Event::PointerMoved(at)]);
+        full_pass(
+            &mut app,
+            &ctx,
+            0.32,
+            vec![pointer_button(at, Primary, true)],
+        );
+        full_pass(
+            &mut app,
+            &ctx,
+            0.34,
+            vec![pointer_button(at, Primary, false)],
+        );
+        assert_eq!(panel(&app).scroll, scroll + 1, "the arrow scrolls the list");
+        // The right button on its "Layers" label opens no menu strip.
+        let label = ui_point(&app, (l.panel.x + 10, 5));
+        let right = egui::PointerButton::Secondary;
+        full_pass(&mut app, &ctx, 0.4, vec![egui::Event::PointerMoved(label)]);
+        full_pass(
+            &mut app,
+            &ctx,
+            0.42,
+            vec![pointer_button(label, right, true)],
+        );
+        assert!(!app.ui.menu.active, "no menu over the panel");
+        full_pass(
+            &mut app,
+            &ctx,
+            0.44,
+            vec![pointer_button(label, right, false)],
+        );
+        // The wheel over the title row scrolls the list as over the rest of the panel.
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        };
+        full_pass(&mut app, &ctx, 0.5, vec![wheel]);
+        assert_eq!(panel(&app).scroll, scroll);
+        // Over the screen's own title bar the right button still opens the menus.
+        let title = ui_point(&app, (100, 5));
+        full_pass(&mut app, &ctx, 0.6, vec![egui::Event::PointerMoved(title)]);
+        full_pass(
+            &mut app,
+            &ctx,
+            0.62,
+            vec![pointer_button(title, right, true)],
+        );
+        assert!(app.ui.menu.active, "the screen's title bar");
     }
 
     #[test]

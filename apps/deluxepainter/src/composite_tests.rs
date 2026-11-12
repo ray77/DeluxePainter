@@ -321,3 +321,248 @@ fn remap_repaints_every_frame_and_layer_and_keeps_colour_0_transparent() {
         assert_eq!(doc.cel(f, 0).unwrap().get(60, 60), Some(4));
     }
 }
+
+#[test]
+fn a_single_layer_stroke_preview_is_shown_without_a_copy() {
+    use egui::PointerButton::Primary;
+    let ctx = egui::Context::default();
+    let mut app = PainterApp::new();
+    app.select_tool(Tool::ContinuousFreehand, false);
+    app.ui.fg = 2;
+    ui_pass(&mut app, &ctx, 0.0, vec![]);
+    let (a, b) = (ui_point(&app, (40, 60)), ui_point(&app, (80, 60)));
+    ui_pass(&mut app, &ctx, 0.1, vec![egui::Event::PointerMoved(a)]);
+    ui_pass(&mut app, &ctx, 0.12, vec![pointer_button(a, Primary, true)]);
+    ui_pass(&mut app, &ctx, 0.14, vec![egui::Event::PointerMoved(b)]);
+    let stroke = app.stroke.as_ref().expect("a stroke in progress");
+    assert!(
+        matches!(app.page(), Cow::Borrowed(p) if std::ptr::eq(p, &stroke.preview)),
+        "every redraw shows the preview itself (ADR-40)"
+    );
+    assert_eq!(app.page().get(60, 60), Some(2));
+}
+
+// ---- The spare page, the Light Table, the fixed background and Arrange with layers.
+
+fn act(app: &mut PainterApp, id: &'static str) {
+    app.run_action(dpx_ui::Action::Command(id), &egui::Context::default());
+}
+
+/// What `doc` shows at (`x`, `y`), as a colour.
+fn looks(doc: &dpx_core::Document, x: i32, y: i32) -> dpx_core::Rgb8 {
+    let p = doc.composite().get(x, y).unwrap();
+    doc.palette().get(p).unwrap()
+}
+
+#[test]
+fn arrange_changes_nothing_when_a_layered_spare_cannot_follow() {
+    let mut app = PainterApp::new();
+    // The spare: CLR 3, and an upper layer in colour 5.
+    act(&mut app, "spare.swap");
+    app.run(Command::Clear { color: 3 });
+    app.run(Command::AddLayer { name: None });
+    app.run(Command::Clear { color: 5 });
+    act(&mut app, "spare.swap");
+    fn spare_doc(app: &PainterApp) -> &dpx_core::Document {
+        app.menu_data.spare.as_ref().unwrap().engine.document()
+    }
+    let spare_look = looks(spare_doc(&app), 5, 5);
+    let before = app.engine.document().clone();
+    // Entries 0 and 5 exchanged: colour 5 would become the transparent 0 on the spare's
+    // upper layer. Nothing is arranged, neither page.
+    let mut order = dpx_core::remap::identity(32);
+    order.swap(0, 5);
+    app.apply_arrange(&order);
+    assert_eq!(
+        app.engine.document(),
+        &before,
+        "the shown page is not arranged"
+    );
+    assert_eq!(spare_doc(&app).palette(), before.palette());
+    act(&mut app, "spare.swap");
+    assert_eq!(
+        looks(app.engine.document(), 5, 5),
+        spare_look,
+        "the spare looks the same"
+    );
+    act(&mut app, "spare.swap");
+    // An order the spare can take: both pages follow and keep their look.
+    let mut order = dpx_core::remap::identity(32);
+    order.swap(3, 5);
+    app.apply_arrange(&order);
+    assert_ne!(app.engine.document().palette(), before.palette());
+    assert_eq!(spare_doc(&app).palette(), app.engine.document().palette());
+    act(&mut app, "spare.swap");
+    assert_eq!(looks(app.engine.document(), 5, 5), spare_look);
+}
+
+#[test]
+fn light_table_merge_puts_what_showed_into_the_active_layer() {
+    let mut app = PainterApp::new();
+    let e = &mut app.engine;
+    // Frame 1 in colour 1; frame 2 in colour 2 with a hole of colour 0 (BG) at 0..=9.
+    e.execute(Command::Clear { color: 1 }).unwrap();
+    e.execute(Command::AddFrames { count: 1 }).unwrap();
+    e.execute(Command::Clear { color: 2 }).unwrap();
+    e.execute(rect((0, 0), (9, 9), 0)).unwrap();
+    // An upper layer (active) with one yellow pixel.
+    e.execute(Command::AddLayer { name: None }).unwrap();
+    e.execute(rect((50, 50), (50, 50), 5)).unwrap();
+    let bottom = e.document().layer(0).unwrap().clone();
+    app.ui.bg = 0;
+    app.anim.light_on = true;
+    app.anim.light.dim = false;
+    app.prepare_anim_view();
+    let view = app.anim.shown.take().expect("the Light Table picture");
+    assert_eq!(
+        (view.get(5, 5), view.get(50, 50), view.get(100, 100)),
+        (Some(1), Some(5), Some(2))
+    );
+    act(&mut app, "light_table.merge");
+    let doc = app.engine.document();
+    assert_eq!(
+        &*doc.composite(),
+        &view,
+        "the frame now shows what the table showed"
+    );
+    let upper = doc.layer(1).unwrap();
+    assert_eq!(
+        upper.get(5, 5),
+        Some(1),
+        "the hole filled on the active layer"
+    );
+    assert_eq!(
+        upper.get(100, 100),
+        Some(0),
+        "the rest of it stays transparent"
+    );
+    assert_eq!(doc.layer(0).unwrap(), &bottom);
+    app.undo();
+    assert_eq!(app.engine.document().layer(1).unwrap().get(5, 5), Some(0));
+}
+
+#[test]
+fn copy_to_spare_and_delete_this_page_carry_every_layer() {
+    // Delete This Page: a layered page is replaced by the spare, all of it, in one step.
+    let mut app = PainterApp::new();
+    act(&mut app, "spare.swap");
+    app.run(Command::Clear { color: 7 });
+    act(&mut app, "spare.swap");
+    app.run(Command::Clear { color: 1 });
+    app.run(Command::AddLayer { name: None });
+    app.run(Command::Clear { color: 4 });
+    app.run(Command::SelectLayer { layer: 0 });
+    act(&mut app, "spare.delete");
+    let doc = app.engine.document();
+    assert_eq!((doc.layer_count(), doc.composite().get(0, 0)), (1, Some(7)));
+    assert!(app.menu_data.spare.is_none());
+    app.undo();
+    let doc = app.engine.document();
+    assert_eq!((doc.layer_count(), doc.composite().get(0, 0)), (2, Some(4)));
+    // Copy to Spare onto a layered spare: the spare becomes the shown page, colour 0 too
+    // (it no longer lands on the spare's transparent upper layer).
+    let mut app = PainterApp::new();
+    act(&mut app, "spare.swap");
+    app.run(Command::Clear { color: 3 });
+    app.run(Command::AddLayer { name: None });
+    act(&mut app, "spare.swap");
+    act(&mut app, "spare.copy");
+    act(&mut app, "spare.swap");
+    let doc = app.engine.document();
+    assert_eq!(
+        (doc.layer_count(), doc.composite().get(100, 100)),
+        (1, Some(0))
+    );
+    app.undo();
+    let doc = app.engine.document();
+    assert_eq!(
+        (doc.layer_count(), doc.composite().get(100, 100)),
+        (2, Some(3)),
+        "one undo step on the spare brings its picture back"
+    );
+    // The backup workflow keeps the layers: Copy to Spare, paint, Delete This Page.
+    let mut app = layered_app();
+    let kept = app.engine.document().clone();
+    act(&mut app, "spare.copy");
+    app.run(Command::Clear { color: 9 });
+    app.run(Command::DeleteLayer { layer: 0 });
+    act(&mut app, "spare.delete");
+    let doc = app.engine.document();
+    assert_eq!(doc.layers(), kept.layers());
+    assert_eq!(
+        doc.cels().collect::<Vec<_>>(),
+        kept.cels().collect::<Vec<_>>()
+    );
+    assert_eq!(doc.active_layer(), kept.active_layer());
+}
+
+#[test]
+fn merge_in_back_fills_only_what_shows_colour_0() {
+    // The spare in colour 7; the page in colour 1 with a hole of colour 0 at (2, 2), and an
+    // empty upper layer (active).
+    let mut app = PainterApp::new();
+    act(&mut app, "spare.swap");
+    app.run(Command::Clear { color: 7 });
+    act(&mut app, "spare.swap");
+    app.run(Command::Clear { color: 1 });
+    app.run(rect((2, 2), (2, 2), 0));
+    app.run(Command::AddLayer { name: None });
+    act(&mut app, "spare.merge_back");
+    let doc = app.engine.document();
+    assert_eq!(
+        doc.composite().get(100, 100),
+        Some(1),
+        "the picture stays in front"
+    );
+    assert_eq!(
+        doc.composite().get(2, 2),
+        Some(7),
+        "the spare shows through its hole"
+    );
+    assert_eq!(
+        doc.layer(1).unwrap().get(2, 2),
+        Some(7),
+        "on the active layer"
+    );
+    assert_eq!(doc.layer(0).unwrap().get(2, 2), Some(0));
+    app.undo();
+    assert_eq!(app.engine.document().composite().get(2, 2), Some(0));
+    // In front the spare covers the picture, on the active layer.
+    act(&mut app, "spare.merge_front");
+    assert_eq!(app.engine.document().composite().get(100, 100), Some(7));
+}
+
+#[test]
+fn clr_restores_the_fixed_background_only_on_its_layer() {
+    let mut app = PainterApp::new();
+    app.ui.bg = 0;
+    app.run(Command::Clear { color: 1 });
+    app.fix_background();
+    app.run(Command::AddLayer { name: None });
+    app.run(Command::Clear { color: 9 });
+    app.run(Command::AddLayer { name: None });
+    app.run(rect((5, 5), (5, 5), 6));
+    // CLR on the top layer clears it (BG 0: transparent); the middle layer shows.
+    app.run(Command::Clear { color: 0 });
+    let doc = app.engine.document();
+    assert_eq!(doc.layer(2).unwrap().get(5, 5), Some(0));
+    assert_eq!(doc.composite().get(5, 5), Some(9));
+    // On the layer it was fixed on, CLR restores it.
+    app.run(Command::SelectLayer { layer: 0 });
+    app.run(rect((7, 7), (7, 7), 3));
+    // Lock FG finds what was painted on that layer since Fix, whichever layer is active.
+    app.run(Command::SelectLayer { layer: 2 });
+    act(&mut app, "background.lock_fg");
+    let area = app.active_area().expect("an area stencil");
+    assert!(area.protects(7, 7) && !area.protects(5, 5));
+    app.menu_data.palette_stencil.area = None;
+    app.run(Command::SelectLayer { layer: 0 });
+    app.run(Command::Clear { color: 0 });
+    let doc = app.engine.document();
+    assert_eq!(
+        doc.layer(0).unwrap().get(7, 7),
+        Some(1),
+        "the fixed picture again"
+    );
+    assert_eq!(doc.composite().get(7, 7), Some(9));
+}
