@@ -176,6 +176,140 @@ pub fn fit_size(
     (w, h)
 }
 
+/// The display proportions of a `page` shown with `pixel_shape` (ADR-45): `(w · x, h · y)`,
+/// reduced. A 320×256 LoRes page gives (5, 4), a 640×256 HiRes page (pixels 1×2) too.
+pub fn display_aspect(page: (u32, u32), pixel_shape: (u32, u32)) -> (u64, u64) {
+    let w = u64::from(page.0.max(1)) * u64::from(pixel_shape.0.max(1));
+    let h = u64::from(page.1.max(1)) * u64::from(pixel_shape.1.max(1));
+    let g = gcd64(w, h);
+    (w / g, h / g)
+}
+
+fn gcd64(a: u64, b: u64) -> u64 {
+    if b == 0 { a.max(1) } else { gcd64(b, a % b) }
+}
+
+/// The centred part of a `src_w`×`src_h` picture (square pixels) with the display
+/// proportions `aspect` = (width, height), as large as the picture allows (crop-to-fill,
+/// ADR-45): a wider picture loses columns left and right, a taller one rows above and
+/// below; odd leftovers put the extra pixel right and below. Returns (x, y, width, height),
+/// each side at least 1.
+pub fn crop_to_aspect(src_w: u32, src_h: u32, aspect: (u64, u64)) -> (u32, u32, u32, u32) {
+    let (sw, sh) = (u64::from(src_w.max(1)), u64::from(src_h.max(1)));
+    let (aw, ah) = (aspect.0.max(1), aspect.1.max(1));
+    let (w, h) = if sw * ah > sh * aw {
+        // Wider than the target: keep the height.
+        (((sh * aw * 2 + ah) / (2 * ah)).clamp(1, sw), sh)
+    } else {
+        (sw, ((sw * ah * 2 + aw) / (2 * aw)).clamp(1, sh))
+    };
+    let (w, h) = (w as u32, h as u32);
+    ((src_w.max(1) - w) / 2, (src_h.max(1) - h) / 2, w, h)
+}
+
+/// Scales `img` to `width`×`height` for pixel art (ADR-45): every output pixel takes the
+/// colour most of the source pixels under its cell have. A cell is the source pixels from
+/// `floor(o · src / dst)` up to `ceil((o + 1) · src / dst)` on each axis (at least one).
+/// Colours are counted in buckets of 8 levels per channel (5 bits), so the slight noise of
+/// generated "pixel art" does not split one colour into many; the winning bucket gives the
+/// mean of its pixels. Pixels with less alpha than [`crate::quantize::ALPHA_THRESHOLD`]
+/// count as one "transparent" bucket, which gives a fully transparent pixel. Ties go to the
+/// bucket met first in reading order. Enlarging takes the source pixel under each cell's
+/// top-left corner. Panics if `width` or `height` is 0.
+pub fn scale_majority(img: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    assert!(width > 0 && height > 0, "target size must be non-zero");
+    if img.width() == width && img.height() == height {
+        return img.clone();
+    }
+    let (sw, sh) = (u64::from(img.width()), u64::from(img.height()));
+    if sw == 0 || sh == 0 {
+        return RgbaImage::new(width, height, Rgba8::new(0, 0, 0, 0));
+    }
+    let span = |o: u32, src: u64, dst: u32| {
+        let dst = u64::from(dst);
+        let lo = u64::from(o) * src / dst;
+        let hi = ((u64::from(o) + 1) * src).div_ceil(dst).clamp(lo + 1, src);
+        (lo as usize, hi as usize)
+    };
+    const CLEAR: u32 = u32::MAX;
+    let key = |p: Rgba8| {
+        if p.a < crate::quantize::ALPHA_THRESHOLD {
+            CLEAR
+        } else {
+            (u32::from(p.r >> 3) << 10) | (u32::from(p.g >> 3) << 5) | u32::from(p.b >> 3)
+        }
+    };
+    let xs: Vec<(usize, usize)> = (0..width).map(|x| span(x, sw, width)).collect();
+    let src = img.pixels();
+    let stride = sw as usize;
+    let mut pixels = Vec::with_capacity(width as usize * height as usize);
+    let mut keys: Vec<u32> = Vec::new();
+    let mut sorted: Vec<u32> = Vec::new();
+    // (bucket, pixels) in bucket order.
+    let mut runs: Vec<(u32, usize)> = Vec::new();
+    for y in 0..height {
+        let (y0, y1) = span(y, sh, height);
+        for &(x0, x1) in &xs {
+            keys.clear();
+            for row in y0..y1 {
+                keys.extend(
+                    src[row * stride + x0..row * stride + x1]
+                        .iter()
+                        .map(|&p| key(p)),
+                );
+            }
+            sorted.clear();
+            sorted.extend_from_slice(&keys);
+            sorted.sort_unstable();
+            runs.clear();
+            for &k in &sorted {
+                match runs.last_mut() {
+                    Some((last, n)) if *last == k => *n += 1,
+                    _ => runs.push((k, 1)),
+                }
+            }
+            let most = runs.iter().map(|&(_, n)| n).max().unwrap_or(0);
+            // The first bucket in reading order with the most pixels.
+            let winner = if runs.len() == 1 {
+                runs[0].0
+            } else {
+                keys.iter()
+                    .copied()
+                    .find(|&k| {
+                        let i = runs.partition_point(|&(r, _)| r < k);
+                        runs[i].1 == most
+                    })
+                    .unwrap_or(CLEAR)
+            };
+            if winner == CLEAR {
+                pixels.push(Rgba8::new(0, 0, 0, 0));
+                continue;
+            }
+            let mut acc = [0u64; 4];
+            let mut n = 0u64;
+            for row in y0..y1 {
+                for &p in &src[row * stride + x0..row * stride + x1] {
+                    if key(p) == winner {
+                        acc[0] += u64::from(p.r);
+                        acc[1] += u64::from(p.g);
+                        acc[2] += u64::from(p.b);
+                        acc[3] += u64::from(p.a);
+                        n += 1;
+                    }
+                }
+            }
+            let mean = |v: u64| ((v + n / 2) / n) as u8;
+            pixels.push(Rgba8::new(
+                mean(acc[0]),
+                mean(acc[1]),
+                mean(acc[2]),
+                mean(acc[3]),
+            ));
+        }
+    }
+    RgbaImage::from_pixels(width, height, pixels).expect("pixel count matches size")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +452,88 @@ mod tests {
         // Laced HiRes (square pixels) and LoRes laced (2,1).
         assert_eq!(fit_size(1920, 1080, 640, 512, (1, 1)), (640, 360));
         assert_eq!(fit_size(1920, 1080, 320, 512, (2, 1)), (320, 360));
+    }
+
+    #[test]
+    fn display_aspect_follows_the_pixel_shape() {
+        assert_eq!(display_aspect((320, 240), (1, 1)), (4, 3));
+        assert_eq!(display_aspect((320, 256), (1, 1)), (5, 4));
+        assert_eq!(display_aspect((640, 256), (1, 2)), (5, 4));
+        assert_eq!(display_aspect((320, 512), (2, 1)), (5, 4));
+        assert_eq!(display_aspect((640, 200), (1, 2)), (8, 5));
+        assert_eq!(display_aspect((1280, 256), (1, 4)), (5, 4));
+    }
+
+    #[test]
+    fn crop_to_aspect_keeps_the_centre() {
+        // Exact proportions: nothing is cut.
+        assert_eq!(crop_to_aspect(1024, 768, (4, 3)), (0, 0, 1024, 768));
+        // Square to 5:4 loses rows above and below (819.2 rounds to 819; the odd row
+        // goes below).
+        assert_eq!(crop_to_aspect(1024, 1024, (5, 4)), (0, 102, 1024, 819));
+        // Square to 3:4 loses columns.
+        assert_eq!(crop_to_aspect(1024, 1024, (3, 4)), (128, 0, 768, 1024));
+        // 1040x832 is exactly 5:4.
+        assert_eq!(crop_to_aspect(1040, 832, (5, 4)), (0, 0, 1040, 832));
+        // Extreme proportions keep at least one pixel.
+        assert_eq!(crop_to_aspect(10, 10, (1000, 1)), (0, 4, 10, 1));
+    }
+
+    #[test]
+    fn majority_takes_the_most_common_colour_of_each_cell() {
+        // A 2x2 picture blown up 3x with noise: every 3x3 cell is one colour except one
+        // pixel, which must not win.
+        let base = [
+            grey(0),
+            grey(200),
+            Rgba8::opaque(200, 0, 0),
+            Rgba8::opaque(0, 0, 200),
+        ];
+        let mut img = RgbaImage::new(6, 6, grey(0));
+        for y in 0..6 {
+            for x in 0..6 {
+                img.set(x, y, base[(y / 3 * 2 + x / 3) as usize]);
+            }
+        }
+        // Odd pixels and slight noise inside the bucket (8 levels).
+        img.set(1, 1, Rgba8::opaque(255, 255, 0));
+        img.set(4, 0, grey(203));
+        let out = scale_majority(&img, 2, 2);
+        assert_eq!(out.get(0, 0), Some(grey(0)));
+        // The mean of 8 x 200 and one 203 rounds to 200.
+        assert_eq!(out.get(1, 0), Some(grey(200)));
+        assert_eq!(out.get(0, 1), Some(base[2]));
+        assert_eq!(out.get(1, 1), Some(base[3]));
+        // Area averaging mixes the odd pixel in.
+        assert_ne!(scale_area(&img, 2, 2).get(0, 0), Some(grey(0)));
+    }
+
+    #[test]
+    fn majority_ties_transparency_and_enlarging() {
+        // A 2x1 cell with two colours: the first in reading order wins.
+        let img = RgbaImage::from_pixels(2, 1, vec![grey(10), grey(250)]).unwrap();
+        assert_eq!(scale_majority(&img, 1, 1).get(0, 0), Some(grey(10)));
+        // Mostly transparent cells become fully transparent.
+        let clear = Rgba8::new(9, 9, 9, 0);
+        let img =
+            RgbaImage::from_pixels(3, 1, vec![clear, Rgba8::new(1, 2, 3, 100), grey(7)]).unwrap();
+        assert_eq!(
+            scale_majority(&img, 1, 1).get(0, 0),
+            Some(Rgba8::new(0, 0, 0, 0))
+        );
+        // Enlarging repeats pixels, like nearest.
+        let img = RgbaImage::from_pixels(2, 1, vec![grey(10), grey(250)]).unwrap();
+        let big = scale_majority(&img, 4, 2);
+        assert_eq!(
+            big.pixels(),
+            &[grey(10), grey(10), grey(250), grey(250)].repeat(2)[..]
+        );
+        // Exact size, also for awkward ratios.
+        let big = RgbaImage::new(1024, 768, grey(5));
+        let small = scale_majority(&big, 320, 240);
+        assert_eq!((small.width(), small.height()), (320, 240));
+        assert!(small.pixels().iter().all(|&p| p == grey(5)));
+        let odd = scale_majority(&RgbaImage::new(1000, 999, grey(5)), 321, 239);
+        assert_eq!((odd.width(), odd.height()), (321, 239));
     }
 }

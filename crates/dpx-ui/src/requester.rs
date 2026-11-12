@@ -124,6 +124,23 @@ pub enum ReqKey {
     Escape,
     /// A typed character (text input).
     Char(char),
+    /// One character of pasted text (Cmd/Ctrl+V, ADR-45): it goes only into the active text
+    /// field, filtered there like typed text, and is never a shortcut.
+    Paste(char),
+}
+
+/// Pasted text as [`ReqKey::Paste`] keys for a single-line field: line breaks and tabs become
+/// spaces, other control characters are dropped. Characters outside the font stay (they
+/// draw as `?`).
+pub fn paste_keys(text: &str) -> Vec<ReqKey> {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .map(ReqKey::Paste)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,7 +536,9 @@ impl ScreenFormatRequester {
                     });
                     ReqResponse::Continue
                 }
-                ReqKey::Char(c) if self.active.is_some() && c.is_ascii_digit() => {
+                ReqKey::Char(c) | ReqKey::Paste(c)
+                    if self.active.is_some() && c.is_ascii_digit() =>
+                {
                     self.edit(k);
                     ReqResponse::Continue
                 }
@@ -1884,5 +1903,95 @@ mod tests {
             (p.y + 3..p.y + 11)
                 .any(|y| (p.x + 20..p.x + p.w).any(|x| img.get(x, y) == Some(pens.dark)))
         );
+    }
+}
+
+/// ADR-45: Cmd/Ctrl+V in the requesters.
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+    use crate::file_requester::{FileKind, FileRequester, FileResponse};
+    use crate::page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};
+
+    fn paste(text: &str) -> Vec<ReqEvent> {
+        paste_keys(text).into_iter().map(ReqEvent::Key).collect()
+    }
+
+    #[test]
+    fn pasted_text_becomes_one_line_of_paste_keys() {
+        assert_eq!(
+            paste_keys("a\tb\r\nc\u{7}ä"),
+            [
+                ReqKey::Paste('a'),
+                ReqKey::Paste(' '),
+                ReqKey::Paste('b'),
+                ReqKey::Paste(' '),
+                ReqKey::Paste(' '),
+                ReqKey::Paste('c'),
+                ReqKey::Paste('ä'),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_text_field_takes_pasted_text_up_to_its_length() {
+        let mut f = crate::widgets::TextField::new(5);
+        for k in paste_keys("Burg im Abendlicht") {
+            f.key(k);
+        }
+        assert_eq!(f.text(), "Burg ");
+    }
+
+    #[test]
+    fn number_fields_keep_only_pasted_digits() {
+        let presets = [Preset {
+            label: "Standard",
+            size: (320, 256),
+        }; 3];
+        let mut r = PageSizeRequester::new((320, 256), presets);
+        // The width field is active and holds "320": clear it and paste.
+        for _ in 0..3 {
+            r.handle(ReqEvent::Key(ReqKey::Backspace));
+        }
+        for e in paste("6x4-0") {
+            r.handle(e);
+        }
+        assert_eq!(
+            r.handle(ReqEvent::Key(ReqKey::Enter)),
+            PageSizeResponse::Ok {
+                width: 640,
+                height: 256
+            }
+        );
+    }
+
+    #[test]
+    fn pasted_text_goes_into_the_file_name_and_never_answers_a_question() {
+        let mut r = FileRequester::new(FileKind::SavePicture);
+        for e in paste("castle.iff") {
+            r.handle(e, 0);
+        }
+        assert_eq!(r.file(), "castle.iff");
+        r.ask_overwrite();
+        for e in paste("y") {
+            assert_eq!(r.handle(e, 0), FileResponse::Continue, "not a Yes");
+        }
+        assert!(matches!(
+            r.handle(ReqEvent::Key(ReqKey::Char('y')), 0),
+            FileResponse::Accept {
+                overwrite: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_screen_format_requester_takes_pasted_digits_but_no_shortcuts() {
+        let target = dpx_core::Target::default();
+        let mut r = ScreenFormatRequester::new(target, (320, 256), 32);
+        // "u" pasted is not Use, "c" not Cancel.
+        for e in paste("uc") {
+            assert_eq!(r.handle(e), ReqResponse::Continue);
+        }
     }
 }

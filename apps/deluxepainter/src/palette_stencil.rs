@@ -799,11 +799,7 @@ impl PainterApp {
         if light_table {
             // Made again on the picture without the stroke preview (Stencil ▸ Paint paints
             // the mask, not the picture).
-            let spare = self
-                .menu_data
-                .spare
-                .as_ref()
-                .map(|s| s.engine.document().composite());
+            let spare = self.light_table_spare();
             let spare = spare.as_deref();
             let light = self.anim.light;
             base = crate::anim::light_table_page(doc, &base, light, spare, self.ui.bg, light.dim);

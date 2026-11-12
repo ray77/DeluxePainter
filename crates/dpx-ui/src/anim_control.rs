@@ -579,11 +579,13 @@ impl MoveRequester {
                     f.text.set(&n.clamp(f.min, f.max).to_string());
                 }
             }
-            ReqKey::Char(c) if !(c.is_ascii_digit() || c == '-') => {}
+            ReqKey::Char(c) | ReqKey::Paste(c) if !(c.is_ascii_digit() || c == '-') => {}
             k => {
                 if let Some(a) = self.active {
                     let f = &mut self.fields[a];
-                    if k == ReqKey::Char('-') && (f.min >= 0 || f.text.cursor != 0) {
+                    if matches!(k, ReqKey::Char('-') | ReqKey::Paste('-'))
+                        && (f.min >= 0 || f.text.cursor != 0)
+                    {
                         return MoveResponse::Continue;
                     }
                     f.text.key(k);

@@ -1,0 +1,27 @@
+[package]
+name = "dpx-imagegen"
+description = "DeluxePainter AI image generation (ADR-45): provider interface, OpenAI Images, API keys, jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23"
+dpx-core.workspace = true
+dpx-formats.workspace = true
+# OS keychain (macOS Keychain, Windows Credential Manager, Secret Service on Linux/BSD).
+keyring = "4.2"
+serde.workspace = true
+serde_json.workspace = true
+# Blocking HTTPS on worker threads. Native TLS only: every rustls build pulls ISC-licensed
+# crates (ring, rustls-webpki, untrusted), which CLAUDE.md does not allow (ADR-45).
+ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
+
+[dev-dependencies]
+png.workspace = true

@@ -121,6 +121,9 @@ fn command_bytes(command: &Command) -> u64 {
         Command::AddLayer { name: Some(name) } | Command::RenameLayer { name, .. } => {
             name.len() as u64
         }
+        Command::ReplacePicture {
+            palette, pixels, ..
+        } => pixels.len() as u64 + 3 * palette.len() as u64,
         Command::ArrangePalette { order } => order.len() as u64,
         Command::SetPicture { layers, frames, .. } => {
             let names: u64 = layers.iter().map(|l| l.name.len() as u64).sum();
@@ -1963,5 +1966,132 @@ mod tests {
             })
             .collect();
         run("100 000 points far off the page", stroke(1, &far));
+    }
+
+    // ---- ADR-45: ReplacePicture.
+
+    fn replacement(target: crate::Target, colors: usize, page: (u32, u32)) -> Command {
+        let palette: Vec<crate::Rgb8> = (0..colors)
+            .map(|i| crate::Rgb8::from_rgb4((i * 0x111 % 0x1000) as u16))
+            .collect();
+        let (w, h) = page;
+        Command::ReplacePicture {
+            target,
+            palette,
+            width: w,
+            height: h,
+            pixels: (0..w * h).map(|i| (i % colors as u32) as u8).collect(),
+        }
+    }
+
+    #[test]
+    fn replace_picture_is_one_undo_step_for_the_whole_document() {
+        use crate::{Chipset, DisplayMode, Target};
+        let mut e = engine();
+        // An AGA document of three frames, the second current, with a changed palette.
+        e.execute(Command::AddFrames { count: 2 }).unwrap();
+        e.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        e.execute(stroke(5, &[(1, 1), (40, 40)])).unwrap();
+        // ... with a second layer, the active one (ADR-44).
+        e.execute(Command::AddLayer { name: None }).unwrap();
+        let before = e.document().clone();
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let cmd = replacement(ocs, 32, (320, 240));
+        let out = e.execute(cmd.clone()).unwrap();
+        assert!(out.format_changed && out.palette_changed && out.undo_available);
+        let doc = e.document();
+        assert_eq!(doc.target(), ocs);
+        assert_eq!(
+            doc.layers(),
+            &[crate::Layer::background()],
+            "one layer again"
+        );
+        assert_eq!(doc.frame_count(), 1);
+        assert_eq!(doc.current_frame(), 0);
+        assert_eq!((doc.page().width(), doc.page().height()), (320, 240));
+        assert_eq!(doc.palette().len(), 32);
+        let Command::ReplacePicture { pixels, .. } = &cmd else {
+            unreachable!()
+        };
+        assert_eq!(doc.page().pixels(), &pixels[..]);
+        // One undo brings back every frame, the current one, palette and target.
+        e.undo().unwrap();
+        let doc = e.document();
+        assert_eq!(doc.target(), before.target());
+        assert_eq!(doc.frame_count(), 3);
+        assert_eq!(doc.current_frame(), 1);
+        assert_eq!(doc.palette(), before.palette());
+        assert_eq!(doc.layers(), before.layers());
+        assert!(doc.cels().eq(before.cels()));
+        e.redo().unwrap();
+        assert_eq!(e.document().frame_count(), 1);
+        assert_eq!(e.document().target(), ocs);
+        // The JSON shape.
+        let json = serde_json::to_string(&replacement(ocs, 2, (320, 240))).unwrap();
+        assert!(json.starts_with(r#"{"op":"replace_picture","target":{"chipset":"ocs""#));
+    }
+
+    #[test]
+    fn replace_picture_checks_its_target() {
+        use crate::{Chipset, DisplayMode, Resolution, Target, Video};
+        let mut e = engine();
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
+        let hires = Target::new(
+            Chipset::Ocs,
+            DisplayMode::new(Video::Pal, Resolution::Hi, false),
+        );
+        let superhi = Target::new(
+            Chipset::Ocs,
+            DisplayMode::new(Video::Pal, Resolution::SuperHi, false),
+        );
+        let code = |e: &mut Engine, c: Command| e.execute(c).unwrap_err().code;
+        assert_eq!(
+            code(&mut e, replacement(hires, 32, (640, 256))),
+            ErrorCode::PaletteRangeInvalid
+        );
+        assert_eq!(
+            code(&mut e, replacement(superhi, 16, (1280, 256))),
+            ErrorCode::UnsupportedMode
+        );
+        assert_eq!(
+            code(&mut e, replacement(ocs, 12, (320, 256))),
+            ErrorCode::PaletteRangeInvalid
+        );
+        // Not a 12-bit colour on OCS (fine on AGA).
+        let mut off = replacement(ocs, 4, (320, 256));
+        if let Command::ReplacePicture { palette, .. } = &mut off {
+            palette[2] = crate::Rgb8::new(1, 2, 3);
+        }
+        assert_eq!(code(&mut e, off.clone()), ErrorCode::PaletteRangeInvalid);
+        if let Command::ReplacePicture { target, .. } = &mut off {
+            target.chipset = Chipset::Aga;
+        }
+        e.execute(off.clone()).unwrap();
+        e.undo().unwrap();
+        // A page smaller than the screen, a bad screen, short pixels, colours outside.
+        assert_eq!(
+            code(&mut e, replacement(ocs, 4, (320, 240))),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(
+                &mut e,
+                replacement(ocs.with_screen(320, 199), 4, (320, 256))
+            ),
+            ErrorCode::InvalidArgument
+        );
+        let mut short = replacement(ocs, 4, (320, 256));
+        if let Command::ReplacePicture { pixels, .. } = &mut short {
+            pixels.pop();
+        }
+        assert_eq!(code(&mut e, short), ErrorCode::InvalidArgument);
+        let mut outside = replacement(ocs, 4, (320, 256));
+        if let Command::ReplacePicture { pixels, .. } = &mut outside {
+            pixels[7] = 4;
+        }
+        assert_eq!(code(&mut e, outside), ErrorCode::PaletteRangeInvalid);
+        // Nothing of it changed the document.
+        assert_eq!(e.document().target(), crate::Target::default());
+        assert!(!e.can_undo());
     }
 }

@@ -46,6 +46,8 @@ pub struct Config {
     pub light: LightTable,
     /// The Import requester's last choices (ADR-42).
     pub import: ImportSettings,
+    /// The image generator, its model and quality (ADR-45; the API key is never here).
+    pub image_generator: crate::generate::ImageGenSettings,
 }
 
 impl Default for Config {
@@ -69,6 +71,7 @@ impl Default for Config {
             light_on: anim.light_on,
             light: anim.light,
             import: ImportSettings::default(),
+            image_generator: crate::generate::ImageGenSettings::default(),
         }
     }
 }
@@ -199,6 +202,8 @@ impl Config {
                 .and_then(import::parse_dither)
                 .unwrap_or(d.import.dither),
         };
+        c.image_generator =
+            crate::generate::ImageGenSettings::from_json(&section(o, "image_generator"));
         Some(c)
     }
 
@@ -243,6 +248,7 @@ impl Config {
                 "colors": self.import.colors,
                 "dither": import::dither_name(self.import.dither),
             },
+            "image_generator": self.image_generator.to_json(),
             "light_table": {
                 "on": self.light_on,
                 "two_back": self.light.two_back,
@@ -275,6 +281,7 @@ impl Config {
             light_on: app.anim.light_on,
             light: app.anim.light,
             import: app.import.settings,
+            image_generator: app.imagegen.settings.clone(),
         }
     }
 
@@ -299,6 +306,7 @@ impl Config {
         app.anim.light_on = self.light_on;
         app.anim.light = self.light;
         app.import.settings = self.import;
+        app.imagegen.settings = self.image_generator.clone();
     }
 }
 

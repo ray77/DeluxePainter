@@ -12,6 +12,7 @@ authors.workspace = true
 dpx-core.workspace = true
 dpx-formats.workspace = true
 dpx-iff.workspace = true
+dpx-imagegen.workspace = true
 dpx-mcp.workspace = true
 dpx-ui.workspace = true
 eframe.workspace = true

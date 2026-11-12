@@ -248,7 +248,7 @@ impl PageSizeRequester {
                 };
                 self.activate(next);
             }
-            ReqKey::Char(c) if !c.is_ascii_digit() => {}
+            ReqKey::Char(c) | ReqKey::Paste(c) if !c.is_ascii_digit() => {}
             k => {
                 let active = self.active;
                 let field = self.field_mut(active);

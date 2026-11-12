@@ -378,11 +378,7 @@ impl PainterApp {
             return;
         }
         let doc = self.engine.document();
-        let spare = self
-            .menu_data
-            .spare
-            .as_ref()
-            .map(|s| s.engine.document().composite());
+        let spare = self.light_table_spare();
         let spare = spare.as_deref();
         let shown = doc.composite();
         let table = light_table_page(doc, &shown, self.anim.light, spare, self.ui.bg, false);
@@ -410,11 +406,7 @@ impl PainterApp {
             // ADR-44: the frame as it shows.
             self.anim.shown = doc.composite_frame(shown_frame).map(|f| f.into_owned());
         } else if self.anim.light_on && (count > 1 || self.anim.light.spare) {
-            let spare = self
-                .menu_data
-                .spare
-                .as_ref()
-                .map(|s| s.engine.document().composite());
+            let spare = self.light_table_spare();
             let spare = spare.as_deref();
             let page = light_table_page(
                 doc,

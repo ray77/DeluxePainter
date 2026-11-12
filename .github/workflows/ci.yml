@@ -27,7 +27,8 @@ jobs:
           rustc --version
           cargo --version
 
-      # eframe 0.37 (wgpu + winit with x11/wayland) needs these only on Linux.
+      # eframe 0.37 (wgpu + winit with x11/wayland) needs these only on Linux; libssl-dev is
+      # for dpx-imagegen's native TLS (openssl-sys, ADR-45).
       - name: Install Linux system packages
         if: runner.os == 'Linux'
         run: |
@@ -36,7 +37,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev pkg-config
+            libgl1-mesa-dev libegl1-mesa-dev libvulkan-dev pkg-config libssl-dev
 
       - uses: Swatinem/rust-cache@v2
 

@@ -11,7 +11,7 @@ use crate::anim_brush::{self, AnimBrush};
 use crate::document::{Document, check_frame_count};
 use crate::gradient::FillType;
 use crate::image::{IndexedImage, Rect};
-use crate::mode::{Chipset, DisplayMode};
+use crate::mode::{Chipset, DisplayMode, Target};
 use crate::paint::{BrushImage, DrawMode, PaintFx};
 use crate::palette::{Palette, Rgb8};
 use crate::shapes::{Shape, Symmetry};
@@ -312,6 +312,19 @@ pub enum Command {
         current: u32,
         #[serde(default)]
         active: u32,
+    },
+    /// ADR-45: replaces the whole picture (a generated picture's "Picture" target): the
+    /// target (chipset, mode and screen), the palette and one `width`×`height` page (row by
+    /// row). Every other frame goes; the frame rate stays. One undo step brings the old
+    /// document back. The target's limits are checked: the mode must exist on the chipset,
+    /// the palette has a power of two of 2 up to the mode's maximum entries (12-bit values on
+    /// OCS), the screen fits the mode and the page the target's page limits.
+    ReplacePicture {
+        target: Target,
+        palette: Vec<Rgb8>,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
     },
 }
 
@@ -688,6 +701,13 @@ impl Command {
                 }
                 command.validate(doc)
             }
+            Command::ReplacePicture {
+                target,
+                palette,
+                width,
+                height,
+                pixels,
+            } => validate_replace_picture(*target, palette, *width, *height, pixels),
             Command::RemapColors { from } => {
                 if (1..=256).contains(&from.len()) {
                     Ok(())
@@ -770,7 +790,7 @@ impl Command {
                 }
             }
             Command::SetLayerVisible { .. } | Command::RenameLayer { .. } => Footprint::LayerInfo,
-            Command::ArrangePalette { .. } => Footprint::Document,
+            Command::ArrangePalette { .. } | Command::ReplacePicture { .. } => Footprint::Document,
             // Every frame's pictures change; size and palette stay.
             Command::RemapColors { .. } => Footprint::Frames,
             // Several frames and the current one change (ADR-38).
@@ -945,6 +965,25 @@ impl Command {
                 doc.for_each_cel(|layer, cel| {
                     *cel = crate::remap::remap_with(cel, if layer == 0 { &lower } else { &upper });
                 });
+            }
+            Command::ReplacePicture {
+                target,
+                palette,
+                width,
+                height,
+                pixels,
+            } => {
+                // One frame with one layer, "Background" (ADR-44): the generated picture.
+                let page = IndexedImage::from_pixels(*width, *height, pixels.clone())
+                    .expect("size checked by validate");
+                doc.set_layered(
+                    vec![vec![std::sync::Arc::new(page)]],
+                    vec![crate::Layer::background()],
+                    0,
+                    0,
+                );
+                doc.palette = Palette::new(palette.clone()).expect("size checked by validate");
+                doc.target = *target;
             }
             Command::ArrangePalette { order } => {
                 // Every animation frame and layer shares the palette (ADR-28, ADR-44), so
@@ -1132,6 +1171,62 @@ fn upper_layers_use(doc: &Document, c: u8) -> bool {
     (1..doc.layer_count()).any(|l| {
         (0..doc.frame_count()).any(|f| doc.cel(f, l).is_some_and(|p| p.pixels().contains(&c)))
     })
+}
+
+/// Checks [`Command::ReplacePicture`] against its own target (the document's is replaced).
+fn validate_replace_picture(
+    target: Target,
+    palette: &[Rgb8],
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), CommandError> {
+    let mode = target.mode;
+    let max = mode.max_colors(target.chipset).ok_or_else(|| {
+        CommandError::new(
+            ErrorCode::UnsupportedMode,
+            format!("{} is not available on {:?}", mode.name(), target.chipset),
+        )
+    })?;
+    let n = palette.len();
+    if !n.is_power_of_two() || n < 2 || n > usize::from(max) {
+        return Err(CommandError::new(
+            ErrorCode::PaletteRangeInvalid,
+            format!(
+                "{n} colours: {} on {:?} allows 2..={max} (powers of two)",
+                mode.name(),
+                target.chipset
+            ),
+        ));
+    }
+    if target.chipset == Chipset::Ocs
+        && let Some(i) = palette
+            .iter()
+            .position(|&c| Rgb8::from_rgb4(c.to_rgb4()) != c)
+    {
+        return Err(CommandError::new(
+            ErrorCode::PaletteRangeInvalid,
+            format!(
+                "palette entry {i} ({}) is not a 12-bit OCS colour",
+                palette[i]
+            ),
+        ));
+    }
+    let (sw, sh) = target.screen;
+    if !mode.screen_fits(sw, sh) {
+        let ((a, b), (c, d)) = mode.screen_limits();
+        return Err(CommandError::invalid(format!(
+            "screen {sw}x{sh}: {} allows {a}x{b} to {c}x{d} in whole UI pixels",
+            mode.name()
+        )));
+    }
+    if !target.page_fits(width, height) {
+        let ((min_w, min_h), (max_w, max_h)) = target.page_limits();
+        return Err(CommandError::invalid(format!(
+            "page {width}x{height}: this target allows {min_w}x{min_h} to {max_w}x{max_h}"
+        )));
+    }
+    other_page(width, height, pixels, n)
 }
 
 /// Keeps the first `n` entries; missing ones become a grey ramp from black to white. Every
