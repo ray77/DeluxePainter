@@ -8,6 +8,7 @@
 //!   the provider's environment variable as a read-only fallback.
 //! - [`JobManager`]: generations on worker threads with ids, polling and cancelling.
 //! - [`SizeRule`]: which size to ask a provider for, from the page's display proportions.
+//! - [`Style`]: the style sentence added to the description (pixel art, painted, none).
 //!
 //! The pictures a provider returns are true colour; `dpx_core::import::convert` turns them
 //! into a page of exactly the target's size and colour limits, and
@@ -22,16 +23,18 @@ pub mod openai;
 pub mod provider;
 pub mod secret;
 pub mod size;
+pub mod style;
 
 use std::sync::Arc;
 
 pub use jobs::{JobId, JobManager, JobState, JobStatus};
-pub use openai::{OpenAiConfig, OpenAiProvider, Quality};
+pub use openai::{KeyCheck, OpenAiConfig, OpenAiProvider, Quality};
 pub use provider::{
     CancelToken, Capabilities, GenError, GenerationRequest, ImageGenerationProvider, ProviderStatus,
 };
 pub use secret::{ApiKeys, KeySource, KeyStatus, Secret, SecretError, SecretStore};
 pub use size::{CustomSizes, SizeRule};
+pub use style::Style;
 
 /// The ids of the providers a user can choose, in the order they are offered.
 pub const USER_PROVIDER_IDS: [&str; 1] = [openai::ID];

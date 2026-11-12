@@ -910,6 +910,7 @@ dependencies = [
  "dpx-core",
  "dpx-formats",
  "dpx-iff",
+ "dpx-imagegen",
  "dpx-mcp",
  "dpx-ui",
  "eframe",

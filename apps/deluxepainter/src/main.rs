@@ -49,6 +49,7 @@ mod brush_menu;
 mod config;
 mod effects;
 mod files;
+mod generate;
 mod import;
 mod menu_actions;
 mod palette_stencil;
@@ -504,6 +505,13 @@ fn main() -> eframe::Result {
             eprintln!("{e}");
             std::process::exit(code);
         });
+        // ADR-45: Picture > Generate.. and the Image Generator setup (no network, no keys).
+        let doc = generate::snapshot(&args, &doc, &mut ui).unwrap_or_else(|(code, e)| {
+            eprintln!("{e}");
+            std::process::exit(code);
+        });
+        // After Apply the picture may have a screen of its own.
+        let view = View::of_target(doc.target());
         if args.iter().any(|a| a == "--notes")
             && let Some((_, _, _, notes)) = &opened
         {
@@ -611,6 +619,9 @@ fn main() -> eframe::Result {
             let mut app = PainterApp::new();
             settings.apply(&mut app);
             app.config = store;
+            // ADR-45: API keys in the system keychain, opened on first use (tests and
+            // snapshots keep them in memory).
+            app.imagegen.system_keys = true;
             if let Some((path, doc, extras, notes)) = opened {
                 app.set_picture(doc, extras, path);
                 app.ui.note_requester = note_requester(LOADED, &notes);
@@ -805,6 +816,14 @@ fn snapshot_rgba(
             view.uy as usize * sy,
         );
     }
+    // ADR-45: the Generate thumbnail likewise.
+    generate::overlay(
+        ui,
+        &mut rgba,
+        screen.width() as usize * sx,
+        view.ux as usize * sx,
+        view.uy as usize * sy,
+    );
     (
         screen.width() * sx as u32,
         screen.height() * sy as u32,
@@ -922,6 +941,8 @@ struct PainterApp {
     tooltip: tooltip::State,
     /// Picture ▸ Load's Import requester for PNG and JPEG (ADR-42, import.rs).
     import: import::ImportState,
+    /// Picture ▸ Generate.., its jobs, keys and settings (ADR-45, generate.rs).
+    imagegen: generate::ImageGenState,
 }
 
 impl PainterApp {
@@ -962,6 +983,7 @@ impl PainterApp {
             perspective: perspective::PerspectiveState::default(),
             tooltip: tooltip::State::default(),
             import: import::ImportState::default(),
+            imagegen: generate::ImageGenState::default(),
         }
     }
 
@@ -980,6 +1002,8 @@ impl PainterApp {
             || ui.file_requester.is_some()
             || ui.page_size_requester.is_some()
             || ui.import_requester.is_some()
+            || ui.generate_requester.is_some()
+            || ui.imagegen_setup.is_some()
             || self.show_page.is_some()
             || ui.anim_control.is_some()
             || self.anim_control.preview.is_some()
@@ -1568,6 +1592,8 @@ impl PainterApp {
                 "picture.load" => self.open_file_requester(FileKind::LoadPicture),
                 "picture.save" => self.open_file_requester(FileKind::SavePicture),
                 "picture.export" => self.open_file_requester(FileKind::ExportPicture),
+                // ADR-45 (generate.rs).
+                "picture.generate" => self.open_generate(),
                 "app.quit" => self.request_quit(ctx),
                 // ADR-15 (menu_actions.rs).
                 "spare.swap" => self.swap_spare(),
@@ -1720,6 +1746,12 @@ impl eframe::App for PainterApp {
         // ADR-42: the Import requester after Picture ▸ Load.. of a PNG or JPEG.
         if self.ui.import_requester.is_some() {
             self.import_input(&ctx, origin, ppp, scale, view);
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-45: Picture ▸ Generate.. and the Image Generator setup.
+        if self.ui.generate_requester.is_some() || self.ui.imagegen_setup.is_some() {
+            self.generate_input(&ctx, origin, ppp, scale, view);
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -2021,6 +2053,8 @@ impl PainterApp {
                             .filter(char::is_ascii_alphanumeric)
                             .map(|c| ReqKey::Char(c.to_ascii_lowercase())),
                     ),
+                    // ADR-45: pasted digits for the custom size (never the U/C/R shortcuts).
+                    egui::Event::Paste(text) => keys.extend(dpx_ui::paste_keys(text)),
                     egui::Event::Key {
                         key, pressed: true, ..
                     } => keys.extend(match key {
@@ -2242,6 +2276,10 @@ impl PainterApp {
             match event {
                 egui::Event::Text(text) => {
                     out.extend(text.chars().map(|c| ReqEvent::Key(ReqKey::Char(c))));
+                }
+                // Cmd/Ctrl+V (ADR-45): into the active text field only, never a shortcut.
+                egui::Event::Paste(text) => {
+                    out.extend(dpx_ui::paste_keys(&text).into_iter().map(ReqEvent::Key));
                 }
                 egui::Event::Key {
                     key,
@@ -2486,6 +2524,7 @@ impl PainterApp {
                     let mut rgba = to_rgba(&screen, self.palette(), 1, 1);
                     // ADR-42: the Import thumbnail in true colour over the indexed screen.
                     self.import_overlay(&mut rgba, screen.width() as usize);
+                    self.generate_overlay(&mut rgba, screen.width() as usize);
                     (screen, rgba)
                 }
             };
@@ -3130,7 +3169,9 @@ mod tests {
     #[test]
     fn menu_spec_parsing() {
         assert_eq!(parse_menu_spec("0"), Some((0, None, None)));
-        assert_eq!(parse_menu_spec("0:5:1"), Some((0, Some(5), Some(1))));
+        // Picture ▸ Flip ▸ Vert (Flip is item 6 since Generate.., ADR-45).
+        assert_eq!(parse_menu_spec("0:6:1"), Some((0, Some(6), Some(1))));
+        assert_eq!(parse_menu_spec("0:5:1"), None, "Print.. has no submenu");
         assert_eq!(parse_menu_spec("7"), None);
         assert_eq!(parse_menu_spec("0:0:0"), None, "Load.. has no submenu");
         assert_eq!(parse_menu_spec("0:99"), None);
@@ -3886,7 +3927,7 @@ mod tests {
 
     /// Picks the menu item at the end of `path` (UI pixels, the menu title first) as on the
     /// Amiga: right button down on the title bar, along the path, up over the item.
-    fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
+    pub(crate) fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
         use egui::PointerButton::Secondary;
         let points: Vec<egui::Pos2> = path.iter().map(|&p| ui_point(app, p)).collect();
         ui_pass(

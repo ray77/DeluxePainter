@@ -37,7 +37,9 @@ impl TextField {
 
     pub fn key(&mut self, key: ReqKey) {
         match key {
-            ReqKey::Char(c) if !c.is_control() && self.chars.len() < self.max => {
+            ReqKey::Char(c) | ReqKey::Paste(c)
+                if !c.is_control() && self.chars.len() < self.max =>
+            {
                 self.chars.insert(self.cursor, c);
                 self.cursor += 1;
             }

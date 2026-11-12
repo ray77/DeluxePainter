@@ -200,21 +200,35 @@ pub(crate) fn default_colors(palette_len: usize) -> u16 {
 }
 
 /// Runs `draw` (marks drawn over the composed screen, such as the toolbox's toggles) without
-/// touching the Import requester: it covers the toolbox column, and the marks belong under it.
+/// touching the Import requester (or ADR-45's Generate requester and its setup): they cover
+/// the toolbox column, and the marks belong under them.
 pub(crate) fn under_import_requester(
     screen: &mut IndexedImage,
     ui: &UiState,
     (ux, uy): (i32, i32),
     draw: impl FnOnce(&mut IndexedImage),
 ) {
-    let kept = ui.import_requester.as_ref().map(|req| {
-        let (ox, oy) = req.origin();
-        let (w, h) = req.size();
-        let rect = dpx_core::Rect::new(ox * ux, oy * uy, w * ux, h * uy);
-        (rect, screen.crop(rect))
-    });
+    let mut rects: Vec<dpx_core::Rect> = ui
+        .import_requester
+        .as_ref()
+        .map(|req| {
+            let (ox, oy) = req.origin();
+            let (w, h) = req.size();
+            dpx_core::Rect::new(ox, oy, w, h)
+        })
+        .into_iter()
+        .collect();
+    // ADR-45: the Generate requester and its setup cover the toolbox too.
+    rects.extend(crate::generate::kept_rects(ui));
+    let kept: Vec<_> = rects
+        .into_iter()
+        .map(|r| {
+            let rect = dpx_core::Rect::new(r.x * ux, r.y * uy, r.w * ux, r.h * uy);
+            (rect, screen.crop(rect))
+        })
+        .collect();
     draw(screen);
-    if let Some((rect, img)) = kept {
+    for (rect, img) in kept {
         screen.blit(&img, rect.x, rect.y);
     }
 }

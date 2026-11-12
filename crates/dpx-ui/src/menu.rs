@@ -267,6 +267,8 @@ pub static MENUS: [Menu; 7] = [
             cmd_key("Load..", Key::Amiga('L'), "picture.load"),
             cmd_key("Save..", Key::Amiga('S'), "picture.save"),
             cmd("Export..", "picture.export"),
+            // ADR-45: a DeluxePainter addition.
+            cmd("Generate..", "picture.generate"),
             cmd_key("Delete..", Key::Amiga('D'), "picture.delete"),
             cmd_key("Print..", Key::Amiga('P'), "picture.print"),
             sub(
@@ -657,6 +659,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "picture.load",
     "picture.save",
     "picture.export",
+    "picture.generate",
     "picture.delete",
     "picture.flip_horizontal",
     "picture.flip_vertical",
@@ -1218,9 +1221,9 @@ mod tests {
     fn picture_menu_geometry_matches_reference() {
         let b = menu_box(0, 320, 256);
         // Box at the left edge, top border on row 9. DeluxePaint has 11 items (rows 9..=126);
-        // Export.. (ADR-27) adds one: rows 9..=136.
+        // Export.. (ADR-27) and Generate.. (ADR-45) add one each: rows 9..=146.
         assert_eq!((b.x, b.y), (0, 9));
-        assert_eq!(b.h, 128);
+        assert_eq!(b.h, 138);
         assert_eq!(b.item_top(0), 13);
         assert_eq!(b.item_top(1), 23);
     }
@@ -1262,15 +1265,15 @@ mod tests {
         );
         // Over "Flip": a submenu, nothing to select until a sub item is hovered.
         let b = menu_box(0, 320, 256);
-        st.pointer(320, 256, 20, b.item_top(5) + 2);
-        assert_eq!(st.item, Some(5));
+        st.pointer(320, 256, 20, b.item_top(6) + 2);
+        assert_eq!(st.item, Some(6));
         assert_eq!(st.hovered_action(&ctx()), None);
-        let Entry::Submenu(items) = MENUS[0].items[5].entry else {
+        let Entry::Submenu(items) = MENUS[0].items[6].entry else {
             panic!("Flip is a submenu");
         };
-        let s = submenu_box(&b, 5, items, 320, 256);
+        let s = submenu_box(&b, 6, items, 320, 256);
         st.pointer(320, 256, s.x + s.w - 5, s.item_top(1) + 2);
-        assert_eq!(st.item, Some(5), "parent item stays highlighted");
+        assert_eq!(st.item, Some(6), "parent item stays highlighted");
         assert_eq!(
             st.hovered_action(&ctx()),
             Some(Action::Command("picture.flip_vertical"))

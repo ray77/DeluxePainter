@@ -38,6 +38,8 @@ pub const DEFAULT_MODEL: &str = "gpt-image-2.6-flare";
 pub const MODELS_CHECKED: &str = "2026-11-12";
 /// The endpoint.
 pub const ENDPOINT: &str = "https://api.openai.com/v1/images/generations";
+/// OpenAI's page for making API keys (Image Generator ▸ Get key..).
+pub const KEYS_PAGE: &str = "https://platform.openai.com/api-keys";
 /// The environment variable read as a fallback key source.
 pub const ENV_KEY: &str = "OPENAI_API_KEY";
 /// The keychain account of the key.
@@ -104,9 +106,15 @@ impl Default for OpenAiConfig {
 }
 
 impl OpenAiConfig {
+    /// The model id is 1-64 printable ASCII characters without spaces.
+    pub fn model_is_valid(&self) -> bool {
+        let m = &self.model;
+        !m.is_empty() && m.len() <= 64 && m.chars().all(|c| c.is_ascii_graphic())
+    }
+
     fn check_model(&self) -> Result<(), GenError> {
         let m = &self.model;
-        if m.is_empty() || m.len() > 64 || !m.chars().all(|c| c.is_ascii_graphic()) {
+        if !self.model_is_valid() {
             return Err(GenError::NotConfigured(format!(
                 "'{}' is no OpenAI model id",
                 clean_message(m)
@@ -157,22 +165,133 @@ impl OpenAiProvider {
     }
 
     fn agent(&self) -> ureq::Agent {
-        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::NativeTls)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let mut config = ureq::Agent::config_builder()
-            .timeout_global(Some(self.timeout))
-            .timeout_connect(Some(self.connect_timeout))
-            .http_status_as_error(false)
-            .tls_config(tls)
-            .user_agent("DeluxePainter");
-        if !self.env_proxy {
-            config = config.proxy(None);
-        }
-        config.build().into()
+        agent(self.timeout, self.connect_timeout, self.env_proxy)
     }
+}
+
+/// The HTTP client: native TLS with the platform's root certificates, both timeouts, HTTP
+/// errors as answers (their body is OpenAI's error object), the environment's proxy unless
+/// `env_proxy` is off (tests against a local server).
+fn agent(timeout: Duration, connect_timeout: Duration, env_proxy: bool) -> ureq::Agent {
+    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    let mut config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(connect_timeout))
+        .http_status_as_error(false)
+        .tls_config(tls)
+        .user_agent("DeluxePainter");
+    if !env_proxy {
+        config = config.proxy(None);
+    }
+    config.build().into()
+}
+
+/// The model list, used to check a key: `GET` only lists models, it makes no picture (the
+/// API reference names no price for it).
+pub const MODELS_ENDPOINT: &str = "https://api.openai.com/v1/models";
+/// Longest wait for the model list.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest model list read.
+const MAX_LIST_BYTES: u64 = 8 * 1024 * 1024;
+
+/// What a key check found ([`check_key`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyCheck {
+    /// The model id that was looked for.
+    pub model: String,
+    /// The account lists that model.
+    pub model_listed: bool,
+    /// Its announced shutdown date, if the list gives one.
+    pub shutdown_date: Option<String>,
+}
+
+impl KeyCheck {
+    /// One ASCII line for the pixel UI.
+    pub fn describe(&self) -> String {
+        let model = clean_message(&self.model);
+        match (&self.model_listed, &self.shutdown_date) {
+            (true, Some(date)) => format!(
+                "The key works. {model} is available; it shuts down on {}.",
+                clean_message(date)
+            ),
+            (true, None) => format!("The key works. {model} is available."),
+            (false, _) => format!(
+                "The key works, but your account does not list {model}. Check the model id."
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    shutdown_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelList {
+    data: Vec<ModelEntry>,
+}
+
+/// Checks `key` with OpenAI's model list (`GET /v1/models`): no picture is made. Blocks;
+/// call it on a worker thread. A wrong key is [`GenError::Auth`], as for a generation.
+pub fn check_key(config: &OpenAiConfig, key: &crate::secret::Secret) -> Result<KeyCheck, GenError> {
+    check_key_at(MODELS_ENDPOINT, config, key, true)
+}
+
+/// [`check_key`] against `url` (a local test server), with or without the environment's
+/// proxy.
+pub fn check_key_at(
+    url: &str,
+    config: &OpenAiConfig,
+    key: &crate::secret::Secret,
+    env_proxy: bool,
+) -> Result<KeyCheck, GenError> {
+    config.check_model()?;
+    let connect = Duration::from_secs(config.connect_timeout_secs.clamp(1, 120));
+    let mut response = agent(CHECK_TIMEOUT, connect.min(CHECK_TIMEOUT), env_proxy)
+        .get(url)
+        .header("Authorization", &format!("Bearer {}", key.expose()))
+        .call()
+        .map_err(transport_error)?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_LIST_BYTES)
+        .read_to_vec()
+        .map_err(transport_error)?;
+    parse_model_list(status, retry_after.as_deref(), &bytes, &config.model)
+}
+
+/// The key check's result from an answer of the model list.
+pub(crate) fn parse_model_list(
+    status: u16,
+    retry_after: Option<&str>,
+    body: &[u8],
+    model: &str,
+) -> Result<KeyCheck, GenError> {
+    if !(200..300).contains(&status) {
+        return Err(status_error(status, retry_after, body));
+    }
+    let list: ModelList = serde_json::from_slice(body)
+        .map_err(|e| GenError::BadResponse(format!("no model list ({e})")))?;
+    let found = list.data.iter().find(|m| m.id == model);
+    Ok(KeyCheck {
+        model: model.to_string(),
+        model_listed: found.is_some(),
+        shutdown_date: found.and_then(|m| m.shutdown_date.clone()),
+    })
 }
 
 impl ImageGenerationProvider for OpenAiProvider {
@@ -776,6 +895,75 @@ mod tests {
         assert!(matches!(
             bad_model.status(),
             ProviderStatus::NotConfigured(_)
+        ));
+    }
+
+    #[test]
+    fn a_key_check_lists_models_and_sends_no_generation() {
+        let list = json!({
+            "object": "list",
+            "data": [
+                { "id": "gpt-4.1", "object": "model", "created": 1, "owned_by": "openai" },
+                { "id": DEFAULT_MODEL, "object": "model", "created": 2, "owned_by": "openai",
+                  "shutdown_date": "2027-06-01" },
+            ],
+        })
+        .to_string();
+        let (url, server) = serve_once(http("200 OK", "", list.as_bytes()), Duration::ZERO);
+        let key = Secret::new("sk-check-1").unwrap();
+        let got = check_key_at(&url, &OpenAiConfig::default(), &key, false).unwrap();
+        assert_eq!(
+            got,
+            KeyCheck {
+                model: DEFAULT_MODEL.into(),
+                model_listed: true,
+                shutdown_date: Some("2027-06-01".into()),
+            }
+        );
+        assert!(got.describe().contains("2027-06-01"), "{}", got.describe());
+        assert!(got.describe().is_ascii());
+        let request = server.join().unwrap();
+        let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(text.starts_with("get "), "{text}");
+        assert!(text.contains("authorization: bearer sk-check-1"), "{text}");
+        assert!(!text.contains("prompt"), "no generation body: {text}");
+        // A model the account does not list.
+        let other = OpenAiConfig {
+            model: "gpt-image-9".into(),
+            ..OpenAiConfig::default()
+        };
+        let (url, server) = serve_once(http("200 OK", "", list.as_bytes()), Duration::ZERO);
+        let got = check_key_at(&url, &other, &key, false).unwrap();
+        assert!(!got.model_listed);
+        assert!(got.describe().contains("does not list gpt-image-9"));
+        server.join().unwrap();
+        // A wrong key is an authentication failure, the key fragment redacted.
+        let (url, server) = serve_once(
+            http(
+                "401 Unauthorized",
+                "",
+                &error_json(
+                    "Incorrect API key provided: sk-check-1.",
+                    "invalid_request_error",
+                    Some("invalid_api_key"),
+                ),
+            ),
+            Duration::ZERO,
+        );
+        let e = check_key_at(&url, &OpenAiConfig::default(), &key, false).unwrap_err();
+        match &e {
+            GenError::Auth {
+                status: 401,
+                message,
+            } => {
+                assert!(!message.contains("sk-check"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        server.join().unwrap();
+        assert!(matches!(
+            parse_model_list(200, None, b"<html>", DEFAULT_MODEL),
+            Err(GenError::BadResponse(_))
         ));
     }
 

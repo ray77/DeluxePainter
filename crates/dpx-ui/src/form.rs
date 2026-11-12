@@ -355,7 +355,7 @@ impl Form {
                     self.message = None;
                 }
             }
-            ReqKey::Char(c) if !c.is_ascii_digit() => {}
+            ReqKey::Char(c) | ReqKey::Paste(c) if !c.is_ascii_digit() => {}
             k => {
                 if let Some(a) = self.active {
                     let f = &mut self.fields[a];

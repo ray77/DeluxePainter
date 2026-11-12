@@ -14,6 +14,8 @@ pub mod choice_requester;
 pub mod file_requester;
 pub mod font;
 pub(crate) mod form;
+pub mod generate_requester;
+pub mod imagegen_setup;
 pub mod import_requester;
 pub mod menu;
 pub mod note_requester;
@@ -44,6 +46,13 @@ pub use animbrush_requester::{AnimBrushReq, AnimBrushRequester};
 pub use arrange_requester::ArrangeRequester;
 pub use choice_requester::{ChoiceRequester, ChoiceResponse};
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
+pub use generate_requester::{
+    GenControl, GenPhase, GenQuality, GenRow, GenStyle, GenTarget, GenerateOptions,
+    GenerateRequester, GenerateResponse, ProviderInfo,
+};
+pub use imagegen_setup::{
+    ImageGenSetupRequester, SetupControl, SetupField, SetupInfo, SetupProvider, SetupResponse,
+};
 pub use import_requester::{
     ImportControl, ImportInfo, ImportRequester, ImportResponse, ImportRow, overlay_rgb,
 };
@@ -54,7 +63,7 @@ pub use palette_requester::{PaletteRequester, PaletteResponse};
 pub use pens::Pens;
 pub use perspective_requester::{PerspectiveRequester, PerspectiveSettings};
 pub use range_requester::{RangeData, RangeRequester, RangeResponse};
-pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester};
+pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester, paste_keys};
 pub use screen::{Hit, PaintMode, Screen, UiState};
 pub use show_page::{ShowPage, ShowPageResponse};
 pub use stencil_requester::StencilRequester;

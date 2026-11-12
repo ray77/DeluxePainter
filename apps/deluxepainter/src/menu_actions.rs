@@ -34,6 +34,11 @@ pub struct OtherPage {
 pub struct MenuData {
     /// The spare page; `None` until it is first used (a blank page then).
     pub spare: Option<OtherPage>,
+    /// ADR-45: the spare page holds a generated picture with a screen format and palette of
+    /// its own (Picture ▸ Generate.. onto the spare page): it is kept as it is instead of
+    /// being matched to the shown page, and these are its file details (colour ranges,
+    /// transparent colour), which travel with it on Swap.
+    pub spare_own: Option<crate::files::PictureExtras>,
     /// Effect ▸ Background ▸ Fix: the fixed picture of the shown page.
     pub background: Option<IndexedImage>,
     /// Palette as of the last picture load; `None` = the start palette.
@@ -64,6 +69,12 @@ impl MenuData {
             .filter(|p| p.len() == doc.len())
             .unwrap_or(doc)
     }
+}
+
+/// Both documents have the same target and palette (ADR-45: else a generated spare page
+/// keeps its own).
+fn same_format(a: &Document, b: &Document) -> bool {
+    a.target() == b.target() && a.palette() == b.palette()
 }
 
 /// `palette` with every active range of `ranges` rotated by the number of steps its rate
@@ -247,7 +258,7 @@ impl PainterApp {
     }
 
     /// A blank spare page (colour 0) of the shown page's size and format.
-    fn blank_page(&self) -> OtherPage {
+    pub(crate) fn blank_page(&self) -> OtherPage {
         let doc = self.engine.document();
         let (w, h) = (doc.page().width(), doc.page().height());
         OtherPage {
@@ -267,6 +278,12 @@ impl PainterApp {
     /// dropped (DeluxePaint discards the spare on a format change, AGA p.241), one with an
     /// older palette takes the current palette (its undo history starts over then).
     fn take_spare(&mut self) -> OtherPage {
+        // ADR-45: a generated spare page keeps its own format and palette.
+        if self.menu_data.spare_own.is_some()
+            && let Some(s) = self.menu_data.spare.take()
+        {
+            return s;
+        }
         let doc = self.engine.document();
         let (target, palette) = (doc.target(), doc.palette().clone());
         match self.menu_data.spare.take() {
@@ -297,10 +314,40 @@ impl PainterApp {
         std::mem::swap(&mut self.picture_path, &mut other.picture_path);
         std::mem::swap(&mut self.menu_data.background, &mut other.background);
         std::mem::swap(&mut self.ui.bg, &mut other.bg);
+        // ADR-45: pages of their own formats swap their file details too, like a Load.
+        if let Some(mut extras) = self.menu_data.spare_own.take() {
+            std::mem::swap(&mut self.extras, &mut extras);
+            if !same_format(self.engine.document(), other.engine.document()) {
+                self.menu_data.spare_own = Some(extras);
+            }
+            self.menu_data.cycled = None;
+        }
         self.menu_data.spare = Some(other);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;
+    }
+
+    /// The spare page for the Light Table: none while it has a format of its own (ADR-45:
+    /// its colour numbers belong to another palette).
+    pub(crate) fn light_table_spare(&self) -> Option<&IndexedImage> {
+        if self.spare_differs() {
+            return None;
+        }
+        self.menu_data
+            .spare
+            .as_ref()
+            .map(|s| s.engine.document().page())
+    }
+
+    /// The spare page has a screen format or palette of its own (ADR-45).
+    pub(crate) fn spare_differs(&self) -> bool {
+        self.menu_data.spare_own.is_some()
+            && self
+                .menu_data
+                .spare
+                .as_ref()
+                .is_some_and(|s| !same_format(self.engine.document(), s.engine.document()))
     }
 
     /// Picture ▸ Spare ▸ Copy to Spare (Ctrl+`j`): the spare becomes a copy of the shown page
@@ -308,7 +355,26 @@ impl PainterApp {
     pub(crate) fn copy_to_spare(&mut self) {
         self.finish_stroke();
         let page = self.engine.document().page().clone();
+        let differs = self.spare_differs();
         let mut other = self.take_spare();
+        if differs {
+            // ADR-45: the spare takes the shown page's format and palette (one undo step on
+            // the spare page) and is an ordinary spare again.
+            let doc = self.engine.document();
+            let command = Command::ReplacePicture {
+                target: doc.target(),
+                palette: doc.palette().colors().to_vec(),
+                width: page.width(),
+                height: page.height(),
+                pixels: page.pixels().to_vec(),
+            };
+            if other.engine.execute(command).is_err() {
+                other.engine = Engine::new(doc.clone());
+            }
+            self.menu_data.spare_own = None;
+            self.menu_data.spare = Some(other);
+            return;
+        }
         let command = Command::SetPage {
             width: page.width(),
             height: page.height(),
@@ -327,6 +393,18 @@ impl PainterApp {
         if self.menu_data.spare.is_none() {
             return; // A blank spare changes nothing.
         }
+        if self.spare_differs() {
+            // ADR-45: colour numbers of another palette or size cannot be merged.
+            self.ui.note_requester = crate::note_requester(
+                "Not merged",
+                &[
+                    "The spare page has its own screen format or palette (Picture > \
+                   Generate..). Merging needs both pages alike; press j to see it."
+                        .to_string(),
+                ],
+            );
+            return;
+        }
         let other = self.take_spare();
         let page = other.engine.document().page();
         let command = Command::MergePage {
@@ -344,6 +422,10 @@ impl PainterApp {
     /// step brings it back) and the spare is freed.
     pub(crate) fn delete_page(&mut self) {
         self.finish_stroke();
+        if self.spare_differs() {
+            return self.delete_page_for_own_spare();
+        }
+        self.menu_data.spare_own = None;
         let other = self.take_spare();
         let page = other.engine.document().page();
         let command = Command::SetPage {
@@ -357,6 +439,42 @@ impl PainterApp {
                 self.picture_path = other.picture_path;
                 self.menu_data.background = other.background;
                 self.ui.bg = other.bg;
+                self.clamp_colors();
+                self.clamp_scroll();
+            }
+            Err(e) => {
+                eprintln!("delete this page: {e}");
+                self.menu_data.spare = Some(other);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Delete This Page with a generated spare of its own format (ADR-45): the shown page
+    /// becomes the spare's picture, format and palette in one undo step.
+    fn delete_page_for_own_spare(&mut self) {
+        let Some(other) = self.menu_data.spare.take() else {
+            return;
+        };
+        let doc = other.engine.document();
+        let page = doc.page();
+        let command = Command::ReplacePicture {
+            target: doc.target(),
+            palette: doc.palette().colors().to_vec(),
+            width: page.width(),
+            height: page.height(),
+            pixels: page.pixels().to_vec(),
+        };
+        match self.engine.execute(command) {
+            Ok(_) => {
+                self.scroll = other.scroll;
+                self.picture_path = other.picture_path;
+                self.menu_data.background = other.background;
+                self.ui.bg = other.bg;
+                if let Some(extras) = self.menu_data.spare_own.take() {
+                    self.extras = extras;
+                }
+                self.menu_data.cycled = None;
                 self.clamp_colors();
                 self.clamp_scroll();
             }

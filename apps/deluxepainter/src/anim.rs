@@ -370,11 +370,7 @@ impl PainterApp {
             return;
         }
         let doc = self.engine.document();
-        let spare = self
-            .menu_data
-            .spare
-            .as_ref()
-            .map(|s| s.engine.document().page());
+        let spare = self.light_table_spare();
         let merged = light_table_page(doc, doc.page(), self.anim.light, spare, self.ui.bg, false);
         self.anim.light_on = false;
         if &merged != doc.page() {
@@ -398,11 +394,7 @@ impl PainterApp {
         if self.anim.playing.is_some() {
             self.anim.shown = doc.frame(shown_frame).cloned();
         } else if self.anim.light_on && (count > 1 || self.anim.light.spare) {
-            let spare = self
-                .menu_data
-                .spare
-                .as_ref()
-                .map(|s| s.engine.document().page());
+            let spare = self.light_table_spare();
             let page = light_table_page(
                 doc,
                 self.page(),
