@@ -421,6 +421,40 @@ mod tests {
         assert!(format_for_save("a").is_err());
     }
 
+    /// ADR-44: a picture holds what the frames show (all visible layers), with a note.
+    #[test]
+    fn saved_pictures_hold_the_visible_layers() {
+        use dpx_core::{Command, Engine};
+        let mut e = Engine::new(doc());
+        e.execute(Command::AddLayer { name: None }).unwrap();
+        e.execute(Command::Clear { color: 2 }).unwrap();
+        e.execute(Command::AddFrames { count: 1 }).unwrap();
+        // Frame 2's upper layer is cleared: the bottom layer's colour 7 at (3, 4) shows.
+        e.execute(Command::Clear { color: 0 }).unwrap();
+        let d = e.document();
+        for format in [Format::Ilbm, Format::Png, Format::Anim] {
+            let (bytes, notes) = encode_document(d, format).unwrap();
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains("2 layers saved as one picture")),
+                "{format:?}: {notes:?}"
+            );
+            let (back, _) = decode_picture("x", &bytes).unwrap();
+            let last = back.frame_count() - 1;
+            assert_eq!(
+                back.frame(last).unwrap(),
+                d.composite_frame(1).unwrap().as_ref(),
+                "{format:?}"
+            );
+            assert_eq!(back.frame(last).unwrap().get(3, 4), Some(7));
+        }
+        // Frame 1 shows the upper layer's colour 2 everywhere.
+        let (bytes, _) = encode_document(d, Format::Anim).unwrap();
+        let (back, _) = decode_picture("x", &bytes).unwrap();
+        assert!(back.frame(0).unwrap().pixels().iter().all(|&p| p == 2));
+    }
+
     #[test]
     fn unsupported_inputs() {
         assert_eq!(

@@ -1,0 +1,12 @@
+[
+{"op":"goto_frame","frame":0},
+{"op":"shape","shape":{"kind":"rect","from":[0,200],"to":[319,255]},"color":16,"filled":true},
+{"op":"copy_frame","first":1,"last":1},
+{"op":"add_layer","name":"Hills"},
+{"op":"shape","shape":{"kind":"polygon","points":[[0,214],[40,168],[92,150],[150,182],[206,140],[262,170],[319,156],[319,232],[0,232]],"closed":true},"color":7,"filled":true},
+{"op":"copy_frame","first":1,"last":1},
+{"op":"add_layer","name":"Moon"},
+{"op":"shape","shape":{"kind":"ellipse","center":[90,60],"radius":[18,18]},"color":3,"filled":true},
+{"op":"goto_frame","frame":1},
+{"op":"shape","shape":{"kind":"ellipse","center":[150,48],"radius":[18,18]},"color":3,"filled":true}
+]

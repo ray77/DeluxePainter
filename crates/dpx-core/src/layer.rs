@@ -865,4 +865,40 @@ mod tests {
             .collect();
         assert_eq!(shown, [1, 2, 3]);
     }
+
+    /// How long one composite takes (the screen makes one per redraw of a layered page).
+    /// `cargo test [--release] -p dpx-core -- --ignored --nocapture composite_timing`.
+    #[test]
+    #[ignore = "timing"]
+    fn composite_timing() {
+        use std::time::Instant;
+        for (w, h, layers) in [(320, 256, 4), (1008, 1024, 4), (4096, 4096, 4)] {
+            let mut e = Engine::new(Document::from_picture(
+                IndexedImage::new(w, h, 1),
+                Palette::dpaint_default_32(),
+                Target::default(),
+            ));
+            for l in 1..layers {
+                e.execute(Command::AddLayer { name: None }).unwrap();
+                e.execute(Command::Clear { color: l as u8 + 1 }).unwrap();
+                e.execute(Command::FloodFill {
+                    x: 0,
+                    y: 0,
+                    color: 0,
+                    fill: Default::default(),
+                })
+                .unwrap();
+                e.execute(dot(l as u8 + 1, (l, l))).unwrap();
+            }
+            let runs = 10;
+            let t = Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(e.document().composite());
+            }
+            println!(
+                "{w}x{h}, {layers} layers: {:.2} ms per composite",
+                t.elapsed().as_secs_f64() * 1000.0 / f64::from(runs)
+            );
+        }
+    }
 }
