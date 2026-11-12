@@ -6,11 +6,15 @@
 //! - States: running, done (pictures ready), failed (typed [`GenError`]), cancelled.
 //! - Cancelling marks the job cancelled at once and sets its [`CancelToken`]; a blocking
 //!   request already sent cannot be stopped, so its answer is thrown away when it comes
-//!   (a cloud provider may still bill it).
-//! - At most [`JobManager::MAX_RUNNING`] jobs run at once (more is `BUSY`): every
-//!   generation may cost money, and MCP clients must not start them without limit.
+//!   (a cloud provider may still bill it). Until then the job is still *in flight*
+//!   ([`JobStatus::in_flight`]).
+//! - At most [`JobManager::MAX_RUNNING`] requests are in flight at once, cancelled ones
+//!   included (more is `BUSY`): every generation may cost money, and neither MCP clients
+//!   nor Cancel-then-Generate in the GUI may start them without limit.
 //! - Finished jobs keep their pictures until [`JobManager::forget`] or until more than
-//!   [`JobManager::KEEP_FINISHED`] jobs have finished (the oldest go first).
+//!   [`JobManager::KEEP_FINISHED`] jobs have finished (the oldest go first). A cancelled
+//!   job stays listed while its request is in flight; forgetting it then takes effect when
+//!   the request ends.
 //! - A provider that panics fails its job; it does not take the editor down.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -66,6 +70,10 @@ pub struct JobStatus {
     pub error: Option<GenError>,
     /// Pictures ready (done jobs).
     pub images: usize,
+    /// The worker still waits for the provider: always while running, and after cancelling
+    /// until the request already sent has ended (it counts against
+    /// [`JobManager::MAX_RUNNING`]).
+    pub in_flight: bool,
 }
 
 struct Job {
@@ -78,6 +86,10 @@ struct Job {
     error: Option<GenError>,
     images: Option<Arc<Vec<RgbaImage>>>,
     cancel: CancelToken,
+    /// The worker thread has not returned yet (its request may still be billed).
+    worker_alive: bool,
+    /// Forgotten while its request was in flight: dropped when the worker returns.
+    forget_when_done: bool,
 }
 
 impl Job {
@@ -90,6 +102,7 @@ impl Job {
             elapsed: self.finished.unwrap_or_else(Instant::now) - self.started,
             error: self.error.clone(),
             images: self.images.as_ref().map_or(0, |i| i.len()),
+            in_flight: self.worker_alive,
         }
     }
 }
@@ -129,7 +142,8 @@ impl std::fmt::Debug for JobManager {
 }
 
 impl JobManager {
-    /// Most jobs running at once.
+    /// Most requests in flight at once (running jobs and cancelled ones whose request has
+    /// not ended yet).
     pub const MAX_RUNNING: usize = 2;
     /// Most finished jobs kept with their pictures.
     pub const KEEP_FINISHED: usize = 8;
@@ -149,7 +163,8 @@ impl JobManager {
 
     /// Starts generating `request` with `provider` on a worker thread. Refused at once, with
     /// nothing sent, when the provider is not set up, the request does not fit its
-    /// capabilities or [`Self::MAX_RUNNING`] jobs are running.
+    /// capabilities or [`Self::MAX_RUNNING`] requests are in flight (cancelled ones count
+    /// until their worker returns).
     pub fn submit(
         &self,
         provider: Arc<dyn ImageGenerationProvider>,
@@ -162,11 +177,7 @@ impl JobManager {
         let cancel = CancelToken::new();
         let id = {
             let mut s = self.lock();
-            let running = s
-                .jobs
-                .iter()
-                .filter(|j| j.state == JobState::Running)
-                .count();
+            let running = s.jobs.iter().filter(|j| j.worker_alive).count();
             if running >= Self::MAX_RUNNING {
                 return Err(GenError::Busy { running });
             }
@@ -182,6 +193,8 @@ impl JobManager {
                 error: None,
                 images: None,
                 cancel: cancel.clone(),
+                worker_alive: true,
+                forget_when_done: false,
             });
             s.revision += 1;
             id
@@ -210,34 +223,26 @@ impl JobManager {
         Ok(id)
     }
 
+    /// The worker returned with `result`.
     fn finish(&self, id: JobId, result: Result<Vec<RgbaImage>, GenError>) {
         {
             let mut s = self.lock();
             let Some(job) = s.jobs.iter_mut().find(|j| j.id == id) else {
                 return;
             };
-            if job.state != JobState::Running {
-                // Cancelled (or forgotten) meanwhile: the answer is thrown away.
-                return;
+            job.worker_alive = false;
+            if job.forget_when_done {
+                s.jobs.retain(|j| j.id != id);
+                s.revision += 1;
+            } else if job.state != JobState::Running {
+                // Cancelled meanwhile: the answer is thrown away; the request has ended.
+                s.revision += 1;
+                prune(&mut s.jobs);
+            } else {
+                finish_job(job, result);
+                s.revision += 1;
+                prune(&mut s.jobs);
             }
-            job.finished = Some(Instant::now());
-            match result {
-                Ok(images) if !images.is_empty() => {
-                    job.state = JobState::Done;
-                    job.images = Some(Arc::new(images));
-                }
-                Ok(_) => {
-                    job.state = JobState::Failed;
-                    job.error = Some(GenError::BadResponse("no picture came back".into()));
-                }
-                Err(GenError::Cancelled) => job.state = JobState::Cancelled,
-                Err(e) => {
-                    job.state = JobState::Failed;
-                    job.error = Some(e);
-                }
-            }
-            s.revision += 1;
-            prune(&mut s.jobs);
         }
         self.notify();
     }
@@ -303,17 +308,24 @@ impl JobManager {
         cancelled
     }
 
-    /// Drops a finished job and its pictures (true); a running job must be cancelled first.
+    /// Drops a finished job and its pictures (true); a running job must be cancelled first
+    /// (false). A cancelled job whose request is still in flight stays listed (and counts
+    /// against [`Self::MAX_RUNNING`]) until its worker returns, then goes (true).
     pub fn forget(&self, id: JobId) -> bool {
         let mut s = self.lock();
-        let before = s.jobs.len();
-        s.jobs
-            .retain(|j| j.id != id || j.state == JobState::Running);
-        let gone = s.jobs.len() < before;
-        if gone {
-            s.revision += 1;
+        let Some(job) = s.jobs.iter_mut().find(|j| j.id == id) else {
+            return false;
+        };
+        if job.state == JobState::Running {
+            return false;
         }
-        gone
+        if job.worker_alive {
+            job.forget_when_done = true;
+        } else {
+            s.jobs.retain(|j| j.id != id);
+        }
+        s.revision += 1;
+        true
     }
 
     /// Waits until the job is no longer running or `timeout` has passed; its state then.
@@ -337,12 +349,35 @@ impl JobManager {
     }
 }
 
-/// Keeps at most [`JobManager::KEEP_FINISHED`] finished jobs (the newest).
+/// A running job's end: its pictures, or why there are none.
+fn finish_job(job: &mut Job, result: Result<Vec<RgbaImage>, GenError>) {
+    job.finished = Some(Instant::now());
+    match result {
+        Ok(images) if !images.is_empty() => {
+            job.state = JobState::Done;
+            job.images = Some(Arc::new(images));
+        }
+        Ok(_) => {
+            job.state = JobState::Failed;
+            job.error = Some(GenError::BadResponse("no picture came back".into()));
+        }
+        Err(GenError::Cancelled) => job.state = JobState::Cancelled,
+        Err(e) => {
+            job.state = JobState::Failed;
+            job.error = Some(e);
+        }
+    }
+}
+
+/// Keeps at most [`JobManager::KEEP_FINISHED`] finished jobs (the newest). Jobs whose request
+/// is still in flight (running or cancelled) always stay: they count against
+/// [`JobManager::MAX_RUNNING`].
 fn prune(jobs: &mut Vec<Job>) {
-    let finished = jobs.iter().filter(|j| j.state != JobState::Running).count();
+    let ended = |j: &Job| j.state != JobState::Running && !j.worker_alive;
+    let finished = jobs.iter().filter(|j| ended(j)).count();
     let mut excess = finished.saturating_sub(JobManager::KEEP_FINISHED);
     jobs.retain(|j| {
-        if excess > 0 && j.state != JobState::Running {
+        if excess > 0 && ended(j) {
             excess -= 1;
             false
         } else {
@@ -495,6 +530,83 @@ mod tests {
         assert_eq!(s.state, JobState::Cancelled);
         assert_eq!(s.images, 0);
         assert!(jobs.images(id).is_none());
+    }
+
+    #[test]
+    fn cancelled_requests_in_flight_count_against_the_limit() {
+        let jobs = JobManager::new();
+        // One gate per request, so the test decides which one ends.
+        let (pa, go_a) = Gated::new();
+        let (pb, go_b) = Gated::new();
+        let (pc, go_c) = Gated::new();
+        // Generate, Cancel, Generate, Cancel: both requests are still in flight.
+        let a = jobs.submit(pa, request()).unwrap();
+        assert!(jobs.status(a).unwrap().in_flight);
+        assert!(jobs.cancel(a));
+        assert!(jobs.forget(a), "forgotten once its request ends");
+        let b = jobs.submit(pb, request()).unwrap();
+        assert!(jobs.cancel(b));
+        assert_eq!(
+            jobs.submit(pc.clone(), request()),
+            Err(GenError::Busy { running: 2 }),
+            "a third request while two are in flight"
+        );
+        // Both stay listed while in flight, cancelled.
+        let listed: Vec<(JobId, JobState, bool)> = jobs
+            .list()
+            .iter()
+            .map(|s| (s.id, s.state, s.in_flight))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (a, JobState::Cancelled, true),
+                (b, JobState::Cancelled, true)
+            ]
+        );
+        // The first request ends: it is gone (it was forgotten), one more may start.
+        go_a.send(Ok(1)).unwrap();
+        let deadline = Instant::now() + WAIT;
+        while jobs.status(a).is_some() {
+            assert!(Instant::now() < deadline, "the worker did not return");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let c = jobs.submit(pc.clone(), request()).unwrap();
+        assert_eq!(
+            jobs.submit(pc, request()),
+            Err(GenError::Busy { running: 2 })
+        );
+        // The second ends unforgotten: cancelled, no longer in flight, its answer dropped.
+        go_b.send(Ok(1)).unwrap();
+        let deadline = Instant::now() + WAIT;
+        while jobs.status(b).unwrap().in_flight {
+            assert!(Instant::now() < deadline, "the worker did not return");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let s = jobs.status(b).unwrap();
+        assert_eq!((s.state, s.images), (JobState::Cancelled, 0));
+        assert!(jobs.forget(b));
+        assert!(jobs.status(b).is_none(), "gone at once now");
+        go_c.send(Ok(1)).unwrap();
+        assert_eq!(jobs.wait(c, WAIT).unwrap().state, JobState::Done);
+        assert!(!jobs.status(c).unwrap().in_flight);
+    }
+
+    #[test]
+    fn pruning_keeps_cancelled_requests_in_flight() {
+        let jobs = JobManager::new();
+        let (p, go) = Gated::new();
+        let stuck = jobs.submit(p.clone(), request()).unwrap();
+        jobs.cancel(stuck);
+        let (q, go_q) = Gated::new();
+        for _ in 0..JobManager::KEEP_FINISHED + 2 {
+            let id = jobs.submit(q.clone(), request()).unwrap();
+            go_q.send(Ok(1)).unwrap();
+            jobs.wait(id, WAIT).unwrap();
+        }
+        assert!(jobs.status(stuck).unwrap().in_flight, "still listed");
+        assert_eq!(jobs.list().len(), JobManager::KEEP_FINISHED + 1);
+        go.send(Ok(1)).unwrap();
     }
 
     #[test]

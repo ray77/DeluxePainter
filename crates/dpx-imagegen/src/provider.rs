@@ -196,7 +196,7 @@ pub enum GenError {
     BadResponse(String),
     /// The service failed (HTTP 5xx).
     Server { status: u16, message: String },
-    /// Too many generations are running already.
+    /// Too many requests are in flight already (cancelled ones count until they end).
     Busy { running: usize },
 }
 
@@ -274,7 +274,8 @@ impl fmt::Display for GenError {
             }
             GenError::Busy { running } => write!(
                 f,
-                "{running} pictures are being generated already; wait for one to finish"
+                "{running} requests are still waiting for the image generator (cancelled \
+                 ones too, until it answers); try again when one has ended"
             ),
         }
     }

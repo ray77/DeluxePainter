@@ -305,6 +305,7 @@ fn without_a_generator_it_says_so_and_set_up_opens_the_setup() {
 #[test]
 fn the_setup_takes_a_pasted_key_and_the_model_and_cancel_changes_nothing() {
     let (mut app, ctx) = app_with(None);
+    app.imagegen.keys = keychain_keys();
     app.open_imagegen_setup();
     assert!(app.modal_open());
     // Cancel after typing: nothing stored, nothing chosen.
@@ -466,7 +467,10 @@ fn a_generated_picture_goes_to_the_spare_page_and_the_shown_page_stays() {
         req(&app).thumbnail(),
         Some(&import::thumbnail(&want.page, &want.palette, w, h))
     );
-    assert_eq!(req(&app).message(), Some(apply_text(GenTarget::Spare)));
+    assert_eq!(
+        req(&app).message(),
+        Some(apply_text(GenTarget::Spare, 1, 0).as_str())
+    );
     assert_eq!(app.engine.document(), &before, "nothing before Apply");
     click(&mut app, &ctx, t + 0.1, GenControl::Apply);
     assert!(app.ui.generate_requester.is_none());
@@ -562,7 +566,10 @@ fn apply_to_the_picture_is_one_undo_step() {
     let before = app.engine.document().clone();
     let t = generate_for(&mut app, &ctx, "A castle", GenTarget::Picture);
     let want = expected(&app, "A castle");
-    assert_eq!(req(&app).message(), Some(apply_text(GenTarget::Picture)));
+    assert_eq!(
+        req(&app).message(),
+        Some(apply_text(GenTarget::Picture, 1, 0).as_str())
+    );
     // Return applies once there is a result.
     ui_pass(
         &mut app,
@@ -862,8 +869,19 @@ fn the_quality_choice_is_remembered_in_the_settings() {
 fn apply_texts_and_the_summary_fit_their_line() {
     let font = dpx_ui::font::Font::builtin();
     for t in [GenTarget::Spare, GenTarget::Picture, GenTarget::Brush] {
-        assert!(font.text_width(apply_text(t)) <= 300, "{}", apply_text(t));
+        for (frames, fitted) in [(1, 0), (dpx_core::anim::MAX_FRAMES, 256)] {
+            let text = apply_text(t, frames, fitted);
+            assert!(font.text_width(&text) <= 300, "{text}");
+        }
     }
+    assert_eq!(
+        apply_text(GenTarget::Picture, 20, 0),
+        "Apply: replaces all 20 frames (undoable)"
+    );
+    assert_eq!(
+        apply_text(GenTarget::Brush, 1, 20),
+        "Apply: as the brush, 20 colours fitted"
+    );
     assert!(font.text_width("OpenAI Images: billed per picture") <= 300);
     assert!(font.text_width(TestPattern.display_name()) <= 300);
     assert!(OPENAI_NOTE.is_ascii() && NO_GENERATOR.is_ascii());
@@ -907,12 +925,15 @@ fn snapshot_specs_parse_and_bad_ones_are_refused() {
         "chipset=ecs",
         "provider=dalle",
         "key=sk-real",
+        "keychain=system",
         "nonsense",
         "size=3",
     ] {
         assert!(parse_spec(bad).is_err(), "{bad}");
     }
     assert_eq!(parse_spec("").unwrap().options, GenerateOptions::default());
+    assert!(parse_spec("keychain=stand_in").unwrap().stand_in_keychain);
+    assert!(!parse_spec("").unwrap().stand_in_keychain);
     // Without colors the default count follows the resolution (OCS HiRes: 16).
     assert_eq!(parse_spec("resolution=3").unwrap().options.colors, 16);
 }
@@ -975,4 +996,666 @@ fn the_keychain_is_opened_only_when_generate_or_the_setup_is_used() {
     let before = Arc::as_ptr(&s.keys);
     s.ensure_keys();
     assert_eq!(Arc::as_ptr(&s.keys), before, "nothing opened");
+}
+
+// ---- Review fixes (ADR-45): details with their page, in-flight limit, Again, the setup.
+
+/// Keys in a keychain stand-in (a working system keychain; no real one is touched).
+fn keychain_keys() -> Arc<ApiKeys> {
+    Arc::new(ApiKeys::new(
+        Some(Box::new(dpx_imagegen::secret::MemoryStore::new())),
+        None,
+        Arc::new(|_: &str| None::<String>),
+    ))
+}
+
+/// Colour ranges, a grab point and a transparent colour for the shown picture.
+fn some_extras() -> files::PictureExtras {
+    let range = |low, high| dpx_iff::ilbm::ColorRange {
+        rate: 8192,
+        flags: 1,
+        low,
+        high,
+    };
+    files::PictureExtras {
+        ranges: vec![range(20, 27), range(8, 15)],
+        grab: Some((3, 4)),
+        transparent_color: Some(3),
+    }
+}
+
+/// Sets the open requester's options (the rows' clicks are tested above).
+fn set_options(app: &mut PainterApp, f: impl FnOnce(&mut GenerateOptions)) {
+    let r = app.ui.generate_requester.as_mut().expect("open");
+    let mut o = r.options();
+    f(&mut o);
+    r.set_options(o);
+}
+
+/// Opens Generate with `prompt` and `options`, generates through `ui()` and applies.
+fn generate_and_apply(
+    app: &mut PainterApp,
+    ctx: &egui::Context,
+    t: f64,
+    prompt: &str,
+    options: impl FnOnce(&mut GenerateOptions),
+) -> f64 {
+    app.open_generate();
+    req_mut(app).set_prompt(prompt);
+    set_options(app, options);
+    click(app, ctx, t + 0.01, GenControl::Generate);
+    let t = settle(app, ctx, t + 0.04);
+    assert_eq!(req(app).phase(), GenPhase::Result, "{:?}", req(app).error());
+    click(app, ctx, t + 0.01, GenControl::Apply);
+    assert!(app.ui.generate_requester.is_none(), "applied");
+    t + 0.04
+}
+
+fn req_mut(app: &mut PainterApp) -> &mut GenerateRequester {
+    app.ui.generate_requester.as_mut().expect("open")
+}
+
+fn aga_320x256_current(o: &mut GenerateOptions) {
+    o.resolution = 1;
+    o.chipset = Chipset::Aga;
+    o.palette = PaletteChoice::Current;
+}
+
+#[test]
+fn swapping_with_a_spare_in_the_pictures_own_format_keeps_its_details() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.extras = some_extras();
+    let before = app.engine.document().clone();
+    assert_eq!(before.target().screen, (320, 256));
+    // PAL LoRes 320x256 on AGA with the current palette: the document's own format.
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", aga_320x256_current);
+    assert!(!app.spare_differs(), "an ordinary spare");
+    assert!(app.menu_data.spare_own.is_none(), "it shares the details");
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    assert_eq!(app.extras, some_extras(), "shared with the generated page");
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::J));
+    assert_eq!(app.engine.document(), &before);
+    assert_eq!(app.extras, some_extras(), "j j drops nothing");
+    // Undo on the spare page (the generated one) changes nothing of them either.
+    ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
+    ui_pass(&mut app, &ctx, t + 0.3, tap(egui::Key::U));
+    ui_pass(&mut app, &ctx, t + 0.4, tap(egui::Key::J));
+    assert_eq!(app.extras, some_extras());
+}
+
+#[test]
+fn a_spare_of_its_own_format_keeps_its_details_when_the_formats_become_alike() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.extras = some_extras();
+    let before = app.engine.document().clone();
+    // The default (OCS 320x240) onto the spare page, j, the same picture onto the spare
+    // page again (now in the shown page's format), j: the old picture is on the spare
+    // engine's undo list.
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    assert!(app.spare_differs());
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    let generated = app.extras.clone();
+    assert_eq!(generated.ranges, Vec::new(), "a new palette has no ranges");
+    assert_eq!(
+        app.menu_data.spare_own.as_ref(),
+        Some(&some_extras()),
+        "the old picture's details travel with it"
+    );
+    let t = generate_and_apply(&mut app, &ctx, t + 0.1, "x", |_| {});
+    assert!(!app.spare_differs(), "alike now");
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    // Undo on that page brings back the old picture and its own details.
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::U));
+    assert_eq!(app.engine.document().page(), before.page());
+    assert_eq!(app.engine.document().target(), before.target());
+    assert_eq!(app.extras, some_extras());
+    assert_eq!(app.menu_data.spare_own.as_ref(), Some(&generated));
+    // j j keeps each page's own.
+    ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
+    assert_eq!(app.extras, generated);
+    ui_pass(&mut app, &ctx, t + 0.3, tap(egui::Key::J));
+    assert_eq!(app.extras, some_extras());
+    // Redo there sets the generated picture again, sharing the generated page's details.
+    app.redo();
+    assert!(app.menu_data.spare_own.is_none());
+    assert_eq!(app.extras, generated);
+}
+
+#[test]
+fn undo_of_apply_to_the_spare_brings_back_its_file_background_and_details() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let castle = std::path::PathBuf::from("/nonexistent/castle.iff");
+    app.extras = some_extras();
+    app.picture_path = Some(castle.clone());
+    app.menu_data.background = Some(app.engine.document().page().clone());
+    app.ui.bg = 5;
+    let before = app.engine.document().clone();
+    // Castle goes to the spare page (j after a generated spare), then another generated
+    // picture replaces it there.
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    let other = app.menu_data.spare.as_ref().unwrap();
+    assert_eq!(other.picture_path.as_ref(), Some(&castle));
+    let t = generate_and_apply(&mut app, &ctx, t + 0.1, "a different castle", |o| {
+        o.colors = 16;
+    });
+    assert!(app.spare_differs());
+    let other = app.menu_data.spare.as_ref().unwrap();
+    assert_eq!(other.picture_path, None, "a new picture has no file");
+    assert!(other.background.is_none());
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::U));
+    assert_eq!(app.engine.document().page(), before.page());
+    assert_eq!(app.picture_path.as_ref(), Some(&castle));
+    assert_eq!(app.menu_data.background.as_ref(), Some(before.page()));
+    assert_eq!(app.ui.bg, 5);
+    assert_eq!(app.extras, some_extras());
+    // Redo: the generated picture again, without them.
+    app.redo();
+    assert_eq!(app.picture_path, None);
+    assert!(app.menu_data.background.is_none());
+    assert_eq!(app.extras.ranges, Vec::new());
+}
+
+#[test]
+fn apply_to_the_picture_sets_and_undo_restores_its_transparent_colour() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    assert_eq!(app.extras.transparent_color, None);
+    let before_extras = app.extras.clone();
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |o| {
+        o.transparent = true;
+        o.target = GenTarget::Picture;
+    });
+    assert_eq!(app.extras.transparent_color, Some(0));
+    assert_eq!(app.extras.ranges, Vec::new(), "a new palette has no ranges");
+    let applied = app.extras.clone();
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::U));
+    assert_eq!(
+        app.extras, before_extras,
+        "Undo brings the old details back"
+    );
+    app.redo();
+    assert_eq!(app.extras, applied);
+    // An opaque picture over one with a transparent colour has none.
+    app.extras.transparent_color = Some(5);
+    generate_and_apply(&mut app, &ctx, t + 0.1, "y", |o| {
+        o.transparent = false;
+        o.target = GenTarget::Picture;
+    });
+    assert_eq!(app.extras.transparent_color, None);
+    assert!(app.engine.document().page().pixels().contains(&5));
+    // The current palette keeps its colour ranges (as Picture > Load's Import requester).
+    app.extras = some_extras();
+    generate_and_apply(&mut app, &ctx, t + 0.2, "z", |o| {
+        o.target = GenTarget::Picture;
+        o.palette = PaletteChoice::Current;
+    });
+    assert_eq!(app.extras.ranges, some_extras().ranges);
+    assert_eq!(app.extras.grab, None);
+}
+
+/// A provider that answers what the test tells it, after the test lets it go.
+fn gated(answer: Result<(), GenError>) -> (Arc<Gated>, Sender<()>) {
+    Gated::new(answer)
+}
+
+#[test]
+fn again_keeps_the_result_until_a_new_one_is_there() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let t = generate_for(&mut app, &ctx, "A castle", GenTarget::Spare);
+    let first = app.imagegen.result.clone().expect("a result");
+    let thumb = req(&app).thumbnail().cloned().unwrap();
+    // Again with a generator that does not answer in time: the result stays.
+    let (slow, gate) = gated(Err(GenError::Timeout));
+    app.imagegen.debug_provider = Some(slow);
+    click(&mut app, &ctx, t + 0.1, GenControl::Generate);
+    assert!(matches!(req(&app).phase(), GenPhase::Working { .. }));
+    // Option changes wait for the new picture (no result shown meanwhile).
+    click(&mut app, &ctx, t + 0.2, GenControl::Next(GenRow::Dither));
+    assert!(matches!(req(&app).phase(), GenPhase::Working { .. }));
+    gate.send(()).unwrap();
+    let t = settle(&mut app, &ctx, t + 0.3);
+    let r = req(&app);
+    assert_eq!(r.phase(), GenPhase::Result);
+    assert_eq!(
+        r.error(),
+        Some("No new picture: The service did not answer in time.")
+    );
+    assert!(r.enabled(GenControl::Apply));
+    // Shown again for the options as they are now (the dither changed meanwhile).
+    let (o, kept) = app.imagegen.result.clone().unwrap();
+    assert_eq!(o, req(&app).options());
+    assert_eq!(kept, expected(&app, "A castle"));
+    assert_ne!(o, first.0);
+    // Back to the first options: exactly the first result and thumbnail.
+    click(&mut app, &ctx, t + 0.1, GenControl::Prev(GenRow::Dither));
+    assert_eq!(app.imagegen.result.as_ref(), Some(&first));
+    assert_eq!(req(&app).thumbnail(), Some(&thumb));
+    assert_eq!(req(&app).error(), None);
+    // Again, then Cancel: still there, and Apply takes it.
+    let (waiting, gate) = gated(Ok(()));
+    app.imagegen.debug_provider = Some(waiting);
+    click(&mut app, &ctx, t + 0.2, GenControl::Generate);
+    click(&mut app, &ctx, t + 0.3, GenControl::Cancel);
+    let r = req(&app);
+    assert_eq!(r.phase(), GenPhase::Result);
+    assert_eq!(
+        r.error(),
+        Some("Stopped waiting. A request already sent may still be billed.")
+    );
+    assert_eq!(app.imagegen.result.as_ref(), Some(&first));
+    click(&mut app, &ctx, t + 0.4, GenControl::Apply);
+    assert_eq!(
+        app.menu_data
+            .spare
+            .as_ref()
+            .unwrap()
+            .engine
+            .document()
+            .page(),
+        &first.1.page
+    );
+    gate.send(()).unwrap();
+}
+
+#[test]
+fn more_after_a_result_makes_the_thumbnail_again_for_the_new_box() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    open_by_menu(&mut app, &ctx, 0.0);
+    type_text(&mut app, &ctx, 0.1, "A castle");
+    click(&mut app, &ctx, 0.2, GenControl::Generate);
+    let t = settle(&mut app, &ctx, 0.3);
+    let big = req(&app).thumb_size();
+    let size = |app: &PainterApp| {
+        let t = req(app).thumbnail().unwrap();
+        (t.width(), t.height())
+    };
+    assert_eq!(size(&app), big);
+    for (i, more) in [true, false].into_iter().enumerate() {
+        click(&mut app, &ctx, t + 0.1 * (i + 1) as f64, GenControl::More);
+        assert_eq!(req(&app).more(), more);
+        assert_eq!(size(&app), req(&app).thumb_size(), "more={more}");
+        let want = expected(&app, "A castle");
+        let (w, h) = req(&app).thumb_size();
+        assert_eq!(
+            req(&app).thumbnail(),
+            Some(&import::thumbnail(&want.page, &want.palette, w, h))
+        );
+    }
+    // On screen the thumbnail stays inside the requester while More shows.
+    click(&mut app, &ctx, t + 0.5, GenControl::More);
+    let r = req(&app);
+    let (rect, (ox, _), (w, _)) = (r.thumb_rect(), r.origin(), r.size());
+    assert!(rect.x + rect.w <= ox + w);
+    assert!(size(&app).0 < big.0);
+}
+
+#[test]
+fn cancel_then_generate_cannot_pile_up_requests_in_flight() {
+    let (slow, gate) = gated(Ok(()));
+    let (mut app, ctx) = app_with(Some(slow.clone()));
+    open_by_menu(&mut app, &ctx, 0.0);
+    type_text(&mut app, &ctx, 0.1, "A castle");
+    let mut t = 0.2;
+    for _ in 0..2 {
+        ui_pass(&mut app, &ctx, t, tap(egui::Key::Enter));
+        assert!(matches!(req(&app).phase(), GenPhase::Working { .. }));
+        ui_pass(&mut app, &ctx, t + 0.01, tap(egui::Key::Escape));
+        assert_eq!(req(&app).phase(), GenPhase::Ask);
+        t += 0.1;
+    }
+    // Both requests are still in flight: the third is refused before anything is sent.
+    let in_flight = |app: &PainterApp| {
+        app.imagegen
+            .jobs
+            .list()
+            .iter()
+            .filter(|s| s.in_flight)
+            .count()
+    };
+    assert_eq!(in_flight(&app), 2);
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::Enter));
+    assert_eq!(req(&app).phase(), GenPhase::Ask);
+    assert_eq!(
+        req(&app).error(),
+        Some(GenError::Busy { running: 2 }.to_string().as_str())
+    );
+    assert_eq!(in_flight(&app), 2);
+    // Once they have ended (their answers are dropped), generating works again.
+    gate.send(()).unwrap();
+    gate.send(()).unwrap();
+    for _ in 0..1000 {
+        if app.imagegen.jobs.list().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(app.imagegen.jobs.list().is_empty(), "forgotten once ended");
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::Enter));
+    gate.send(()).unwrap();
+    settle(&mut app, &ctx, t + 0.2);
+    assert_eq!(req(&app).phase(), GenPhase::Result);
+}
+
+#[test]
+fn a_current_palette_larger_than_the_mode_is_refused_before_anything_is_sent() {
+    let counting = Arc::new(Counting::default());
+    let (mut app, ctx) = app_with(Some(counting.clone()));
+    assert_eq!(app.engine.document().palette().len(), 32);
+    open_by_menu(&mut app, &ctx, 0.0);
+    type_text(&mut app, &ctx, 0.1, "A castle");
+    set_options(&mut app, |o| {
+        o.resolution = 3; // NTSC HiRes 640x200: 16 colours on OCS
+        o.palette = PaletteChoice::Current;
+    });
+    assert!(req(&app).palette_problem().is_some());
+    assert!(!req(&app).enabled(GenControl::Generate));
+    click(&mut app, &ctx, 0.2, GenControl::Generate);
+    ui_pass(&mut app, &ctx, 0.3, vec![key_event(egui::Key::Enter, true)]);
+    app.start_generation();
+    assert_eq!(
+        counting.calls.load(Ordering::SeqCst),
+        0,
+        "nothing generated"
+    );
+    assert!(app.imagegen.jobs.list().is_empty());
+    assert_eq!(req(&app).phase(), GenPhase::Ask);
+    // AGA shows 32: generating goes ahead.
+    set_options(&mut app, |o| o.chipset = Chipset::Aga);
+    click(&mut app, &ctx, 0.4, GenControl::Generate);
+    settle(&mut app, &ctx, 0.5);
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(req(&app).phase(), GenPhase::Result);
+}
+
+#[test]
+fn the_brush_target_shows_the_fitted_brush_and_says_how_many_colours_were_fitted() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let t = generate_for(&mut app, &ctx, "A castle", GenTarget::Brush);
+    let want = expected(&app, "A castle");
+    let doc_palette = app.engine.document().palette().clone();
+    let (_, brush, fitted) = fitted_brush(&want, &doc_palette);
+    assert!(fitted > 0, "a new palette differs from the picture's");
+    assert_eq!(
+        req(&app).message(),
+        Some(format!("Apply: as the brush, {fitted} colours fitted").as_str())
+    );
+    // The thumbnail shows the brush Apply makes, in the picture palette.
+    let (w, h) = req(&app).thumb_size();
+    let page = IndexedImage::from_pixels(brush.width, brush.height, brush.pixels.clone()).unwrap();
+    assert_eq!(
+        req(&app).thumbnail(),
+        Some(&import::thumbnail(&page, &doc_palette, w, h))
+    );
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert_eq!(app.custom_brush.as_ref(), Some(&brush));
+}
+
+#[test]
+fn a_transparent_brush_keeps_every_opaque_pixel_opaque() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    generate_and_apply(&mut app, &ctx, 0.0, "A sprite", |o| {
+        o.transparent = true;
+        o.target = GenTarget::Brush;
+    });
+    let brush = app.custom_brush.clone().unwrap();
+    assert_eq!(brush.transparent, Some(0));
+    let own = &app.menu_data.palette_stencil.loaded.as_ref().unwrap().brush;
+    for (i, (&o, &b)) in own.pixels.iter().zip(&brush.pixels).enumerate() {
+        assert_eq!(
+            o == 0,
+            b == 0,
+            "pixel {i}: transparent exactly where it was"
+        );
+    }
+}
+
+#[test]
+fn picture_names_every_frame_it_replaces_and_delete_this_page_keeps_an_animation() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.engine
+        .execute(dpx_core::Command::SetFrameCount { count: 20 })
+        .unwrap();
+    generate_for(&mut app, &ctx, "x", GenTarget::Picture);
+    assert_eq!(
+        req(&app).message(),
+        Some("Apply: replaces all 20 frames (undoable)")
+    );
+    app.close_generate();
+    // A spare of its own format cannot become one frame of a 20-frame animation.
+    generate_and_apply(&mut app, &ctx, 1.0, "x", |o| o.target = GenTarget::Spare);
+    assert!(app.spare_differs());
+    let before = app.engine.document().clone();
+    app.delete_page();
+    assert_eq!(app.engine.document(), &before, "nothing replaced");
+    assert_eq!(app.engine.document().frame_count(), 20);
+    assert!(app.menu_data.spare.is_some(), "the spare stays");
+    let note = format!("{:?}", app.ui.note_requester.as_ref().expect("it says why"));
+    assert!(
+        note.contains("Not deleted") && note.contains("all 20"),
+        "{note}"
+    );
+}
+
+#[test]
+fn delete_this_page_with_an_own_spare_brings_back_the_details_on_undo() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.extras = some_extras();
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    let own = app.menu_data.spare_own.clone().unwrap();
+    app.delete_page();
+    assert_eq!(app.extras, own, "the spare's details come with its picture");
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::U));
+    assert_eq!(app.extras, some_extras());
+    app.redo();
+    assert_eq!(app.extras, own);
+}
+
+/// Serves one model list on 127.0.0.1 once the test lets it answer.
+fn serve_models_when(go: std::sync::mpsc::Receiver<()>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/models", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf);
+        let _ = go.recv_timeout(Duration::from_secs(10));
+        let body = r#"{"object":"list","data":[{"id":"gpt-image-2.6-flare","object":"model"}]}"#;
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = s.write_all(answer.as_bytes());
+    });
+    url
+}
+
+#[test]
+fn a_key_test_answer_is_not_shown_for_a_key_edited_since() {
+    let (mut app, ctx) = app_with(None);
+    let (go, wait) = channel();
+    app.imagegen.models_endpoint = serve_models_when(wait);
+    app.imagegen.settings.provider = GenProvider::OpenAi;
+    app.open_imagegen_setup();
+    ui_pass(
+        &mut app,
+        &ctx,
+        0.1,
+        vec![egui::Event::Paste("sk-old-1".into())],
+    );
+    click_setup(&mut app, &ctx, 0.2, SetupControl::Test);
+    assert!(app.imagegen.key_test.is_some());
+    // The key is edited while the test waits for its answer.
+    type_text(&mut app, &ctx, 0.3, "2");
+    go.send(()).unwrap();
+    let mut t = 0.4;
+    while app.imagegen.key_test.is_some() {
+        ui_pass(&mut app, &ctx, t, vec![]);
+        assert!(t < 10.0, "the test was not dropped");
+        t += 0.01;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for i in 0..20 {
+        ui_pass(&mut app, &ctx, t + f64::from(i) * 0.01, vec![]);
+    }
+    let setup = app.ui.imagegen_setup.as_ref().unwrap();
+    assert_eq!(setup.test(), None, "no answer for the old key");
+    assert_eq!(setup.typed_key().as_deref(), Some("sk-old-12"));
+}
+
+#[test]
+fn remove_key_then_none_then_ok_removes_the_key() {
+    let (mut app, ctx) = app_with(None);
+    app.imagegen.keys = keychain_keys();
+    app.imagegen
+        .keys
+        .set(KEY_ACCOUNT, &Secret::new("sk-stored").unwrap());
+    app.imagegen.settings.provider = GenProvider::OpenAi;
+    app.open_imagegen_setup();
+    click_setup(&mut app, &ctx, 0.1, SetupControl::RemoveKey);
+    click_setup(
+        &mut app,
+        &ctx,
+        0.2,
+        SetupControl::Provider(SetupProvider::None),
+    );
+    let setup = app.ui.imagegen_setup.as_ref().unwrap();
+    assert_eq!(setup.key_line(), "The API key is removed at Ok.");
+    click_setup(&mut app, &ctx, 0.3, SetupControl::Ok);
+    assert!(app.ui.imagegen_setup.is_none());
+    assert_eq!(app.imagegen.settings.provider, GenProvider::None);
+    assert!(
+        app.imagegen.keys.key(KEY_ACCOUNT, ENV_KEY).is_none(),
+        "removed as the key line said"
+    );
+    // A key typed, then None: saved as the key line says (nothing is sent with None).
+    app.open_imagegen_setup();
+    click_setup(
+        &mut app,
+        &ctx,
+        0.4,
+        SetupControl::Provider(SetupProvider::OpenAi),
+    );
+    ui_pass(
+        &mut app,
+        &ctx,
+        0.5,
+        vec![egui::Event::Paste("sk-new".into())],
+    );
+    click_setup(
+        &mut app,
+        &ctx,
+        0.6,
+        SetupControl::Provider(SetupProvider::None),
+    );
+    assert_eq!(
+        app.ui.imagegen_setup.as_ref().unwrap().key_line(),
+        "The new key is saved at Ok."
+    );
+    click_setup(&mut app, &ctx, 0.7, SetupControl::Ok);
+    assert!(app.ui.imagegen_setup.is_none());
+    let (key, source) = app.imagegen.keys.key(KEY_ACCOUNT, ENV_KEY).unwrap();
+    assert_eq!((key.expose(), source), ("sk-new", KeySource::Keychain));
+}
+
+#[test]
+fn a_key_kept_for_this_session_only_is_said_before_the_setup_closes() {
+    // No keychain (this session's memory only, as on Linux without a Secret Service).
+    let (mut app, ctx) = app_with(None);
+    app.imagegen.settings.provider = GenProvider::OpenAi;
+    app.open_imagegen_setup();
+    let setup = app.ui.imagegen_setup.as_ref().unwrap();
+    assert_eq!(setup.info().key_status, "No API key (this session only)");
+    assert!(
+        setup.info().note.contains("No keychain here"),
+        "{}",
+        setup.info().note
+    );
+    assert!(!setup.info().note.contains("goes to the system keychain"));
+    assert_eq!(setup.test(), Some("Session only: test store."));
+    ui_pass(
+        &mut app,
+        &ctx,
+        0.1,
+        vec![egui::Event::Paste("sk-test-3".into())],
+    );
+    click_setup(&mut app, &ctx, 0.2, SetupControl::Ok);
+    let setup = app
+        .ui
+        .imagegen_setup
+        .as_ref()
+        .expect("still open, to say so");
+    assert_eq!(
+        setup.test(),
+        Some("Saved for this session only (test store); it is gone after a restart.")
+    );
+    assert_eq!(setup.typed_key(), None);
+    assert!(setup.key_line().contains("this session only"));
+    let (_, source) = app.imagegen.keys.key(KEY_ACCOUNT, ENV_KEY).unwrap();
+    assert_eq!(source, KeySource::Session);
+    assert_eq!(app.imagegen.settings.provider, GenProvider::OpenAi);
+    click_setup(&mut app, &ctx, 0.3, SetupControl::Ok);
+    assert!(app.ui.imagegen_setup.is_none(), "the next Ok closes");
+    // With a working keychain, Ok closes at once and the note names the keychain.
+    let (mut app, ctx) = app_with(None);
+    app.imagegen.keys = keychain_keys();
+    app.imagegen.settings.provider = GenProvider::OpenAi;
+    app.open_imagegen_setup();
+    let setup = app.ui.imagegen_setup.as_ref().unwrap();
+    assert!(setup.info().note.contains("goes to the system keychain"));
+    assert_eq!(setup.test(), None);
+    ui_pass(
+        &mut app,
+        &ctx,
+        0.1,
+        vec![egui::Event::Paste("sk-test-4".into())],
+    );
+    click_setup(&mut app, &ctx, 0.2, SetupControl::Ok);
+    assert!(app.ui.imagegen_setup.is_none());
+}
+
+#[test]
+fn own_details_survive_j_j_after_the_shown_page_took_the_spares_format() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    // A generated spare of its own format, then the same picture onto the shown page: the
+    // two pages are alike now, but the spare keeps its own details.
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    let t = generate_and_apply(&mut app, &ctx, t, "x", |o| o.target = GenTarget::Picture);
+    assert!(!app.spare_differs(), "alike now");
+    assert!(app.menu_data.spare_own.is_some());
+    // The shown page's ranges are edited; j j must not lose them.
+    app.extras.ranges = some_extras().ranges;
+    let edited = app.extras.clone();
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    assert_ne!(app.extras, edited, "the spare's own details");
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::J));
+    assert_eq!(app.extras, edited);
+}
+
+#[test]
+fn undo_on_one_page_never_turns_a_spare_of_another_format_into_one_to_drop() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.extras = some_extras();
+    // A generated spare (OCS 320x240); then the shown picture takes another format (OCS
+    // NTSC 320x200, Apply to Picture).
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    let t = generate_and_apply(&mut app, &ctx, t, "y", |o| {
+        o.resolution = 0;
+        o.target = GenTarget::Picture;
+    });
+    let picture = app.engine.document().clone();
+    let picture_extras = app.extras.clone();
+    // j, then Undo on the generated page: it is the old blank spare again, of the old
+    // format, while the other page has a third format.
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::U));
+    assert_eq!(app.engine.document().target().screen, (320, 256));
+    assert_eq!(app.extras, some_extras(), "the details it shared then");
+    assert!(app.spare_differs(), "the other page keeps its own format");
+    // So j shows that picture unchanged, with its own details.
+    ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
+    assert_eq!(app.engine.document(), &picture);
+    assert_eq!(app.extras, picture_extras);
 }

@@ -110,6 +110,9 @@ pub struct ImageGenSetupRequester {
     info: SetupInfo,
     /// The last test's result, or why Ok was refused.
     test: Option<String>,
+    /// Counts changes of what a key test depends on (the key, the model, the generator,
+    /// Remove key): a test answer made for an older revision is not shown.
+    revision: u64,
     screen: (i32, i32),
     held: Option<SetupControl>,
     pointer: (i32, i32),
@@ -140,6 +143,7 @@ impl ImageGenSetupRequester {
             remove: false,
             info,
             test: None,
+            revision: 0,
             screen,
             held: None,
             pointer: (0, 0),
@@ -186,6 +190,27 @@ impl ImageGenSetupRequester {
     /// The test's result, or why Ok was refused.
     pub fn set_test(&mut self, text: Option<String>) {
         self.test = text;
+    }
+
+    /// Changes with every edit of the key, the model, the generator choice and Remove key:
+    /// the app shows a key test's answer only while it is the revision the test was made
+    /// for.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Something a key test depends on changed: an earlier answer no longer applies.
+    fn edited(&mut self) {
+        self.revision += 1;
+        self.test = None;
+    }
+
+    /// Empties the key field and forgets Remove key (the app saved the typed key and keeps
+    /// the requester open to say where it went).
+    pub fn clear_key(&mut self) {
+        self.key.set("");
+        self.remove = false;
+        self.edited();
     }
 
     /// Lines the note gets above the buttons.
@@ -319,7 +344,10 @@ impl ImageGenSetupRequester {
     fn apply(&mut self, c: SetupControl) -> SetupResponse {
         match c {
             SetupControl::Provider(p) => {
-                self.provider = p;
+                if p != self.provider {
+                    self.provider = p;
+                    self.edited();
+                }
                 self.active = (p == SetupProvider::OpenAi).then_some(SetupField::Key);
                 SetupResponse::Continue
             }
@@ -332,7 +360,7 @@ impl ImageGenSetupRequester {
             SetupControl::RemoveKey => {
                 self.key.set("");
                 self.remove = self.info.removable;
-                self.test = None;
+                self.edited();
                 SetupResponse::Continue
             }
             SetupControl::Cancel => SetupResponse::Cancel,
@@ -386,15 +414,23 @@ impl ImageGenSetupRequester {
             k => {
                 match self.active {
                     Some(SetupField::Key) => {
-                        let before = self.key.chars.len();
+                        let before = self.key.chars.clone();
                         self.key.key(k);
-                        if self.key.chars.len() > before {
+                        if self.key.chars.len() > before.len() {
                             // A new key replaces the stored one instead of removing it.
                             self.remove = false;
-                            self.test = None;
+                        }
+                        if self.key.chars != before {
+                            self.edited();
                         }
                     }
-                    Some(SetupField::Model) => self.model.key(k),
+                    Some(SetupField::Model) => {
+                        let before = self.model.chars.clone();
+                        self.model.key(k);
+                        if self.model.chars != before {
+                            self.edited();
+                        }
+                    }
                     None => {}
                 }
                 SetupResponse::Continue
@@ -653,6 +689,48 @@ mod tests {
         click(&mut r, SetupControl::RemoveKey);
         assert_eq!(r.typed_key(), None);
         assert!(!r.remove_key());
+    }
+
+    #[test]
+    fn every_edit_a_key_test_depends_on_changes_the_revision_and_drops_the_answer() {
+        fn changed(r: &mut ImageGenSetupRequester, last: &mut u64, what: &str) {
+            assert!(r.revision() > *last, "{what} changes the revision");
+            assert_eq!(r.test(), None, "{what} drops the answer");
+            *last = r.revision();
+            r.set_test(Some("The key works.".into()));
+        }
+        let mut r = requester(SetupProvider::OpenAi, true);
+        let mut last = r.revision();
+        r.set_test(Some("The key works.".into()));
+        r.handle(ReqEvent::Key(ReqKey::Char('s')));
+        changed(&mut r, &mut last, "typing");
+        r.handle(ReqEvent::Key(ReqKey::Backspace));
+        changed(&mut r, &mut last, "deleting");
+        // Moving the cursor or deleting nothing is no edit.
+        r.handle(ReqEvent::Key(ReqKey::Left));
+        r.handle(ReqEvent::Key(ReqKey::Backspace));
+        assert_eq!(r.revision(), last);
+        assert_eq!(r.test(), Some("The key works."));
+        r.handle(ReqEvent::Key(ReqKey::Tab));
+        r.handle(ReqEvent::Key(ReqKey::Backspace));
+        changed(&mut r, &mut last, "the model");
+        click(&mut r, SetupControl::RemoveKey);
+        changed(&mut r, &mut last, "Remove key");
+        click(&mut r, SetupControl::Provider(SetupProvider::None));
+        changed(&mut r, &mut last, "another generator");
+        click(&mut r, SetupControl::Provider(SetupProvider::None));
+        assert_eq!(r.revision(), last, "the same generator again");
+        click(&mut r, SetupControl::Provider(SetupProvider::OpenAi));
+        for k in crate::requester::paste_keys("sk-1") {
+            r.handle(ReqEvent::Key(k));
+        }
+        assert!(r.typed_key().is_some());
+        let before = r.revision();
+        r.clear_key();
+        assert!(r.revision() > before);
+        assert_eq!(r.typed_key(), None);
+        assert!(!r.remove_key());
+        assert_eq!(r.key_line(), r.info().key_status);
     }
 
     #[test]

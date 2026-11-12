@@ -491,6 +491,21 @@ impl GenerateRequester {
         }
     }
 
+    /// Why nothing can be generated with these options: Palette Current with a document
+    /// palette larger than the chosen mode shows (generating would be paid for and then not
+    /// convertible). Shown in the box instead of the note; Generate is disabled meanwhile.
+    pub fn palette_problem(&self) -> Option<String> {
+        let max = self.options.max_colors();
+        (self.options.palette == PaletteChoice::Current && self.doc_colors > max).then(|| {
+            format!(
+                "The current palette has {} colours; this mode shows {max} on {}. Choose \
+                 Palette New, AGA or another resolution.",
+                self.doc_colors,
+                self.value(GenRow::Chipset),
+            )
+        })
+    }
+
     /// The rows shown, below Resolution.
     pub fn rows(&self) -> Vec<GenRow> {
         let mut rows = BASIC.to_vec();
@@ -602,11 +617,18 @@ impl GenerateRequester {
     }
 
     /// Paints the thumbnail into an RGBA frame of the screen: `frame_w` pixels per row, `sx`×`sy`
-    /// frame pixels per UI pixel.
+    /// frame pixels per UI pixel. Never outside [`Self::thumb_rect`]: a thumbnail made for
+    /// a larger box (before More.. or Less..) is cut to it until the app makes it again.
     pub fn overlay(&self, rgba: &mut [u8], frame_w: usize, sx: usize, sy: usize) {
         if let (GenPhase::Result, Some(t)) = (self.phase, &self.thumb) {
             let r = self.thumb_rect();
-            crate::overlay_rgb(rgba, frame_w, (r.x, r.y), t, sx, sy);
+            let (w, h) = (r.w.max(0) as u32, r.h.max(0) as u32);
+            if t.width() > w || t.height() > h {
+                let cut = t.crop(0, 0, t.width().min(w), t.height().min(h));
+                crate::overlay_rgb(rgba, frame_w, (r.x, r.y), &cut, sx, sy);
+            } else {
+                crate::overlay_rgb(rgba, frame_w, (r.x, r.y), t, sx, sy);
+            }
         }
     }
 
@@ -745,6 +767,7 @@ impl GenerateRequester {
                 self.provider.ready
                     && !matches!(self.phase, GenPhase::Working { .. })
                     && !self.prompt.text().trim().is_empty()
+                    && self.palette_problem().is_none()
             }
             GenControl::SetUp => !matches!(self.phase, GenPhase::Working { .. }),
             GenControl::Apply => self.phase == GenPhase::Result && self.thumb.is_some(),
@@ -780,7 +803,12 @@ impl GenerateRequester {
             }
             GenControl::More => {
                 self.more = !self.more;
-                GenerateResponse::Continue
+                // The box changes its size: a result's thumbnail must be made again for it.
+                if self.phase == GenPhase::Result {
+                    GenerateResponse::Changed
+                } else {
+                    GenerateResponse::Continue
+                }
             }
             GenControl::Prompt => GenerateResponse::Continue,
             GenControl::SetUp => GenerateResponse::SetUp,
@@ -897,9 +925,15 @@ impl GenerateRequester {
         let inner = b.inset(2);
         let showing_thumb = self.phase == GenPhase::Result && self.thumb.is_some();
         let text_lines: Vec<String> = match self.phase {
-            GenPhase::Ask | GenPhase::Result => match &self.error {
+            // A palette the mode cannot show comes first: nothing can be generated until the
+            // options change.
+            GenPhase::Ask => match (self.palette_problem(), &self.error) {
+                (Some(p), _) => wrap(&p, inner.w - 2),
+                (None, Some(e)) => wrap(e, inner.w - 2),
+                (None, None) => wrap(&self.provider.note, inner.w - 2),
+            },
+            GenPhase::Result => match &self.error {
                 Some(e) => wrap(e, inner.w - 2),
-                None if self.phase == GenPhase::Ask => wrap(&self.provider.note, inner.w - 2),
                 None => Vec::new(),
             },
             GenPhase::Working { seconds } => {
@@ -929,16 +963,21 @@ impl GenerateRequester {
         }
 
         // The two lines under the options: the generator (on both lines while there is no
-        // message), then the message.
+        // message), then the message. With a result shown in the box, an error (a new
+        // generation that failed or was stopped; the result shown stays) takes both lines.
         let ly = self.lines_y();
         let line_w = w - 2 * LEFT;
         let mut lines = wrap(&self.provider.summary, line_w);
-        match &self.message {
-            Some(m) => {
+        match (&self.error, &self.message) {
+            (Some(e), _) if showing_thumb => {
+                lines = wrap(e, line_w);
+                lines.truncate(2);
+            }
+            (_, Some(m)) => {
                 lines.truncate(1);
                 lines.extend(wrap(m, line_w).into_iter().take(1));
             }
-            None => lines.truncate(2),
+            _ => lines.truncate(2),
         }
         for (i, line) in lines.iter().enumerate() {
             font.draw(&mut img, LEFT, ly + i as i32 * LINE_STEP, line, pens.dark);
@@ -1280,6 +1319,123 @@ mod tests {
             .filter(|&(x, y)| failed.get(x, y) == Some(pens.dark))
             .count();
         assert!(dark < (t.w * t.h / 2) as usize, "text, not a dark box");
+    }
+
+    #[test]
+    fn more_after_a_result_asks_for_a_new_thumbnail_and_never_paints_outside_its_box() {
+        let mut r = requester((320, 256));
+        typed(&mut r, "x");
+        r.set_phase(GenPhase::Result);
+        let (tw, th) = r.thumb_size();
+        r.set_thumbnail(Some(RgbaImage::new(tw, th, Rgba8::opaque(9, 8, 7))));
+        // More.. makes the box smaller: the app must make the thumbnail again.
+        assert_eq!(click(&mut r, GenControl::More), GenerateResponse::Changed);
+        let small = r.thumb_size();
+        assert!(small.0 < tw && small.1 < th, "{small:?} < {tw}x{th}");
+        // Until it does, the old (larger) thumbnail stays inside the new box.
+        let (ox, _) = r.origin();
+        let (w, _) = r.size();
+        let (sw, sh) = (360usize, 283usize);
+        let mut rgba = vec![0u8; sw * sh * 4];
+        r.overlay(&mut rgba, sw, 1, 1);
+        let tr = r.thumb_rect();
+        for y in 0..sh as i32 {
+            for x in 0..sw as i32 {
+                let o = (y as usize * sw + x as usize) * 4;
+                let painted = rgba[o..o + 3] == [9, 8, 7];
+                assert_eq!(painted, tr.contains(x, y), "({x}, {y})");
+            }
+        }
+        assert!(tr.x + tr.w <= ox + w, "inside the requester");
+        // Less.. likewise; without a result More.. changes nothing to convert.
+        assert_eq!(click(&mut r, GenControl::More), GenerateResponse::Changed);
+        r.set_phase(GenPhase::Ask);
+        assert_eq!(click(&mut r, GenControl::More), GenerateResponse::Continue);
+    }
+
+    #[test]
+    fn a_current_palette_the_mode_cannot_show_blocks_generate_and_says_why() {
+        let pens = pens();
+        let mut r = requester((320, 256));
+        typed(&mut r, "A castle");
+        let note = r.render(&pens);
+        click(&mut r, GenControl::More);
+        click(&mut r, GenControl::Next(GenRow::Palette));
+        assert_eq!(r.options().palette, PaletteChoice::Current);
+        // 32 colours fit OCS PAL LoRes; NTSC HiRes on OCS shows 16 at most.
+        assert!(r.palette_problem().is_none());
+        assert!(r.enabled(GenControl::Generate));
+        click(&mut r, GenControl::Next(GenRow::Resolution));
+        assert_eq!(r.value(GenRow::Resolution), "NTSC HiRes 640x200");
+        assert_eq!(
+            r.palette_problem().as_deref(),
+            Some(
+                "The current palette has 32 colours; this mode shows 16 on OCS. Choose \
+                 Palette New, AGA or another resolution."
+            )
+        );
+        assert!(!r.enabled(GenControl::Generate));
+        assert_eq!(
+            r.handle(ReqEvent::Key(ReqKey::Enter)),
+            GenerateResponse::Continue,
+            "Return does not generate either"
+        );
+        // The reason shows in the box, before any older error.
+        r.set_error(Some("No picture: it failed.".into()));
+        let blocked = r.render(&pens);
+        r.set_error(None);
+        assert_eq!(r.render(&pens).pixels(), blocked.pixels());
+        assert_ne!(blocked.pixels(), note.pixels());
+        // AGA shows 256: fine again; so is a new palette.
+        click(&mut r, GenControl::Next(GenRow::Chipset));
+        assert!(r.palette_problem().is_none() && r.enabled(GenControl::Generate));
+        click(&mut r, GenControl::Prev(GenRow::Chipset));
+        click(&mut r, GenControl::Prev(GenRow::Palette));
+        assert!(r.palette_problem().is_none() && r.enabled(GenControl::Generate));
+        // The longest reason fits the box on the smallest screen.
+        let mut small = GenerateRequester::new(
+            GenerateOptions {
+                palette: PaletteChoice::Current,
+                resolution: 5,
+                ..GenerateOptions::default()
+            },
+            "x",
+            256,
+            (320, 200),
+            ready(),
+        );
+        small.set_more(true);
+        let b = small.box_rect().inset(2);
+        let lines = wrap(&small.palette_problem().unwrap(), b.w - 2);
+        let n = lines.len() as i32;
+        assert!(n * LINE_STEP <= b.h, "{n} lines in {}: {lines:?}", b.h);
+    }
+
+    #[test]
+    fn an_error_beside_a_kept_result_takes_the_two_lines_and_apply_stays() {
+        let pens = pens();
+        let mut r = requester((320, 256));
+        typed(&mut r, "x");
+        r.set_phase(GenPhase::Result);
+        let (tw, th) = r.thumb_size();
+        r.set_thumbnail(Some(RgbaImage::new(tw, th, Rgba8::opaque(1, 2, 3))));
+        r.set_message(Some("Apply: onto the spare page (j shows it)".into()));
+        let plain = r.render(&pens);
+        r.set_error(Some(
+            "No new picture: The service did not answer in time.".into(),
+        ));
+        let failed = r.render(&pens);
+        assert!(
+            r.enabled(GenControl::Apply),
+            "the result shown can be applied"
+        );
+        // The box still shows the thumbnail (dark here); the lines differ.
+        let t = r.thumb_local();
+        assert_eq!(failed.crop(t), plain.crop(t));
+        let ly = r.lines_y();
+        let (w, _) = r.size();
+        let lines = Rect::new(LEFT, ly, w - 2 * LEFT, 2 * LINE_STEP);
+        assert_ne!(failed.crop(lines), plain.crop(lines));
     }
 
     #[test]

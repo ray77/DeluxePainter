@@ -316,6 +316,8 @@ impl ApiKeys {
                 Ok(()) => {
                     let _ = self.session.delete(account);
                     lock(&self.cache).insert(account.to_string(), Some(secret.clone()));
+                    // The keychain works (again): new keys are no longer session-only.
+                    *lock(&self.session_reason) = None;
                     return KeySource::Keychain;
                 }
                 Err(e) => *lock(&self.session_reason) = Some(e.to_string()),
@@ -349,7 +351,7 @@ mod tests {
     #[derive(Default)]
     struct FakeKeychain {
         inner: MemoryStore,
-        refuse: bool,
+        refuse: Arc<std::sync::atomic::AtomicBool>,
         reads: Arc<Mutex<usize>>,
     }
 
@@ -362,7 +364,7 @@ mod tests {
             self.inner.get(account)
         }
         fn set(&self, account: &str, secret: &Secret) -> Result<(), SecretError> {
-            if self.refuse {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(SecretError::Denied("locked".into()));
             }
             self.inner.set(account, secret)
@@ -463,11 +465,11 @@ mod tests {
 
     #[test]
     fn a_refusing_keychain_falls_back_to_the_session() {
-        let chain = FakeKeychain {
-            refuse: true,
-            ..Default::default()
-        };
+        let chain = FakeKeychain::default();
+        let refuse = chain.refuse.clone();
+        refuse.store(true, std::sync::atomic::Ordering::SeqCst);
         let keys = ApiKeys::new(Some(Box::new(chain)), None, env(Some("sk-env")));
+        assert_eq!(keys.status("openai", "TEST_KEY").session_only, None);
         assert_eq!(keys.set("openai", &key("sk-typed")), KeySource::Session);
         // The typed key wins over the environment.
         assert_eq!(
@@ -476,5 +478,11 @@ mod tests {
         );
         let status = keys.status("openai", "TEST_KEY");
         assert!(status.session_only.unwrap().contains("refused"));
+        // Unlocked again: the next key goes to the keychain and nothing says session-only.
+        refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(keys.set("openai", &key("sk-later")), KeySource::Keychain);
+        let status = keys.status("openai", "TEST_KEY");
+        assert_eq!(status.source, Some(KeySource::Keychain));
+        assert_eq!(status.session_only, None);
     }
 }

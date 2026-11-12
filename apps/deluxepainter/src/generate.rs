@@ -8,13 +8,20 @@
 //! Apply:
 //!
 //! - **Spare page** (default): the spare page becomes the picture, with its own screen format
-//!   and palette (one undo step on the spare page); the shown page stays untouched, `j` shows
-//!   the picture.
-//! - **Picture**: the picture replaces the shown page, its format and palette in one undo step
-//!   (`Command::ReplacePicture`).
+//!   and palette (one undo step on the spare page, which also brings back its file name,
+//!   fixed background, BG colour and colour ranges); the shown page stays untouched, `j`
+//!   shows the picture.
+//! - **Picture**: the picture replaces the whole picture, every animation frame, its format
+//!   and palette in one undo step (`Command::ReplacePicture`; the Apply line says how many
+//!   frames go); Undo also brings back its colour ranges and transparent colour
+//!   ([`page_state`]).
 //! - **Brush**: the picture becomes the custom brush, fitted to the picture palette like a
-//!   brush file (Brush ▸ Load: every colour to the nearest picture colour; Color ▸ Palette ▸
-//!   Use Brush Palette then takes the generated palette).
+//!   brush file (Brush ▸ Load: every colour to the nearest picture colour, never onto the
+//!   transparent one; Color ▸ Palette ▸ Use Brush Palette then takes the generated palette).
+//!   The thumbnail shows the fitted brush, and the Apply line how many colours were fitted.
+//!
+//! "Again" keeps the result shown until the new picture is there: a new generation that fails
+//! or is stopped leaves it (and Apply) as it was.
 //!
 //! Without a generator that is set up the requester says so and offers Set up..; nothing is
 //! generated or faked. The setup requester chooses the generator (None / OpenAI Images), takes
@@ -25,7 +32,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use dpx_core::import::{self, ConvertOptions, ConvertTarget, Imported, Margins, PaletteChoice};
-use dpx_core::{BrushImage, Target};
+use dpx_core::{BrushImage, IndexedImage, Palette, Target};
 use dpx_imagegen::openai::{self, DEFAULT_MODEL, ENV_KEY, KEY_ACCOUNT, MODELS_CHECKED};
 use dpx_imagegen::{
     ApiKeys, GenError, GenerationRequest, ImageGenerationProvider, JobId, JobManager, JobState,
@@ -40,6 +47,8 @@ use eframe::egui;
 use serde_json::{Value, json};
 
 use crate::{PainterApp, View, files};
+
+pub(crate) mod page_state;
 
 /// What the requester says without a generator (spec: never a fake picture).
 pub const NO_GENERATOR: &str =
@@ -137,8 +146,9 @@ pub(crate) struct ImageGenState {
     /// made with.
     picture: Option<dpx_core::RgbaImage>,
     result: Option<(GenerateOptions, Imported)>,
-    /// A key test on a worker thread.
-    key_test: Option<Receiver<Result<KeyCheck, GenError>>>,
+    /// A key test on a worker thread, with the setup's revision it was made for (an answer
+    /// for a key or model edited since is dropped).
+    key_test: Option<(Receiver<Result<KeyCheck, GenError>>, u64)>,
     /// The model list the key test asks (tests point it at a local server).
     pub(crate) models_endpoint: String,
     /// The job manager wakes the window when a job changes.
@@ -223,13 +233,57 @@ pub(crate) fn convert_options(o: &GenerateOptions) -> ConvertOptions {
     }
 }
 
-/// The line under the options once there is a result: what Apply does.
-pub(crate) fn apply_text(t: GenTarget) -> &'static str {
+/// The line under the options once there is a result: what Apply does. `frames`: the
+/// picture's frames (Picture replaces them all); `fitted`: the brush colours that had to be
+/// fitted to the picture palette (as Brush ▸ Load says in its note).
+pub(crate) fn apply_text(t: GenTarget, frames: usize, fitted: usize) -> String {
     match t {
-        GenTarget::Spare => "Apply: onto the spare page (j shows it)",
-        GenTarget::Picture => "Apply: replaces the picture (undoable)",
-        GenTarget::Brush => "Apply: becomes the brush",
+        GenTarget::Spare => "Apply: onto the spare page (j shows it)".into(),
+        GenTarget::Picture if frames > 1 => {
+            format!("Apply: replaces all {frames} frames (undoable)")
+        }
+        GenTarget::Picture => "Apply: replaces the picture (undoable)".into(),
+        GenTarget::Brush if fitted > 0 => {
+            format!("Apply: as the brush, {fitted} colours fitted")
+        }
+        GenTarget::Brush => "Apply: becomes the brush".into(),
     }
+}
+
+/// The Brush target's brush: the result as a brush in its own palette, and fitted to the
+/// picture palette `page` like Brush ▸ Load (`brush_menu::fit_brush`), with the number of
+/// colours that had to change.
+fn fitted_brush(r: &Imported, page: &Palette) -> (BrushImage, BrushImage, usize) {
+    let own = BrushImage::from_image(&r.page, r.transparent_color);
+    let (fitted, changed) = crate::brush_menu::fit_brush(&own, &r.palette, page);
+    (own, fitted, changed)
+}
+
+/// The fitted brush as the thumbnail shows it: in the picture palette, its transparent pixels
+/// in the result's transparent colour (no opaque pixel uses that number).
+fn brush_preview(r: &Imported, page: &Palette, fitted: &BrushImage) -> (IndexedImage, Palette) {
+    let mut colors = page.colors().to_vec();
+    if let Some(t) = fitted.transparent
+        && let (Some(slot), Some(c)) = (colors.get_mut(usize::from(t)), r.palette.get(t))
+    {
+        *slot = c;
+    }
+    let image = IndexedImage::from_pixels(fitted.width, fitted.height, fitted.pixels.clone())
+        .expect("a brush has width x height pixels");
+    (
+        image,
+        Palette::new(colors).expect("as many entries as the picture palette"),
+    )
+}
+
+/// At most `max` characters of `why`, cut at a word (for the setup's test line).
+fn short(why: &str, max: usize) -> String {
+    if why.chars().count() <= max {
+        return why.to_string();
+    }
+    let cut: String = why.chars().take(max).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(a, _)| a);
+    format!("{}..", cut.trim_end_matches([',', ';', ':']))
 }
 
 /// The UI rectangles of the Generate and setup requesters: they cover the toolbox column, so
@@ -346,21 +400,34 @@ impl PainterApp {
             GenProvider::OpenAi => SetupProvider::OpenAi,
         };
         let screen = View::of_target(self.engine.document().target()).ui_size();
-        let req = ImageGenSetupRequester::new(provider, &s.openai.model, self.setup_info(), screen);
+        let mut req =
+            ImageGenSetupRequester::new(provider, &s.openai.model, self.setup_info(), screen);
+        // Why a key would last for this session only (no keychain, or it refused one).
+        if let Some(why) = self.imagegen.keys.status(KEY_ACCOUNT, ENV_KEY).session_only {
+            req.set_test(Some(format!("Session only: {why}.")));
+        }
         self.ui.imagegen_setup = Some(req);
         self.imagegen.key_test = None;
         self.dirty = true;
     }
 
-    /// The setup's lines about the key (never the key).
+    /// The setup's lines about the key (never the key). Without a usable system keychain
+    /// (none, or it refused a key) the key line and the note say that a key lasts for this
+    /// session only ([`Self::open_imagegen_setup`] says why on the test line).
     fn setup_info(&self) -> SetupInfo {
         let status = self.imagegen.keys.status(KEY_ACCOUNT, ENV_KEY);
-        let mut key_status = status.describe();
-        if status.source == Some(KeySource::Session)
-            && let Some(why) = &status.session_only
-        {
-            key_status = format!("API key kept for this session only ({why})");
-        }
+        let key_status = match (status.source, &status.session_only) {
+            (Some(KeySource::Session), Some(why)) => {
+                format!("API key kept for this session only ({why})")
+            }
+            (None, Some(_)) => "No API key (this session only)".into(),
+            _ => status.describe(),
+        };
+        let keychain = if status.session_only.is_some() {
+            "No keychain here: the key lasts for this session only."
+        } else {
+            "The key goes to the system keychain, never to a file."
+        };
         SetupInfo {
             key_status,
             has_key: status.source.is_some(),
@@ -371,9 +438,8 @@ impl PainterApp {
             model_hint: format!("Default {DEFAULT_MODEL}"),
             note: format!(
                 "OpenAI bills each picture to your API account, also a cancelled one; no free \
-                 tier. Your text goes over the internet. The key goes to the system \
-                 keychain, never to a file. Test only lists your models. Default model checked \
-                 {MODELS_CHECKED}."
+                 tier. Your text goes over the internet. {keychain} Test only lists your \
+                 models. Default model checked {MODELS_CHECKED}."
             ),
         }
     }
@@ -430,6 +496,9 @@ impl PainterApp {
         self.dirty = true;
         match response {
             GenerateResponse::Continue => {}
+            // While a new picture is made the options wait for it: it is converted with them
+            // when it comes (or the kept one again if it does not).
+            GenerateResponse::Changed if self.imagegen.job.is_some() => {}
             GenerateResponse::Changed => self.generate_convert(),
             GenerateResponse::Generate => self.start_generation(),
             GenerateResponse::CancelJob => {
@@ -468,6 +537,14 @@ impl PainterApp {
         };
         let o = req.options();
         let description = req.prompt();
+        // Nothing is generated (and paid for) that cannot be converted for these options:
+        // a current palette larger than the mode shows (the box says so, Generate is off).
+        let doc_colors = self.engine.document().palette().len();
+        if req.palette_problem().is_some()
+            || (o.palette == PaletteChoice::Current && doc_colors > usize::from(o.max_colors()))
+        {
+            return;
+        }
         // The quality is the provider's setting (remembered); the provider is made with it.
         self.imagegen.settings.openai.quality = quality_of(o.quality);
         let info = self.provider_info();
@@ -495,18 +572,29 @@ impl PainterApp {
         match submitted {
             None => req.set_error(Some(NO_GENERATOR.into())),
             Some(Ok(id)) => {
+                // A picture shown so far (Again) is kept until the new one is there.
                 self.imagegen.job = Some(id);
-                self.imagegen.picture = None;
-                self.imagegen.result = None;
                 req.set_phase(GenPhase::Working { seconds: 0 });
                 req.set_error(None);
                 req.set_message(None);
             }
-            Some(Err(e)) => {
-                req.set_phase(GenPhase::Ask);
-                req.set_error(Some(e.to_string()));
-            }
+            Some(Err(e)) => self.generation_failed(e.to_string()),
         }
+    }
+
+    /// A generation that brought no new picture (`why`): a picture kept from before (Again)
+    /// is shown again for the current options, with `why` beside it, and can still be
+    /// applied; else the requester asks again.
+    fn generation_failed(&mut self, why: String) {
+        if self.imagegen.picture.is_some() {
+            self.generate_convert();
+        } else if let Some(req) = &mut self.ui.generate_requester {
+            req.set_phase(GenPhase::Ask);
+        }
+        if let Some(req) = &mut self.ui.generate_requester {
+            req.set_error(Some(why));
+        }
+        self.dirty = true;
     }
 
     /// Follows the running job: the elapsed time, then its picture or why it failed. Returns
@@ -530,33 +618,36 @@ impl PainterApp {
             return true;
         }
         let images = self.imagegen.jobs.images(id);
+        // A cancelled request still in flight goes once it has ended (it still counts as
+        // running for the job manager's limit until then).
         self.imagegen.jobs.forget(id);
         self.imagegen.job = None;
         self.dirty = true;
         let network = self.imagegen_provider().is_some_and(|p| p.needs_network());
-        if let Some(req) = &mut self.ui.generate_requester {
-            match status.state {
-                JobState::Done => {}
-                JobState::Failed => {
-                    req.set_phase(GenPhase::Ask);
-                    let why = status
-                        .error
-                        .map_or_else(|| "it failed".into(), |e| e.to_string());
-                    req.set_error(Some(format!("No picture: {why}.")));
+        let new = if self.imagegen.picture.is_some() {
+            "No new picture"
+        } else {
+            "No picture"
+        };
+        match status.state {
+            JobState::Done => match images.and_then(|i| i.first().cloned()) {
+                Some(picture) => {
+                    self.imagegen.picture = Some(picture);
+                    self.generate_convert();
                 }
-                _ => {
-                    req.set_phase(GenPhase::Ask);
-                    req.set_error(Some(if network {
-                        "Stopped waiting. A request already sent may still be billed.".into()
-                    } else {
-                        "Stopped.".into()
-                    }));
-                }
+                None => self.generation_failed(format!("{new}: none came back.")),
+            },
+            JobState::Failed => {
+                let why = status
+                    .error
+                    .map_or_else(|| "it failed".into(), |e| e.to_string());
+                self.generation_failed(format!("{new}: {why}."));
             }
-        }
-        if status.state == JobState::Done {
-            self.imagegen.picture = images.and_then(|i| i.first().cloned());
-            self.generate_convert();
+            _ => self.generation_failed(if network {
+                "Stopped waiting. A request already sent may still be billed.".into()
+            } else {
+                "Stopped.".into()
+            }),
         }
         false
     }
@@ -581,9 +672,18 @@ impl PainterApp {
         match import::convert(picture, &convert_options(&o), &t) {
             Ok(r) => {
                 let (w, h) = req.thumb_size();
-                req.set_thumbnail(Some(import::thumbnail(&r.page, &r.palette, w, h)));
+                let (thumb, fitted) = match o.target {
+                    // The brush as Apply makes it: fitted to the picture palette.
+                    GenTarget::Brush => {
+                        let (_, brush, fitted) = fitted_brush(&r, doc.palette());
+                        let (page, palette) = brush_preview(&r, doc.palette(), &brush);
+                        (import::thumbnail(&page, &palette, w, h), fitted)
+                    }
+                    _ => (import::thumbnail(&r.page, &r.palette, w, h), 0),
+                };
+                req.set_thumbnail(Some(thumb));
                 req.set_error(None);
-                req.set_message(Some(apply_text(o.target).into()));
+                req.set_message(Some(apply_text(o.target, doc.frame_count(), fitted)));
                 self.imagegen.result = Some((o, r));
             }
             Err(e) => {
@@ -604,10 +704,10 @@ impl PainterApp {
         let target = o.target();
         let applied = match o.target {
             GenTarget::Spare => {
-                self.spare_from_generated(&r, target);
+                self.spare_from_generated(&r, target, o.palette);
                 Ok(())
             }
-            GenTarget::Picture => self.picture_from_generated(&r, target),
+            GenTarget::Picture => self.picture_from_generated(&r, target, o.palette),
             GenTarget::Brush => {
                 self.brush_from_generated(&r);
                 Ok(())
@@ -625,41 +725,77 @@ impl PainterApp {
         self.dirty = true;
     }
 
-    /// Spare page: it becomes the picture with its own format and palette (undoable on the
-    /// spare page); the shown page is not touched.
-    fn spare_from_generated(&mut self, r: &Imported, target: Target) {
+    /// Spare page: it becomes the picture with its own format and palette (one undo step on
+    /// the spare page, which brings back its file name, fixed background, BG colour and
+    /// details too); the shown page is not touched. A result in the shown page's own format
+    /// and palette makes an ordinary spare (sharing the shown page's colour ranges); any
+    /// other gets details of its own (no colour ranges, its transparent colour).
+    fn spare_from_generated(&mut self, r: &Imported, target: Target, palette: PaletteChoice) {
         let mut other = match self.menu_data.spare.take() {
             Some(s) => s,
-            None => self.blank_page(),
+            None => {
+                self.menu_data.page_history.spare = Default::default();
+                self.blank_page()
+            }
         };
-        if other.engine.execute(r.replace_command(target)).is_err() {
-            other.engine = dpx_core::Engine::new(dpx_core::Document::from_picture(
-                r.page.clone(),
-                r.palette.clone(),
-                target,
-            ));
+        let before = self.spare_files(&other);
+        let command = r.replace_command(target);
+        let key = page_state::step_key(&command);
+        match (other.engine.execute(command), key) {
+            (Ok(_), Some(key)) => self.menu_data.page_history.spare.record(key, before),
+            _ => {
+                other.engine = dpx_core::Engine::new(dpx_core::Document::from_picture(
+                    r.page.clone(),
+                    r.palette.clone(),
+                    target,
+                ));
+                self.menu_data.page_history.spare = Default::default();
+            }
         }
         other.scroll = (0, 0);
         other.picture_path = None;
         other.background = None;
-        other.bg = 0;
-        self.menu_data.spare = Some(other);
-        self.menu_data.spare_own = Some(files::PictureExtras {
+        // Margins were made with the BG index for the current palette (ADR-42).
+        other.bg = match palette {
+            PaletteChoice::Current => self.ui.bg,
+            PaletteChoice::New => 0,
+        };
+        let differs =
+            !crate::menu_actions::same_format(self.engine.document(), other.engine.document());
+        self.menu_data.spare_own = differs.then(|| files::PictureExtras {
             ranges: Vec::new(),
             grab: None,
             transparent_color: r.transparent_color.map(u16::from),
         });
+        self.menu_data.spare = Some(other);
     }
 
-    /// Picture: one undoable command replaces page, format and palette.
-    fn picture_from_generated(&mut self, r: &Imported, target: Target) -> Result<(), String> {
+    /// Picture: one undoable command replaces the whole picture (every frame), format and
+    /// palette. The details follow Picture ▸ Load's Import requester (ADR-42): a current
+    /// palette keeps its colour ranges, a new one has none; no grab point; the transparent
+    /// colour is the picture's (none when it is opaque). Undo brings the old ones back.
+    fn picture_from_generated(
+        &mut self,
+        r: &Imported,
+        target: Target,
+        palette: PaletteChoice,
+    ) -> Result<(), String> {
         self.finish_stroke();
-        self.engine
-            .execute(r.replace_command(target))
-            .map_err(|e| e.message)?;
-        if let Some(t) = r.transparent_color {
-            self.extras.transparent_color = Some(u16::from(t));
+        let before = self.shown_files();
+        let command = r.replace_command(target);
+        let key = page_state::step_key(&command);
+        self.engine.execute(command).map_err(|e| e.message)?;
+        if let Some(key) = key {
+            self.menu_data.page_history.shown.record(key, before);
         }
+        self.extras = files::PictureExtras {
+            ranges: match palette {
+                PaletteChoice::Current => std::mem::take(&mut self.extras.ranges),
+                PaletteChoice::New => Vec::new(),
+            },
+            grab: None,
+            transparent_color: r.transparent_color.map(u16::from),
+        };
         self.menu_data.cycled = None;
         self.scroll = (0, 0);
         self.clamp_colors();
@@ -670,9 +806,8 @@ impl PainterApp {
     /// Brush: the picture in the picture palette's colours, like a loaded brush file (its own
     /// palette stays for Use Brush Palette); transparent pixels are its transparent colour.
     fn brush_from_generated(&mut self, r: &Imported) {
-        let own = BrushImage::from_image(&r.page, r.transparent_color);
         let palette = self.engine.document().palette().clone();
-        let (brush, _) = crate::brush_menu::fit_brush(&own, &r.palette, &palette);
+        let (own, brush, _) = fitted_brush(r, &palette);
         self.remember_loaded_brush(own, r.palette.clone(), Vec::new(), brush.clone());
         self.custom_brush = Some(brush.clone());
         self.picked_brush = Some(brush);
@@ -700,7 +835,11 @@ impl PainterApp {
     fn close_setup(&mut self) {
         self.ui.imagegen_setup = None;
         self.imagegen.key_test = None;
-        // The Generate requester below shows the generator as it is now.
+        self.refresh_generate_provider();
+    }
+
+    /// The Generate requester (under the setup) shows the generator as it is now.
+    fn refresh_generate_provider(&mut self) {
         let info = self.provider_info();
         if let Some(req) = &mut self.ui.generate_requester {
             if info.ready && req.error() == Some(NO_GENERATOR) {
@@ -711,7 +850,10 @@ impl PainterApp {
     }
 
     /// Ok: the generator and model go to the settings, a typed key to the keychain; Remove
-    /// key forgets the stored one. A key or model that cannot be used keeps the requester open.
+    /// key forgets the stored one. The key line says what Ok does with the key, and Ok does
+    /// that whichever generator is chosen (a key removed, then None chosen, is removed). A key
+    /// or model that cannot be used keeps the requester open, and so does a key that could
+    /// only be kept for this session (it says so; the next Ok closes).
     fn setup_ok(&mut self) {
         let Some(req) = &mut self.ui.imagegen_setup else {
             return;
@@ -732,23 +874,44 @@ impl PainterApp {
                 ));
                 return;
             }
-            if let Some(typed) = req.typed_key() {
-                let Some(secret) = Secret::new(&typed) else {
-                    req.set_test(Some(
-                        "That is no API key: printable characters without spaces only.".into(),
-                    ));
-                    return;
-                };
-                self.imagegen.keys.set(KEY_ACCOUNT, &secret);
-            } else if req.remove_key()
-                && let Err(e) = self.imagegen.keys.clear(KEY_ACCOUNT)
-            {
-                req.set_test(Some(format!("The key could not be removed: {e}.")));
+        }
+        let mut session_only = false;
+        if let Some(typed) = req.typed_key() {
+            let Some(secret) = Secret::new(&typed) else {
+                req.set_test(Some(
+                    "That is no API key: printable characters without spaces only.".into(),
+                ));
                 return;
-            }
+            };
+            session_only = self.imagegen.keys.set(KEY_ACCOUNT, &secret) == KeySource::Session;
+        } else if req.remove_key()
+            && let Err(e) = self.imagegen.keys.clear(KEY_ACCOUNT)
+        {
+            req.set_test(Some(format!("The key could not be removed: {e}.")));
+            return;
         }
         self.imagegen.settings.provider = provider;
         self.imagegen.settings.openai = config;
+        if session_only {
+            // The keychain is missing or refused the key: say so before closing.
+            let why = self
+                .imagegen
+                .keys
+                .status(KEY_ACCOUNT, ENV_KEY)
+                .session_only
+                .unwrap_or_else(|| "no system keychain".into());
+            let info = self.setup_info();
+            if let Some(req) = &mut self.ui.imagegen_setup {
+                req.clear_key();
+                req.set_info(info);
+                req.set_test(Some(format!(
+                    "Saved for this session only ({}); it is gone after a restart.",
+                    short(&why, 60)
+                )));
+            }
+            self.refresh_generate_provider();
+            return;
+        }
         self.close_setup();
     }
 
@@ -786,17 +949,24 @@ impl PainterApp {
                 let _ = tx.send(openai::check_key_at(&url, &config, &secret, env_proxy));
             })
             .ok();
-        self.imagegen.key_test = Some(rx);
+        self.imagegen.key_test = Some((rx, req.revision()));
         req.set_test(Some(
             "Testing the key: asking OpenAI for your model list..".into(),
         ));
     }
 
-    /// Shows the key test's answer once it is there.
+    /// Shows the key test's answer once it is there, unless the key, the model or the
+    /// generator was changed since the test started (the answer is then dropped).
     pub(crate) fn key_test_poll(&mut self) {
-        let Some(rx) = &self.imagegen.key_test else {
+        let Some((rx, revision)) = &self.imagegen.key_test else {
             return;
         };
+        let current = self.ui.imagegen_setup.as_ref().map(|r| r.revision());
+        if current != Some(*revision) {
+            self.imagegen.key_test = None;
+            self.dirty = true;
+            return;
+        }
         let text = match rx.try_recv() {
             Ok(Ok(check)) => check.describe(),
             Ok(Err(e)) => format!("{e}."),
@@ -836,8 +1006,11 @@ pub(crate) fn overlay(ui: &UiState, rgba: &mut [u8], frame_w: usize, sx: usize, 
 /// (ocs/aga), `colors`, `style` (pixel_art/painted/none), `palette` (new/current), `dither`
 /// (none/diffusion/ordered), `fit` (crop/whole), `scaler` (smooth/nearest/pixel_art),
 /// `background` (opaque/transparent), `quality` (low/medium/high/auto), `target`
-/// (spare/picture/brush), `more`, `provider` (none/openai/test_pattern) and `key=placeholder`
-/// (a placeholder key in this session's memory, so OpenAI shows as set up; nothing is sent).
+/// (spare/picture/brush), `more`, `provider` (none/openai/test_pattern), `key=placeholder`
+/// (a placeholder key in this session's memory, so OpenAI shows as set up; nothing is sent)
+/// and `keychain=stand_in` (a stand-in in memory where the system keychain would be, so the
+/// setup looks as with a working keychain; without it the snapshot's keys are session-only,
+/// and the setup says so).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Spec {
     pub(crate) options: GenerateOptions,
@@ -845,6 +1018,7 @@ pub(crate) struct Spec {
     pub(crate) more: bool,
     pub(crate) provider: Option<String>,
     pub(crate) placeholder_key: bool,
+    pub(crate) stand_in_keychain: bool,
 }
 
 pub(crate) fn parse_spec(spec: &str) -> Result<Spec, String> {
@@ -949,6 +1123,7 @@ pub(crate) fn parse_spec(spec: &str) -> Result<Spec, String> {
                 _ => return Err(bad()),
             },
             "key" if value == "placeholder" => s.placeholder_key = true,
+            "keychain" if value == "stand_in" => s.stand_in_keychain = true,
             _ => return Err(format!("unknown key '{key}'")),
         }
     }
@@ -999,6 +1174,14 @@ pub(crate) fn snapshot(
     let mut app = PainterApp::new();
     app.engine = dpx_core::Engine::new(doc.clone());
     app.ui = ui.clone();
+    if spec.stand_in_keychain {
+        // In memory, in the keychain's place: the real keychain is never touched.
+        app.imagegen.keys = Arc::new(ApiKeys::new(
+            Some(Box::new(dpx_imagegen::secret::MemoryStore::new())),
+            None,
+            Arc::new(|_: &str| None::<String>),
+        ));
+    }
     match spec.provider.as_deref() {
         Some("openai") => app.imagegen.settings.provider = GenProvider::OpenAi,
         Some("test_pattern") => {

@@ -1017,6 +1017,8 @@ impl PainterApp {
         self.anim.playing = None;
         self.engine = Engine::new(doc);
         self.extras = extras;
+        // ADR-45: a new engine, so the page's own history of details starts over.
+        self.menu_data.page_history.shown = Default::default();
         self.last_drawer = path.parent().map(|p| p.to_string_lossy().into_owned());
         self.picture_path = Some(path);
         self.clamp_colors();
@@ -1460,7 +1462,12 @@ impl PainterApp {
             return;
         }
         // ADR-39: the engine's undo; the area stencil follows its picture.
-        Self::report(self.history_step(false), ErrorCode::NothingToUndo);
+        let stepped = self.history_step(false);
+        // ADR-45: a ReplacePicture step brings back the page's details outside the document.
+        if stepped.is_ok() {
+            self.page_files_undone();
+        }
+        Self::report(stepped, ErrorCode::NothingToUndo);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;
@@ -1471,7 +1478,13 @@ impl PainterApp {
         if self.stencil_paint_undo(true) {
             return;
         }
-        Self::report(self.history_step(true), ErrorCode::NothingToRedo);
+        let key = self.redo_key();
+        let stepped = self.history_step(true);
+        // ADR-45: and Redo sets them again.
+        if stepped.is_ok() {
+            self.page_files_redone(key);
+        }
+        Self::report(stepped, ErrorCode::NothingToRedo);
         self.clamp_colors();
         self.clamp_scroll();
         self.dirty = true;

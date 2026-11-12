@@ -85,7 +85,9 @@ pub fn read_brush(bytes: &[u8]) -> Result<(BrushImage, Palette, Vec<ColorRange>)
 
 /// `brush` (colour numbers of `file_palette`) with its colours fitted to `page_palette`: numbers
 /// whose colour differs from the page palette's go to the nearest page colour, the
-/// transparent colour keeps its number. The second value is how many colours had to change.
+/// transparent colour keeps its number, and no opaque colour goes to the transparent number
+/// (a black outline must not turn into holes where page colour 0 is black too). The second
+/// value is how many colours had to change.
 pub fn fit_brush(
     brush: &BrushImage,
     file_palette: &Palette,
@@ -104,7 +106,10 @@ pub fn fit_brush(
         let to = match want {
             Some(c) if page_palette.get(p) != Some(c) => {
                 changed += usize::from(Some(p) != transparent);
-                page_palette.nearest(c)
+                match transparent {
+                    Some(t) => page_palette.nearest_excluding(c, &[t]),
+                    None => page_palette.nearest(c),
+                }
             }
             _ => p,
         };
@@ -383,9 +388,51 @@ mod tests {
         assert_eq!(changed, 1);
         assert_eq!(b.transparent, Some(0));
         assert_eq!(b.get(0, 0), Some(0), "transparent index kept");
-        let want = page.nearest(Rgb8::new(1, 2, 3));
+        // The nearest colour that is not the transparent one (page colour 0 is black too).
+        let want = page.nearest_excluding(Rgb8::new(1, 2, 3), &[0]);
+        assert_ne!(want, 0);
         assert_eq!(b.get(1, 0), Some(want));
         assert_eq!(b.get(2, 0), Some(6));
+    }
+
+    #[test]
+    fn no_opaque_colour_is_fitted_onto_the_transparent_colour() {
+        // A sprite with its own palette (pink = transparent, black outline, white, red) on a
+        // page whose colour 0 is black: the outline must stay opaque.
+        let own = Palette::new(vec![
+            Rgb8::new(255, 0, 255),
+            Rgb8::BLACK,
+            Rgb8::WHITE,
+            Rgb8::new(255, 0, 0),
+        ])
+        .unwrap();
+        let page = Palette::dpaint_default_32();
+        assert_eq!(page.get(0), Some(Rgb8::BLACK));
+        let sprite = BrushImage {
+            width: 4,
+            height: 1,
+            pixels: vec![0, 1, 2, 3],
+            handle: (0, 0),
+            transparent: Some(0),
+        };
+        let (fitted, changed) = fit_brush(&sprite, &own, &page);
+        assert_eq!(
+            fitted.pixels[0], 0,
+            "the transparent colour keeps its number"
+        );
+        for (i, &p) in fitted.pixels.iter().enumerate().skip(1) {
+            assert_ne!(p, 0, "opaque pixel {i} is no hole");
+            let want = own.get(sprite.pixels[i]).unwrap();
+            assert_eq!(p, page.nearest_excluding(want, &[0]), "pixel {i}");
+        }
+        assert_eq!(changed, 3);
+        // An opaque brush may use colour 0 like any other.
+        let opaque = BrushImage {
+            transparent: None,
+            ..sprite
+        };
+        let (fitted, _) = fit_brush(&opaque, &own, &page);
+        assert_eq!(fitted.pixels[1], 0, "black is page colour 0");
     }
 
     #[test]
