@@ -1,0 +1,16 @@
+[
+{"op":"clear","color":10},
+{"op":"shape","shape":{"kind":"rect","from":[0,222],"to":[319,255]},"color":16,"filled":true},
+{"op":"add_layer","name":"Sketch"},
+{"op":"shape","shape":{"kind":"rect","from":[40,150],"to":[110,205]},"color":2,"filled":false,"brush":[[0,0]]},
+{"op":"shape","shape":{"kind":"line","from":[40,150],"to":[75,120]},"color":2,"brush":[[0,0]]},
+{"op":"shape","shape":{"kind":"line","from":[75,120],"to":[110,150]},"color":2,"brush":[[0,0]]},
+{"op":"add_layer","name":"Hill"},
+{"op":"shape","shape":{"kind":"polygon","points":[[0,200],[50,170],[110,160],[170,186],[230,150],[290,172],[319,165],[319,232],[0,232]],"closed":true},"color":7,"filled":true},
+{"op":"shape","shape":{"kind":"polygon","points":[[0,222],[70,200],[130,212],[200,196],[260,214],[319,204],[319,236],[0,236]],"closed":true},"color":6,"filled":true},
+{"op":"add_layer","name":"Sky"},
+{"op":"shape","shape":{"kind":"ellipse","center":[160,60],"radius":[20,20]},"color":5,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[70,48],"radius":[26,10]},"color":3,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[92,40],"radius":[18,9]},"color":3,"filled":true},
+{"op":"set_layer_visible","layer":1,"visible":false}
+]

@@ -136,6 +136,12 @@ pub struct UiState {
     /// The tooltip naming the toolbox button or Control Panel button under the resting
     /// pointer (ADR-41, a DeluxePainter addition); drawn over everything else.
     pub tooltip: Option<crate::tooltip::Tooltip>,
+    // Layers (ADR-44).
+    /// The layer panel while Prefs ▸ Layers is on; the app keeps its layers in sync.
+    pub layer_panel: Option<crate::layer_panel::LayerPanel>,
+    /// The active layer's name, shown at the right of the title bar while the panel is off
+    /// and the picture has layers (the app sets it).
+    pub layer_label: Option<String>,
 }
 
 impl UiState {
@@ -192,6 +198,8 @@ impl Default for UiState {
             anim_control: None,
             anim_expanded: false,
             tooltip: None,
+            layer_panel: None,
+            layer_label: None,
         }
     }
 }
@@ -256,6 +264,8 @@ pub enum Hit {
     },
     /// The Animation Control Panel (ADR-38).
     AnimPanel(crate::anim_panel::PanelHit),
+    /// The layer panel (ADR-44), over the screen or docked right of it.
+    LayerPanel(crate::layer_panel::LayerHit),
 }
 
 pub struct Screen {
@@ -350,6 +360,13 @@ impl Screen {
                 crate::anim_panel::Layout::new(self.width, self.height, ui.toolbox_visible);
             panel.draw(img, pens, &layout);
         }
+        // ADR-44: the layer panel over the screen's right edge, under the menus and
+        // requesters (the app draws the docked one right of the screen).
+        if let Some(panel) = ui.layer_panel.as_ref().filter(|p| !p.docked)
+            && let Some(layout) = crate::layer_panel::Layout::of(ui, self.width, self.height)
+        {
+            panel.draw(img, pens, &layout);
+        }
         if ui.title_visible {
             if ui.menu.active {
                 let ctx = ui.menu_context();
@@ -427,9 +444,30 @@ impl Screen {
             None if ui.prefs.get(Pref::Coords) => None,
             None => ui.perspective.clone(),
         };
+        let right_end = w - geom::DEPTH_W - 3;
+        let mut label_end = right_end;
         if let Some(text) = right {
-            let tx = w - geom::DEPTH_W - 3 - font.text_width(&text);
+            let tx = right_end - font.text_width(&text);
             font.draw(img, tx, geom::TITLE_TEXT_Y, &text, pens.dark);
+            label_end = tx - font.text_width("  ");
+        }
+        // ADR-44: the active layer while the layer panel is off, left of the coordinates;
+        // a long name is cut, and it goes when even its start does not fit.
+        if let Some(name) = &ui.layer_label {
+            let left_end = geom::TITLE_TEXT_X + font.text_width(&title) + font.text_width("  ");
+            let label = format!("Layer: {name}");
+            let room = label_end - left_end;
+            if room >= font.text_width("Layer: ") + font.text_width("W") {
+                let shown = font.text_width(&label).min(room);
+                crate::widgets::draw_clipped(
+                    img,
+                    label_end - shown,
+                    geom::TITLE_TEXT_Y,
+                    label.chars(),
+                    shown,
+                    pens.dark,
+                );
+            }
         }
         self.draw_depth_gadget(img, pens);
     }
@@ -576,6 +614,13 @@ impl Screen {
             if let Some(hit) = panel.hit(&layout, x, y) {
                 return Hit::AnimPanel(hit);
             }
+        }
+        // ADR-44: the layer panel, also docked right of the screen (x >= width).
+        if let Some(panel) = &ui.layer_panel
+            && let Some(layout) = crate::layer_panel::Layout::of(ui, self.width, self.height)
+            && let Some(hit) = panel.hit(&layout, x, y)
+        {
+            return Hit::LayerPanel(hit);
         }
         let x0 = self.toolbox_x();
         if ui.toolbox_visible && x >= x0 && y >= geom::TITLE_H {
@@ -773,6 +818,160 @@ mod tests {
             }
         }
         assert_ne!(img, plain);
+    }
+
+    /// The title bar's text row as drawn: for each column, whether it has ink.
+    fn title_ink(img: &IndexedImage, p: &Pens) -> Vec<bool> {
+        (0..img.width() as i32)
+            .map(|x| {
+                (geom::TITLE_TEXT_Y..geom::TITLE_TEXT_Y + 8).any(|y| img.get(x, y) == Some(p.dark))
+            })
+            .collect()
+    }
+
+    /// The ink of `text` drawn alone with its right end at `right` on a 320-wide row.
+    fn text_ink(text: &str, right: i32) -> Vec<bool> {
+        let font = Font::builtin();
+        let mut img = IndexedImage::new(320, 11, 0);
+        font.draw(
+            &mut img,
+            right - font.text_width(text),
+            geom::TITLE_TEXT_Y,
+            text,
+            1,
+        );
+        (0..320)
+            .map(|x| (geom::TITLE_TEXT_Y..geom::TITLE_TEXT_Y + 8).any(|y| img.get(x, y) == Some(1)))
+            .collect()
+    }
+
+    #[test]
+    fn the_title_bar_names_the_active_layer_left_of_the_coordinates() {
+        let pal = Palette::dpaint_default_32();
+        let p = Pens::from_palette(&pal);
+        let page = IndexedImage::new(320, 256, 0);
+        let screen = Screen::new(320, 256);
+        let right_end = 320 - geom::DEPTH_W - 3;
+        let mut ui = UiState {
+            layer_label: Some("Sky".into()),
+            ..UiState::default()
+        };
+        let img = screen.render(&page, &pal, &ui);
+        let label = text_ink("Layer: Sky", right_end);
+        let ink = title_ink(&img, &p);
+        for x in 160..right_end {
+            assert_eq!(ink[x as usize], label[x as usize], "column {x}");
+        }
+        // With Coords on, the label moves left of them (a short name still fits whole).
+        ui.prefs.set(Pref::Coords, true);
+        ui.coords = Some((12, 34));
+        ui.layer_label = Some("A".into());
+        let img = screen.render(&page, &pal, &ui);
+        let font = Font::builtin();
+        let coords = format!("{:4} {:4}", 12, 34);
+        let label_end = right_end - font.text_width(&coords) - font.text_width("  ");
+        let label = text_ink("Layer: A", label_end);
+        let ink = title_ink(&img, &p);
+        for x in 160..label_end {
+            assert_eq!(ink[x as usize], label[x as usize], "column {x}");
+        }
+        // A long name is cut before the program name and the mode; it never overlaps them.
+        ui.prefs.set(Pref::Coords, false);
+        ui.layer_label = Some("W".repeat(60));
+        ui.flags = "A P S T".into();
+        let img = screen.render(&page, &pal, &ui);
+        let left = format!("{APP_TITLE}  Color  A P S T");
+        let left_end = geom::TITLE_TEXT_X + font.text_width(&left);
+        let ink = title_ink(&img, &p);
+        let gap = font.text_width("  ");
+        assert!(
+            ink[left_end as usize..(left_end + gap) as usize]
+                .iter()
+                .all(|&i| !i)
+        );
+        assert!(
+            ink[(left_end + gap) as usize..right_end as usize]
+                .iter()
+                .any(|&i| i)
+        );
+        // No room at all (a long frame counter, flags and coordinates): no label.
+        ui.frame_counter = Some((100, 999));
+        ui.flags = "A P S T".into();
+        ui.prefs.set(Pref::Coords, true);
+        ui.layer_label = Some("Sky".into());
+        let with = screen.render(&page, &pal, &ui);
+        ui.layer_label = None;
+        assert_eq!(with, screen.render(&page, &pal, &ui));
+    }
+
+    #[test]
+    fn the_layer_panel_is_hit_before_the_page_and_drawn_under_the_menus() {
+        use crate::layer_panel::{LayerHit, LayerPanel, LayerRow, Layout};
+        let pal = Palette::dpaint_default_32();
+        let p = Pens::from_palette(&pal);
+        let screen = Screen::new(320, 256);
+        let mut panel = LayerPanel::default();
+        let rows = ["Background", "Sky"].map(|n| LayerRow {
+            name: n.into(),
+            visible: true,
+        });
+        panel.update(rows.to_vec(), 1, [true; 6], 19);
+        let mut ui = UiState {
+            layer_panel: Some(panel),
+            ..UiState::default()
+        };
+        let l = Layout::of(&ui, 320, 256).unwrap();
+        let eye = l.eye(0);
+        assert_eq!(
+            screen.hit_test(32, &ui, eye.x + 2, eye.y + 2),
+            Hit::LayerPanel(LayerHit::Eye(1))
+        );
+        assert_eq!(
+            screen.hit_test(32, &ui, l.panel.x + 30, 150),
+            Hit::LayerPanel(LayerHit::Background),
+            "an empty row is the panel, not the page"
+        );
+        assert_eq!(
+            screen.hit_test(32, &ui, l.panel.x - 1, 150),
+            Hit::Page { x: 215, y: 150 }
+        );
+        assert_eq!(screen.hit_test(32, &ui, 5, 5), Hit::TitleBar);
+        let page = IndexedImage::new(320, 256, 4);
+        let img = screen.render(&page, &pal, &ui);
+        assert_eq!(img.get(l.panel.x, 100), Some(p.dark), "drawn");
+        // The menu boxes lie over it: inside the Prefs box the screen is as without panel.
+        ui.menu.open(320, 256, 300, 1);
+        let with_menu = screen.render(&page, &pal, &ui);
+        let menu_only = screen.render(
+            &page,
+            &pal,
+            &UiState {
+                layer_panel: None,
+                ..ui.clone()
+            },
+        );
+        let b = menu::menu_box(ui.menu.menu.unwrap(), 320, 256);
+        assert!(
+            b.x < l.panel.x + l.panel.w && b.y + b.h > l.panel.y,
+            "they overlap"
+        );
+        for y in b.y..b.y + b.h {
+            for x in b.x..b.x + b.w {
+                assert_eq!(with_menu.get(x, y), menu_only.get(x, y), "({x}, {y})");
+            }
+        }
+        // Docked: not on the screen, but hit right of it.
+        ui.menu.close();
+        ui.layer_panel.as_mut().unwrap().docked = true;
+        let docked = screen.render(&page, &pal, &ui);
+        assert_eq!(docked.get(l.panel.x, 100), Some(4), "the page");
+        let d = Layout::of(&ui, 320, 256).unwrap();
+        let new = d.button(crate::layer_panel::LayerButton::New);
+        assert_eq!(
+            screen.hit_test(32, &ui, new.x + 3, new.y + 3),
+            Hit::LayerPanel(LayerHit::Button(crate::layer_panel::LayerButton::New))
+        );
+        assert!(new.x >= 320);
     }
 
     #[test]

@@ -76,11 +76,13 @@ pub enum Pref {
     AutoGrid,
     OriginUl,
     FastAdjust,
+    /// Prefs ▸ Layers: the layer panel is shown (ADR-44, a DeluxePainter addition; key `L`).
+    LayerPanel,
 }
 
 impl Pref {
     /// Every preference, in menu order.
-    pub const ALL: [Pref; 11] = [
+    pub const ALL: [Pref; 12] = [
         Pref::Coords,
         Pref::FastFb,
         Pref::MultiCycle,
@@ -92,6 +94,7 @@ impl Pref {
         Pref::AutoGrid,
         Pref::OriginUl,
         Pref::FastAdjust,
+        Pref::LayerPanel,
     ];
 
     /// Stable name used in the settings file; never changes when the enum is reordered.
@@ -108,6 +111,7 @@ impl Pref {
             Pref::AutoGrid => "auto_grid",
             Pref::OriginUl => "origin_ul",
             Pref::FastAdjust => "fast_adjust",
+            Pref::LayerPanel => "layer_panel",
         }
     }
 
@@ -242,6 +246,14 @@ const fn pref(label: &'static str, p: Pref) -> Item {
     Item {
         label,
         key: Key::None,
+        entry: Entry::Action(Action::Pref(p)),
+    }
+}
+
+const fn pref_key(label: &'static str, key: Key, p: Pref) -> Item {
+    Item {
+        label,
+        key,
         entry: Entry::Action(Action::Pref(p)),
     }
 }
@@ -546,6 +558,8 @@ pub static MENUS: [Menu; 7] = [
             pref("AutoGrid", Pref::AutoGrid),
             pref("OriginUL", Pref::OriginUl),
             pref("FastAdjust", Pref::FastAdjust),
+            // ADR-44: the layer panel (DeluxePainter addition).
+            pref_key("Layers", plain("L"), Pref::LayerPanel),
             sub(
                 "Pixel Size",
                 &[

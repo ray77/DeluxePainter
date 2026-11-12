@@ -15,6 +15,8 @@ pub mod file_requester;
 pub mod font;
 pub(crate) mod form;
 pub mod import_requester;
+// The layer panel (ADR-44).
+pub mod layer_panel;
 pub mod menu;
 pub mod note_requester;
 pub mod page_size_requester;
@@ -47,6 +49,7 @@ pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, P
 pub use import_requester::{
     ImportControl, ImportInfo, ImportRequester, ImportResponse, ImportRow, overlay_rgb,
 };
+pub use layer_panel::{LayerButton, LayerHit, LayerPanel, LayerRow, RenameStep};
 pub use menu::{Action, MenuState, PixelSize, Pref, Prefs};
 pub use note_requester::{NoteRequester, NoteResponse};
 pub use page_size_requester::{PageSizeRequester, PageSizeResponse, Preset};

@@ -1,7 +1,7 @@
 //! ADR-44 in the app: a layered document shows, exports and saves as its visible layers
-//! (the composite), while every gesture paints the active layer. The layer panel is not here
-//! (it comes with the second layer builder); these tests make layers through the command
-//! engine, as `--commands` does, and drive the real `ui()` loop where the screen is shown.
+//! (the composite), while every gesture paints the active layer. These tests make layers
+//! through the command engine, as `--commands` does, and drive the real `ui()` loop where the
+//! screen is shown; the layer panel's tests are in `layers.rs`.
 
 use std::borrow::Cow;
 

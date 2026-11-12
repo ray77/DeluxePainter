@@ -34,6 +34,8 @@
 //!     [--import-requester FILE]         the Import requester for a PNG or JPEG (ADR-42)
 //!     [--import SPEC] [--import-apply]  … with position=centre|top_left;palette=new|current;
 //!                                       colors=N;dither=none|fs|ordered, or the page after Ok
+//!     [--layers-panel [docked]]         show the layer panel (ADR-44) over the screen's right
+//!                                       edge, or docked in the work area right of the screen
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -53,6 +55,8 @@ mod config;
 mod effects;
 mod files;
 mod import;
+// The layer panel (ADR-44).
+mod layers;
 mod menu_actions;
 mod palette_stencil;
 mod perspective;
@@ -521,6 +525,8 @@ fn main() -> eframe::Result {
                 recovery::format_utc(recovery::unix_now()),
             ));
         }
+        // ADR-44: the layer panel (`--layers-panel`) or the title bar's layer name.
+        layers::snapshot_ui(&args, &mut engine, &mut ui, view);
         // ADR-41: the tooltip of a resting pointer.
         if let Err(e) =
             tooltip::snapshot_hover(&args, doc.palette().len(), &view.ui_screen(), &mut ui)
@@ -777,7 +783,9 @@ fn snapshot(
     ui: &UiState,
     custom_brush: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (w, h, rgba) = snapshot_rgba(scale, doc, view, scroll, ui, custom_brush);
+    let shot = snapshot_rgba(scale, doc, view, scroll, ui, custom_brush);
+    // ADR-44: the docked layer panel right of the screen.
+    let (w, h, rgba) = layers::with_docked_strip(shot, doc.palette(), ui, view, scale);
     write_png(path, w, h, &rgba)
 }
 
@@ -929,6 +937,8 @@ struct PainterApp {
     tooltip: tooltip::State,
     /// Picture ▸ Load's Import requester for PNG and JPEG (ADR-42, import.rs).
     import: import::ImportState,
+    /// The layer panel (ADR-44, layers.rs).
+    layers: layers::State,
 }
 
 impl PainterApp {
@@ -969,6 +979,7 @@ impl PainterApp {
             perspective: perspective::PerspectiveState::default(),
             tooltip: tooltip::State::default(),
             import: import::ImportState::default(),
+            layers: layers::State::default(),
         }
     }
 
@@ -1519,6 +1530,7 @@ impl PainterApp {
                 self.press_page(x, y, right)
             }
             Hit::AnimPanel(hit) => self.panel_press(hit, right),
+            Hit::LayerPanel(hit) => self.layer_panel_press(hit, right),
             Hit::TitleBar | Hit::Indicator | Hit::ToolboxBackground => {}
         }
     }
@@ -1662,6 +1674,8 @@ impl eframe::App for PainterApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // ADR-44: the time for double-clicks; a held panel button goes up.
+        self.layers_pass(&ctx);
         self.ui.has_brush = self.custom_brush.is_some();
         self.ui.can_restore = self.picked_brush.is_some();
         self.animbrush_sync(&ctx);
@@ -1709,8 +1723,10 @@ impl eframe::App for PainterApp {
         let (view, scale) = self.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
+        // ADR-44: a docked layer panel right of the screen is centred with it.
+        let frame_w = img_w + self.lay_out_layer_strip(view, scale);
         let origin_px = egui::vec2(
-            ((window.w - img_w) / 2) as f32,
+            ((window.w - frame_w) / 2) as f32,
             ((window.h - img_h) / 2) as f32,
         );
         let origin = area.min + origin_px / ppp;
@@ -1855,6 +1871,8 @@ impl eframe::App for PainterApp {
             };
             // ADR-41 (tooltip.rs).
             self.tooltip_hover(&ctx, hit);
+            // ADR-44: the wheel over the layer panel scrolls its list.
+            self.layer_hover(hit);
             let on_page = match hit {
                 Some(Hit::Page { x, y }) => Some((x, y)),
                 _ => None,
@@ -1866,7 +1884,9 @@ impl eframe::App for PainterApp {
                 self.ui.coords = on_page;
                 self.dirty |= self.ui.prefs.get(dpx_ui::Pref::Coords);
             }
-            if press_r && hit == Some(Hit::TitleBar) {
+            if (press_l || press_r) && self.layer_rename_press(hit) {
+                // ADR-44: the press ended a layer rename (it takes the name, as Return).
+            } else if press_r && hit == Some(Hit::TitleBar) {
                 self.ui.menu.open(sw, sh, ux, uy);
                 self.dirty = true;
             } else if press_l || press_r {
@@ -1888,6 +1908,7 @@ impl eframe::App for PainterApp {
         } else {
             self.hover_brush(None);
             self.tooltip_hover(&ctx, None);
+            self.layer_hover(None);
         }
         if !(down_l || down_r) {
             self.release();
@@ -1895,6 +1916,11 @@ impl eframe::App for PainterApp {
         self.tick(&ctx);
         if self.ui.menu.active {
             // Keyboard shortcuts are ignored while the menu strip is shown.
+            self.upload_and_paint(ui, &ctx, rect, area);
+            return;
+        }
+        // ADR-44: while a layer name is edited, its gadget takes every key.
+        if self.layer_rename_keys(&ctx) {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
@@ -1946,6 +1972,8 @@ impl eframe::App for PainterApp {
             self.animbrush_keys(&ctx);
             self.anim_control_keys(&ctx);
             self.palette_stencil_keys(&ctx);
+            // ADR-44: `L` shows or hides the layer panel.
+            self.layer_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
         let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
@@ -2101,6 +2129,7 @@ impl PainterApp {
                     };
                     self.scroll_to(self.scroll.0 + dx, self.scroll.1 + dy);
                 }
+                egui::Event::MouseWheel { unit, delta, .. } if self.layer_wheel(unit, delta) => {}
                 egui::Event::MouseWheel { unit, delta, .. } => {
                     // DeluxePainter addition: wheel and trackpad scroll the page. Positive
                     // deltas move the content down/right, i.e. show the part above/left.
@@ -2484,6 +2513,9 @@ impl PainterApp {
             self.prepare_perspective_view();
             self.prepare_anim_view();
             self.prepare_stencil_view();
+            // ADR-44: after the Control Panel's state (the overlay keeps above it).
+            self.sync_layer_panel();
+            self.upload_layer_strip(ctx);
             let (screen, rgba) = match (&self.requester, &self.show_page) {
                 (Some(req), _) => {
                     let screen = req.render();
@@ -2534,6 +2566,8 @@ impl PainterApp {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             painter.image(t.id(), rect, uv, egui::Color32::WHITE);
         }
+        // ADR-44: the docked layer panel right of the screen.
+        self.paint_layer_strip(painter, rect);
     }
 }
 
@@ -2674,7 +2708,10 @@ mod tests {
         let (view, scale) = app.layout();
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
-        let (ox, oy) = (((1280 - img_w) / 2) as f32, ((1024 - img_h) / 2) as f32);
+        // ADR-44: centred together with a docked layer panel.
+        let frame_w = img_w + app.layer_strip_px(view, scale);
+        let (ww, wh) = app.window.map_or((1280, 1024), |w| (w.w, w.h));
+        let (ox, oy) = (((ww - frame_w) / 2) as f32, ((wh - img_h) / 2) as f32);
         let sx = (x * view.ux) as f32 + 0.5;
         let sy = (y * view.uy) as f32 + 0.5;
         egui::pos2(
@@ -3900,7 +3937,7 @@ mod tests {
 
     /// Picks the menu item at the end of `path` (UI pixels, the menu title first) as on the
     /// Amiga: right button down on the title bar, along the path, up over the item.
-    fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
+    pub(crate) fn pick(app: &mut PainterApp, ctx: &egui::Context, t: f64, path: &[(i32, i32)]) {
         use egui::PointerButton::Secondary;
         let points: Vec<egui::Pos2> = path.iter().map(|&p| ui_point(app, p)).collect();
         ui_pass(
