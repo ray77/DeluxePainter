@@ -205,6 +205,40 @@ impl Command {
     /// and hold what `doc` does: every frame with every layer, the layer stack, the current
     /// frame and the active layer (the rate is a setting and stays).
     pub fn set_picture(doc: &Document) -> Command {
+        let PictureStack {
+            layers,
+            frames,
+            current,
+            active,
+        } = PictureStack::of(doc);
+        Command::SetPicture {
+            width: doc.page.width(),
+            height: doc.page.height(),
+            layers,
+            frames,
+            current,
+            active,
+        }
+    }
+}
+
+/// Every frame with every layer of a picture, as [`Command::SetPicture`] holds them: the
+/// layer stack, `frames[f][l]` (layer `l` of frame `f`, bottom layer first, the page's
+/// pixels row by row), the current frame and the active layer. The rest of a
+/// [`Command::ReplacePicture`] that puts another page's whole picture in
+/// ([`Command::replace_with_picture`], wave-8 integration).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PictureStack {
+    pub layers: Vec<Layer>,
+    pub frames: Vec<Vec<Vec<u8>>>,
+    pub current: u32,
+    pub active: u32,
+}
+
+impl PictureStack {
+    /// What `doc` holds: every frame with every layer, its stack, current frame and active
+    /// layer.
+    pub fn of(doc: &Document) -> Self {
         let layers = doc.layer_count();
         let frames = (0..doc.frame_count())
             .map(|f| {
@@ -216,14 +250,50 @@ impl Command {
                     .collect()
             })
             .collect();
-        Command::SetPicture {
-            width: doc.page.width(),
-            height: doc.page.height(),
+        PictureStack {
             layers: doc.layers.clone(),
             frames,
             current: doc.current_frame() as u32,
             active: doc.active_layer() as u32,
         }
+    }
+
+    /// Bytes of its pixels and layer names (for the undo budget).
+    pub(crate) fn bytes(&self) -> u64 {
+        let names: u64 = self.layers.iter().map(|l| l.name.len() as u64).sum();
+        let pixels: u64 = self.frames.iter().flatten().map(|p| p.len() as u64).sum();
+        names + pixels
+    }
+
+    /// Checks it for a picture of `width`×`height` pages in a palette of `colors` entries
+    /// (the rules of [`Command::SetPicture`] but the page size, which the caller checks).
+    pub(crate) fn validate(
+        &self,
+        colors: usize,
+        width: u32,
+        height: u32,
+    ) -> Result<(), CommandError> {
+        check_stack(
+            colors,
+            (width, height),
+            Ok(()),
+            &self.layers,
+            &self.frames,
+            self.current,
+            self.active,
+        )
+    }
+
+    /// Makes `doc` hold it (pages of `width`×`height`). Call only after [`Self::validate`].
+    pub(crate) fn apply(&self, doc: &mut Document, width: u32, height: u32) {
+        set_stack(
+            doc,
+            (width, height),
+            &self.layers,
+            &self.frames,
+            self.current,
+            self.active,
+        );
     }
 }
 
@@ -242,14 +312,27 @@ fn layer_exists(doc: &Document, l: u32, what: &str) -> Result<usize, CommandErro
 
 /// One more layer must fit [`MAX_LAYERS`] and the memory limit of all frames' pictures.
 fn room_for_another(doc: &Document) -> Result<(), CommandError> {
-    let count = doc.layer_count();
-    if count >= MAX_LAYERS {
+    let (w, h) = (doc.page.width(), doc.page.height());
+    room_for_layer(doc.layer_count(), doc.frame_count(), w, h)
+}
+
+/// Whether a picture of `layers` layers in `frames` frames of `width`×`height` pages has room
+/// for one more layer: at most [`MAX_LAYERS`], and every frame's pictures within the memory
+/// limit ([`crate::anim::MAX_FRAME_BYTES`]). The rule `AddLayer`, `DuplicateLayer` and
+/// `AddPictureLayer` apply, for callers that check it before work that would be wasted (ADR-45,
+/// wave-8 integration: MCP's `generate_image` for a new layer sends nothing then).
+pub fn room_for_layer(
+    layers: usize,
+    frames: usize,
+    width: u32,
+    height: u32,
+) -> Result<(), CommandError> {
+    if layers >= MAX_LAYERS {
         return Err(CommandError::invalid(format!(
-            "{count} layers: at most {MAX_LAYERS} allowed"
+            "{layers} layers: at most {MAX_LAYERS} allowed"
         )));
     }
-    let (w, h) = (doc.page.width(), doc.page.height());
-    check_frame_count(doc.frame_count(), count + 1, w, h)
+    check_frame_count(frames, layers + 1, width, height)
 }
 
 pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError> {
@@ -326,6 +409,37 @@ fn validate_picture(
     current: u32,
     active: u32,
 ) -> Result<(), CommandError> {
+    let same = (width, height) == (doc.page.width(), doc.page.height());
+    let fits = if !same && !doc.target.page_fits(width, height) {
+        let ((min_w, min_h), (max_w, max_h)) = doc.target.page_limits();
+        Err(CommandError::invalid(format!(
+            "Page must be {min_w}x{min_h} to {max_w}x{max_h}"
+        )))
+    } else {
+        Ok(())
+    };
+    check_stack(
+        doc.palette.len(),
+        (width, height),
+        fits,
+        layers,
+        frames,
+        current,
+        active,
+    )
+}
+
+/// [`validate_picture`] for a palette of `colors` entries; `fits` is the page size check,
+/// reported after the layers and pictures and before the memory limit.
+fn check_stack(
+    colors: usize,
+    (width, height): (u32, u32),
+    fits: Result<(), CommandError>,
+    layers: &[Layer],
+    frames: &[Vec<Vec<u8>>],
+    current: u32,
+    active: u32,
+) -> Result<(), CommandError> {
     if layers.is_empty() || layers.len() > MAX_LAYERS {
         return Err(CommandError::invalid(format!(
             "{} layers: 1 to {MAX_LAYERS} allowed",
@@ -340,7 +454,6 @@ fn validate_picture(
             "a picture needs at least one frame".into(),
         ));
     }
-    let colors = doc.palette.len();
     for (f, frame) in frames.iter().enumerate() {
         if frame.len() != layers.len() {
             return Err(CommandError::invalid(format!(
@@ -354,13 +467,7 @@ fn validate_picture(
             crate::command::other_page(width, height, pixels, colors)?;
         }
     }
-    let same = (width, height) == (doc.page.width(), doc.page.height());
-    if !same && !doc.target.page_fits(width, height) {
-        let ((min_w, min_h), (max_w, max_h)) = doc.target.page_limits();
-        return Err(CommandError::invalid(format!(
-            "Page must be {min_w}x{min_h} to {max_w}x{max_h}"
-        )));
-    }
+    fits?;
     check_frame_count(frames.len(), layers.len(), width, height)?;
     if current as usize >= frames.len() {
         return Err(CommandError::invalid(format!(
@@ -503,22 +610,33 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
             frames,
             current,
             active,
-        } => {
-            let frames = frames
-                .iter()
-                .map(|f| {
-                    f.iter()
-                        .map(|p| {
-                            let picture = IndexedImage::from_pixels(*width, *height, p.clone());
-                            Arc::new(picture.expect("size checked by validate"))
-                        })
-                        .collect()
-                })
-                .collect();
-            doc.set_layered(frames, layers.clone(), *current as usize, *active as usize);
-        }
+        } => set_stack(doc, (*width, *height), layers, frames, *current, *active),
         _ => unreachable!("not a layer command"),
     }
+}
+
+/// Makes `doc` hold `frames` of `layers` (checked pictures of `width`×`height`), with frame
+/// `current` and layer `active` as the page.
+fn set_stack(
+    doc: &mut Document,
+    (width, height): (u32, u32),
+    layers: &[Layer],
+    frames: &[Vec<Vec<u8>>],
+    current: u32,
+    active: u32,
+) {
+    let frames = frames
+        .iter()
+        .map(|f| {
+            f.iter()
+                .map(|p| {
+                    let picture = IndexedImage::from_pixels(width, height, p.clone());
+                    Arc::new(picture.expect("size checked by validate"))
+                })
+                .collect()
+        })
+        .collect();
+    doc.set_layered(frames, layers.to_vec(), current as usize, active as usize);
 }
 
 #[cfg(test)]
@@ -622,6 +740,39 @@ mod tests {
             ErrorCode::InvalidArgument
         );
         assert_eq!(e.document().revision(), MAX_LAYERS as u64 - 1);
+    }
+
+    /// Wave-8 integration review: the rule for one more layer, for callers that check it
+    /// before work (MCP's generate_image for a new layer): the most layers, and the memory
+    /// of every frame's pictures, as AddLayer applies them.
+    #[test]
+    fn room_for_one_more_layer_counts_layers_and_memory() {
+        assert!(room_for_layer(1, 1, 320, 256).is_ok());
+        assert!(room_for_layer(MAX_LAYERS - 1, 1, 320, 256).is_ok());
+        assert!(room_for_layer(MAX_LAYERS, 1, 320, 256).is_err());
+        // 320x256: 820 frames of one layer fit, a second layer does not.
+        assert!(room_for_layer(1, 819, 320, 256).is_ok());
+        let e = room_for_layer(1, 820, 320, 256).unwrap_err();
+        assert!(
+            e.message.starts_with("820 frames of 2 layers"),
+            "{}",
+            e.message
+        );
+        let mut engine =
+            crate::Engine::new(Document::new(320, 256, crate::Palette::dpaint_default_32()));
+        engine
+            .execute(Command::SetFrameCount { count: 820 })
+            .unwrap();
+        let doc = engine.document().clone();
+        assert_eq!(
+            engine
+                .execute(Command::AddLayer { name: None })
+                .unwrap_err()
+                .message,
+            room_for_layer(doc.layer_count(), doc.frame_count(), 320, 256)
+                .unwrap_err()
+                .message
+        );
     }
 
     #[test]

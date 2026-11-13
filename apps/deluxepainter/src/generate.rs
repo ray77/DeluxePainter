@@ -149,6 +149,10 @@ pub(crate) struct ImageGenState {
     /// set up (the test pattern). The GUI never sets it.
     pub(crate) debug_provider: Option<Arc<dyn ImageGenerationProvider>>,
     pub(crate) last: Option<Remembered>,
+    /// What the open requester showed when it was opened: closed unchanged, it leaves `last`
+    /// as it was (wave-8 integration review: MCP's defaults follow the requester only once
+    /// the user made a choice there).
+    opened: Option<Remembered>,
     /// The generations MCP clients started (ADR-45, `generate_image`); they share `jobs`
     /// with the requester, and with it the limit of requests in flight.
     pub(crate) mcp_plans: dpx_mcp::generation::GenPlans,
@@ -179,6 +183,7 @@ impl Default for ImageGenState {
             jobs: JobManager::new(),
             debug_provider: None,
             last: None,
+            opened: None,
             mcp_plans: Default::default(),
             job: None,
             picture: None,
@@ -308,7 +313,9 @@ pub(crate) fn layer_name(layers: &[Layer]) -> String {
 
 /// The conversion of a generated picture for `to` on a document: a new layer is made in the
 /// document's palette with colour 0 kept for transparency ([`import::convert_for_layer`]),
-/// every other target with [`import::convert`]. One entry point for Generate and MCP.
+/// the brush with [`import::convert_for_brush`] (both match the document's palette as it is
+/// stored), every other target with [`import::convert`]. MCP's generation tools convert the
+/// same way (`dpx_mcp`'s `tools_gen.rs`).
 pub(crate) fn convert_for(
     picture: &dpx_core::RgbaImage,
     opts: &ConvertOptions,
@@ -317,6 +324,7 @@ pub(crate) fn convert_for(
 ) -> Result<Imported, dpx_core::CommandError> {
     match to {
         GenTarget::NewLayer => import::convert_for_layer(picture, opts, t),
+        GenTarget::Brush => import::convert_for_brush(picture, opts, t),
         _ => import::convert(picture, opts, t),
     }
 }
@@ -373,8 +381,8 @@ impl PainterApp {
     /// What MCP's generation tools share with Picture ▸ Generate.. (ADR-45): the job manager
     /// (one limit of requests in flight), the generator set up (the keychain is opened
     /// first when it is OpenAI), its model, the MCP jobs and the defaults: the requester's
-    /// choices of this session, else the shown picture's format with the requester's
-    /// default options.
+    /// choices of this session (once the user made one, [`Self::close_generate`]), else the
+    /// shown picture's format with the requester's default options.
     pub(crate) fn mcp_gen_host(&mut self) -> dpx_mcp::generation::GenHost {
         if self.imagegen.debug_provider.is_none()
             && self.imagegen.settings.provider == GenProvider::OpenAi
@@ -513,6 +521,11 @@ impl PainterApp {
         req.set_more(last.more);
         req.set_document(doc_format.0, doc_format.1);
         req.set_doc_layers(doc_layers);
+        self.imagegen.opened = Some(Remembered {
+            options: req.options(),
+            prompt: req.prompt(),
+            more: req.more(),
+        });
         self.ui.generate_requester = Some(req);
         self.imagegen.picture = None;
         self.imagegen.result = None;
@@ -644,18 +657,25 @@ impl PainterApp {
         }
     }
 
-    /// Closes the requester (remembering its choices); a running job is stopped.
+    /// Closes the requester (remembering its choices); a running job is stopped. Closed as it
+    /// was opened, before the user chose anything in this session, nothing is remembered:
+    /// MCP's `generate_image` then keeps the shown picture's format for options left out
+    /// (wave-8 integration review; the requester opens the same either way).
     fn close_generate(&mut self) {
         if let Some(id) = self.imagegen.job.take() {
             self.imagegen.jobs.cancel(id);
             self.imagegen.jobs.forget(id);
         }
+        let opened = self.imagegen.opened.take();
         if let Some(req) = self.ui.generate_requester.take() {
-            self.imagegen.last = Some(Remembered {
+            let now = Remembered {
                 options: req.options(),
                 prompt: req.prompt(),
                 more: req.more(),
-            });
+            };
+            if self.imagegen.last.is_some() || opened.as_ref() != Some(&now) {
+                self.imagegen.last = Some(now);
+            }
         }
         self.imagegen.picture = None;
         self.imagegen.result = None;

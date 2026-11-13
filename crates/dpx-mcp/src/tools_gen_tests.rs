@@ -293,10 +293,18 @@ mod with_generator {
 
     impl G {
         fn new(provider: Option<Arc<dyn ImageGenerationProvider>>) -> G {
+            G::with_workspace(provider, HeadlessWorkspace::default())
+        }
+
+        /// With `inner` as the picture and its spare page.
+        fn with_workspace(
+            provider: Option<Arc<dyn ImageGenerationProvider>>,
+            inner: HeadlessWorkspace,
+        ) -> G {
             let jobs = JobManager::new();
             let applied = Arc::new(Mutex::new(Vec::new()));
             let ws = GenWs {
-                inner: HeadlessWorkspace::default(),
+                inner,
                 host: GenHost {
                     jobs: jobs.clone(),
                     provider,
@@ -757,5 +765,191 @@ mod with_generator {
         let again = g.ok("cancel_generation", json!({ "job_id": job }));
         assert_eq!(again["cancelled"], false, "idempotent");
         drop(tx);
+    }
+
+    /// The status preview as a PNG of RGBA pixels and its colour type's channel count.
+    fn preview_of(r: &CallToolResult) -> dpx_core::RgbaImage {
+        let image = r.content[0].as_image().expect("a preview").data.clone();
+        let bytes = view::from_base64(&image).unwrap();
+        crate::pictures::decode_rgba("preview", &bytes).unwrap().0
+    }
+
+    /// Wave-8 integration review: one more layer must also fit the memory of every frame's
+    /// pictures (the rule `create_layer` meets); a new layer past it is refused before
+    /// anything is sent (and billed), and so is Apply of a job made for another target.
+    #[test]
+    fn a_new_layer_past_the_picture_memory_is_refused_before_anything_is_sent() {
+        let g = G::new(test_pattern());
+        let job = g.ok("generate_image", json!({"prompt": "x", "target": "brush"}))["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        g.done(&job);
+        // 320x256 pages: 820 frames of one layer fit, of two layers not.
+        g.ok(
+            "execute_command",
+            json!({"command": {"op": "set_frame_count", "count": 820}}),
+        );
+        let refused = g.call("create_layer", json!({}));
+        assert_eq!(code_of(&refused), "INVALID_ARGUMENT");
+        let sent = g.jobs.list().len();
+        let r = g.call(
+            "generate_image",
+            json!({"prompt": "a tree", "target": "new_layer"}),
+        );
+        assert_eq!(code_of(&r), "LAYER_LIMIT");
+        let msg = r.structured_content.unwrap()["message"].to_string();
+        assert!(msg.contains("820 frames of 2 layers"), "{msg}");
+        assert_eq!(g.jobs.list().len(), sent, "nothing was sent");
+        assert_eq!(
+            g.code(
+                "apply_generated_image",
+                json!({"job_id": job, "target": "new_layer"})
+            ),
+            "LAYER_LIMIT"
+        );
+        assert!(g.applied.lock().unwrap().is_empty(), "nothing applied");
+    }
+
+    /// Wave-8 integration review: a new layer with a transparent background is previewed as
+    /// it lands: its colour 0 is left transparent (alpha 0), as `get_preview` shows a layer
+    /// above the bottom one, and the note says so.
+    #[test]
+    fn a_new_layers_preview_leaves_colour_0_transparent() {
+        let g = G::new(test_pattern());
+        g.ok("fill_area", json!({"x": 0, "y": 0, "color": 5}));
+        let job = g.ok(
+            "generate_image",
+            json!({"prompt": "a tree", "target": "new_layer", "background": "transparent"}),
+        )["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let r = g.done(&job);
+        let png = preview_of(&r);
+        let st = r.structured_content.unwrap();
+        let scale = st["preview_scale"].as_u64().unwrap() as usize;
+        assert!(
+            st["notes"].to_string().contains("transparent (alpha 0)"),
+            "{st}"
+        );
+        g.ok("apply_generated_image", json!({ "job_id": job }));
+        let layer = g.applied.lock().unwrap()[0].result.page.clone();
+        let clear = layer.pixels().iter().filter(|&&p| p == 0).count();
+        assert!(clear > 0, "the test pattern's sky is transparent");
+        let transparent = png.pixels().iter().filter(|p| p.a == 0).count();
+        assert_eq!(
+            transparent,
+            clear * scale * scale,
+            "colour 0 is see-through"
+        );
+        assert!(png.pixels().iter().all(|p| p.a == 0 || p.a == 255));
+        // Where the layer is clear the picture shows the layer below (colour 5).
+        let at = layer.pixels().iter().position(|&p| p == 0).unwrap() as i32;
+        let (x, y) = (at % layer.width() as i32, at / layer.width() as i32);
+        let px = g.ok(
+            "get_pixels",
+            json!({"rect": {"x": x, "y": y, "w": 1, "h": 1}}),
+        );
+        assert_eq!(px["pixels"], json!([[5]]), "{px}");
+        // The brush and the other targets keep opaque previews.
+        let job = g.ok(
+            "generate_image",
+            json!({"prompt": "a tree", "target": "brush"}),
+        )["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let png = preview_of(&g.done(&job));
+        assert!(png.pixels().iter().all(|p| p.a == 255));
+    }
+
+    const OLD_OCS: &[u8] = include_bytes!("../../dpx-formats/tests/data/v1-ocs-not-12-bit.dpxproj");
+
+    /// Wave-8 integration review (ADR-46): the brush and a new layer keep an older OCS
+    /// project's palette as it is stored, so their results say which entries are not 12-bit
+    /// (as open_picture does) instead of claiming every entry is, report 8 palette bits, and
+    /// the picture is matched against the stored colours: the new layer's preview has only
+    /// the picture's colours and the brush needs no colour fitted. The spare page takes the
+    /// result's rounded palette and keeps the 12-bit note.
+    #[test]
+    fn the_brush_and_a_new_layer_keep_an_older_ocs_palette_and_say_so() {
+        let doc = dpx_formats::project::read_project(OLD_OCS)
+            .unwrap()
+            .document;
+        let stored = doc.palette().clone();
+        assert!(dpx_core::hardware::first_unshowable(Chipset::Ocs, stored.colors()).is_some());
+        let g = G::with_workspace(test_pattern(), HeadlessWorkspace::new(doc));
+        for target in ["new_layer", "brush"] {
+            let job = g.ok(
+                "generate_image",
+                json!({"prompt": "x", "target": target, "palette": "current"}),
+            )["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let r = g.done(&job);
+            let png = preview_of(&r);
+            let st = r.structured_content.unwrap();
+            let applied = g.ok("apply_generated_image", json!({ "job_id": job }));
+            for (what, v) in [("status", &st), ("apply", &applied)] {
+                let notes = v["notes"].to_string();
+                assert!(
+                    !notes.contains("every palette entry is a 12-bit colour"),
+                    "{target} {what}: {notes}"
+                );
+                assert!(
+                    notes.contains("palette entries 9-27, 29, 30 are not 12-bit OCS colours"),
+                    "{target} {what}: {notes}"
+                );
+                assert!(notes.contains("set_palette_color"), "{target} {what}");
+                assert!(v.get("rounded_colors").is_none(), "{target} {what}: {v}");
+            }
+            assert_eq!(st["palette_bits"], 8, "{target}: {st}");
+            // Matched against the stored colours: nothing to fit, nothing foreign shown.
+            assert!(
+                png.pixels()
+                    .iter()
+                    .filter(|p| p.a == 255)
+                    .all(|p| stored.colors().contains(&Rgb8::new(p.r, p.g, p.b))),
+                "{target}: every preview pixel is a stored colour"
+            );
+            if target == "brush" {
+                assert!(
+                    st["notes"]
+                        .to_string()
+                        .contains("0 of its colours had to change"),
+                    "{st}"
+                );
+            }
+        }
+        let list = g.applied.lock().unwrap();
+        assert_eq!(
+            list[0].result.palette, stored,
+            "the layer's palette as stored"
+        );
+        assert_eq!(list[0].result.rounded_colors, 0);
+        assert_eq!(
+            list[1].result.palette, stored,
+            "the brush's own palette too"
+        );
+        drop(list);
+        // The spare page takes the result's palette, rounded to 12 bits.
+        let job = g.ok(
+            "generate_image",
+            json!({"prompt": "x", "target": "spare", "palette": "current"}),
+        )["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let st = g.done(&job).structured_content.unwrap();
+        assert_eq!(st["palette_bits"], 4, "{st}");
+        assert_eq!(st["rounded_colors"], 21, "{st}");
+        assert!(
+            st["notes"]
+                .to_string()
+                .contains("every palette entry is a 12-bit colour"),
+            "{st}"
+        );
     }
 }

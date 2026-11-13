@@ -415,6 +415,31 @@ fn create_document_keeping_the_chipset_is_undoable() {
     assert_eq!(t.pixel(3, 3), 7);
 }
 
+/// Wave-8 integration review: a change to OCS counts the colours it rounds in
+/// `rounded_colors`, as the tool's description says (left out when none); a name of 200
+/// characters is taken whatever their UTF-8 length, 201 are refused.
+#[test]
+fn create_document_counts_rounded_colours_and_name_characters() {
+    let t = T::new();
+    t.ok("create_document", json!({"chipset": "aga"}));
+    t.ok("set_palette_color", json!({"index": 9, "color": "#123456"}));
+    t.ok(
+        "set_palette_color",
+        json!({"index": 10, "color": "#abcdef"}),
+    );
+    let c = t.ok("create_document", json!({"chipset": "ocs"}));
+    assert_eq!(c["rounded_colors"], 2, "{c}");
+    assert!(c["notes"].to_string().contains("2 colours rounded"), "{c}");
+    let c = t.ok("create_document", json!({"chipset": "ocs"}));
+    assert!(c.get("rounded_colors").is_none(), "{c}");
+    let name = "ä".repeat(200);
+    let c = t.ok("create_document", json!({"name": name}));
+    assert_eq!(c["success"], true);
+    let (code, msg) = t.err("create_document", json!({"name": "ä".repeat(201)}));
+    assert_eq!(code, "INVALID_ARGUMENT");
+    assert!(msg.contains("at most 200 characters"), "{msg}");
+}
+
 #[test]
 fn palette_colours_follow_the_chipset() {
     let t = T::new();
@@ -704,6 +729,11 @@ fn import_image_into_picture_spare_and_brush() {
     );
     assert_eq!(r["palette"], "current");
     assert_eq!(r["undoable"], true);
+    // Wave-8 integration review: the result names the page it went to (its undo step is
+    // there), with that page's revision.
+    assert_eq!(r["document_id"], "page2");
+    let spare = t.ok("get_document_info", json!({"document_id": "page2"}));
+    assert_eq!(r["revision"], spare["revision"]);
     t.ok("select_document", json!({"document_id": "page2"}));
     assert_eq!(t.pixel(10, 10), red, "spare top-left in the shared palette");
     t.ok("select_document", json!({"document_id": "page1"}));
@@ -716,6 +746,9 @@ fn import_image_into_picture_spare_and_brush() {
         (json!(8), json!(6))
     );
     assert!(r["notes"][0].as_str().unwrap().contains("transparent"));
+    // Wave-8 integration review: the brush is no document, so no undo step.
+    assert_eq!(r["undoable"], false, "{r}");
+    assert_eq!(r["document_id"], "page1");
     let s = t.ok("get_app_status", json!({}));
     assert_eq!(s["brush"], json!([8, 6]));
 

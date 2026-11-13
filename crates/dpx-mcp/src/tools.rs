@@ -43,7 +43,9 @@ pub const INSTRUCTIONS: &str = "DeluxePainter is an Amiga-style pixel editor (De
 A document is an indexed picture: every pixel is a palette index, drawing tools take a palette \
 index as `color` (see get_palette). OCS documents allow 32 colours in Low Res and 16 in High Res \
 with 12-bit colours; AGA allows 256 colours with 24-bit colours. Every change is one undo step \
-unless the result says `undoable: false`. Use get_preview to look at the picture; save with \
+of the page it changed (the result's document_id) unless the result says `undoable: false`; \
+undo and redo step the active page, so select_document a spare page first to undo a change \
+there. Use get_preview to look at the picture; save with \
 save_project (.dpxproj) and export with export_image (IFF ILBM, IFF ANIM, PNG). File paths must \
 lie in the approved directories (get_app_status lists them).";
 
@@ -620,7 +622,7 @@ static SPECS: &[Spec] = &[
     edit(
         "import_image",
         "Import image",
-        "Convert a PNG or JPEG (a path in an approved directory, or base64 data) into the document's format: fitted into the page, centre or top_left, a new palette of `colors` or the current palette, dither none|floyd_steinberg|ordered. Target picture (replaces it, not undoable), spare or brush.",
+        "Convert a PNG or JPEG (a path in an approved directory, or base64 data) into the document's format: fitted into the page, centre or top_left, a new palette of `colors` or the current palette, dither none|floyd_steinberg|ordered. Target picture (replaces it, not undoable), spare (one undo step on the spare page, in the picture's format and palette) or brush (not undoable).",
         schema::<ImportImageArgs>,
         true,
     ),
@@ -1370,6 +1372,10 @@ struct Created {
     revision: u64,
     undoable: bool,
     document: DocumentInfo,
+    /// Kept palette entries rounded to 12-bit OCS values by a change to OCS (ADR-46; left
+    /// out when none), as the tool's description and `set_format`'s outcome say.
+    #[serde(skip_serializing_if = "is_zero")]
+    rounded_colors: u16,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<String>,
 }
@@ -1378,6 +1384,7 @@ fn create_in(ws: &mut dyn Workspace, a: &CreateDocumentArgs) -> Result<Created, 
     let current = ws.engine().document();
     let f = plan_format(a, current.target())?;
     let mut notes = Vec::new();
+    let mut rounded_colors = 0;
     // One picture: an undoable SetFormat, a chipset change included (ADR-46: to OCS the
     // kept colours are rounded to 12 bits and counted). An animation is replaced by a
     // one-frame picture, as Picture > Load would.
@@ -1395,6 +1402,7 @@ fn create_in(ws: &mut dyn Workspace, a: &CreateDocumentArgs) -> Result<Created, 
             }
             .into(),
         )?;
+        rounded_colors = o.rounded_colors;
         if o.rounded_colors > 0 {
             notes.push(format!(
                 "{} colours rounded to 12-bit OCS values",
@@ -1436,6 +1444,7 @@ fn create_in(ws: &mut dyn Workspace, a: &CreateDocumentArgs) -> Result<Created, 
         revision: document.revision,
         undoable,
         document,
+        rounded_colors,
         notes,
     })
 }
@@ -1445,7 +1454,7 @@ async fn create_document(
     a: CreateDocumentArgs,
 ) -> Result<CallToolResult, ToolError> {
     if let Some(n) = &a.name
-        && (n.len() > 200 || n.chars().any(char::is_control))
+        && (n.chars().count() > 200 || n.chars().any(char::is_control))
     {
         return Err(ToolError::invalid(
             "name: at most 200 characters, no control characters",
@@ -2053,11 +2062,13 @@ pub const OLD_PALETTE_REFUSED_BY: &str = "export_image (every format, PNG too)";
 /// not 12-bit; it opens with them as stored, and the result names them, that `export_image`
 /// refuses the picture in every format until they are 12-bit, and how to fix them.
 fn old_palette_notes(doc: &Document) -> Vec<String> {
-    match dpx_core::hardware::stored_palette_note(
-        doc.target(),
-        doc.palette(),
-        OLD_PALETTE_REFUSED_BY,
-    ) {
+    stored_palette_notes(doc.target(), doc.palette())
+}
+
+/// [`old_palette_notes`] for a picture of `target` with `palette` (also the generation tools'
+/// brush and new layer, which keep the picture's palette as it is stored).
+fn stored_palette_notes(target: Target, palette: &Palette) -> Vec<String> {
+    match dpx_core::hardware::stored_palette_note(target, palette, OLD_PALETTE_REFUSED_BY) {
         Some(note) => vec![
             note,
             "to fix them, set them with set_palette_color (12-bit colours), or run set_format \
@@ -2315,7 +2326,15 @@ async fn import_image(ctx: &ToolCtx, a: ImportImageArgs) -> Result<CallToolResul
                 })?,
             }
             ws.log(&format!("import_image {log_name} to {kind:?}").to_lowercase());
-            Ok((ws.shown(), ws.engine().document().revision()))
+            // The page it went to: the spare page's id and revision for the spare (its undo
+            // step is on that page, as apply_generated_image reports it).
+            Ok(match kind {
+                ImportTargetArg::Spare => (
+                    ws.shown().other(),
+                    ws.spare().map_or(0, |d| d.revision()),
+                ),
+                _ => (ws.shown(), ws.engine().document().revision()),
+            })
         })
         .await??;
     #[derive(Serialize)]
@@ -2344,7 +2363,8 @@ async fn import_image(ctx: &ToolCtx, a: ImportImageArgs) -> Result<CallToolResul
         size: [size.0, size.1],
         palette: palette_choice,
         colors: result_palette,
-        undoable: kind != ImportTargetArg::Picture,
+        // The brush is no document: no undo step (as apply_generated_image's brush target).
+        undoable: kind == ImportTargetArg::Spare,
         notes,
     }))
 }

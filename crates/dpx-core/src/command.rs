@@ -337,13 +337,21 @@ pub enum Command {
         height: u32,
         pixels: Vec<u8>,
         /// The palette is a page's own, copied as it is stored ([`Command::replace_with_page`]:
-        /// Copy to Spare and Delete This Page between pages of different formats). On OCS it
+        /// Copy to Spare and Delete This Page between pages of different formats, and MCP's
+        /// `import_image` onto a spare page of its own format). On OCS it
         /// may then keep colours that are not 12-bit, as a project saved before ADR-46 holds
         /// them (wave-8 integration; every IFF export still refuses them), so a copy never
         /// changes colours. Not part of the JSON form: a command from MCP or a script always
         /// gives 12-bit colours on OCS.
         #[serde(skip)]
         stored: bool,
+        /// Another page's whole picture instead of the one page (wave-8 integration:
+        /// [`Command::replace_with_picture`], Delete This Page with a spare of its own format):
+        /// every frame with every layer, its current frame and active layer, checked as
+        /// [`Command::SetPicture`] checks them; `pixels` is then that picture's page (the
+        /// active layer of the current frame). Not part of the JSON form.
+        #[serde(skip)]
+        picture: Option<Box<crate::layer::PictureStack>>,
     },
 }
 
@@ -736,7 +744,14 @@ impl Command {
                 height,
                 pixels,
                 stored,
-            } => validate_replace_picture(*target, palette, *width, *height, pixels, *stored),
+                picture,
+            } => {
+                validate_replace_picture(*target, palette, *width, *height, pixels, *stored)?;
+                match picture {
+                    Some(p) => p.validate(palette.len(), *width, *height),
+                    None => Ok(()),
+                }
+            }
             Command::RemapColors { from } => {
                 if (1..=256).contains(&from.len()) {
                     Ok(())
@@ -1003,17 +1018,23 @@ impl Command {
                 width,
                 height,
                 pixels,
+                picture,
                 ..
             } => {
-                // One frame with one layer, "Background" (ADR-44): the generated picture.
-                let page = IndexedImage::from_pixels(*width, *height, pixels.clone())
-                    .expect("size checked by validate");
-                doc.set_layered(
-                    vec![vec![std::sync::Arc::new(page)]],
-                    vec![crate::Layer::background()],
-                    0,
-                    0,
-                );
+                if let Some(p) = picture {
+                    // Another page's whole picture, every frame with every layer.
+                    p.apply(doc, *width, *height);
+                } else {
+                    // One frame with one layer, "Background" (ADR-44): the generated picture.
+                    let page = IndexedImage::from_pixels(*width, *height, pixels.clone())
+                        .expect("size checked by validate");
+                    doc.set_layered(
+                        vec![vec![std::sync::Arc::new(page)]],
+                        vec![crate::Layer::background()],
+                        0,
+                        0,
+                    );
+                }
                 doc.palette = Palette::new(palette.clone()).expect("size checked by validate");
                 doc.target = *target;
             }
@@ -1220,7 +1241,22 @@ impl Command {
             height: page.height(),
             pixels: page.pixels().to_vec(),
             stored: true,
+            picture: None,
         }
+    }
+
+    /// [`Command::replace_with_page`] with `doc`'s whole picture: every frame with every
+    /// layer, its current frame and active layer (`picture`), so one undo step replaces a
+    /// document with all of `doc` (wave-8 integration: Delete This Page with a spare of its
+    /// own format). A one-frame picture with the default layer stack needs no `picture`.
+    pub fn replace_with_picture(doc: &Document) -> Command {
+        let mut command = Command::replace_with_page(doc);
+        if (doc.frame_count() > 1 || !crate::layer::is_default_stack(doc.layers()))
+            && let Command::ReplacePicture { picture, .. } = &mut command
+        {
+            *picture = Some(Box::new(crate::layer::PictureStack::of(doc)));
+        }
+        command
     }
 }
 

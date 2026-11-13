@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dpx_core::{BrushImage, Command, Document, Engine, IndexedImage, Outcome, Request};
+use dpx_core::{BrushImage, Document, Engine, IndexedImage, Outcome, Request};
 use dpx_formats::project::ProjectExtras;
 use dpx_mcp::endpoint;
 use dpx_mcp::generation::{ApplyTo, GenApply, GenHost};
@@ -858,16 +858,8 @@ impl Workspace for GuiWorkspace<'_> {
     }
 
     fn set_spare_page(&mut self, page: IndexedImage) -> Result<(), ToolError> {
-        let app = &mut *self.0;
-        let mut other = app.take_spare();
-        let result = other.engine.execute(Command::SetPage {
-            width: page.width(),
-            height: page.height(),
-            pixels: page.pixels().to_vec(),
-        });
-        app.menu_data.spare = Some(other);
-        app.dirty = true;
-        result.map(|_| ()).map_err(Into::into)
+        // A spare of its own format takes the picture's format and palette with the page.
+        self.0.import_to_spare(page).map_err(Into::into)
     }
 
     fn swap_spare(&mut self) -> Result<(), ToolError> {

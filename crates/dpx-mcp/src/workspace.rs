@@ -98,7 +98,9 @@ pub trait Workspace {
     /// page, ADR-15); `None` until it is first used.
     fn spare(&self) -> Option<Document>;
     /// Makes `page` the other page's picture (one undo step on that page). It must have the
-    /// shown page's size and use its palette.
+    /// shown page's size and use its palette; the other page then has the shown page's format
+    /// and palette (in the GUI a spare page with a format of its own, ADR-45, takes them with
+    /// the page).
     fn set_spare_page(&mut self, page: IndexedImage) -> Result<(), ToolError>;
     /// Picture > Spare > Swap.
     fn swap_spare(&mut self) -> Result<(), ToolError>;

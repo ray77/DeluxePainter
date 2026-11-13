@@ -4,7 +4,7 @@
 //!
 //! `Command::ReplacePicture` replaces a page's picture, format and palette in one undo step
 //! (Picture ▸ Generate.. onto the picture or the spare page, Delete This Page and Copy to
-//! Spare with a spare of its own format). The engine's undo brings back the document only, so
+//! Spare with a spare of its own format, MCP's `import_image` onto such a spare). The engine's undo brings back the document only, so
 //! this module keeps what the page had outside it with each such step: Undo on that page puts
 //! it back, Redo sets what the step gave again. The shown page and the spare page each have
 //! their own history, which `j` swaps with the pages (like their engines).
@@ -122,13 +122,14 @@ pub(crate) fn step_key(command: &Command) -> Option<u64> {
         width,
         height,
         pixels,
+        picture,
         ..
     } = command
     else {
         return None;
     };
     let mut h = DefaultHasher::new();
-    (target, palette, width, height, pixels).hash(&mut h);
+    (target, palette, width, height, pixels, picture).hash(&mut h);
     Some(h.finish())
 }
 
@@ -295,6 +296,7 @@ mod tests {
             height: 1,
             pixels: vec![p],
             stored: false,
+            picture: None,
         };
         assert_eq!(step_key(&command(0)), step_key(&command(0)));
         assert_ne!(step_key(&command(0)), step_key(&command(1)));

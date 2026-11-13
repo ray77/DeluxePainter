@@ -5,10 +5,11 @@
 //! They use the workspace's image generator ([`Workspace::image_generation`]): in the running
 //! GUI the generator, job manager (and so its in-flight limit), key store and choices of
 //! Picture ▸ Generate..; the conversion is `dpx_core::import::convert` (a new layer:
-//! `convert_for_layer`), the one the Generate requester uses, and Apply goes through the
-//! requester's own Apply ([`Workspace::apply_generated`]). Without a set-up generator nothing
-//! is generated and nothing is made up (`IMAGE_GENERATOR_NOT_CONFIGURED`); the headless
-//! server has no generator (`IMAGE_GENERATION_UNAVAILABLE`).
+//! `convert_for_layer`, the brush: `convert_for_brush`), the one the Generate requester uses,
+//! and Apply goes through the requester's own Apply ([`Workspace::apply_generated`]).
+//! Without a set-up generator nothing is generated and nothing is made up
+//! (`IMAGE_GENERATOR_NOT_CONFIGURED`); the headless server has no generator
+//! (`IMAGE_GENERATION_UNAVAILABLE`).
 //!
 //! `generate_image` only starts a job and answers at once; `get_generation_status` shows the
 //! converted picture when it is there; `apply_generated_image` applies it as one undo step,
@@ -311,7 +312,9 @@ mod work {
         }
     }
 
-    /// A new layer needs room and a palette its mode shows.
+    /// A new layer needs room (the most layers, and the memory of every frame's pictures:
+    /// `dpx_core::layer::room_for_layer`, the rule `AddPictureLayer` applies) and a palette its
+    /// mode shows.
     fn layer_fits(dc: &DocContext) -> Result<(), ToolError> {
         if dc.layers >= MAX_LAYERS {
             return Err(ToolError::new(
@@ -320,6 +323,17 @@ mod work {
                     "the picture has {} layers, the most allowed ({MAX_LAYERS}): delete or \
                      merge one, or use another target",
                     dc.layers
+                ),
+            ));
+        }
+        if let Err(e) = dpx_core::layer::room_for_layer(dc.layers, dc.frames, dc.page.0, dc.page.1)
+        {
+            return Err(ToolError::new(
+                "LAYER_LIMIT",
+                format!(
+                    "no room for another layer: {}; delete frames or layers, or use another \
+                     target",
+                    e.message
                 ),
             ));
         }
@@ -716,7 +730,6 @@ mod work {
     ) -> Result<Imported, ToolError> {
         let (format, page, opts) = conversion(plan, dc, to);
         let (palette, bg) = (dc.palette.clone(), dc.bg);
-        let layer = to == GenTargetArg::NewLayer;
         blocking(move || {
             let t = ConvertTarget {
                 target: format,
@@ -725,10 +738,12 @@ mod work {
                 bg,
                 transparent: TRANSPARENT_PINK,
             };
-            if layer {
-                import::convert_for_layer(&picture, &opts, &t)
-            } else {
-                import::convert(&picture, &opts, &t)
+            // As the Generate requester converts (`generate::convert_for` in the app): the
+            // brush and a new layer match the picture's palette as it is stored.
+            match to {
+                GenTargetArg::NewLayer => import::convert_for_layer(&picture, &opts, &t),
+                GenTargetArg::Brush => import::convert_for_brush(&picture, &opts, &t),
+                _ => import::convert(&picture, &opts, &t),
             }
         })
         .await?
@@ -781,7 +796,32 @@ mod work {
         }
     }
 
-    fn notes_for(r: &Imported, to: GenTargetArg, landed: &Landed) -> Vec<String> {
+    /// The brush and a new layer keep the shown picture's palette as it is stored (ADR-46,
+    /// wave-8 integration: an older OCS project's may hold colours that are not 12-bit).
+    fn keeps_palette(to: GenTargetArg) -> bool {
+        matches!(to, GenTargetArg::Brush | GenTargetArg::NewLayer)
+    }
+
+    /// The notes on an older OCS project's stored palette that `to` keeps (none for the
+    /// targets that take the result's palette, which is 12-bit on OCS).
+    fn kept_palette_notes(dc: &DocContext, to: GenTargetArg) -> Vec<String> {
+        if keeps_palette(to) {
+            stored_palette_notes(dc.target, &dc.palette)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Bits per colour channel of the palette the picture lands in: 4 on OCS, 8 on AGA and
+    /// for an older OCS project's stored palette that the brush or a new layer keeps.
+    fn palette_bits(dc: &DocContext, to: GenTargetArg, landed: &Landed) -> u8 {
+        match landed.format.chipset {
+            Chipset::Ocs if kept_palette_notes(dc, to).is_empty() => 4,
+            _ => 8,
+        }
+    }
+
+    fn notes_for(r: &Imported, to: GenTargetArg, landed: &Landed, dc: &DocContext) -> Vec<String> {
         let format = landed.format;
         let mut notes = Vec::new();
         if r.transparent_color.is_some() {
@@ -800,9 +840,11 @@ mod work {
                 landed.fitted
             ));
         }
-        if format.chipset == Chipset::Ocs {
+        let stored = kept_palette_notes(dc, to);
+        if format.chipset == Chipset::Ocs && stored.is_empty() {
             notes.push("OCS: every palette entry is a 12-bit colour".to_string());
         }
+        notes.extend(stored);
         let rounded = rounded_colors(r, to);
         if rounded > 0 {
             notes.push(format!(
@@ -934,19 +976,28 @@ mod work {
                 out.chipset = Some(ChipsetArg::of(landed.format.chipset));
                 out.colors_used = Some(landed.colors_used);
                 out.palette_size = Some(landed.palette.len());
-                out.palette_bits = Some(match landed.format.chipset {
-                    Chipset::Ocs => 4,
-                    Chipset::Aga => 8,
-                });
+                out.palette_bits = Some(palette_bits(&l.dc, to, &landed));
                 out.rounded_colors = rounded_colors(&r, to);
-                out.notes = notes_for(&r, to, &landed);
+                out.notes = notes_for(&r, to, &landed, &l.dc);
                 out.notes.push(
                     "apply_generated_image applies it (one undo step); the preview shows it \
                      as it lands, in the palette colours, square pixels"
                         .into(),
                 );
+                // A new layer as get_preview shows a layer above the bottom one: its colour 0
+                // is transparent (alpha 0), as it will be in the picture.
+                let transparent = (to == GenTargetArg::NewLayer).then_some(0);
+                if transparent.is_some() {
+                    out.notes.push(
+                        "the preview shows the new layer alone; its colour 0 is left \
+                         transparent (alpha 0), where the layers below will show"
+                            .into(),
+                    );
+                }
                 let Landed { page, palette, .. } = landed;
-                let rendered = blocking(move || view::render_png(&page, &palette, scale)).await??;
+                let rendered =
+                    blocking(move || view::render_png_with(&page, &palette, scale, transparent))
+                        .await??;
                 out.preview_scale = Some(rendered.scale);
                 Ok(image_result(view::to_base64(&rendered.png), &out))
             }
@@ -974,7 +1025,8 @@ mod work {
 
     /// The question before a generated picture replaces the shown one (spec §7.7): it
     /// names every frame and layer that goes when there is more than one (Picture is one
-    /// frame with one layer afterwards), as the Generate requester's Apply line does.
+    /// frame with one layer afterwards). The Generate requester's Apply line names the
+    /// frames only (`generate::apply_text` in the app; ADR-45, "Seam review").
     pub fn replace_question(
         client: Option<&str>,
         w: u32,
@@ -1135,7 +1187,7 @@ mod work {
         let depends = apply_to == ApplyTo::NewLayer || opts.palette == PaletteChoice::Current;
         let dc = l.dc.clone();
         let format = conversion(&l.plan, &l.dc, to).0;
-        let mut notes = notes_for(&r, to, &landed);
+        let mut notes = notes_for(&r, to, &landed, &l.dc);
         let rounded = rounded_colors(&r, to);
         let (slot, revision, document) = ctx
             .exec

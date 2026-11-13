@@ -1924,6 +1924,7 @@ mod tests {
             height: 256,
             pixels: vec![5; 320 * 256],
             stored: false,
+            picture: None,
         };
         let new_layer = Command::AddPictureLayer {
             name: Some("Generated".into()),

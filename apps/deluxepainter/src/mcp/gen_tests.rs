@@ -564,3 +564,154 @@ fn the_api_key_never_reaches_a_client_or_the_activity_log() {
         Some(dpx_imagegen::openai::DEFAULT_MODEL)
     );
 }
+
+/// Wave-8 integration review: a layer an AI client adds to a generated spare page of its own
+/// format (acceptance test 5's page, shown with select_document) is kept when the user then
+/// picks Delete This Page: the shown page becomes the spare's whole picture.
+#[test]
+fn layers_made_over_mcp_on_a_generated_spare_survive_delete_this_page() {
+    let mut rig = rig_with(Some(Arc::new(TestPattern)));
+    let job = generated(
+        &mut rig,
+        json!({"prompt": "a castle", "width": 320, "height": 240, "chipset": "OCS",
+               "palette_size": 32}),
+    );
+    rig.ok("apply_generated_image", json!({ "job_id": job }));
+    rig.ok("select_document", json!({"document_id": "page2"}));
+    let castle = rig.app.engine.document().page().clone();
+    rig.ok("create_layer", json!({"name": "Sky"}));
+    rig.ok("draw_rectangle", rect(10, 10, 5));
+    let worked = rig.app.engine.document().clone();
+    rig.ok("select_document", json!({"document_id": "page1"}));
+    let info = rig.ok("get_document_info", json!({"document_id": "page2"}));
+    assert_eq!(info["layer_count"], 2);
+    rig.app.delete_page();
+    rig.pass();
+    let doc = rig.app.engine.document();
+    assert_eq!(doc.layers(), worked.layers());
+    assert_eq!(doc.cel(0, 0), Some(&castle), "the generated picture");
+    assert_eq!(doc.cel(0, 1), worked.cel(0, 1), "the client's layer");
+    let info = rig.ok("get_document_info", json!({}));
+    assert_eq!(info["layer_count"], 2, "{info}");
+}
+
+/// A 2x2 PNG: red, green, blue and white.
+fn four_colours_png() -> String {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, 2, 2);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])
+        .unwrap();
+    dpx_mcp::view::to_base64(&out)
+}
+
+/// Wave-8 integration review: import_image to a generated spare page of its own format
+/// (new_document) puts the picture there in the shown page's format and palette, the
+/// colours it was converted for, whether the spare's own page has that size or not; one
+/// undo step on that page brings the generated picture back. The result names that page.
+#[test]
+fn an_image_imported_to_a_spare_of_its_own_format_is_in_the_pictures_palette() {
+    for preset in ["pal_lores", "pal_hires"] {
+        let mut rig = rig_with(Some(Arc::new(TestPattern)));
+        let job = generated(
+            &mut rig,
+            json!({"prompt": "a castle", "target": "new_document", "chipset": "aga",
+                   "preset": preset, "colors": 256}),
+        );
+        rig.ok("apply_generated_image", json!({ "job_id": job }));
+        assert!(rig.app.menu_data.spare_own.is_some(), "{preset}");
+        let generated_spare = rig.app.mcp_spare().unwrap();
+        let r = rig.ok(
+            "import_image",
+            json!({"data": four_colours_png(), "target": "spare", "dither": "none",
+                   "position": "top_left"}),
+        );
+        assert_eq!(r["document_id"], "page2", "{preset}: {r}");
+        assert_eq!(r["undoable"], true);
+        let shown = rig.app.engine.document().clone();
+        let spare = rig.app.mcp_spare().unwrap();
+        assert_eq!(spare.target(), shown.target(), "{preset}");
+        assert_eq!(spare.palette(), shown.palette(), "{preset}");
+        let size = |d: &dpx_core::Document| (d.page().width(), d.page().height());
+        assert_eq!(size(&spare), size(&shown), "{preset}");
+        assert!(
+            rig.app.menu_data.spare_own.is_none(),
+            "an ordinary spare again"
+        );
+        assert_eq!(r["revision"], spare.revision());
+        // The red quarter shows the picture palette's red on the spare page.
+        rig.ok("select_document", json!({"document_id": "page2"}));
+        let pal = rig.ok("get_palette", json!({}));
+        let red = rig.pixel(10, 10);
+        let shows =
+            dpx_mcp::tools::parse_color(pal["colors"][red as usize].as_str().unwrap()).unwrap();
+        assert!(
+            shows.r >= 0xc0 && shows.g < 0x40 && shows.b < 0x40,
+            "{preset}: {shows}"
+        );
+        // One undo step there: the generated picture, its own format and details again.
+        rig.ok("undo", json!({}));
+        let doc = rig.app.engine.document();
+        assert_eq!(doc.target(), generated_spare.target(), "{preset}");
+        assert_eq!(doc.palette(), generated_spare.palette());
+        assert_eq!(doc.page(), generated_spare.page());
+        assert!(
+            rig.app.menu_data.spare_own.is_some(),
+            "its own details again"
+        );
+    }
+}
+
+/// Wave-8 integration review: opening Picture > Generate.. and closing it without a choice
+/// leaves generate_image's defaults at the shown picture's format; a choice made there is
+/// remembered for MCP as before.
+#[test]
+fn opening_and_cancelling_generate_leaves_the_mcp_defaults_alone() {
+    let mut rig = rig_with(Some(Arc::new(TestPattern)));
+    rig.ok(
+        "create_document",
+        json!({"preset": "pal_interlace", "chipset": "aga", "colors": 64}),
+    );
+    let plan = |v: &Value| {
+        (
+            v["width"].clone(),
+            v["height"].clone(),
+            v["chipset"].clone(),
+            v["colors"].clone(),
+        )
+    };
+    let shown = (json!(640), json!(512), json!("aga"), json!(64));
+    let a = rig.ok("generate_image", json!({"prompt": "a tree"}));
+    assert_eq!(plan(&a), shown);
+    rig.app.imagegen.jobs.wait(
+        JobId(job_of(&a).strip_prefix("gen-").unwrap().parse().unwrap()),
+        Duration::from_secs(10),
+    );
+    rig.app.open_generate();
+    rig.app
+        .generate_event(dpx_ui::ReqEvent::Key(dpx_ui::ReqKey::Escape));
+    assert!(rig.app.ui.generate_requester.is_none(), "closed again");
+    assert!(rig.app.imagegen.last.is_none(), "nothing chosen");
+    let b = rig.ok("generate_image", json!({"prompt": "a tree"}));
+    assert_eq!(plan(&b), shown, "still the shown picture's format");
+    rig.app.imagegen.jobs.wait(
+        JobId(job_of(&b).strip_prefix("gen-").unwrap().parse().unwrap()),
+        Duration::from_secs(10),
+    );
+    // A description typed there is a choice: the requester's choices count from then on.
+    rig.app.open_generate();
+    rig.app
+        .ui
+        .generate_requester
+        .as_mut()
+        .unwrap()
+        .set_prompt("A tree");
+    rig.app
+        .generate_event(dpx_ui::ReqEvent::Key(dpx_ui::ReqKey::Escape));
+    assert!(rig.app.imagegen.last.is_some());
+    let c = rig.ok("generate_image", json!({"prompt": "a tree"}));
+    assert_ne!(plan(&c), shown, "the requester's resolution");
+}

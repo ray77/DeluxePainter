@@ -117,13 +117,31 @@ fn tool_list() -> Vec<(String, String)> {
         .into_iter()
         .map(|t| {
             let d = t.description.as_deref().unwrap_or_default();
-            let first = match d.find(". ") {
-                Some(i) => &d[..=i],
-                None => d,
-            };
-            (t.name.to_string(), first.trim().to_string())
+            (t.name.to_string(), first_sentence(d).to_string())
         })
         .collect()
+}
+
+/// The first sentence of `text`: up to the first ". " outside parentheses that does not end
+/// an abbreviation such as "e.g." (wave-8 integration review: generate_image's description
+/// has "(...; e.g. OpenAI Images)" before its first full stop), else all of it.
+fn first_sentence(text: &str) -> &str {
+    const ABBREVIATIONS: [&str; 3] = ["e.g", "i.e", "etc"];
+    let mut depth = 0i32;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '.' if depth == 0 && text[i + 1..].starts_with(' ') => {
+                let word = text[..i].rsplit([' ', '(']).next().unwrap_or_default();
+                if !ABBREVIATIONS.contains(&word) {
+                    return text[..=i].trim();
+                }
+            }
+            _ => {}
+        }
+    }
+    text.trim()
 }
 
 /// The binary's path inside the bundle for `os`.
@@ -285,13 +303,41 @@ mod tests {
         let tools = m["tools"].as_array().unwrap();
         for t in tools {
             keys_within(t, TOOL, "tool");
-            assert!(!t["description"].as_str().unwrap().is_empty());
+            let d = t["description"].as_str().unwrap();
+            assert!(!d.is_empty());
+            // A whole sentence: parentheses closed, not cut at an abbreviation.
+            assert_eq!(d.matches('(').count(), d.matches(')').count(), "{d}");
+            assert!(
+                !d.ends_with("e.g.") && !d.ends_with("i.e.") && d.ends_with('.'),
+                "{d}"
+            );
         }
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, dpx_mcp::tools::names(), "the server's own tools");
         assert!(
             m.get("icon").is_none(),
             "no icon: branding is the owner's call"
+        );
+    }
+
+    /// Wave-8 integration review: generate_image's first sentence holds "(...; e.g. ...)".
+    #[test]
+    fn the_first_sentence_skips_abbreviations_and_parentheses() {
+        assert_eq!(first_sentence("One. Two."), "One.");
+        assert_eq!(first_sentence("No full stop"), "No full stop");
+        assert_eq!(
+            first_sentence("Ask (a; e.g. B) for it. More (x. y)."),
+            "Ask (a; e.g. B) for it."
+        );
+        assert_eq!(first_sentence("Use i.e. this. Then"), "Use i.e. this.");
+        let generate = tool_list()
+            .into_iter()
+            .find(|(n, _)| n == "generate_image")
+            .unwrap()
+            .1;
+        assert!(
+            generate.ends_with("for a picture from a description."),
+            "{generate}"
         );
     }
 

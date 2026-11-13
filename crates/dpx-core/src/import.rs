@@ -501,7 +501,7 @@ pub fn convert(
     opts: &ConvertOptions,
     t: &ConvertTarget,
 ) -> Result<Imported, CommandError> {
-    convert_with(img, opts, t, false)
+    convert_with(img, opts, t, false, false)
 }
 
 /// [`convert`] for a new layer above the bottom one (ADR-45, the "New layer" target), where
@@ -509,6 +509,11 @@ pub fn convert(
 /// used), and colour 0 goes only to transparent pixels (with `transparent_background`) and
 /// to the margins that are transparent or in BG colour 0. Every opaque pixel takes the
 /// nearest other colour, so nothing the picture shows turns see-through on the layer.
+///
+/// The layer keeps the document's palette, so the picture is matched against that palette
+/// as it is stored: on OCS an older project's colours that are not 12-bit are not rounded
+/// first (wave-8 integration; [`Imported::rounded_colors`] is 0, the result's palette is the
+/// current one).
 pub fn convert_for_layer(
     img: &RgbaImage,
     opts: &ConvertOptions,
@@ -518,14 +523,30 @@ pub fn convert_for_layer(
         palette: PaletteChoice::Current,
         ..*opts
     };
-    convert_with(img, &opts, t, true)
+    convert_with(img, &opts, t, true, true)
 }
 
+/// [`convert`] for the brush (ADR-45, the "Brush" target), which is fitted to the document's
+/// palette: with the current palette the picture is matched against it as it is stored, so
+/// on OCS an older project's colours that are not 12-bit are not rounded first (wave-8
+/// integration; [`Imported::rounded_colors`] is 0 and the result's palette is the current
+/// one). With a new palette it is [`convert`].
+pub fn convert_for_brush(
+    img: &RgbaImage,
+    opts: &ConvertOptions,
+    t: &ConvertTarget,
+) -> Result<Imported, CommandError> {
+    convert_with(img, opts, t, false, true)
+}
+
+/// `stored`: a current palette is used as it is stored, not rounded for the chipset (the
+/// targets that keep the document's palette).
 fn convert_with(
     img: &RgbaImage,
     opts: &ConvertOptions,
     t: &ConvertTarget,
     reserve_zero: bool,
+    stored: bool,
 ) -> Result<Imported, CommandError> {
     let target = t.target;
     let mode = target.mode;
@@ -582,7 +603,11 @@ fn convert_with(
         Chipset::Aga => PaletteDepth::Rgb8,
     };
     let mut colors = t.palette.colors().to_vec();
-    let rounded = crate::hardware::snap_colors(target.chipset, &mut colors);
+    let rounded = if stored && opts.palette == PaletteChoice::Current {
+        0
+    } else {
+        crate::hardware::snap_colors(target.chipset, &mut colors)
+    };
     let current = Palette::new(colors).expect("same number of entries");
     let bg = t.bg.min((current.len() - 1) as u8);
     let bg_rgb = current.get(bg).unwrap_or(Rgb8::BLACK);
@@ -677,6 +702,7 @@ impl Imported {
             height: self.page.height(),
             pixels: self.page.pixels().to_vec(),
             stored: false,
+            picture: None,
         }
     }
 
@@ -1407,6 +1433,51 @@ mod tests {
         let plain = Palette::dpaint_default_32();
         let r = convert(&img, &current, &ctarget(ocs_320x240(), (320, 240), &plain)).unwrap();
         assert_eq!(r.rounded_colors, 0);
+    }
+
+    /// Wave-8 integration review: a new layer and the brush keep the document's palette as
+    /// it is stored, so they are matched against those colours, not against a rounded copy:
+    /// a pixel that is exactly an older OCS project's colour 10 (not 12-bit) is colour 10,
+    /// as on AGA, and nothing is counted as rounded. `convert` (the spare page, the picture)
+    /// still rounds.
+    #[test]
+    fn a_new_layer_and_the_brush_are_matched_against_the_stored_palette() {
+        let mut colors = Palette::dpaint_default_32().colors()[..8].to_vec();
+        for i in 0..24u32 {
+            let v = (i * 255 / 23) as u8;
+            colors.push(Rgb8::new(v, v, v));
+        }
+        let pal = Palette::new(colors.clone()).unwrap();
+        assert!(!is_12_bit(colors[10]));
+        let exact = Rgba8::opaque(colors[10].r, colors[10].g, colors[10].b);
+        let img = image(320, 256, |_, _| exact);
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
+        let t = ctarget(ocs, (320, 256), &pal);
+        let current = ConvertOptions {
+            palette: PaletteChoice::Current,
+            ..copts(Scaler::Nearest, 32, Dither::None)
+        };
+        for r in [
+            convert_for_layer(&img, &current, &t).unwrap(),
+            convert_for_brush(&img, &current, &t).unwrap(),
+        ] {
+            assert_eq!(r.page.get(10, 10), Some(10));
+            assert_eq!(r.palette, pal, "the palette as stored");
+            assert_eq!(r.rounded_colors, 0);
+        }
+        // The targets that take the result's palette round it for OCS.
+        let r = convert(&img, &current, &t).unwrap();
+        assert!(r.rounded_colors > 0);
+        assert!(r.palette.colors().iter().all(|&c| is_12_bit(c)));
+        // A new palette for the brush is made in 12-bit colours, as by `convert`.
+        let new = ConvertOptions {
+            palette: PaletteChoice::New,
+            ..current
+        };
+        assert_eq!(
+            convert_for_brush(&img, &new, &t).unwrap(),
+            convert(&img, &new, &t).unwrap()
+        );
     }
 
     const GREEN: Rgba8 = Rgba8::opaque(0, 255, 0);

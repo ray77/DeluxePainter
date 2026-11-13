@@ -126,8 +126,15 @@ fn command_bytes(command: &Command) -> u64 {
             pixels.len() as u64 + name.as_ref().map_or(0, |n| n.len() as u64)
         }
         Command::ReplacePicture {
-            palette, pixels, ..
-        } => pixels.len() as u64 + 3 * palette.len() as u64,
+            palette,
+            pixels,
+            picture,
+            ..
+        } => {
+            pixels.len() as u64
+                + 3 * palette.len() as u64
+                + picture.as_ref().map_or(0, |p| p.bytes())
+        }
         Command::ArrangePalette { order } => order.len() as u64,
         Command::SetPicture { layers, frames, .. } => {
             let names: u64 = layers.iter().map(|l| l.name.len() as u64).sum();
@@ -2091,6 +2098,7 @@ mod tests {
             height: h,
             pixels: (0..w * h).map(|i| (i % colors as u32) as u8).collect(),
             stored: false,
+            picture: None,
         }
     }
 
@@ -2254,5 +2262,73 @@ mod tests {
         );
         assert_eq!(e.document().target(), before.target());
         assert_eq!(e.document().palette(), before.palette());
+    }
+
+    /// Wave-8 integration review: `replace_with_picture` replaces a document with another
+    /// page's whole picture (format, palette, every frame with every layer, its current frame
+    /// and active layer) in one undo step, and Redo gives all of it again; a picture that does
+    /// not fit its stack's rules is refused. The JSON form has no such field.
+    #[test]
+    fn a_whole_picture_replaces_a_document_in_one_step() {
+        use crate::{Chipset, DisplayMode, Layer, Target};
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES).with_screen(320, 240);
+        let mut other = Engine::new(Document::from_picture(
+            IndexedImage::new(320, 240, 4),
+            Palette::dpaint_default_32(),
+            ocs,
+        ));
+        other
+            .execute(Command::AddLayer {
+                name: Some("Sky".into()),
+            })
+            .unwrap();
+        other.execute(Command::Clear { color: 3 }).unwrap();
+        other.execute(Command::AddFrames { count: 2 }).unwrap();
+        other.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        other.execute(Command::Clear { color: 7 }).unwrap();
+        other.execute(Command::SelectLayer { layer: 0 }).unwrap();
+        let want = other.document().clone();
+        assert_eq!((want.frame_count(), want.layer_count()), (3, 2));
+        let command = Command::replace_with_picture(&want);
+        let mut e = engine();
+        let before = e.document().clone();
+        let same = |d: &Document| {
+            assert_eq!(d.target(), want.target());
+            assert_eq!(d.palette(), want.palette());
+            assert_eq!(d.layers(), want.layers());
+            assert_eq!(d.frame_count(), 3);
+            assert_eq!((d.current_frame(), d.active_layer()), (1, 0));
+            for f in 0..3 {
+                for l in 0..2 {
+                    assert_eq!(d.cel(f, l), want.cel(f, l), "frame {f} layer {l}");
+                }
+            }
+        };
+        e.execute(command.clone()).unwrap();
+        same(e.document());
+        e.undo().unwrap();
+        assert_eq!(e.document().target(), before.target());
+        assert_eq!(e.document().page(), before.page());
+        assert_eq!(e.document().layers(), before.layers());
+        assert!(!e.can_undo(), "one step");
+        e.redo().unwrap();
+        same(e.document());
+        // A one-frame picture with the default stack is the page alone.
+        let plain = Document::new(16, 8, Palette::dpaint_default_32());
+        assert!(matches!(
+            Command::replace_with_picture(&plain),
+            Command::ReplacePicture { picture: None, .. }
+        ));
+        // The stack is checked as SetPicture checks it.
+        let mut broken = command.clone();
+        if let Command::ReplacePicture {
+            picture: Some(p), ..
+        } = &mut broken
+        {
+            p.layers.push(Layer::new("Extra"));
+        }
+        assert!(e.execute(broken).is_err());
+        let json = serde_json::to_value(&command).unwrap();
+        assert!(json.get("picture").is_none());
     }
 }

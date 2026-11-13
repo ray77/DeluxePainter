@@ -34,7 +34,7 @@ See [`docs/FEATURES.md`](docs/FEATURES.md) for the prioritised feature set and [
 
 ## Connect to Claude in two minutes
 
-Claude can paint in DeluxePainter for you: you ask in plain words, Claude uses DeluxePainter's own tools, and the result appears in the window. Most changes Claude makes (drawing, palette, layer edits) are normal undo steps, so `U` takes them back like your own strokes. A few changes are not: opening a picture or importing one onto the picture (as Picture ▸ Load.. is not), a new picture in place of an animation, and a generated picture made the brush. Nothing is switched on or installed until you do it yourself.
+Claude can paint in DeluxePainter for you: you ask in plain words, Claude uses DeluxePainter's own tools, and the result appears in the window. Most changes Claude makes (drawing, palette, layer edits) are normal undo steps, so `U` takes them back like your own strokes. A few changes are not: opening a picture or importing one onto the picture (as Picture ▸ Load.. is not), a new picture in place of an animation, and an imported or generated picture made the brush. A change Claude makes to the spare page is an undo step of that page: press `j` to show it, then `U`. Nothing is switched on or installed until you do it yourself.
 
 You need DeluxePainter (there are no ready-made downloads yet, see [Building](#building)) and [Claude Code](https://code.claude.com/docs/en/setup) or [Claude Desktop](https://claude.ai/download).
 

@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use dpx_core::{Command, Document, Engine, IndexedImage, Palette, Rgb8, Target};
+use dpx_core::{Command, CommandError, Document, Engine, IndexedImage, Palette, Rgb8, Target};
 use dpx_iff::{ColorRange, iff};
 use dpx_ui::{FileKind, NoteRequester, RangeData, RangeRequester, RangeResponse, ReqEvent};
 use eframe::egui;
@@ -450,6 +450,50 @@ impl PainterApp {
         self.menu_data.spare = Some(other);
     }
 
+    /// MCP's `import_image` to the spare page: `page` (the shown page's size, in its
+    /// palette) becomes the spare's picture in one undo step on the spare page. A spare of
+    /// its own format (ADR-45) takes the shown page's format and palette with it (one
+    /// `ReplacePicture` step, which also brings back its own details) and is an ordinary spare
+    /// again, as Copy to Spare makes it (wave-8 integration review: the picture's colour
+    /// numbers never land in the spare's own palette). The palette goes as the shown page
+    /// stores it (`stored`, as `Command::replace_with_page`).
+    pub(crate) fn import_to_spare(&mut self, page: IndexedImage) -> Result<(), CommandError> {
+        let own = self.menu_data.spare_own.is_some();
+        let mut other = self.take_spare();
+        let (width, height) = (page.width(), page.height());
+        let result = if own {
+            let before = self.spare_files(&other);
+            let doc = self.engine.document();
+            let command = Command::ReplacePicture {
+                target: doc.target(),
+                palette: doc.palette().colors().to_vec(),
+                width,
+                height,
+                pixels: page.pixels().to_vec(),
+                stored: true,
+                picture: None,
+            };
+            let key = crate::generate::page_state::step_key(&command);
+            let result = other.engine.execute(command);
+            if result.is_ok() {
+                if let Some(key) = key {
+                    self.menu_data.page_history.spare.record(key, before);
+                }
+                self.menu_data.spare_own = None;
+            }
+            result
+        } else {
+            other.engine.execute(Command::SetPage {
+                width,
+                height,
+                pixels: page.pixels().to_vec(),
+            })
+        };
+        self.menu_data.spare = Some(other);
+        self.dirty = true;
+        result.map(drop)
+    }
+
     /// Picture ▸ Spare ▸ Merge in Front / Back (undoable). Colour 0 is transparent: in front,
     /// the spare's colour-0 pixels; in back, the shown page's (ADR-15). The spare as it shows
     /// (all visible layers) merges into the active layer (ADR-44); in back only where the
@@ -527,8 +571,11 @@ impl PainterApp {
 
     /// Delete This Page with a generated spare of its own format or palette (ADR-45): the
     /// shown page becomes the spare's picture, format, palette and details in one undo step
-    /// (which brings all of them back). Refused, with a note, while the picture has more than
-    /// one frame: every frame shares one format, so the whole animation would go.
+    /// (which brings all of them back; Redo gives the spare's picture again). The spare's
+    /// whole picture goes, every frame with every layer (wave-8 integration:
+    /// `Command::replace_with_picture`), as Swap would show it. Refused, with a note, while
+    /// the shown picture has more than one frame: every frame shares one format, so the whole
+    /// animation would go.
     fn delete_page_for_own_spare(&mut self) {
         let frames = self.engine.document().frame_count();
         if frames > 1 {
@@ -548,8 +595,9 @@ impl PainterApp {
             return;
         };
         let before = self.shown_files();
-        // The spare's palette as it stores it (also an older OCS project's, wave-8).
-        let command = Command::replace_with_page(other.engine.document());
+        // The spare's whole picture (every frame and layer) with its palette as it stores it
+        // (also an older OCS project's, wave-8), in one undo step.
+        let command = Command::replace_with_picture(other.engine.document());
         let key = crate::generate::page_state::step_key(&command);
         match self.engine.execute(command) {
             Ok(_) => {

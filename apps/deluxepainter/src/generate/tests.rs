@@ -2033,3 +2033,111 @@ fn a_picture_with_the_most_layers_gets_no_new_one_and_says_so() {
     assert!(app.ui.generate_requester.is_none(), "applied as the brush");
     assert!(app.custom_brush.is_some());
 }
+
+/// Wave-8 integration review: Delete This Page with a generated spare of its own format that
+/// was given layers takes the spare's whole picture (every layer, the generated picture
+/// on the bottom one) in one undo step; Undo brings the shown page back, Redo the spare's
+/// whole picture again.
+#[test]
+fn delete_this_page_keeps_every_layer_of_a_spare_of_its_own_format() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let shown = app.engine.document().clone();
+    let t = generate_for(&mut app, &ctx, "A castle", GenTarget::Spare);
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert!(app.spare_differs());
+    // j: on the generated page, a layer "Sky" with a band of colour 3, then back.
+    ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
+    let castle = app.engine.document().page().clone();
+    let (w, h) = (castle.width(), castle.height());
+    app.engine
+        .execute(Command::AddLayer {
+            name: Some("Sky".into()),
+        })
+        .unwrap();
+    let mut band = vec![0u8; (w * h) as usize];
+    band[..(w * 10) as usize].fill(3);
+    app.engine
+        .execute(Command::SetPage {
+            width: w,
+            height: h,
+            pixels: band,
+        })
+        .unwrap();
+    let worked = app.engine.document().clone();
+    ui_pass(&mut app, &ctx, t + 0.3, tap(egui::Key::J));
+    assert!(app.spare_differs(), "still its own format");
+    app.delete_page();
+    assert!(app.menu_data.spare.is_none(), "the spare is freed");
+    let same_picture = |doc: &dpx_core::Document| {
+        assert_eq!(doc.target(), worked.target());
+        assert_eq!(doc.palette(), worked.palette());
+        assert_eq!(doc.layers(), worked.layers(), "the spare's layers");
+        assert_eq!(doc.active_layer(), worked.active_layer());
+        assert_eq!(doc.cel(0, 0), Some(&castle), "the generated picture");
+        assert_eq!(doc.cel(0, 1), worked.cel(0, 1));
+    };
+    same_picture(app.engine.document());
+    // One undo step: the shown page as it was; Redo: the spare's whole picture.
+    ui_pass(&mut app, &ctx, t + 0.4, tap(egui::Key::U));
+    let doc = app.engine.document();
+    assert_eq!(doc.target(), shown.target());
+    assert_eq!(doc.layers(), shown.layers());
+    assert_eq!(doc.page(), shown.page());
+    app.redo();
+    same_picture(app.engine.document());
+}
+
+/// Wave-8 integration review: the same with frames: a generated spare of its own format
+/// made into three frames keeps them all through Delete This Page.
+#[test]
+fn delete_this_page_keeps_every_frame_of_a_spare_of_its_own_format() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let t = generate_for(&mut app, &ctx, "A castle", GenTarget::Spare);
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
+    app.engine.execute(Command::AddFrames { count: 2 }).unwrap();
+    app.engine.execute(Command::Clear { color: 5 }).unwrap();
+    let worked = app.engine.document().clone();
+    assert_eq!(worked.frame_count(), 3);
+    ui_pass(&mut app, &ctx, t + 0.3, tap(egui::Key::J));
+    assert!(app.spare_differs());
+    app.delete_page();
+    assert!(app.menu_data.spare.is_none(), "the spare is freed");
+    let doc = app.engine.document();
+    assert_eq!(doc.frame_count(), 3, "every frame of the spare");
+    assert_eq!(doc.current_frame(), worked.current_frame());
+    for f in 0..3 {
+        assert_eq!(doc.cel(f, 0), worked.cel(f, 0), "frame {}", f + 1);
+    }
+}
+
+/// Wave-8 integration review (ADR-46): the Brush and New layer targets keep an older OCS
+/// project's palette, so the picture is matched against its colours as stored: nothing is
+/// rounded, the brush has no colour to fit (the Apply line counts none) and the result's
+/// palette is the picture's.
+#[test]
+fn the_brush_and_a_new_layer_on_an_old_ocs_project_use_its_colours_as_stored() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let dir = open_old_ocs(&mut app, "keep");
+    let stored = app.engine.document().palette().clone();
+    app.open_generate();
+    req_mut(&mut app).set_prompt("x");
+    set_options(&mut app, |o| {
+        o.palette = PaletteChoice::Current;
+        o.target = GenTarget::Brush;
+    });
+    click(&mut app, &ctx, 0.01, GenControl::Generate);
+    settle(&mut app, &ctx, 0.04);
+    assert_eq!(req(&app).message(), Some("Apply: becomes the brush"));
+    let (_, r) = app.imagegen.result.as_ref().expect("a result");
+    assert_eq!((&r.palette, r.rounded_colors), (&stored, 0));
+    set_options(&mut app, |o| o.target = GenTarget::NewLayer);
+    app.generate_convert();
+    assert_eq!(
+        req(&app).message(),
+        Some("Apply: as a new layer (undoable)")
+    );
+    let (_, r) = app.imagegen.result.as_ref().expect("a result");
+    assert_eq!((&r.palette, r.rounded_colors), (&stored, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
