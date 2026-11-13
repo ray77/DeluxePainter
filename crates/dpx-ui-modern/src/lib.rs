@@ -10,11 +10,11 @@
 //! - [`theme`]: the colour tokens of the dark and the light scheme.
 //! - [`font`]: the bundled Go fonts and text measuring.
 //! - [`icons`]: our own vector icons for the tools and the built-in brushes.
-//! - [`layout`]: the rectangles of the main window.
+//! - [`layout`]: the rectangles of the main window (bar, dock, layer column, picture).
 //! - [`hit`]: what lies under a point.
 //! - [`menu`]: the pull-down menus: their cards, the pointer tracking, their drawing.
-//! - [`build`]: display lists of the bar, the dock, the picture viewport and the overlay
-//!   (menu cards, tooltip).
+//! - [`build`]: display lists of the bar, the dock, the layer column, the picture viewport
+//!   and the overlay (menu cards, tooltip); under a requester the chrome is dimmed.
 //! - [`raster`]: display list to RGBA8 (`tiny-skia`, `ab_glyph`).
 //! - [`frame`]: a whole window in one call, for headless snapshots. The live window
 //!   rasterises the same lists region by region ([`Renderer::render_region`]).
@@ -34,7 +34,7 @@ pub mod theme;
 
 pub use build::{Model, Toggles};
 pub use frame::{Frame, render_window};
-pub use hit::{Spot, hit};
-pub use layout::{Chrome, MainLayout, Picture};
+pub use hit::{Spot, hit, hit_in};
+pub use layout::{Chrome, LayerColumn, MainLayout, Picture};
 pub use raster::{Image, Renderer};
 pub use theme::{Theme, ThemeKind};

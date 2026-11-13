@@ -431,6 +431,12 @@ impl LayerPanel {
         self.rename.as_ref().map(|r| r.field.text())
     }
 
+    /// Where the cursor of the rename gadget is: the number of characters before it. For a
+    /// skin that draws the gadget itself (ADR-47).
+    pub fn rename_cursor(&self) -> Option<usize> {
+        self.rename.as_ref().map(|r| r.field.cursor)
+    }
+
     /// A key for the rename gadget: Return ends it with the name (unless it is still the
     /// one the gadget opened with), Esc without; characters outside [`name_char`] are left
     /// out.

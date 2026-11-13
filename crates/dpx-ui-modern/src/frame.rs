@@ -25,7 +25,8 @@ pub struct Frame<'a> {
 
 impl Frame<'_> {
     /// The layout of this frame: the bar and the dock follow the shared visibility flags
-    /// (F9, F10), the picture's enlargement follows Prefs ▸ Pixel Size.
+    /// (F9, F10), the layer column the shared layer panel (Prefs ▸ Layers), the picture's
+    /// enlargement Prefs ▸ Pixel Size.
     pub fn layout(&self) -> MainLayout {
         let ui = self.model.ui;
         MainLayout::for_picture(
@@ -34,6 +35,8 @@ impl Frame<'_> {
             Chrome {
                 bar: ui.title_visible,
                 dock: ui.toolbox_visible,
+                // The layer column goes with the dock (F10) and needs a panel to show.
+                layers: ui.toolbox_visible && ui.layer_panel.is_some(),
             },
             self.model.palette.len(),
             Picture {
@@ -178,7 +181,11 @@ mod tests {
                     l.dock.as_ref().expect("dock").rect,
                     build::dock(&l, &frame.theme, &frame.model),
                 ),
-                ("viewport", l.viewport, build::canvas(&l, &frame.theme)),
+                (
+                    "viewport",
+                    l.viewport,
+                    build::canvas(&l, &frame.theme, false),
+                ),
             ];
             for (name, rect, list) in regions {
                 let px = |v: f32| (v * scale).round() as i32;
@@ -511,5 +518,130 @@ mod tests {
         assert!(l.bar.is_none() && l.dock.is_none());
         assert_eq!(shot.at(2.0, 2.0), theme.canvas);
         assert_eq!(shot.at(1277.0, 797.0), theme.canvas);
+    }
+
+    fn panel(names: &[(&str, bool)], active: usize) -> dpx_ui::LayerPanel {
+        let mut panel = dpx_ui::LayerPanel::default();
+        let rows = names
+            .iter()
+            .map(|&(name, visible)| dpx_ui::LayerRow {
+                name: name.into(),
+                visible,
+            })
+            .collect();
+        panel.update(rows, active, [true, true, true, false, true, true], 100);
+        panel
+    }
+
+    /// The layer column and the scrim reach the pixels: the active row's card, the accent
+    /// at its edge, a button's ground, and every part of the chrome darker under a requester
+    /// while the picture keeps its colours.
+    #[test]
+    fn the_layer_column_and_the_scrim_reach_the_pixels() {
+        let palette = Palette::dpaint_default_32();
+        let rgba = picture();
+        for (kind, scale) in [(ThemeKind::Dark, 1.0), (ThemeKind::Light, 2.0)] {
+            let theme = Theme::of(kind);
+            let ui = UiState {
+                layer_panel: Some(panel(&[("Background", true), ("Sky", true)], 1)),
+                ..UiState::default()
+            };
+            let render = |dimmed: bool| {
+                let frame = Frame {
+                    size: (1280.0, 800.0),
+                    scale,
+                    theme,
+                    model: Model {
+                        dimmed,
+                        ..Model::new(&ui, &palette)
+                    },
+                    picture: Image {
+                        width: 320,
+                        height: 256,
+                        rgba: &rgba,
+                    },
+                    per_ui_pixel: 1,
+                };
+                let (w, _, out) = render_window(&frame, &mut Renderer::new());
+                (
+                    Shot {
+                        w,
+                        scale,
+                        rgba: out,
+                    },
+                    frame.layout(),
+                )
+            };
+            let (shot, l) = render(false);
+            let column = l.layers.as_ref().expect("the layer column");
+            let dock = l.dock.as_ref().expect("dock");
+            assert_eq!(column.rect.right(), dock.rect.x);
+            assert_eq!(l.viewport.right(), column.rect.x);
+            // Row 0 is the top layer, the active one: a raised card with the accent bar.
+            let row = column.row(0);
+            assert_eq!(
+                shot.at(row.right() - 12.0, row.y + row.h / 2.0),
+                theme.raised
+            );
+            assert_eq!(shot.at(row.x + 5.5, row.y + row.h / 2.0), theme.accent);
+            // Row 1 is not: the panel shows.
+            let below = column.row(1);
+            assert_eq!(
+                shot.at(below.right() - 12.0, below.y + below.h / 2.0),
+                theme.panel
+            );
+            let new = column.buttons[0];
+            assert_eq!(shot.at(new.x + 3.0, new.y + new.h / 2.0), theme.raised);
+            assert_eq!(shot.at(column.header.right() - 40.0, 35.0), theme.panel);
+
+            // Under a requester: everything but the picture is veiled.
+            let (dim, _) = render(true);
+            let veiled = |c: Color| {
+                let a = u32::from(theme.scrim.a);
+                let ch = |under: u8, over: u8| {
+                    ((u32::from(over) * a + u32::from(under) * (255 - a) + 127) / 255) as u8
+                };
+                Color::rgb(
+                    ch(c.r, theme.scrim.r),
+                    ch(c.g, theme.scrim.g),
+                    ch(c.b, theme.scrim.b),
+                )
+            };
+            let near = |a: Color, b: Color| {
+                a.r.abs_diff(b.r) <= 1 && a.g.abs_diff(b.g) <= 1 && a.b.abs_diff(b.b) <= 1
+            };
+            let bar = l.bar.expect("bar");
+            for (what, x, y, under) in [
+                ("bar", bar.right() - 3.0, bar.y + 3.0, theme.panel),
+                (
+                    "dock",
+                    dock.rect.x + 3.0,
+                    dock.rect.bottom() - 3.0,
+                    theme.panel,
+                ),
+                ("column", column.header.right() - 40.0, 35.0, theme.panel),
+                (
+                    "active row",
+                    row.right() - 12.0,
+                    row.y + row.h / 2.0,
+                    theme.raised,
+                ),
+                (
+                    "canvas",
+                    l.viewport.x + 3.0,
+                    l.viewport.y + 3.0,
+                    theme.canvas,
+                ),
+            ] {
+                assert_eq!(shot.at(x, y), under, "{what}, {kind:?}");
+                let got = dim.at(x, y);
+                assert!(
+                    near(got, veiled(under)) && got != under,
+                    "{what}, {kind:?}: {got:?} is not {under:?} under the scrim"
+                );
+            }
+            let (cx, cy) = l.picture.center();
+            assert_eq!(dim.at(cx, cy), shot.at(cx, cy), "the picture is not veiled");
+        }
     }
 }

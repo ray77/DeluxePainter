@@ -370,6 +370,84 @@ pub fn key_cap_letter(cap: crate::paint::Rect) -> Path {
         )
 }
 
+/// The eye of a layer row: open for a layer that shows, closed (a lid with lashes) for a
+/// hidden one. Stroked, on the 24-unit grid.
+pub fn eye(open: bool) -> Path {
+    if open {
+        Path::new()
+            .move_to(3.0, 12.0)
+            .quad_to(12.0, 3.5, 21.0, 12.0)
+            .quad_to(12.0, 20.5, 3.0, 12.0)
+            .close()
+            .circle(12.0, 12.0, 2.6)
+    } else {
+        Path::new()
+            .move_to(3.5, 10.5)
+            .quad_to(12.0, 18.0, 20.5, 10.5)
+            .segment(6.6, 14.0, 5.0, 16.6)
+            .segment(12.0, 15.2, 12.0, 18.4)
+            .segment(17.4, 14.0, 19.0, 16.6)
+    }
+}
+
+/// The icon of a layer column button. Stroked, on the 24-unit grid: a plus (New), two
+/// sheets (Copy), a bin (Delete), arrows (Up, Down) and an arrow onto a line (Merge Down).
+pub fn layer_button(button: dpx_ui::LayerButton) -> Path {
+    use dpx_ui::LayerButton as B;
+    match button {
+        B::New => Path::new()
+            .segment(12.0, 5.0, 12.0, 19.0)
+            .segment(5.0, 12.0, 19.0, 12.0),
+        B::Copy => Path::new()
+            .round_rect(crate::paint::Rect::new(9.0, 9.0, 11.0, 11.0), 2.0)
+            .move_to(15.0, 5.0)
+            .line_to(6.5, 5.0)
+            .quad_to(4.5, 5.0, 4.5, 7.0)
+            .line_to(4.5, 15.5),
+        B::Delete => Path::new()
+            .segment(5.0, 7.5, 19.0, 7.5)
+            .move_to(9.5, 7.5)
+            .line_to(9.5, 5.0)
+            .line_to(14.5, 5.0)
+            .line_to(14.5, 7.5)
+            .move_to(7.0, 7.5)
+            .line_to(8.0, 19.5)
+            .line_to(16.0, 19.5)
+            .line_to(17.0, 7.5),
+        B::Up => Path::new()
+            .segment(12.0, 19.0, 12.0, 5.5)
+            .move_to(6.5, 11.0)
+            .line_to(12.0, 5.5)
+            .line_to(17.5, 11.0),
+        B::Down => Path::new()
+            .segment(12.0, 5.0, 12.0, 18.5)
+            .move_to(6.5, 13.0)
+            .line_to(12.0, 18.5)
+            .line_to(17.5, 13.0),
+        B::Merge => Path::new()
+            .segment(12.0, 4.0, 12.0, 14.0)
+            .move_to(7.5, 9.5)
+            .line_to(12.0, 14.0)
+            .line_to(16.5, 9.5)
+            .segment(5.0, 19.5, 19.0, 19.5),
+    }
+}
+
+/// A scroll arrow of the layer column's title row. Stroked, on the 24-unit grid.
+pub fn scroll_arrow(up: bool) -> Path {
+    if up {
+        Path::new()
+            .move_to(7.0, 14.5)
+            .line_to(12.0, 9.5)
+            .line_to(17.0, 14.5)
+    } else {
+        Path::new()
+            .move_to(7.0, 9.5)
+            .line_to(12.0, 14.5)
+            .line_to(17.0, 9.5)
+    }
+}
+
 /// The filled shape of built-in brush `index` (toolbox order: four round brushes, four
 /// squares, two scatter brushes), centred on (`cx`, `cy`); one brush pixel is `unit` points.
 /// The size comes from the brush's real footprint, so the dock shows the brushes in their

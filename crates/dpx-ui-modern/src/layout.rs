@@ -5,6 +5,7 @@
 //! sharp edges and the picture is an exact integer enlargement.
 
 use dpx_ui::PixelSize;
+use dpx_ui::layer_panel::{BUTTONS, LayerButton};
 use dpx_ui::screen::palette_grid;
 use dpx_ui::toolbox::TOOL_ROWS;
 
@@ -40,23 +41,107 @@ pub const TITLE_PAD: f32 = 8.0;
 /// Left edge of the first menu title.
 pub const TITLES_X: f32 = 6.0;
 
+/// Width of the layer column (Prefs ▸ Layers), left of the dock.
+pub const LAYERS_W: f32 = 200.0;
+/// Height of the layer column's title row and of one layer row.
+pub const LAYER_HEADER_H: f32 = 30.0;
+pub const LAYER_ROW_H: f32 = 26.0;
+/// Height of the layer column's buttons and the free space around them.
+pub const LAYER_BUTTON_H: f32 = 28.0;
+pub const LAYER_PAD: f32 = 8.0;
+/// Space between two of the layer column's buttons.
+pub const LAYER_BUTTON_GAP: f32 = 4.0;
+/// Width of the eye box at the left of a layer row, and where the name starts.
+pub const LAYER_EYE_W: f32 = 30.0;
+
 /// The built-in brushes as the well shows them, by index into `BUILTIN_BRUSHES`: the round
 /// ones growing to the right above the squares growing to the right, the two scatter brushes
 /// in the last column.
 pub const BRUSH_GRID: [[usize; 5]; 2] = [[0, 1, 2, 3, 8], [7, 6, 5, 4, 9]];
 
-/// Which parts of the chrome are shown (F9 hides the bar; F10 hides the bar and the dock).
+/// Which parts of the chrome are shown (F9 hides the bar; F10 hides the bar, the dock and the
+/// layer column; Prefs ▸ Layers shows the layer column).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chrome {
     pub bar: bool,
     pub dock: bool,
+    /// The layer column left of the dock.
+    pub layers: bool,
 }
 
 impl Chrome {
+    /// Bar and dock, as at the first start (Prefs ▸ Layers is off then).
     pub const ALL: Chrome = Chrome {
         bar: true,
         dock: true,
+        layers: false,
     };
+    /// Bar, dock and the layer column.
+    pub const WITH_LAYERS: Chrome = Chrome {
+        bar: true,
+        dock: true,
+        layers: true,
+    };
+}
+
+/// The layer column's rectangles (ADR-44's panel in the Modern look): a title row with the
+/// scroll arrows, the layer rows from the top layer down, and the six buttons at the bottom.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerColumn {
+    pub rect: Rect,
+    /// The title row.
+    pub header: Rect,
+    /// The scroll arrows at the right of the title row.
+    pub scroll_up: Rect,
+    pub scroll_down: Rect,
+    /// The area of the layer rows.
+    pub list: Rect,
+    /// How many rows fit.
+    pub capacity: usize,
+    /// The buttons, in the order of `dpx_ui::layer_panel::BUTTONS`.
+    pub buttons: [Rect; 6],
+    /// Physical pixels per point, for rows on whole pixels.
+    scale: f32,
+}
+
+impl LayerColumn {
+    fn snap(&self, v: f32) -> f32 {
+        (v * self.scale).round() / self.scale
+    }
+
+    /// Row `slot` of the list (0 = the top row shown).
+    pub fn row(&self, slot: usize) -> Rect {
+        let y = self.snap(self.list.y + slot as f32 * LAYER_ROW_H);
+        let bottom = self.snap(self.list.y + (slot + 1) as f32 * LAYER_ROW_H);
+        Rect::new(self.list.x, y, self.list.w, bottom - y)
+    }
+
+    /// The eye box of row `slot`: shows or hides the layer.
+    pub fn eye(&self, slot: usize) -> Rect {
+        let r = self.row(slot);
+        Rect::new(r.x, r.y, self.snap(LAYER_EYE_W), r.h)
+    }
+
+    /// The name of row `slot` (the rest of the row, and the rename field).
+    pub fn name(&self, slot: usize) -> Rect {
+        let r = self.row(slot);
+        let x = r.x + self.snap(LAYER_EYE_W);
+        Rect::new(x, r.y, r.right() - self.snap(6.0) - x, r.h)
+    }
+
+    /// The rectangle of `button`.
+    pub fn button(&self, button: LayerButton) -> Rect {
+        let i = BUTTONS.iter().position(|&b| b == button).unwrap_or(0);
+        self.buttons[i]
+    }
+
+    /// The row slot under `y`, when it is one of the rows that fit.
+    pub fn slot_at(&self, y: f32) -> Option<usize> {
+        (0..self.capacity).find(|&slot| {
+            let r = self.row(slot);
+            y >= r.y && y < r.bottom()
+        })
+    }
 }
 
 /// The dock's rectangles.
@@ -91,6 +176,8 @@ pub struct MainLayout {
     /// The hit rectangle of each menu title in the bar (empty without the bar).
     pub menu_titles: Vec<Rect>,
     pub dock: Option<Dock>,
+    /// The layer column left of the dock (Prefs ▸ Layers).
+    pub layers: Option<LayerColumn>,
     /// Everything that is not chrome: canvas colour with the picture in its middle.
     pub viewport: Rect,
     /// The picture quad. It may be larger than the viewport when even one physical pixel per
@@ -203,8 +290,19 @@ impl MainLayout {
         } else {
             0.0
         };
+        let layers_w = if chrome.layers {
+            snap(LAYERS_W).min(window.w - dock_w)
+        } else {
+            0.0
+        };
         let bar = chrome.bar.then(|| Rect::new(0.0, 0.0, window.w, bar_h));
-        let viewport = Rect::new(0.0, bar_h, window.w - dock_w, window.h - bar_h);
+        let viewport = Rect::new(0.0, bar_h, window.w - dock_w - layers_w, window.h - bar_h);
+        let layers = chrome.layers.then(|| {
+            layer_column(
+                Rect::new(viewport.right(), bar_h, layers_w, window.h - bar_h),
+                scale,
+            )
+        });
 
         let menu_titles = if chrome.bar {
             let mut x = TITLES_X;
@@ -261,6 +359,7 @@ impl MainLayout {
             bar,
             menu_titles,
             dock,
+            layers,
             viewport,
             picture,
             zoom,
@@ -280,6 +379,48 @@ impl MainLayout {
     pub fn tool_button(&self, tool: dpx_ui::Tool) -> Option<Rect> {
         let i = TOOL_ROWS.iter().flatten().position(|&t| t == tool)?;
         Some(self.dock.as_ref()?.tools[i])
+    }
+}
+
+fn layer_column(rect: Rect, scale: f32) -> LayerColumn {
+    let snap = |v: f32| (v * scale).round() / scale;
+    let header = Rect::new(rect.x, rect.y, rect.w, snap(LAYER_HEADER_H).min(rect.h));
+    // The arrows: two squares at the right end of the title row.
+    let side = snap(22.0);
+    let arrow_y = snap(header.y + (header.h - side) / 2.0);
+    let scroll_down = Rect::new(snap(rect.right() - 6.0 - side), arrow_y, side, side);
+    let scroll_up = Rect::new(scroll_down.x - side, arrow_y, side, side);
+    // The buttons: one row at the bottom.
+    let buttons_y = snap(rect.bottom() - LAYER_PAD - LAYER_BUTTON_H).max(header.bottom());
+    let (x0, x1) = (snap(rect.x + LAYER_PAD), snap(rect.right() - LAYER_PAD));
+    let pitch = (x1 - x0 + LAYER_BUTTON_GAP) / 6.0;
+    let mut buttons = [Rect::default(); 6];
+    for (i, slot) in buttons.iter_mut().enumerate() {
+        let bx = x0 + i as f32 * pitch;
+        *slot = Rect::new(
+            snap(bx),
+            buttons_y,
+            snap(bx + pitch - LAYER_BUTTON_GAP) - snap(bx),
+            snap(rect.bottom() - LAYER_PAD) - buttons_y,
+        );
+    }
+    let list_bottom = snap(buttons_y - LAYER_PAD).max(header.bottom());
+    let list = Rect::new(
+        rect.x + snap(1.0),
+        header.bottom(),
+        rect.w - snap(1.0),
+        list_bottom - header.bottom(),
+    );
+    let capacity = ((list.h + 1e-3) / LAYER_ROW_H).floor().max(0.0) as usize;
+    LayerColumn {
+        rect,
+        header,
+        scroll_up,
+        scroll_down,
+        list,
+        capacity,
+        buttons,
+        scale,
     }
 }
 
@@ -621,6 +762,7 @@ mod tests {
         let no_bar = at(Chrome {
             bar: false,
             dock: true,
+            layers: false,
         });
         assert!(no_bar.bar.is_none() && no_bar.menu_titles.is_empty());
         assert_eq!(no_bar.viewport, Rect::new(0.0, 0.0, 1188.0, 800.0));
@@ -628,6 +770,7 @@ mod tests {
         let bare = at(Chrome {
             bar: false,
             dock: false,
+            layers: false,
         });
         assert!(bare.dock.is_none());
         assert_eq!(bare.viewport, bare.window);
@@ -656,5 +799,83 @@ mod tests {
         let two = layout((1280.0, 800.0), 1.0, 2);
         let dock = two.dock.as_ref().expect("dock");
         assert_eq!((dock.palette_cols, dock.cells.len()), (1, 2));
+    }
+
+    #[test]
+    fn the_layer_column_lies_between_the_picture_and_the_dock() {
+        for window in [(1280.0, 800.0), (720.0, 520.0), (1001.0, 640.0)] {
+            for scale in SCALES {
+                let l = MainLayout::new(
+                    window,
+                    scale,
+                    Chrome::WITH_LAYERS,
+                    32,
+                    (320, 256),
+                    PixelSize::default(),
+                );
+                let plain = layout(window, scale, 32);
+                let (column, dock) = (
+                    l.layers.as_ref().expect("the layer column"),
+                    l.dock.as_ref().expect("dock"),
+                );
+                let what = format!("{window:?} at {scale}x");
+                assert!(plain.layers.is_none());
+                assert_eq!(dock, plain.dock.as_ref().expect("dock"), "{what}");
+                assert_eq!(column.rect.right(), dock.rect.x, "{what}");
+                assert_eq!(column.rect.x, l.viewport.right(), "{what}");
+                assert_eq!(column.rect.y, dock.rect.y, "{what}");
+                assert!((column.rect.w - LAYERS_W).abs() < 1.0, "{what}");
+                // The picture still fits beside it, whole.
+                assert!(l.viewport.encloses(&l.picture), "{what}: {:?}", l.picture);
+                // Every part lies in the column, on whole physical pixels.
+                let mut parts = vec![column.header, column.scroll_up, column.scroll_down];
+                parts.extend(column.buttons);
+                assert!(column.capacity >= 14, "{what}: {} rows", column.capacity);
+                for slot in 0..column.capacity {
+                    parts.extend([column.row(slot), column.eye(slot), column.name(slot)]);
+                }
+                for r in &parts {
+                    assert!(column.rect.encloses(r), "{what}: {r:?}");
+                    for v in [r.x, r.y, r.right(), r.bottom()] {
+                        assert!(on_pixels(v, scale), "{what}: {r:?}");
+                    }
+                }
+                // Rows follow each other without a gap, above the buttons; an eye box and
+                // its name share the row.
+                for slot in 0..column.capacity {
+                    let (row, eye, name) = (column.row(slot), column.eye(slot), column.name(slot));
+                    assert_eq!(eye.right(), name.x, "{what}");
+                    assert!(row.bottom() <= column.buttons[0].y, "{what}");
+                    assert_eq!(column.slot_at(row.y), Some(slot), "{what}");
+                    assert_eq!(column.slot_at(row.bottom() - 0.01), Some(slot), "{what}");
+                    if slot > 0 {
+                        assert_eq!(column.row(slot - 1).bottom(), row.y, "{what}");
+                    }
+                }
+                assert_eq!(column.slot_at(column.row(column.capacity).y + 1.0), None);
+                // The buttons: six in a row, none overlapping, the arrows in the title row.
+                for pair in column.buttons.windows(2) {
+                    assert!(pair[0].right() <= pair[1].x, "{what}");
+                    assert!(pair[0].w >= 22.0, "{what}");
+                }
+                assert!(column.header.encloses(&column.scroll_up));
+                assert!(column.scroll_up.right() <= column.scroll_down.x);
+            }
+        }
+        // Without the dock the column is at the window's edge.
+        let l = MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome {
+                bar: false,
+                dock: false,
+                layers: true,
+            },
+            32,
+            (320, 256),
+            PixelSize::default(),
+        );
+        let column = l.layers.expect("the layer column");
+        assert_eq!((column.rect.right(), column.rect.y), (1280.0, 0.0));
     }
 }

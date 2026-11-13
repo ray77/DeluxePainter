@@ -1,16 +1,18 @@
 //! Builds the display lists of the Modern main window from the shared interface state
-//! (ADR-47): the canvas with the picture, the bar, the dock and what lies over them (the
-//! menu that is held open, a tooltip). What the lists show is the
-//! same state the Classic skin draws; only the look differs.
+//! (ADR-47): the canvas with the picture, the bar, the dock, the layer column and what lies
+//! over them (the menu that is held open, a tooltip). What the lists show is the same state
+//! the Classic skin draws; only the look differs. While a requester is open (it is shown in
+//! the Classic look inside the picture), bar, dock and layer column lie under a scrim.
 
 use dpx_core::Palette;
+use dpx_ui::layer_panel::BUTTONS;
 use dpx_ui::screen::APP_TITLE;
 use dpx_ui::toolbox::TOOL_ROWS;
-use dpx_ui::{Hit, Pref, Tool, Tooltip, TooltipTarget, UiState};
+use dpx_ui::{Hit, LayerHit, LayerPanel, Pref, Tool, Tooltip, TooltipTarget, UiState};
 
 use crate::font;
 use crate::icons::{self, Ink};
-use crate::layout::{Dock, MainLayout};
+use crate::layout::{Dock, LayerColumn, MainLayout};
 use crate::menu::{self, TitleLook};
 use crate::paint::{Color, List, Path, Rect, Weight};
 use crate::theme::Theme;
@@ -45,6 +47,9 @@ pub struct Model<'a> {
     pub toggles: Toggles,
     /// The part of the chrome under the pointer, shown raised.
     pub hover: Option<Hit>,
+    /// A requester, a note, Show Page or playback has the pointer and the keys: the chrome
+    /// lies under a scrim.
+    pub dimmed: bool,
 }
 
 impl<'a> Model<'a> {
@@ -56,6 +61,7 @@ impl<'a> Model<'a> {
             custom_brush: false,
             toggles: Toggles::default(),
             hover: None,
+            dimmed: false,
         }
     }
 }
@@ -76,10 +82,11 @@ fn rgb(palette: &Palette, index: u8) -> Color {
         .map_or(Color::rgb(0, 0, 0), |c| Color::rgb(c.r, c.g, c.b))
 }
 
-/// The whole window: canvas and picture, dock, bar, and over them the open menu or the
-/// tooltip.
+/// The whole window: canvas and picture, layer column, dock, bar, and over them the open
+/// menu or the tooltip.
 pub fn window(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List {
-    let mut list = canvas(layout, theme);
+    let mut list = canvas(layout, theme, model.dimmed);
+    list.append(layers(layout, theme, model));
     list.append(dock(layout, theme, model));
     list.append(title_bar(layout, theme, model));
     if let Some((_, over)) = overlay(layout, theme, model) {
@@ -121,16 +128,22 @@ const TIP_GAP: f32 = 8.0;
 const TIP_PAD: f32 = 10.0;
 const TIP_KEY_GAP: f32 = 9.0;
 
-/// The rectangle of the tooltip of a dock button: left of the dock, centred on the button,
-/// inside the window. `None` for a target the Modern skin does not draw itself (the
-/// Animation Control Panel and the layer panel are still shown in the Classic look, with
-/// their Classic tooltips) and while the dock is hidden.
+/// The rectangle of the tooltip of a dock button or of a layer column button: left of the
+/// dock or the column, centred on the button, inside the window. `None` for a target the
+/// Modern skin does not draw itself (the Animation Control Panel is still shown in the
+/// Classic look, with its Classic tooltips) and while its button is not shown.
 pub fn tooltip_rect(layout: &MainLayout, tip: &Tooltip) -> Option<Rect> {
-    let TooltipTarget::Tool { tool, .. } = tip.target else {
-        return None;
+    // The button and the left edge of the part of the chrome it is in.
+    let (button, edge) = match tip.target {
+        TooltipTarget::Tool { tool, .. } => {
+            (layout.tool_button(tool)?, layout.dock.as_ref()?.rect.x)
+        }
+        TooltipTarget::Layer(b) => {
+            let column = layout.layers.as_ref()?;
+            (column.button(b), column.rect.x)
+        }
+        TooltipTarget::Panel(_) => return None,
     };
-    let button = layout.tool_button(tool)?;
-    let dock = layout.dock.as_ref()?;
     let (name, key) = tooltip_parts(tip);
     let size = font::SIZE_PANEL;
     let mut w = 2.0 * TIP_PAD + font::measure(name, size, Weight::Regular);
@@ -139,7 +152,7 @@ pub fn tooltip_rect(layout: &MainLayout, tip: &Tooltip) -> Option<Rect> {
     }
     let snap = |v: f32| (v * layout.scale).round() / layout.scale;
     let w = snap(w.ceil());
-    let x = (dock.rect.x - TIP_GAP - w).max(0.0);
+    let x = (edge - TIP_GAP - w).max(0.0);
     let y = (button.center().1 - TIP_H / 2.0)
         .min(layout.window.bottom() - TIP_H - 4.0)
         .max(layout.bar.map_or(4.0, |b| b.bottom() + 4.0));
@@ -158,7 +171,7 @@ fn key_chip_width(key: &str) -> f32 {
     (font::measure(key, font::SIZE_PANEL, Weight::Medium) + 10.0).max(18.0)
 }
 
-/// Draws the tooltip of a dock button: its name and, on a chip, its key. Returns the
+/// Draws the tooltip of a dock or layer column button: its name and, on a chip, its key. Returns the
 /// rectangle the drawing covers.
 fn tooltip(list: &mut List, layout: &MainLayout, theme: &Theme, tip: &Tooltip) -> Option<Rect> {
     let rect = tooltip_rect(layout, tip)?;
@@ -193,8 +206,9 @@ fn tooltip(list: &mut List, layout: &MainLayout, theme: &Theme, tip: &Tooltip) -
 }
 
 /// The picture viewport: canvas colour, a soft shadow around the picture and the picture
-/// itself, clipped to the viewport.
-pub fn canvas(layout: &MainLayout, theme: &Theme) -> List {
+/// itself, clipped to the viewport. `dimmed`: a requester is open (it is part of the
+/// picture's image), so the canvas around the picture lies under the scrim like the chrome.
+pub fn canvas(layout: &MainLayout, theme: &Theme, dimmed: bool) -> List {
     let mut list = List::new();
     let view = layout.viewport;
     if view.w <= 0.0 || view.h <= 0.0 {
@@ -210,6 +224,9 @@ pub fn canvas(layout: &MainLayout, theme: &Theme) -> List {
     for (grow, drop) in [(6.0, 3.0), (3.0, 2.0), (1.0, 1.0)] {
         let r = layout.picture.inset(-grow);
         list.round_rect(Rect::new(r.x, r.y + drop, r.w, r.h), grow + 1.0, step);
+    }
+    if dimmed {
+        list.rect(view, theme.scrim);
     }
     list.image(layout.picture, PICTURE_IMAGE);
     list.unclip();
@@ -330,7 +347,15 @@ pub fn title_bar(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List 
             list.text(end - w, base, label, size, Weight::Regular, theme.text_dim);
         }
     }
+    scrim(&mut list, bar, theme, model);
     list
+}
+
+/// Under a requester the chrome takes no input: a veil over `region` says so.
+fn scrim(list: &mut List, region: Rect, theme: &Theme, model: &Model<'_>) {
+    if model.dimmed {
+        list.rect(region, theme.scrim);
+    }
 }
 
 /// The dock: built-in brushes, the tools, the colour indicator and the palette.
@@ -350,7 +375,200 @@ pub fn dock(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List {
     }
     indicator(&mut list, dock, theme, model);
     palette(&mut list, dock, theme, model);
+    scrim(&mut list, dock.rect, theme, model);
     list
+}
+
+/// Side of the box a layer column icon is drawn in.
+const LAYER_ICON: f32 = 18.0;
+
+/// Strokes `icon` (24-unit grid) centred in `rect`.
+fn small_icon(list: &mut List, rect: Rect, icon: Path, ink: Color) {
+    let scale = LAYER_ICON / icons::GRID;
+    let (cx, cy) = rect.center();
+    list.stroke(
+        icon.placed(scale, cx - LAYER_ICON / 2.0, cy - LAYER_ICON / 2.0),
+        ink,
+        (icons::STROKE * scale).max(1.2),
+    );
+}
+
+/// The layer column (ADR-44's panel): the title row with the scroll arrows, one row per
+/// layer from the top layer down (an eye that shows or hides it, its name, the active one
+/// marked; a name being edited is a field with a caret) and the buttons New, Copy, Delete,
+/// Up, Down and Merge Down, ghosted where the command would be refused.
+pub fn layers(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List {
+    let mut list = List::new();
+    let Some(column) = &layout.layers else {
+        return list;
+    };
+    let r = column.rect;
+    list.rect(r, theme.panel);
+    list.rect(Rect::new(r.x, r.y, 1.0, r.h), theme.hairline);
+    let size = font::SIZE_PANEL;
+    let header = column.header;
+    list.text(
+        header.x + 12.0,
+        font::baseline_centered(header.y + header.h / 2.0, size, Weight::Medium),
+        "Layers",
+        size,
+        Weight::Medium,
+        theme.text,
+    );
+    list.rect(
+        Rect::new(r.x + 1.0, header.bottom() - 1.0, r.w - 1.0, 1.0),
+        theme.hairline,
+    );
+    let buttons_top = column.buttons[0].y - crate::layout::LAYER_PAD;
+    list.rect(
+        Rect::new(r.x + 1.0, buttons_top, r.w - 1.0, 1.0),
+        theme.hairline,
+    );
+    let hover = match model.hover {
+        Some(Hit::LayerPanel(hit)) => Some(hit),
+        _ => None,
+    };
+    let empty = LayerPanel::default();
+    let panel = model.ui.layer_panel.as_ref().unwrap_or(&empty);
+    let cap = column.capacity;
+
+    // The scroll arrows, while the rows do not all fit.
+    if panel.more_above() || panel.more_below(cap) {
+        for (rect, up, live, hit) in [
+            (
+                column.scroll_up,
+                true,
+                panel.more_above(),
+                LayerHit::ScrollUp,
+            ),
+            (
+                column.scroll_down,
+                false,
+                panel.more_below(cap),
+                LayerHit::ScrollDown,
+            ),
+        ] {
+            if live && hover == Some(hit) {
+                list.round_rect(rect, RADIUS_SMALL, theme.hover);
+            }
+            let ink = if live { theme.text } else { theme.disabled };
+            small_icon(&mut list, rect, icons::scroll_arrow(up), ink);
+        }
+    }
+
+    for slot in 0..cap {
+        let Some(layer) = panel.layer_at(slot) else {
+            break;
+        };
+        layer_row(&mut list, column, theme, panel, slot, layer, hover);
+    }
+
+    for (rect, button) in column.buttons.iter().zip(BUTTONS) {
+        let enabled = panel.enabled(button);
+        let (ground, ink) = if !enabled {
+            (theme.raised.mix(theme.panel, 50), theme.disabled)
+        } else if panel.held == Some(button) {
+            (theme.accent, theme.on_accent)
+        } else if hover == Some(LayerHit::Button(button)) {
+            (theme.hover, theme.text)
+        } else {
+            (theme.raised, theme.text)
+        };
+        list.round_rect(*rect, RADIUS_SMALL, ground);
+        small_icon(&mut list, *rect, icons::layer_button(button), ink);
+    }
+    scrim(&mut list, r, theme, model);
+    list
+}
+
+/// One row of the layer column: the layer `layer` in row `slot`.
+fn layer_row(
+    list: &mut List,
+    column: &LayerColumn,
+    theme: &Theme,
+    panel: &LayerPanel,
+    slot: usize,
+    layer: usize,
+    hover: Option<LayerHit>,
+) {
+    let Some(row) = panel.rows.get(layer) else {
+        return;
+    };
+    let (rect, eye, name) = (column.row(slot), column.eye(slot), column.name(slot));
+    let active = layer == panel.active;
+    let card = Rect::new(rect.x + 4.0, rect.y + 1.0, rect.w - 8.0, rect.h - 2.0);
+    if active {
+        // The active layer: a raised card with the accent at its left edge.
+        list.round_rect(card, RADIUS_SMALL, theme.raised);
+        list.round_rect(
+            Rect::new(card.x, card.y + 4.0, 3.0, card.h - 8.0),
+            1.5,
+            theme.accent,
+        );
+    } else if hover == Some(LayerHit::Name(layer)) {
+        list.round_rect(card, RADIUS_SMALL, theme.hover.mix(theme.panel, 50));
+    }
+    if hover == Some(LayerHit::Eye(layer)) {
+        let spot = Rect::new(eye.x + 6.0, eye.y + 2.0, eye.w - 6.0, eye.h - 4.0);
+        list.round_rect(spot, RADIUS_SMALL, theme.hover);
+    }
+    let eye_ink = if row.visible {
+        theme.text
+    } else {
+        theme.disabled
+    };
+    let eye_box = Rect::new(eye.x + 6.0, eye.y, eye.w - 6.0, eye.h);
+    small_icon(list, eye_box, icons::eye(row.visible), eye_ink);
+
+    let size = font::SIZE_PANEL;
+    let mid = rect.y + rect.h / 2.0;
+    if panel.renaming() == Some(layer) {
+        // The string gadget: the text scrolls so the caret stays inside.
+        let field = Rect::new(name.x, rect.y + 3.0, name.w, rect.h - 6.0);
+        list.round_rect(field, RADIUS_SWATCH, theme.canvas);
+        list.ring(field, RADIUS_SWATCH, theme.accent, 1.5);
+        let text = panel.rename_text().unwrap_or_default();
+        let cursor = panel.rename_cursor().unwrap_or(0);
+        let before: String = text.chars().take(cursor).collect();
+        let caret = font::measure(&before, size, Weight::Regular);
+        let (pad, room) = (5.0, (field.w - 10.0).max(1.0));
+        let shift = (caret - room).max(0.0);
+        list.clip(Path::new().round_rect(field.inset(2.0), 0.0));
+        let x = field.x + pad - shift;
+        list.text(
+            x,
+            font::baseline_centered(mid, size, Weight::Regular),
+            text,
+            size,
+            Weight::Regular,
+            theme.text,
+        );
+        list.rect(
+            Rect::new(x + caret, field.y + 3.0, 1.0, field.h - 6.0),
+            theme.accent,
+        );
+        list.unclip();
+        return;
+    }
+    let weight = if active {
+        Weight::Medium
+    } else {
+        Weight::Regular
+    };
+    let ink = if row.visible {
+        theme.text
+    } else {
+        theme.text_dim
+    };
+    let shown = font::fit(&row.name, name.w - 4.0, size, weight);
+    list.text(
+        name.x + 2.0,
+        font::baseline_centered(mid, size, weight),
+        shown,
+        size,
+        weight,
+        ink,
+    );
 }
 
 fn brushes(list: &mut List, dock: &Dock, theme: &Theme, model: &Model<'_>) {
@@ -687,6 +905,7 @@ mod tests {
             Chrome {
                 bar: false,
                 dock: false,
+                layers: false,
             },
             32,
             (320, 256),
@@ -897,7 +1116,7 @@ mod tests {
         let model = Model::new(&ui, &palette);
         assert_eq!(
             window(&l, &theme, &model).len(),
-            canvas(&l, &theme).len()
+            canvas(&l, &theme, false).len()
                 + dock(&l, &theme, &model).len()
                 + title_bar(&l, &theme, &model).len()
         );
@@ -955,6 +1174,7 @@ mod tests {
             Chrome {
                 bar: true,
                 dock: false,
+                layers: false,
             },
             32,
             (320, 256),
@@ -978,5 +1198,325 @@ mod tests {
         // The window's list ends with it.
         let all = window(&l, &theme, &Model::new(&ui, &palette));
         assert_eq!(all.ops()[all.len() - list.len()..], *list.ops());
+    }
+
+    fn with_layers() -> MainLayout {
+        MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome::WITH_LAYERS,
+            32,
+            (320, 256),
+            PixelSize::default(),
+        )
+    }
+
+    fn panel(names: &[(&str, bool)], active: usize) -> LayerPanel {
+        let mut panel = LayerPanel::default();
+        let rows = names
+            .iter()
+            .map(|&(name, visible)| dpx_ui::LayerRow {
+                name: name.into(),
+                visible,
+            })
+            .collect();
+        // Up is refused (the active layer is the top one in most of these tests).
+        panel.update(rows, active, [true, true, true, false, true, true], 100);
+        panel
+    }
+
+    fn strokes(list: &List, colour: Color) -> usize {
+        list.ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Path { stroke: Some(s), .. } if s.color == colour))
+            .count()
+    }
+
+    #[test]
+    fn the_layer_column_lists_the_layers_from_the_top_down() {
+        let (l, theme, palette) = (with_layers(), Theme::dark(), Palette::dpaint_default_32());
+        let column = l.layers.as_ref().expect("the layer column");
+        let ui = UiState {
+            layer_panel: Some(panel(
+                &[("Background", true), ("Sketch", false), ("Sky", true)],
+                2,
+            )),
+            ..UiState::default()
+        };
+        let list = layers(&l, &theme, &Model::new(&ui, &palette));
+        let texts = texts(&list);
+        let shown: Vec<&str> = texts.iter().map(|t| t.0.as_str()).collect();
+        assert_eq!(shown, ["Layers", "Sky", "Sketch", "Background"]);
+        // A hidden layer's name is subdued; its eye is closed and ghosted.
+        assert_eq!(texts[1].2, theme.text);
+        assert_eq!(texts[2].2, theme.text_dim);
+        assert_eq!(texts[3].2, theme.text);
+        // The names start in their rows' name rectangles.
+        for (slot, text) in texts[1..].iter().enumerate() {
+            let name = column.name(slot);
+            assert!(text.1 >= name.x && text.1 < name.x + 6.0, "{text:?}");
+        }
+        // The active layer (row 0): a raised card and the accent at its edge.
+        let row = column.row(0);
+        let cards = fills(&list, theme.raised);
+        assert!(cards.iter().any(|r| row.encloses(r) && r.w > 150.0));
+        let marks = fills(&list, theme.accent);
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert!(row.encloses(&marks[0]) && marks[0].w <= 3.0);
+        // Five buttons work, Up is ghosted: the two eyes that show and five icons in the
+        // text colour; one closed eye and one icon ghosted.
+        assert_eq!(strokes(&list, theme.text), 2 + 5);
+        assert_eq!(strokes(&list, theme.disabled), 1 + 1);
+        for button in column.buttons {
+            assert!(
+                list.ops().iter().any(
+                    |op| matches!(op, Op::RoundRect { rect, fill: Some(_), .. } if *rect == button)
+                ),
+                "{button:?} has a ground"
+            );
+        }
+        // Everything is drawn inside the column.
+        for op in list.ops() {
+            if let Op::RoundRect { rect, .. } = op {
+                assert!(column.rect.encloses(rect), "{rect:?}");
+            }
+        }
+        // No panel, no column: nothing is built.
+        assert!(layers(&layout(), &theme, &Model::new(&ui, &palette)).is_empty());
+    }
+
+    #[test]
+    fn hover_a_held_button_and_the_scroll_arrows_show_in_the_layer_column() {
+        let (l, theme, palette) = (with_layers(), Theme::light(), Palette::dpaint_default_32());
+        let column = l.layers.as_ref().expect("the layer column");
+        let mut ui = UiState {
+            layer_panel: Some(panel(&[("Background", true), ("Sky", true)], 1)),
+            ..UiState::default()
+        };
+        let build = |ui: &UiState, hover: Option<LayerHit>| {
+            layers(
+                &l,
+                &theme,
+                &Model {
+                    hover: hover.map(Hit::LayerPanel),
+                    ..Model::new(ui, &palette)
+                },
+            )
+        };
+        let idle = build(&ui, None);
+        assert!(fills(&idle, theme.hover).is_empty());
+        // All rows fit: no arrows.
+        let arrows = |list: &List| {
+            list.ops()
+                .iter()
+                .filter(|op| match op {
+                    Op::Path { path, .. } => {
+                        path.bounds().is_some_and(|b| column.header.encloses(&b))
+                    }
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(arrows(&idle), 0);
+        // The button under the pointer is raised; a ghosted one is not.
+        use dpx_ui::LayerButton as B;
+        let new = build(&ui, Some(LayerHit::Button(B::New)));
+        assert_eq!(fills(&new, theme.hover), [column.button(B::New)]);
+        let up = build(&ui, Some(LayerHit::Button(B::Up)));
+        assert!(fills(&up, theme.hover).is_empty(), "Up is ghosted");
+        // The eye under the pointer, and the row of a layer that is not the active one.
+        let eye = build(&ui, Some(LayerHit::Eye(0)));
+        let spots = fills(&eye, theme.hover);
+        assert!(spots.len() == 1 && column.eye(1).encloses(&spots[0]));
+        assert_ne!(build(&ui, Some(LayerHit::Name(0))), idle);
+        assert_eq!(build(&ui, Some(LayerHit::Name(1))), idle, "the active row");
+        // A held button is on the accent.
+        ui.layer_panel.as_mut().expect("panel").held = Some(B::Copy);
+        let held = build(&ui, None);
+        assert!(fills(&held, theme.accent).contains(&column.button(B::Copy)));
+        assert_eq!(strokes(&held, theme.on_accent), 1);
+        // More layers than rows: both arrows; the one with nothing further is ghosted.
+        let many: Vec<(String, bool)> = (0..column.capacity + 3)
+            .map(|i| (format!("Layer {i}"), true))
+            .collect();
+        let names: Vec<(&str, bool)> = many.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let mut long = panel(&names, names.len() - 1);
+        long.scroll_by(0, column.capacity);
+        ui.layer_panel = Some(long);
+        let top = build(&ui, None);
+        assert_eq!(arrows(&top), 2);
+        assert_eq!(
+            texts(&top).len(),
+            1 + column.capacity,
+            "as many rows as fit"
+        );
+        assert_eq!(texts(&top)[1].0, format!("Layer {}", names.len() - 1));
+        ui.layer_panel
+            .as_mut()
+            .expect("panel")
+            .scroll_by(1, column.capacity);
+        let scrolled = build(&ui, None);
+        assert_eq!(texts(&scrolled)[1].0, format!("Layer {}", names.len() - 2));
+        assert_ne!(top, scrolled);
+        let over = build(&ui, Some(LayerHit::ScrollUp));
+        assert_eq!(fills(&over, theme.hover), [column.scroll_up]);
+    }
+
+    #[test]
+    fn a_name_being_edited_is_a_field_with_a_caret() {
+        use dpx_ui::ReqKey;
+        let (l, theme, palette) = (with_layers(), Theme::dark(), Palette::dpaint_default_32());
+        let column = l.layers.as_ref().expect("the layer column");
+        let mut ui = UiState {
+            layer_panel: Some(panel(&[("Background", true), ("Sky", true)], 1)),
+            ..UiState::default()
+        };
+        let caret = |ui: &UiState| {
+            let list = layers(&l, &theme, &Model::new(ui, &palette));
+            let name = column.name(0);
+            let carets: Vec<Rect> = fills(&list, theme.accent)
+                .into_iter()
+                .filter(|r| r.w == 1.0 && name.encloses(r))
+                .collect();
+            assert_eq!(carets.len(), 1, "one caret");
+            (carets[0].x, texts(&list))
+        };
+        let edit = |ui: &mut UiState, key: ReqKey| {
+            ui.layer_panel.as_mut().expect("panel").rename_key(key);
+        };
+        ui.layer_panel.as_mut().expect("panel").begin_rename(1);
+        let (at_end, shown) = caret(&ui);
+        assert_eq!(shown[1].0, "Sky", "the name as it is");
+        // The field: the canvas colour inside an accent ring, in the name's rectangle.
+        let list = layers(&l, &theme, &Model::new(&ui, &palette));
+        let grounds = fills(&list, theme.canvas);
+        assert!(grounds.len() == 1 && column.name(0).encloses(&grounds[0]));
+        // The caret is behind the text and follows the cursor and what is typed.
+        let text_end = shown[1].1 + font::measure("Sky", font::SIZE_PANEL, Weight::Regular);
+        assert!((at_end - text_end).abs() < 0.01, "{at_end} vs {text_end}");
+        edit(&mut ui, ReqKey::Left);
+        let (one_back, _) = caret(&ui);
+        assert!(one_back < at_end);
+        edit(&mut ui, ReqKey::Home);
+        let (at_start, shown) = caret(&ui);
+        assert!((at_start - shown[1].1).abs() < 0.01);
+        edit(&mut ui, ReqKey::End);
+        edit(&mut ui, ReqKey::Char('!'));
+        let (after, shown) = caret(&ui);
+        assert_eq!(shown[1].0, "Sky!");
+        assert!(after > at_end);
+        // A name longer than the field scrolls: the caret stays inside it.
+        for c in "a very long name that does not fit the field at all".chars() {
+            edit(&mut ui, ReqKey::Char(c));
+        }
+        let (far, shown) = caret(&ui);
+        let name = column.name(0);
+        assert!(far > name.x && far < name.right(), "{far} in {name:?}");
+        assert!(shown[1].1 < name.x, "the text starts left of the field");
+        // The other row is drawn as before.
+        assert_eq!(shown[2].0, "Background");
+        // Esc: the name again, no field.
+        edit(&mut ui, ReqKey::Escape);
+        let list = layers(&l, &theme, &Model::new(&ui, &palette));
+        assert!(fills(&list, theme.canvas).is_empty());
+        assert_eq!(texts(&list)[1].0, "Sky");
+    }
+
+    #[test]
+    fn a_long_layer_name_is_cut_to_its_row() {
+        let (l, theme, palette) = (with_layers(), Theme::dark(), Palette::dpaint_default_32());
+        let column = l.layers.as_ref().expect("the layer column");
+        let long = "The sky behind the hills at dusk, second try";
+        let ui = UiState {
+            layer_panel: Some(panel(&[("Background", true), (long, true)], 0)),
+            ..UiState::default()
+        };
+        let list = layers(&l, &theme, &Model::new(&ui, &palette));
+        let shown = &texts(&list)[1];
+        assert!(
+            shown.0.ends_with('…') && shown.0.len() < long.len(),
+            "{shown:?}"
+        );
+        let end = shown.1 + font::measure(&shown.0, font::SIZE_PANEL, Weight::Regular);
+        assert!(end <= column.name(0).right(), "{end}");
+    }
+
+    #[test]
+    fn under_a_requester_every_part_of_the_chrome_ends_with_the_scrim() {
+        let (l, theme, palette) = (with_layers(), Theme::dark(), Palette::dpaint_default_32());
+        let ui = UiState {
+            layer_panel: Some(panel(&[("Background", true)], 0)),
+            ..UiState::default()
+        };
+        let lit = Model::new(&ui, &palette);
+        let dimmed = Model {
+            dimmed: true,
+            ..Model::new(&ui, &palette)
+        };
+        let veil = |rect: Rect| Op::RoundRect {
+            rect,
+            radius: 0.0,
+            fill: Some(theme.scrim),
+            stroke: None,
+        };
+        let column = l.layers.as_ref().expect("the layer column").rect;
+        let dock_rect = l.dock.as_ref().expect("dock").rect;
+        type Build = fn(&MainLayout, &Theme, &Model<'_>) -> List;
+        let parts: [(&str, Rect, Build); 3] = [
+            ("bar", l.bar.expect("bar"), title_bar),
+            ("dock", dock_rect, dock),
+            ("layers", column, layers),
+        ];
+        for (name, rect, build) in parts {
+            let (plain, veiled) = (build(&l, &theme, &lit), build(&l, &theme, &dimmed));
+            assert_eq!(veiled.len(), plain.len() + 1, "{name}");
+            assert_eq!(veiled.ops().last(), Some(&veil(rect)), "{name}");
+            assert_eq!(&veiled.ops()[..plain.len()], plain.ops(), "{name}");
+            assert!(!plain.ops().contains(&veil(rect)), "{name}");
+        }
+        // The canvas is veiled under the picture, never over it.
+        let plain = canvas(&l, &theme, false);
+        let veiled = canvas(&l, &theme, true);
+        assert_eq!(veiled.len(), plain.len() + 1);
+        let at = |list: &List, wanted: &dyn Fn(&Op) -> bool| {
+            list.ops().iter().position(wanted).expect("the op")
+        };
+        let scrim_at = at(&veiled, &|op| *op == veil(l.viewport));
+        let image_at = at(&veiled, &|op| matches!(op, Op::Image { .. }));
+        assert!(scrim_at < image_at);
+        // The whole window's list has the four veils.
+        let whole = window(&l, &theme, &dimmed);
+        let veils = whole
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::RoundRect { fill: Some(c), .. } if *c == theme.scrim))
+            .count();
+        assert_eq!(veils, 4);
+    }
+
+    #[test]
+    fn a_layer_button_s_tooltip_stands_left_of_the_column() {
+        use dpx_ui::{KeyMode, LayerButton};
+        let (l, theme, palette) = (with_layers(), Theme::dark(), Palette::dpaint_default_32());
+        let column = l.layers.as_ref().expect("the layer column");
+        for button in BUTTONS {
+            let tip = Tooltip::new(TooltipTarget::Layer(button), KeyMode::Paint);
+            let rect = tooltip_rect(&l, &tip).expect("a tooltip");
+            let b = column.button(button);
+            assert!(rect.right() < column.rect.x, "{button:?}: {rect:?}");
+            assert!(l.window.encloses(&rect), "{button:?}: {rect:?}");
+            assert!(rect.y < b.bottom() && rect.bottom() > b.y - 8.0);
+            let ui = UiState {
+                layer_panel: Some(panel(&[("Background", true)], 0)),
+                tooltip: Some(tip),
+                ..UiState::default()
+            };
+            let (bounds, list) = overlay(&l, &theme, &Model::new(&ui, &palette)).expect("overlay");
+            assert!(bounds.encloses(&rect.inset(-1.0)) || bounds.intersects(&rect));
+            assert_eq!(texts(&list)[0].0, button.name());
+        }
+        // Without the column there is no such tooltip.
+        let tip = Tooltip::new(TooltipTarget::Layer(LayerButton::New), KeyMode::Paint);
+        assert_eq!(tooltip_rect(&layout(), &tip), None);
     }
 }

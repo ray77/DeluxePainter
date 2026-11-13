@@ -19,6 +19,30 @@
   <img src="docs/design/screenshots/phase1-menu-picture.png" alt="Picture menu open" width="400">
 </p>
 
+## Two skins: Classic and Modern
+
+DeluxePainter has two looks for the same program. **Classic** is the pixel interface shown above and what a first start shows. **Modern** (Prefs ▸ Modern UI, `F12` or Cmd/Ctrl+Shift+U; the choice is remembered) draws the interface as sharp vector graphics in a dark or a light theme (Prefs ▸ Theme ▸ System / Dark / Light) and keeps pixels for the picture only, enlarged at whole factors. Both skins share one state: the same tools, the same hotkeys, the same pull-down menus held with the right mouse button on the bar at the top, the same undo history. Switching never touches the picture.
+
+<p align="center">
+  <img src="docs/design/screenshots/modern-layers-dark.png" alt="Modern skin, dark theme: bar, picture, layer column and dock" width="400">
+  <img src="docs/design/screenshots/modern-light-1x.png" alt="Modern skin, light theme" width="400">
+</p>
+<p align="center">
+  <img src="docs/design/screenshots/modern-menu-dark.png" alt="Modern skin: the Mode menu held open with the right mouse button" width="400">
+  <img src="docs/design/screenshots/modern-requester-dark.png" alt="Modern skin: the Color Mixer in the Classic look inside the picture, the interface around it dimmed" width="400">
+</p>
+
+What is Modern today (ADR-47, slice 1):
+
+- the bar with the menu titles, status and coordinates, and the pull-down menus with submenus, check marks and shortcuts;
+- the dock at the right: built-in brushes, the 18 tools (split tools divided on the diagonal), colour indicator and palette, with tooltips;
+- the layer column left of the dock (Prefs ▸ Layers or `L`): eye, name, active layer, rename by double-click, New / Copy / Delete / Up / Down / Merge Down, wheel scrolling;
+- the picture, centred, zoomed with Cmd/Ctrl `+` / `−` / `0` or Prefs ▸ Pixel Size (the window keeps its size).
+
+What still has the Classic pixel look inside the Modern window: every requester (they open inside the picture, the interface around it is dimmed and takes no input until they close), Screen Format (it takes the whole window, as in Classic), Show Page, the Animation Control Panel and the Magnify divider. They work exactly as in Classic; they are converted in later slices.
+
+Not verified: the Modern skin has only been run through automated tests and headless renders on one Apple-silicon Mac. It has not been used by hand in a real window, and not been built or run on Windows or Linux. The picture area shows one Amiga screen; a screen larger than the free area of a small window is cut at its edges. Details and the full list: [ADR-47](docs/adr/0047-modern-ui-skin.md).
+
 ## What it will be
 
 - **The classic look and feel**, rebuilt from scratch: menu bar, two-column toolbox, palette, requesters — rendered as crisp pixel art at integer scales (1×–5×, 4K-ready), never blurred.

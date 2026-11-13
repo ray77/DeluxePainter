@@ -60,6 +60,9 @@
 //!     [--pointer X,Y]                   … a pointer at window point X,Y
 //!     [--tooltip]                       … that has rested there: the tooltip of the dock
 //!                                       button under it (`--menu` draws the Modern cards)
+//!                                       (`--layers-panel` shows the Modern layer column; a
+//!                                       requester flag draws the requester inside the
+//!                                       picture and dims the interface around it)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -329,7 +332,10 @@ fn main() -> eframe::Result {
                 .into_iter()
                 .find(|f| args.iter().any(|a| a == f))
         {
-            eprintln!("{flag} is a full-screen view the Modern skin does not host yet");
+            eprintln!(
+                "{flag} draws its own full-screen view; a --ui modern snapshot shows the main \
+                 window (the live Modern window hosts it, see the ui-loop tests)"
+            );
             std::process::exit(2);
         }
         let doc = match &opened {
@@ -2115,7 +2121,7 @@ impl PainterApp {
             // quad (the screen) or the canvas around it. `None` in the Classic skin.
             let spot = modern_layout.as_ref().map(|l| {
                 let p = pos - area.min;
-                dpx_ui_modern::hit(l, p.x, p.y)
+                dpx_ui_modern::hit_in(l, &self.ui, p.x, p.y)
             });
             let on_screen = matches!(spot, None | Some(dpx_ui_modern::Spot::Picture { .. }));
             // Screen pixels are page pixels, shifted by the scroll position (or magnified,
@@ -2848,7 +2854,8 @@ impl PainterApp {
                     (screen, rgba)
                 }
                 (None, None) => {
-                    let screen = self.compose_screen();
+                    // ADR-47: without the tooltips the Modern chrome draws itself.
+                    let screen = self.compose_for_skin();
                     let mut rgba = to_rgba(&screen, self.palette(), 1, 1);
                     // ADR-42: the Import thumbnail in true colour over the indexed screen.
                     self.import_overlay(&mut rgba, screen.width() as usize);

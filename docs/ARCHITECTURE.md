@@ -28,6 +28,9 @@ crates/
                 layer and frame)
   dpx-ui        RetroUi: framebuffer, bitmap font, widgets, toolbox, menus, requesters
                 (incl. the layer panel, Prefs > AI & MCP.., Generate, Image Generator setup)
+  dpx-ui-modern The Modern skin (ADR-47): display list, tiny-skia/ab_glyph rasteriser, theme
+                tokens, bundled Go font, own vector icons, layout, hit testing, menus,
+                the lists of bar, dock, layer column and overlay; no egui, no pixel logic
   dpx-mcp       MCP (rmcp): tools and resources, the Workspace trait and job queue, the
                 Streamable HTTP server on 127.0.0.1, endpoint files, the stdio bridge,
                 the .mcpb names; feature `imagegen` for the generation tools
@@ -42,7 +45,7 @@ xtask           `cargo run -p xtask -- mcpb` packs the Claude Desktop extension
 
 Planned in Phase 0 but not split out: `dpx-raster` (in `dpx_core::raster`), `dpx-project` (in `dpx-formats`), `dpx-render` (compositing is `dpx_core::layer`, the screen is drawn by `dpx-ui` and the app).
 
-Dependency direction (no cycles): `core ← iff/formats ← app`, `core ← ui ← app`, `core/formats ← imagegen ← app`, `core/formats/iff ← mcp ← app/bridge/xtask` (`mcp` → `imagegen` only with its `imagegen` feature, which the app turns on and the bridge leaves off). `dpx-ui` never touches files directly; it issues commands. No pixel logic outside `dpx-core`.
+Dependency direction (no cycles): `core ← iff/formats ← app`, `core ← ui ← app`, `core/ui ← ui-modern ← app`, `core/formats ← imagegen ← app`, `core/formats/iff ← mcp ← app/bridge/xtask` (`mcp` → `imagegen` only with its `imagegen` feature, which the app turns on and the bridge leaves off). `dpx-ui` never touches files directly; it issues commands. No pixel logic outside `dpx-core`.
 
 One binary for the GUI, the CLI and the headless MCP server (ADR-5); since ADR-43 there is also the small `dpx-mcp-bridge` binary, so a client configuration can start a process without the GUI toolkit (the same bridge is `deluxepainter mcp-bridge`).
 
@@ -116,6 +119,30 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
 - Colour cycling is a display-time palette rotation; document pixels never change while cycling.
 - Font: an **original** 8×8 / 8×9 bitmap font drawn for this project (Topaz and other Amiga ROM fonts are not redistributable). Icons are original pixel art drawn in the spirit of DPaint IV, not copied.
 
+### 5a. The Modern skin (ADR-47)
+
+A second renderer for the main window; state, input and commands are the Classic ones.
+
+```text
+ UiState, Document ──► dpx-ui (Classic): compose_screen() without title bar and toolbox
+        │                    └─► the picture quad: one NEAREST texture, whole physical
+        │                        pixels per pixel, centred in the viewport
+        └────────────► dpx-ui-modern: MainLayout (points, edges on physical pixels)
+                             ├─ build::{canvas, title_bar, dock, layers} → display lists
+                             ├─ build::overlay (held menu, tooltip)      → display list
+                             └─ raster (tiny-skia, ab_glyph) → RGBA per region, redone
+                                only when the list's fingerprint changes
+ pointer ─► dpx_ui_modern::hit_in ─► Spot::Ui(dpx_ui::Hit)   → handle_press (shared)
+                                    Spot::Picture{x, y}      → classic hit test on the quad
+```
+
+- During a Modern pass the two classic chrome flags are held aside, so the classic code lays out, draws and hit-tests a screen without its own chrome; the quad is the classic screen rectangle and every pointer mapping, tool, key and requester works unchanged.
+- The chrome answers with the Classic skin's `Hit` values (tools, brushes, palette, `Hit::LayerPanel`) and writes the same `MenuState`; no action is implemented twice.
+- The layer column is the Classic `LayerPanel` state with another geometry: the panel is marked docked (the classic screen neither draws nor hits it) and gets the column's row count.
+- While a requester, a note or Show Page is open, the classic screen with the requester is the quad and every region ends with a scrim; the input branch for the chrome is not reached. Screen Format (its own HiRes screen) gets a layout without chrome. Playback keeps the chrome lit.
+- `--snapshot --ui modern` and the ui-loop tests render the same lists with the same rasteriser as the window; only the GPU blit of the textures is outside the tests.
+- Rule for new main-window features: draw them in both skins and add a parity test (the same script in a Classic and a Modern window, compared after every step).
+
 ## 6. Files
 
 | Path | Crate | Notes |
@@ -152,6 +179,7 @@ scripts / tests ──stdio or HTTP──► deluxepainter mcp [--http] ──�
 - Unit + property tests (proptest) for raster algorithms, ByteRun1, IFF parsing with fuzzed bytes.
 - Golden files: ILBM fixtures we generate ourselves + a small set of redistributable third-party files (licence checked), compared pixel-by-pixel after decode.
 - UI golden screenshots rendered headless by `dpx-ui`.
+- Classic guard (ADR-47): four scenes of the classic screen and snapshot pinned by hash (`classic_pin_tests.rs`). Modern skin: list-level tests in `dpx-ui-modern` (bit-identical everywhere), raster probes, and parity scripts that run in both skins through real `ui()` passes.
 - MCP: tool tests on the headless workspace, ui-loop tests on the GUI workspace, integration tests against the real `deluxepainter mcp` (stdio and HTTP) and the real bridge binary; see [`MCP_API.md`](MCP_API.md) §9.
 - CI: `fmt --check`, `clippy -D warnings`, `test`, release build on macOS, Windows, Linux.
 

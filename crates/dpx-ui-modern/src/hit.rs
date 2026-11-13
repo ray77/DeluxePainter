@@ -3,16 +3,17 @@
 //! tool, brush, palette and indicator actions) is shared; a point on the picture answers with
 //! the picture pixel, which the app maps to the page exactly as in Classic.
 
-use dpx_ui::Hit;
+use dpx_ui::layer_panel::BUTTONS;
 use dpx_ui::toolbox::TOOL_ROWS;
+use dpx_ui::{Hit, LayerHit, LayerPanel, UiState};
 
-use crate::layout::MainLayout;
+use crate::layout::{LayerColumn, MainLayout};
 use crate::paint::Rect;
 
 /// What a point of the window is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Spot {
-    /// The chrome: the bar or a part of the dock.
+    /// The chrome: the bar, a part of the dock or of the layer column.
     Ui(Hit),
     /// The picture quad, at pixel (`x`, `y`) of its image.
     Picture { x: i32, y: i32 },
@@ -27,13 +28,64 @@ pub fn in_filled_half(rect: &Rect, x: f32, y: f32) -> bool {
     (x - rect.x) / rect.w + (y - rect.y) / rect.h >= 1.0
 }
 
-/// What is under the window point (`x`, `y`).
+/// What the layer column has at (`x`, `y`), a point inside it, for the layers `panel` shows.
+/// The answers are the Classic panel's: an eye box, a name, the rename field, a button, a
+/// scroll arrow (while there is something to scroll) or nothing.
+pub fn layer_hit(column: &LayerColumn, panel: &LayerPanel, x: f32, y: f32) -> LayerHit {
+    let cap = column.capacity;
+    let scrolls = panel.more_above() || panel.more_below(cap);
+    if scrolls && column.scroll_up.contains(x, y) {
+        return LayerHit::ScrollUp;
+    }
+    if scrolls && column.scroll_down.contains(x, y) {
+        return LayerHit::ScrollDown;
+    }
+    if let Some(i) = column.buttons.iter().position(|r| r.contains(x, y)) {
+        return LayerHit::Button(BUTTONS[i]);
+    }
+    if column.list.contains(x, y)
+        && let Some(slot) = column.slot_at(y)
+        && let Some(layer) = panel.layer_at(slot)
+    {
+        let name = column.name(slot);
+        if panel.renaming() == Some(layer) && name.contains(x, y) {
+            return LayerHit::Field;
+        }
+        return if x < name.x {
+            LayerHit::Eye(layer)
+        } else {
+            LayerHit::Name(layer)
+        };
+    }
+    LayerHit::Background
+}
+
+/// What is under the window point (`x`, `y`) while the interface is in state `ui`: as
+/// [`hit`], and inside the layer column the part of the layer panel that is there.
+pub fn hit_in(layout: &MainLayout, ui: &UiState, x: f32, y: f32) -> Spot {
+    match (hit(layout, x, y), &layout.layers, &ui.layer_panel) {
+        (Spot::Ui(Hit::LayerPanel(_)), Some(column), Some(panel)) => {
+            Spot::Ui(Hit::LayerPanel(layer_hit(column, panel, x, y)))
+        }
+        (spot, ..) => spot,
+    }
+}
+
+/// What is under the window point (`x`, `y`). This is the layout alone: the layer column
+/// answers as its background everywhere ([`hit_in`] knows its rows and buttons).
 pub fn hit(layout: &MainLayout, x: f32, y: f32) -> Spot {
     if !layout.window.contains(x, y) {
         return Spot::Canvas;
     }
     if layout.bar.is_some_and(|bar| bar.contains(x, y)) {
         return Spot::Ui(Hit::TitleBar);
+    }
+    if layout
+        .layers
+        .as_ref()
+        .is_some_and(|c| c.rect.contains(x, y))
+    {
+        return Spot::Ui(Hit::LayerPanel(LayerHit::Background));
     }
     if let Some(dock) = layout.dock.as_ref().filter(|d| d.rect.contains(x, y)) {
         if let Some(i) = dock.tools.iter().position(|r| r.contains(x, y)) {
@@ -212,6 +264,7 @@ mod tests {
             Chrome {
                 bar: false,
                 dock: false,
+                layers: false,
             },
             32,
             (320, 256),
@@ -261,6 +314,144 @@ mod tests {
             menu_title(&l, l.status_x() + 5.0, 15.0),
             None,
             "on the status text"
+        );
+    }
+
+    fn panel(count: usize, active: usize, capacity: usize) -> LayerPanel {
+        let mut panel = LayerPanel::default();
+        let rows = (0..count)
+            .map(|i| dpx_ui::LayerRow {
+                name: format!("Layer {i}"),
+                visible: true,
+            })
+            .collect();
+        panel.update(rows, active, [true; 6], capacity);
+        panel
+    }
+
+    fn with_layers(window: (f32, f32), scale: f32) -> MainLayout {
+        MainLayout::new(
+            window,
+            scale,
+            Chrome::WITH_LAYERS,
+            32,
+            (320, 256),
+            PixelSize::default(),
+        )
+    }
+
+    #[test]
+    fn the_layer_column_answers_with_the_classic_panels_hits() {
+        for (window, scale) in [
+            ((1280.0, 800.0), 1.0),
+            ((1280.0, 800.0), 2.0),
+            ((720.0, 520.0), 1.0),
+            ((1001.0, 640.0), 1.5),
+            ((900.0, 600.0), 1.25),
+        ] {
+            let l = with_layers(window, scale);
+            let column = l.layers.as_ref().expect("the layer column");
+            let ui = UiState {
+                layer_panel: Some(panel(3, 1, column.capacity)),
+                ..UiState::default()
+            };
+            let at = |x: f32, y: f32| hit_in(&l, &ui, x, y);
+            let layer = |hit: LayerHit| Spot::Ui(Hit::LayerPanel(hit));
+            // Rows from the top layer down.
+            for slot in 0..3 {
+                let n = 2 - slot;
+                let (ex, ey) = column.eye(slot).center();
+                assert_eq!(at(ex, ey), layer(LayerHit::Eye(n)), "{window:?} {scale}");
+                let (nx, ny) = column.name(slot).center();
+                assert_eq!(at(nx, ny), layer(LayerHit::Name(n)), "{window:?} {scale}");
+                // Every corner of the row belongs to that row.
+                let r = column.row(slot);
+                let e = 0.2 / scale;
+                assert_eq!(at(r.x + e, r.y + e), layer(LayerHit::Eye(n)));
+                assert_eq!(
+                    at(r.right() - e, r.bottom() - e),
+                    layer(LayerHit::Name(n)),
+                    "{window:?} {scale}"
+                );
+            }
+            // An empty row, the title and the gaps: nothing.
+            let (x, y) = column.row(3).center();
+            assert_eq!(at(x, y), layer(LayerHit::Background));
+            let (x, y) = column.header.center();
+            assert_eq!(at(x, y), layer(LayerHit::Background));
+            for (i, r) in column.buttons.iter().enumerate() {
+                let (x, y) = r.center();
+                assert_eq!(at(x, y), layer(LayerHit::Button(BUTTONS[i])));
+            }
+            // The arrows scroll only while rows are scrolled away.
+            let (ux, uy) = column.scroll_up.center();
+            let (dx, dy) = column.scroll_down.center();
+            assert_eq!(at(ux, uy), layer(LayerHit::Background));
+            // The layout alone knows the column, not its rows.
+            let (nx, ny) = column.name(0).center();
+            assert_eq!(hit(&l, nx, ny), layer(LayerHit::Background));
+            // Without a panel the column is background.
+            assert_eq!(
+                hit_in(&l, &UiState::default(), nx, ny),
+                layer(LayerHit::Background)
+            );
+            // Left of the column the picture or the canvas, right of it the dock.
+            assert!(!matches!(
+                at(column.rect.x - 1.0, 300.0),
+                Spot::Ui(Hit::LayerPanel(_))
+            ));
+            assert!(matches!(
+                at(column.rect.right() + 1.0, 300.0),
+                Spot::Ui(
+                    Hit::ToolboxBackground | Hit::Tool { .. } | Hit::Brush(_) | Hit::PaletteCell(_)
+                )
+            ));
+
+            // More layers than rows: the arrows work, and the rows follow the scroll.
+            let many = column.capacity + 5;
+            let mut scrolled = panel(many, many - 1, column.capacity);
+            scrolled.scroll_by(2, column.capacity);
+            let ui = UiState {
+                layer_panel: Some(scrolled),
+                ..UiState::default()
+            };
+            let at = |x: f32, y: f32| hit_in(&l, &ui, x, y);
+            assert_eq!(at(ux, uy), layer(LayerHit::ScrollUp));
+            assert_eq!(at(dx, dy), layer(LayerHit::ScrollDown));
+            let (nx, ny) = column.name(0).center();
+            assert_eq!(at(nx, ny), layer(LayerHit::Name(many - 3)));
+            let last = column.capacity - 1;
+            let (nx, ny) = column.name(last).center();
+            assert_eq!(at(nx, ny), layer(LayerHit::Name(many - 3 - last)));
+        }
+    }
+
+    #[test]
+    fn the_name_being_edited_is_the_field() {
+        let l = with_layers((1280.0, 800.0), 1.0);
+        let column = l.layers.as_ref().expect("the layer column");
+        let mut panel = panel(3, 2, column.capacity);
+        panel.begin_rename(1);
+        let ui = UiState {
+            layer_panel: Some(panel),
+            ..UiState::default()
+        };
+        let at = |r: Rect| {
+            let (x, y) = r.center();
+            hit_in(&l, &ui, x, y)
+        };
+        // Layer 1 is in row 1: its name is the gadget, its eye still the eye.
+        assert_eq!(
+            at(column.name(1)),
+            Spot::Ui(Hit::LayerPanel(LayerHit::Field))
+        );
+        assert_eq!(
+            at(column.eye(1)),
+            Spot::Ui(Hit::LayerPanel(LayerHit::Eye(1)))
+        );
+        assert_eq!(
+            at(column.name(0)),
+            Spot::Ui(Hit::LayerPanel(LayerHit::Name(2)))
         );
     }
 }

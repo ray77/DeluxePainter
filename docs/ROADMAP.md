@@ -56,6 +56,32 @@ Still open: hand testing in the window; layer opacity, lock and groups (not want
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 
+## Modern UI skin status (ADR-47, 2026-11-13)
+
+The owner asked for a second, modern look: no pixels in the interface, only in the picture; dark and light; same hotkeys; switchable. Slice 1 (the main window) is built in four steps, 1a–1d.
+
+Modern now (drawn by `dpx-ui-modern`):
+- Bar (menu titles, program name or frame counter, paint mode, flags, coordinates, layer name) and the pull-down menus held with the right button, with submenus, marks, ghosting and shortcuts.
+- Dock: built-in brushes, 18 tools with split halves, toggles, colour indicator, palette up to 64 colours, tooltips.
+- Layer column (Prefs ▸ Layers / `L`): rows with eye and name, active layer, rename by double-click with a caret, six buttons with tooltips, scroll arrows and wheel. Same commands and undo steps as the Classic panel.
+- Picture quad with zoom (Cmd/Ctrl `+` / `−` / `0`, Prefs ▸ Pixel Size), free window size, device scales, dark and light theme (system or fixed), the switch (Prefs ▸ Modern UI, `F12`, Cmd/Ctrl+Shift+U) remembered in the settings.
+
+Still in the Classic look inside the Modern window (they work, hosted in the picture quad):
+- All requesters (tool settings, file, Page Size, Color Mixer, Range, Import, Generate, AI & MCP, notes, questions, Anim requesters) under a dimmed interface; Screen Format on the whole window; Show Page.
+- The Animation Control Panel and its tooltips; the Magnify divider.
+
+Next: slice 2 (Animation Control Panel as a Modern strip), slice 3 (free picture viewport: more than one Amiga screen, optional pixel grid), slice 4 and later (requesters, one family per slice).
+
+Verified by tests on macOS (Apple silicon) only: parity scripts in a Classic and a Modern window (every tool button, brush and palette cell with both buttons; a key script with strokes; menu picks; the whole layer panel; one requester of each kind clicked on the first and last pixels of its buttons: tool settings, file, Screen Format, Show Page, Color Mixer, Import, Generate, AI & MCP; the Control Panel) at device scales 1, 1.5 and 2, and headless renders that were looked at.
+
+Not verified:
+- The Modern skin was never used by hand in a real window; what the GPU shows (region textures, the overlay's alpha) is outside the tests. The owner declines remote control of the app, so this needs the owner's own look.
+- Windows and Linux: not built, not run. Whether the raster probes hold there (anti-aliasing) is open; the Classic pin hashes were made on one Mac.
+- F12 and Cmd/Ctrl+Shift+U reaching the app on each system; the system theme reported at runtime.
+- Display modes other than PAL LoRes in the Modern window; a screen larger than the free area (HiRes beside the layer column in a small window) is cut at both edges until slice 3.
+- Requesters other than the eight kinds above, playback and Show Page beyond one click, in Modern.
+- Rendering times of the Modern chrome.
+
 ## Wave 8 status (2026-11-13)
 
 Done (verified by unit, ui-loop and integration tests, real snapshot renders and debug runs on macOS, Apple Silicon; details and the exact lists in the ADRs):

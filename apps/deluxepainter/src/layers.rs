@@ -93,6 +93,19 @@ fn layout(ui: &UiState, docked: bool, (w, h): (i32, i32)) -> Layout {
 /// buttons ghosted where the engine would refuse their command (a dry run); the label while
 /// it is off and the picture has more than the one visible "Background" layer.
 pub fn sync(engine: &mut Engine, ui: &mut UiState, docked: bool, hidden: bool, screen: (i32, i32)) {
+    let capacity = layout(ui, docked, screen).capacity;
+    sync_rows(engine, ui, docked, hidden, capacity);
+}
+
+/// [`sync`] for a list with room for `capacity` rows (the Modern skin's layer column has its
+/// own, ADR-47).
+pub fn sync_rows(
+    engine: &mut Engine,
+    ui: &mut UiState,
+    docked: bool,
+    hidden: bool,
+    capacity: usize,
+) {
     let doc = engine.document();
     let active = doc.active_layer();
     let layers = doc.layers().to_vec();
@@ -113,7 +126,6 @@ pub fn sync(engine: &mut Engine, ui: &mut UiState, docked: bool, hidden: bool, s
                 .is_ok()
         })
     });
-    let capacity = layout(ui, docked, screen).capacity;
     let rows = layers
         .into_iter()
         .map(|l| LayerRow {
@@ -185,8 +197,8 @@ impl PainterApp {
         if !self.layer_panel_on() || !self.free || self.requester.is_some() {
             return 0;
         }
-        // ADR-47: the Modern window has no strip beside the screen (its layer column comes
-        // with a later slice; until then the panel lies over the picture as in a window).
+        // ADR-47: the Modern window has no strip beside the screen; its layer column is part
+        // of its own layout.
         if self.is_modern() {
             return 0;
         }
@@ -230,15 +242,22 @@ impl PainterApp {
     /// Before the screen is composed: the panel and the title-bar label follow the document.
     pub(crate) fn sync_layer_panel(&mut self) {
         let (view, scale) = self.layout();
-        let docked = self.layer_strip_px(view, scale) > 0;
         let hidden = self.modal_open();
-        sync(
-            &mut self.engine,
-            &mut self.ui,
-            docked,
-            hidden,
-            view.ui_size(),
-        );
+        match self.modern_layer_rows() {
+            // ADR-47: the Modern skin's layer column, beside the picture (so the classic
+            // screen neither draws nor hits the panel) with its own number of rows.
+            Some(rows) => sync_rows(&mut self.engine, &mut self.ui, true, hidden, rows),
+            None => {
+                let docked = self.layer_strip_px(view, scale) > 0;
+                sync(
+                    &mut self.engine,
+                    &mut self.ui,
+                    docked,
+                    hidden,
+                    view.ui_size(),
+                );
+            }
+        }
         self.layers.synced = Some(document_key(&self.engine));
     }
 
@@ -333,7 +352,9 @@ impl PainterApp {
         let Some(panel) = &self.ui.layer_panel else {
             return;
         };
-        let capacity = layout(&self.ui, panel.docked, screen).capacity;
+        let capacity = self
+            .modern_layer_rows()
+            .unwrap_or_else(|| layout(&self.ui, panel.docked, screen).capacity);
         if let Some(panel) = &mut self.ui.layer_panel {
             panel.scroll_by(rows, capacity);
         }
@@ -470,7 +491,9 @@ impl PainterApp {
     /// Uploads the docked strip (with the screen, when the screen changed); drops it while
     /// the panel is not docked.
     pub(crate) fn upload_layer_strip(&mut self, ctx: &egui::Context) {
-        let Some(panel) = self.ui.layer_panel.as_ref().filter(|p| p.docked) else {
+        // ADR-47: the Modern skin draws its layer column itself.
+        let classic = !self.is_modern();
+        let Some(panel) = self.ui.layer_panel.as_ref().filter(|p| p.docked && classic) else {
             self.layers.texture = None;
             return;
         };

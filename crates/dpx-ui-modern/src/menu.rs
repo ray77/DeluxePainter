@@ -614,6 +614,7 @@ mod tests {
             Chrome {
                 bar: false,
                 dock: true,
+                layers: false,
             },
             32,
             (320, 256),

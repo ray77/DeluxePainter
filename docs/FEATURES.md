@@ -27,6 +27,26 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P1 | Layer panel at the right (a DeluxePainter addition): Prefs ▸ Layers / `L`, rows with eye box, name and active marker, New / Copy / Del / Up / Dn / Merge, rename by double-click, scrolls past the rows that fit | done (ADR-44): over the screen's right edge, docked beside the screen in a full-screen window with room; hidden under requesters; title bar names the active layer while the panel is off |
 | P1 | Prefs ▸ AI & MCP.. requester (a DeluxePainter addition): MCP control on/off, status, connect Claude Desktop / Claude Code, Disconnect, Revoke access, permissions, approved folder, image generator state with Set up.., last calls | done (ADR-43, ADR-45); not yet used by hand or with a real Claude client |
 
+### Modern skin (a DeluxePainter addition, ADR-47)
+
+A second, switchable look for the same program; Classic stays the default on a first start. One state, one input path and the same hotkeys in both.
+
+| P | Feature | Notes |
+|---|---|---|
+| P1 | Switch Classic ⇄ Modern at any time: Prefs ▸ Modern UI, `F12`, Cmd/Ctrl+Shift+U; remembered in the settings file | done (slice 1c); document, tool, scroll, Magnify and undo history are shared |
+| P1 | Dark and light theme, following the system or fixed by Prefs ▸ Theme ▸ System / Dark / Light | done (slice 1c); accent warm orange |
+| P1 | Vector interface at any device scale, pixels only in the picture (nearest neighbour, whole physical pixels per pixel) | done (slices 1a, 1b); own CPU renderer, Go font, own icons |
+| P1 | Bar with always-visible menu titles; pull-downs while the right button is held, as in DPaint; left button multi-select | done (slice 1c) |
+| P1 | Dock at the right in toolbox order: brushes, 18 tools with split halves, colour indicator, palette up to 64 colours; tooltips | done (slices 1a–1c) |
+| P1 | Layer column left of the dock: eye, name, active layer, inline rename with caret, six icon buttons with tooltips, scroll arrows and wheel | done (slice 1d); same commands and undo steps as the Classic panel |
+| P1 | Picture zoom with Cmd/Ctrl `+` / `−` / `0` and Prefs ▸ Pixel Size; the window is sized freely (minimum 720 × 520 points) | done (slice 1b) |
+| P1 | Classic requesters hosted inside the picture, the interface around dimmed and without input; Screen Format on the whole window | done (slice 1d); still pixel look |
+| P2 | Animation Control Panel as a Modern strip | slice 2; today pixel look inside the picture |
+| P2 | Free picture viewport (more than one Amiga screen visible, optional pixel grid) | slice 3; today a screen larger than the free area is cut at its edges |
+| P2 | Requesters in the Modern look, one family at a time | slice 4 and later |
+
+Only run through automated tests and headless renders on one Mac so far; see ROADMAP.md, "Modern UI skin status".
+
 ## 2. Documents & hardware targets
 
 | P | Feature | Notes |
