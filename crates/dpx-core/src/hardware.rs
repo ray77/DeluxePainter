@@ -204,7 +204,7 @@ pub fn stored_palette_note(target: Target, palette: &Palette, refused_by: &str) 
 }
 
 /// Every hardware rule (module docs) for `doc`, in that order. The rules of MCP's
-/// `save_picture` (`dpx_mcp::pictures::validate_hardware` wraps this).
+/// `export_image` (`dpx_mcp::pictures::validate_hardware` wraps this).
 pub fn validate(doc: &Document) -> Result<(), HardwareError> {
     check(doc, false)
 }

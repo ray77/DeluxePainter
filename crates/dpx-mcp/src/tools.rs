@@ -555,7 +555,7 @@ static SPECS: &[Spec] = &[
     edit(
         "create_document",
         "New picture",
-        "Create a new blank picture with width, height, chipset (ocs|aga) and colours (or palette_size); optional video, resolution, interlace, preset, name. Hardware limits are checked: OCS allows 32 colours in Low Res, 16 in High Res. Undoable when the chipset stays; a chipset change replaces the picture (undoable: false in the result).",
+        "Create a new blank picture with width, height, chipset (ocs|aga) and colours (or palette_size); optional video, resolution, interlace, preset, name. Hardware limits are checked: OCS allows 32 colours in Low Res, 16 in High Res. For a one-frame picture this is one undo step, a chipset change included (to OCS the kept colours are rounded to 12 bits and counted in rounded_colors); an animation is replaced by a one-frame picture (undoable: false in the result).",
         schema::<CreateDocumentArgs>,
         false,
     ),

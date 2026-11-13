@@ -82,11 +82,7 @@ The owner's acceptance tests (spec §10), as far as they were checked:
 
 Not verified in wave 8 (see the ADRs' "Not verified" lists): real Claude Code, Claude Desktop and MCP Inspector; a real OpenAI request and the real system keychain; Windows and Linux (builds, tests, file permissions, the Claude paths, `.mcpb` opening); the stateless MCP `2026-07-28` protocol era; everything by hand in a visible window (the owner declines remote control). Open owner decisions: whether an MCP `generate_image` should also ask in the app before it sends a billed request (ADR-45, "Integration (wave 8)"); signing and notarizing the bridge, an icon for the extension and release packaging (ADR-43); whether the permissive but unlisted licences the full licence scan found (ISC, BSL-1.0, OFL-1.1, Ubuntu-font-1.0, Unicode-3.0; all through `eframe` or `url` except `unicode-ident`, which every crate reaches through `proc-macro2`; none new in wave 8) are acceptable ([research/dependencies.md](research/dependencies.md) §7.3).
 
-Open follow-ups found while documenting wave 8 (small code changes, not done in the docs step):
-- `create_document`'s tool description still says a chipset change replaces the picture; the code makes it one undoable step (ADR-46).
-- `apply_generated_image` does not report how many entries of the current palette it rounded for an OCS target (`TODO(wave8-integration)` in `apps/deluxepainter/src/generate.rs`); the Generate requester's Apply does.
-- `docs/design/screenshots/wave8-mcp-gui-calls.png` (640×512) predates the snapshot following the calls' display mode and renders 640×480 now (ADR-44, "Integration (wave 8)").
-- A few doc comments still name ADR-24's `save_picture` tool (`dpx_core::hardware::validate`, a `dpx-mcp` test comment).
+The follow-ups found while documenting wave 8 were fixed in the merge: `create_document`'s tool description (a chipset change of a one-frame picture is one undo step), `get_generation_status`/`apply_generated_image` report `rounded_colors`, `wave8-mcp-gui-calls.png` was regenerated (640×480), and the doc comments no longer name ADR-24's `save_picture`.
 
 ## Phase 1 status
 

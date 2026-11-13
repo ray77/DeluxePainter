@@ -203,7 +203,8 @@ mod work {
             "JOB_NOT_FOUND",
             format!(
                 "no generation {id:?} started by an AI client is known (ids look like gen-3; \
-                 the {} newest are kept)",
+                 the {} newest are known, and a finished picture that was never fetched may \
+                 be dropped sooner)",
                 crate::generation::GenPlans::KEEP
             ),
         )

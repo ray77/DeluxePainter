@@ -447,7 +447,7 @@ mod tests {
         );
     }
 
-    /// ADR-46: save_picture names a custom screen in every format and, for IFF, the chipset
+    /// ADR-46: export_image names a custom screen in every format and, for IFF, the chipset
     /// the file cannot carry, as the app's exports do.
     #[test]
     fn saved_pictures_name_custom_screens_and_the_lost_chipset() {
