@@ -50,9 +50,43 @@ Done since (night of 2026-11-10/11, parallel agent waves; verified by unit/app t
 - CI on macOS, Windows and Linux (GitHub Actions).
 - An independent code review found 20 issues (2 high: a hostile .dpxproj could exhaust memory; MCP opened HAM/EHB wrongly); fixes are in progress.
 
-Still open: hand testing in the window; layers (Phase 4); EHB/HAM export (Phase 5); animpainting (Alt while drawing), per-frame palettes, Move ▸ Fill / Load / Save, the Perspective, Brush and Wrap fill types. Picture ▸ Print stays out of scope (ADR-39).
+- Wave 8 (2026-11-12/13, the owner's spec "DeluxePainter – MCP-Anbindung und KI-Bildgenerierung"; see "Wave 8 status" below): live MCP in the running app with the stdio bridge, the `.mcpb` extension and Prefs ▸ AI & MCP.. (ADR-43, supersedes ADR-5's socket plan); layers with the layer panel and project format version 3 (ADR-44); AI image generation with Picture ▸ Generate.. and OpenAI Images (ADR-45); the chipset choice, screen presets and hardware checks on export (ADR-46).
+
+Still open: hand testing in the window; layer opacity, lock and groups (not wanted for now, owner decision); EHB/HAM export (Phase 5); animpainting (Alt while drawing), per-frame palettes, Move ▸ Fill / Load / Save, the Perspective, Brush and Wrap fill types. Picture ▸ Print stays out of scope (ADR-39).
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
+
+## Wave 8 status (2026-11-13)
+
+Done (verified by unit, ui-loop and integration tests, real snapshot renders and debug runs on macOS, Apple Silicon; details and the exact lists in the ADRs):
+- **Live MCP (ADR-43):** the running app serves MCP Streamable HTTP on `127.0.0.1` (port 8765, fallbacks) while Prefs ▸ AI & MCP.. has MCP control on (off by default) or with `--mcp`; bearer token, Host and Origin checks, separate read/edit permissions, approved folders, the "Replace File?" question, Revoke access; the stdio bridge `dpx-mcp-bridge` (also `deluxepainter mcp-bridge`) that the Claude apps start; connect buttons for Claude Code (shows and runs `claude mcp add --scope user deluxe-painter -- <app> mcp-bridge` after a click) and Claude Desktop (opens the `.mcpb` extension); `cargo run -p xtask -- mcpb` (a local macOS Apple Silicon bundle was built and unpacked; the CI job `mcpb` for `macos-latest` and `windows-latest` is configured but has not run yet, so no Windows bundle has been built). Headless `deluxepainter mcp` (stdio) and `deluxepainter mcp --http` stay.
+- **Layers (ADR-44):** the layer model shared by every frame, colour 0 transparent above the bottom layer, shown/hidden only, up to 32 layers, project format version 3, exports of the composite with a note; the layer panel (Prefs ▸ Layers, `L`); MCP layer tools.
+- **AI image generation (ADR-45):** the `dpx-imagegen` crate (provider trait, OpenAI Images, keychain, jobs with at most 2 requests in flight), `dpx_core::import::convert`, Picture ▸ Generate.. with targets Spare page (default), Picture, Brush and New layer, the Image Generator setup (also from Prefs ▸ AI & MCP.. ▸ Set up..), the MCP tools `generate_image`, `get_generation_status`, `apply_generated_image`, `cancel_generation`.
+- **Modes and hardware rules (ADR-46):** Chipset and Preset in Screen Format (one preset table for Screen Format, Generate and MCP, with "Pixel art 320x240 (custom)"), OCS colours 12-bit as a document rule, IFF exports checked and refused with the broken rule, honest notes for custom screens and the lost chipset; older OCS projects with 24-bit colours open as stored with a note.
+- [MCP_API.md](MCP_API.md) and the README guide "Connect to Claude in two minutes".
+
+The owner's acceptance tests (spec §10), as far as they were checked:
+
+| # | Test | State |
+|---|---|---|
+| 1 | Start, MCP on, connect Claude Code, create a 320×240 OCS 32-colour picture by a spoken request | **not verified with real Claude Code**; the connect flow ran against a fake `claude`, the 320×240 OCS picture was made over HTTP and through the bridge in a debug run of the GUI |
+| 2 | Claude draws a rectangle; it shows at once and can be undone | verified in ui-loop tests (the change lands in the same pass, `U` and MCP `undo` take it back); not watched by a person in a visible window |
+| 3 | Claude reads the palette and changes a colour; the editor follows | verified by the `dpx-mcp` tool tests and in the window's snapshot `wave8-mcp-gui-calls.png` (palette entries set through the GUI workspace with `--mcp-calls`); not with a real client |
+| 4 | Claude Desktop connected through the `.mcpb` without editing JSON; the app shows the status | **not verified**: Claude Desktop never installed the extension (unsigned); the bundle's bridge answered `initialize`/`tools/list` and forwarded calls to a debug run of the GUI |
+| 5 | A configured generator makes a picture of exactly 320×240 with at most 32 OCS colours after preview and confirmation | verified with the debug test pattern and gated test providers through the requester and the MCP tools; **no real OpenAI picture** (no key) |
+| 6 | Without a generator: a clear message, nothing faked, no crash | verified (requester and MCP tests) |
+| 7 | Saved as project and as IFF ILBM, read back | verified (ADR-46 round trip; an OCS IFF file reopens as AGA, the project keeps OCS) |
+| 8 | OCS HiRes with too many colours is refused with a reason | verified (`create_document`, Screen Format, every IFF export) |
+| 9 | Turn on, connect, disconnect and reconnect, also after a restart of the app | partly: the token survives restarts and the bridge reconnects to a restarted server (tests); not with real clients |
+| 10 | Windows, macOS and Linux stay usable without Claude or a provider | macOS only; Windows and Linux not verified for wave 8 |
+
+Not verified in wave 8 (see the ADRs' "Not verified" lists): real Claude Code, Claude Desktop and MCP Inspector; a real OpenAI request and the real system keychain; Windows and Linux (builds, tests, file permissions, the Claude paths, `.mcpb` opening); the stateless MCP `2026-07-28` protocol era; everything by hand in a visible window (the owner declines remote control). Open owner decisions: whether an MCP `generate_image` should also ask in the app before it sends a billed request (ADR-45, "Integration (wave 8)"); signing and notarizing the bridge, an icon for the extension and release packaging (ADR-43); whether the permissive but unlisted licences the full licence scan found (ISC, BSL-1.0, OFL-1.1, Ubuntu-font-1.0, Unicode-3.0; all through `eframe` or `url` except `unicode-ident`, which every crate reaches through `proc-macro2`; none new in wave 8) are acceptable ([research/dependencies.md](research/dependencies.md) §7.3).
+
+Open follow-ups found while documenting wave 8 (small code changes, not done in the docs step):
+- `create_document`'s tool description still says a chipset change replaces the picture; the code makes it one undoable step (ADR-46).
+- `apply_generated_image` does not report how many entries of the current palette it rounded for an OCS target (`TODO(wave8-integration)` in `apps/deluxepainter/src/generate.rs`); the Generate requester's Apply does.
+- `docs/design/screenshots/wave8-mcp-gui-calls.png` (640×512) predates the snapshot following the calls' display mode and renders 640×480 now (ADR-44, "Integration (wave 8)").
+- A few doc comments still name ADR-24's `save_picture` tool (`dpx_core::hardware::validate`, a `dpx-mcp` test comment).
 
 ## Phase 1 status
 

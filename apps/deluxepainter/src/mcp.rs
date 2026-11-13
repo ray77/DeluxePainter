@@ -58,7 +58,7 @@ pub const HOLD_LIMIT: Duration = Duration::from_secs(10);
 pub struct McpSettings {
     /// The server runs while the app runs.
     pub enabled: bool,
-    /// The port tried first (then the next ten, then any free one; `0`: any).
+    /// The port tried first (then the next nine, then any free one; `0`: any).
     pub port: u16,
     /// AI clients may read the document (off: only `get_app_status` answers).
     pub allow_read: bool,

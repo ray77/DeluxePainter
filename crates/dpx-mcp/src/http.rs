@@ -36,15 +36,17 @@ use crate::state::ServerState;
 
 /// The port tried first.
 pub const DEFAULT_PORT: u16 = 8765;
-/// Ports tried after a busy one (then any free port).
+/// Ports tried from the preferred one on, that one included (8765..=8774 by default), before
+/// any free port.
 pub const FALLBACK_PORTS: u16 = 10;
 /// Largest request body (a base64 `import_image` of 12 MiB fits).
 pub const MAX_BODY: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpOptions {
-    /// The port to try first: `0` takes any free port, otherwise the next
-    /// [`FALLBACK_PORTS`] ports and then any free port are tried when it is busy.
+    /// The port to try first: `0` takes any free port, otherwise the ports after it (up to
+    /// [`FALLBACK_PORTS`] in all, this one included) and then any free port are tried when it
+    /// is busy.
     pub port: u16,
     /// The bearer token; `None` makes a random one. With an endpoint directory the endpoint
     /// file names another token, made for this start, which is accepted as well.

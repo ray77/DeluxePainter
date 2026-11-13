@@ -317,7 +317,7 @@ pub fn iff_notes(target: &Target, page: (u32, u32)) -> Vec<String> {
 
 /// The notes an export of `doc` gives about its target: [`format_notes`] for every export
 /// format, plus [`iff_notes`] (with the page size) for an IFF ILBM or ANIM file (`iff`). The
-/// GUI's and the CLI's exports and MCP's `save_picture` all give these (ADR-46).
+/// GUI's and the CLI's exports and MCP's `export_image` all give these (ADR-46).
 pub fn export_notes(doc: &Document, iff: bool) -> Vec<String> {
     let t = doc.target();
     let mut notes = format_notes(&t);

@@ -29,7 +29,7 @@ Method: `cargo search`, the crates.io API (`https://crates.io/api/v1/crates/<nam
 | schemars | **1.2.3** | 1.2.3 | 1.74 | MIT | JSON Schema for MCP tool I/O (JSON Schema 2020-12) | https://crates.io/crates/schemars | 2026-11-09 |
 | tokio | **1.54.1** | 1.54.1 | 1.85 | MIT | Async runtime for rmcp / sockets | https://crates.io/crates/tokio | 2026-11-09 |
 | rmcp | **3.9.0** | 3.9.0 | 1.88 | Apache-2.0 | Official MCP Rust SDK | https://crates.io/crates/rmcp | 2026-11-09 |
-| interprocess | **2.4.8** | 2.4.8 | 1.75 | 0BSD OR Apache-2.0 | Unix domain sockets / Windows named pipes (editor <-> MCP server IPC) | https://crates.io/crates/interprocess | 2026-11-09 |
+| interprocess | not used (ADR-43: the bridge speaks Streamable HTTP to the app) | 2.4.8 | 1.75 | 0BSD OR Apache-2.0 | Unix domain sockets / Windows named pipes (editor <-> MCP server IPC) | https://crates.io/crates/interprocess | 2026-11-09 |
 | proptest | **1.12.0** | 1.12.0 | 1.88 | MIT OR Apache-2.0 | Property tests (dev-dependency) | https://crates.io/crates/proptest | 2026-11-09 |
 | rfd | **0.17.2** | 0.18.0 (MSRV 1.92) | not declared (resolves fine on 1.90) | MIT | Native open/save file dialogs | https://crates.io/crates/rfd | 2026-11-09 |
 | directories | **6.0.0** | 6.0.0 | not declared | MIT OR Apache-2.0 | Config/data dir locations per OS | https://crates.io/crates/directories | 2026-11-09 |
@@ -188,7 +188,7 @@ Source: https://modelcontextprotocol.io/specification (-> /specification/2026-07
 7. **uuid 1.29.x MSRV is 1.89** - already within 1.90, but the margin is one minor version.
 8. **Fractional DPI** breaks pixel-exact integer scaling (Windows/Linux); needs a defined policy.
 9. **rfd 0.18 needs rustc 1.92**; rfd 0.17.2 does not declare an MSRV (resolver cannot protect us), though it checks fine on 1.90.
-10. **Transitive licenses and bundled fonts** not audited; run a license tool before the public release and ship a THIRD-PARTY notice.
+10. **Transitive licenses and bundled fonts** not audited; run a license tool before the public release and ship a THIRD-PARTY notice. (2026-11-13: the whole graph was scanned by licence expression, section 7.3; the notices are still to be generated.)
 11. **Streamable HTTP** (if used) adds a network attack surface: bind 127.0.0.1, check Origin/Host, consider auth; stdio + local socket is safer for a local editor.
 12. **Not verified:** runtime behavior of the editor on Windows/Linux (research done only on macOS); actual rendering with glow vs wgpu; rmcp prompts/resources snippets were taken from the README/examples and not compiled by us (only the tool skeleton above was).
 
@@ -197,3 +197,123 @@ Source: https://modelcontextprotocol.io/specification (-> /specification/2026-07
 - `cargo search <crate> --limit 1` works online for all crates; crates.io API for MSRV/license.
 - Scratch project (outside the repo) with `rust-version = "1.90"`, `resolver = "3"`, dependencies: eframe 0.33, image 0.25 (png, jpeg), png 0.18, zip 9, zstd 0.14, serde, serde_json, ciborium 0.2, thiserror 2, anyhow, uuid 1 (v4, serde), schemars 1, tokio 1, rmcp 3 (server, transport-io, transport-streamable-http-server), interprocess 2 (tokio), rfd 0.17, directories 6, proptest 1: `cargo generate-lockfile` + `cargo check` succeeded on rustc 1.90.0. Resolver notes: eframe 0.37.0 (needs 1.95) and rfd 0.18.0 (needs 1.92) were skipped automatically.
 - Separate scratch project: the rmcp stdio skeleton above passed `cargo check`.
+
+## 7. Wave 8 additions and the licence scan (2026-11-13)
+
+Method: `cargo metadata --format-version 1 --locked` on main at `cc920a7` (the whole graph, every target platform: 551 packages, 9 of them workspace crates), the same with `--filter-platform` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`, and the `Cargo.lock` before wave 8 (`300257a`, 476 packages) for comparison; licence expressions as the packages declare them. The two wave-8 integration branches (MCP generation tools at `a82f22a`, MCP layer tools at `a1b5a9e`) add no package: their `Cargo.lock` files hold the same 551 name/version pairs as main's; the first only adds the dependency edge `dpx-mcp` → `dpx-imagegen` (optional, feature `imagegen`, which the app turns on), the second leaves `Cargo.lock` unchanged. That edge reaches no flagged package that `dpx-mcp` did not reach already (of the flagged ones `dpx-imagegen` reaches only `unicode-ident`), so the scan result below holds for the merge as well. The scan was made with a small script over the `cargo metadata` output (an expression parser for `OR`, `AND`, `/`, `WITH` and parentheses, and a breadth-first search from every workspace crate for the paths), not with `cargo deny` or `cargo about`.
+
+### 7.1 New workspace crates and direct dependencies
+
+| Crate | Direct dependencies added (version, licence) |
+|---|---|
+| `dpx-mcp` (ADR-43) | `axum` 0.8.9 (MIT; features `tokio`, `http1`), `reqwest` 0.13.5 (MIT OR Apache-2.0; `default-features = false`, the bridge's own client), `getrandom` 0.3.4 (MIT OR Apache-2.0, already in the tree), `tokio-util` 0.7.20 (MIT, already in the tree); `rmcp` 3.9.0 (Apache-2.0) gained the features `transport-streamable-http-server`, `client`, `transport-streamable-http-client-reqwest`, and `tokio` the features `net`, `sync`, `time`, `signal`; optional `dpx-imagegen` (workspace) behind the feature `imagegen` (integration strand A) |
+| `dpx-imagegen` (new, ADR-45) | `ureq` 3.5.2 (MIT OR Apache-2.0; `default-features = false`, feature `native-tls-no-default`), `keyring` 4.2.0 (MIT OR Apache-2.0), `base64` 0.23.1 (MIT OR Apache-2.0, already in the tree); `dpx-core`, `dpx-formats`, `serde`, `serde_json` |
+| `dpx-mcp-bridge` (new app, ADR-43) | `dpx-mcp` (workspace) only |
+| `xtask` (new, ADR-43) | `dpx-mcp`, `serde_json`, `zip` (all already in the tree) |
+| `deluxepainter` | `dpx-imagegen` (workspace); `dpx-mcp` with the feature `imagegen` (integration strand A) |
+
+### 7.2 Every package new in `Cargo.lock` (72)
+
+"all" = resolved for all four platforms above.
+
+| Package | Version | Licence | Reached from | Platforms |
+|---|---|---|---|---|
+| aes | 0.9.4 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| aho-corasick | 1.1.5 | Unlicense OR MIT | dpx-imagegen | Windows |
+| apple-native-keyring-store | 1.0.2 | MIT OR Apache-2.0 | dpx-imagegen | macOS |
+| axum | 0.8.9 | MIT | dpx-mcp | all |
+| axum-core | 0.5.6 | MIT | dpx-mcp | all |
+| base64ct | 1.8.3 | Apache-2.0 OR MIT | dpx-imagegen | all |
+| block-padding | 0.4.2 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| byteorder | 1.5.0 | Unlicense OR MIT | dpx-imagegen | Windows |
+| cbc | 0.2.1 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| chacha20 | 0.10.2 | MIT OR Apache-2.0 | dpx-mcp | all |
+| cipher | 0.5.2 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| cmov | 0.5.4 | Apache-2.0 OR MIT | dpx-imagegen, dpx-mcp | all |
+| core-foundation | 0.10.1 (0.9.4 was already there) | MIT OR Apache-2.0 | dpx-imagegen | macOS |
+| cpubits | 0.1.1 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| ctutils | 0.4.8 | Apache-2.0 OR MIT | dpx-imagegen, dpx-mcp | all |
+| der | 0.8.3 | Apache-2.0 OR MIT | dpx-imagegen | all |
+| foreign-types | 0.3.2 (0.5.0 was already there) | MIT/Apache-2.0 | dpx-imagegen | Linux |
+| foreign-types-shared | 0.1.1 (0.3.1 was already there) | MIT/Apache-2.0 | dpx-imagegen | Linux |
+| hkdf | 0.13.0 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| hmac | 0.13.0 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| http | 1.5.0 | MIT OR Apache-2.0 | dpx-imagegen, dpx-mcp | all |
+| http-body | 1.1.0 | MIT | dpx-mcp | all |
+| http-body-util | 0.1.5 | MIT | dpx-mcp | all |
+| httparse | 1.10.1 | MIT OR Apache-2.0 | dpx-imagegen, dpx-mcp | all |
+| httpdate | 1.0.3 | MIT OR Apache-2.0 | dpx-mcp | all |
+| hyper | 1.12.0 | MIT | dpx-mcp | all |
+| hyper-util | 0.1.21 | MIT | dpx-mcp | all |
+| inout | 0.2.6 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| ipnet | 2.12.2 | MIT OR Apache-2.0 | dpx-mcp | all |
+| keyring | 4.2.0 | MIT OR Apache-2.0 | dpx-imagegen | all |
+| keyring-core | 1.0.1 | MIT OR Apache-2.0 | dpx-imagegen | all |
+| matchit | 0.8.4 | MIT AND BSD-3-Clause | dpx-mcp | all |
+| mime | 0.3.18 | MIT OR Apache-2.0 | dpx-mcp | all |
+| native-tls | 0.2.18 | MIT OR Apache-2.0 | dpx-imagegen | all |
+| num | 0.4.3 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| num-bigint | 0.4.8 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| num-complex | 0.4.6 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| num-integer | 0.1.47 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| num-iter | 0.1.46 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| num-rational | 0.4.2 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| openssl | 0.10.82 | Apache-2.0 | dpx-imagegen | Linux |
+| openssl-macros | 0.1.1 | MIT/Apache-2.0 | dpx-imagegen | Linux |
+| openssl-probe | 0.2.2 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| openssl-sys | 0.9.118 | MIT | dpx-imagegen | Linux |
+| pem-rfc7468 | 1.0.0 | Apache-2.0 OR MIT | dpx-imagegen | all |
+| rand | 0.10.3 | MIT OR Apache-2.0 | dpx-mcp | all |
+| rand_core | 0.10.1 | MIT OR Apache-2.0 | several workspace crates | all |
+| regex | 1.13.1 | MIT OR Apache-2.0 | dpx-imagegen | Windows |
+| regex-automata | 0.4.18 | MIT OR Apache-2.0 | dpx-imagegen | Windows |
+| regex-syntax | 0.8.11 | MIT OR Apache-2.0 | dpx-imagegen | Windows |
+| reqwest | 0.13.5 | MIT OR Apache-2.0 | dpx-mcp | all |
+| rustls-pki-types | 1.16.0 | MIT OR Apache-2.0 | dpx-imagegen (types only, no rustls) | all |
+| schannel | 0.1.30 | MIT | dpx-imagegen | Windows |
+| secret-service | 5.2.0 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+| security-framework | 3.7.0 | MIT OR Apache-2.0 | dpx-imagegen | macOS |
+| security-framework-sys | 2.17.0 | MIT OR Apache-2.0 | dpx-imagegen | macOS |
+| sse-stream | 0.2.6 | MIT OR Apache-2.0 | dpx-mcp | all |
+| sync_wrapper | 1.0.2 | Apache-2.0 | dpx-mcp | all |
+| tokio-stream | 0.1.19 | MIT | dpx-mcp | all |
+| tower | 0.5.3 | MIT | dpx-mcp | all |
+| tower-http | 0.6.11 | MIT | dpx-mcp | all |
+| tower-layer | 0.3.3 | MIT | dpx-mcp | all |
+| tower-service | 0.3.3 | MIT | dpx-mcp | all |
+| try-lock | 0.2.5 | MIT | dpx-mcp | all |
+| ureq | 3.5.2 | MIT OR Apache-2.0 | dpx-imagegen | all |
+| ureq-proto | 0.7.1 | MIT OR Apache-2.0 | dpx-imagegen | all |
+| utf8-zero | 0.8.1 | MIT OR Apache-2.0 | dpx-imagegen | all |
+| vcpkg | 0.2.15 | MIT/Apache-2.0 | dpx-imagegen (build time) | Linux |
+| want | 0.3.2 | MIT | dpx-mcp | all |
+| wasm-streams | 0.5.0 | MIT OR Apache-2.0 | dpx-mcp (reqwest on wasm32 only) | none of the four |
+| windows-native-keyring-store | 1.1.0 | MIT OR Apache-2.0 | dpx-imagegen | Windows |
+| zbus-secret-service-keyring-store | 1.0.1 | MIT OR Apache-2.0 | dpx-imagegen | Linux |
+
+Each of them offers MIT, Apache-2.0 or BSD-3-Clause (`aho-corasick` and `byteorder` are Unlicense OR MIT; `matchit` is MIT AND BSD-3-Clause, both allowed). No `ring`, `rustls`, `rustls-webpki`, `untrusted`, `webpki-roots` or `aws-lc-*` crate is in the lock (ADR-45 chose native TLS for that reason). The OpenSSL crates are Linux only; the OpenSSL library itself is a system library, not a crate. No existing crate changed its version.
+
+### 7.3 Licence scan of the whole graph
+
+Rule: a package passes when its licence expression can be satisfied with MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, Zlib or 0BSD alone (OR picks one side, AND needs both, `/` counts as OR). **24 packages do not pass. None of them is new in wave 8: all 24 were in `Cargo.lock` before it, at the same versions.** Wave 8 added new paths to the Unicode-3.0 crates (through `reqwest` and `rmcp`'s client in `dpx-mcp`), so the bridge binary and `xtask` now carry them too.
+
+| Package | Version | Licence | Workspace crate and path | Platforms |
+|---|---|---|---|---|
+| libloading | 0.8.9 | ISC | `deluxepainter` via `eframe` → `glutin` and `eframe` → `wgpu` → `wgpu-hal` (its direct users: `glutin`, `wgpu-hal`, `ash`, `khronos-egl`, and `dlib` and `x11rb` outside Windows) | all |
+| clipboard-win | 5.4.3 | BSL-1.0 | `deluxepainter` via `eframe` → `egui-winit` → `arboard` | Windows |
+| error-code | 3.4.0 | BSL-1.0 | `deluxepainter` via `eframe` → `egui-winit` → `arboard` → `clipboard-win` | Windows |
+| epaint_default_fonts | 0.37.0 | (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 | `deluxepainter` via `eframe` → `egui` → `epaint` | all |
+| unicode-properties | 0.1.5 | (MIT OR Apache-2.0) AND Unicode-3.0 | `deluxepainter` via `eframe` → `egui` → `epaint` | all |
+| unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | every workspace crate, through `proc-macro2` (build time, inside proc macros such as `serde_derive`), also `wasm-bindgen-shared` | all |
+| icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data, icu_properties, icu_properties_data, icu_provider | 2.4.0 | Unicode-3.0 | `url` 2.5.8 → `idna` 1.1.0 → `idna_adapter` 1.2.2, reached from `deluxepainter` via `eframe` → `egui-winit` → `webbrowser` → `url` (before wave 8, same versions) and from `dpx-mcp` via `reqwest` (directly, under `rmcp`'s HTTP client, and through its `tower-http`) → `url` (wave 8), so also from `deluxepainter`, `dpx-mcp-bridge` and `xtask` through `dpx-mcp` | all |
+| litemap | 0.8.3 | Unicode-3.0 | as the ICU crates | all |
+| potential_utf | 0.1.6 | Unicode-3.0 | as the ICU crates | all |
+| tinystr | 0.8.5 | Unicode-3.0 | as the ICU crates | all |
+| writeable | 0.6.4 | Unicode-3.0 | as the ICU crates | all |
+| yoke, yoke-derive | 0.8.4 | Unicode-3.0 | as the ICU crates (`yoke-derive` is a proc macro) | all |
+| zerofrom, zerofrom-derive | 0.1.8 | Unicode-3.0 | as the ICU crates (`zerofrom-derive` is a proc macro) | all |
+| zerotrie | 0.2.5 | Unicode-3.0 | as the ICU crates | all |
+| zerovec | 0.11.9 | Unicode-3.0 | as the ICU crates | all |
+| zerovec-derive | 0.11.7 | Unicode-3.0 | as the ICU crates (a proc macro) | all |
+
+Notes: ADR-45's sentence "The only flagged crate in the graph is `unicode-ident`" holds for the graph of `dpx-imagegen` (whose own dependencies reach no other flagged package), not for the workspace; ADR-43's "No ISC-only crate was added" holds for what `dpx-mcp` added (it added Unicode-3.0 paths, but no package). This is the first scan over the whole graph. ISC, BSL-1.0, OFL-1.1, Ubuntu-font-1.0 and Unicode-3.0 are permissive licences but not on CLAUDE.md's list; they all come through `eframe` or through `url` (which `eframe` already used), except `unicode-ident` (Unicode-3.0), which every workspace crate reaches through `proc-macro2` (`serde_derive` and other proc macros; `dpx-core`, `dpx-formats`, `dpx-iff`, `dpx-ui` and `dpx-imagegen` reach it without `eframe` or `url`), and whether they are acceptable is the owner's call (no dependency was changed). `epaint_default_fonts` holds egui's built-in fonts; DeluxePainter draws its own bitmap font. The third-party notices for a binary release still have to be generated (`cargo about` or `cargo deny`, section 1).

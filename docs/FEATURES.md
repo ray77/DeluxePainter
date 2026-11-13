@@ -24,17 +24,20 @@ Priorities: **P0** = first usable release core · **P1** = classic DPaint toolse
 | P0 | Window: snaps to the picture's screen in whole and half pixel-size steps (Prefs ▸ Pixel Size Largest/1x–8x, Cmd/Ctrl +/−/0), full screen centred with Ctrl+Cmd+F / F11 | done (ADR-13); layout C (screen larger than the picture's screen), grey work area, movable requesters and status line dropped |
 | P1 | Settings file: pixel size, Prefs toggles, last drawer, grid/symmetry/spacing/fill, translucency and Light Table choices are remembered in `settings.json` in the config directory (`--no-settings` skips it) | done (ADR-33); full-screen state and window position not saved |
 | P1 | Layout preference "Classic screen": fixed 640×512 (PAL) / 640×400 (NTSC) virtual screen, letterboxed | decided, design option A |
+| P1 | Layer panel at the right (a DeluxePainter addition): Prefs ▸ Layers / `L`, rows with eye box, name and active marker, New / Copy / Del / Up / Dn / Merge, rename by double-click, scrolls past the rows that fit | done (ADR-44): over the screen's right edge, docked beside the screen in a full-screen window with room; hidden under requesters; title bar names the active layer while the panel is off |
+| P1 | Prefs ▸ AI & MCP.. requester (a DeluxePainter addition): MCP control on/off, status, connect Claude Desktop / Claude Code, Disconnect, Revoke access, permissions, approved folder, image generator state with Set up.., last calls | done (ADR-43, ADR-45); not yet used by hand or with a real Claude client |
 
 ## 2. Documents & hardware targets
 
 | P | Feature | Notes |
 |---|---|---|
-| P0 | New document dialog = AGA-style "Choose Display Mode" requester: mode list, page size, palette size | `HARDWARE_MODES.md` |
-| P0 | OCS PAL/NTSC LoRes/HiRes (+ interlace), 2–32 colours, RGB4 palette | |
+| P0 | New document dialog = AGA-style "Choose Display Mode" requester: mode list, page size, palette size | `HARDWARE_MODES.md`; Picture ▸ Screen Format.. does this (ADR-7, ADR-11), with Chipset and Preset gadgets since ADR-46 |
+| P0 | Chipset choice (OCS / AGA) and screen presets: NTSC LoRes 320×200, PAL LoRes 320×256, "Pixel art 320x240 (custom)", NTSC/PAL HiRes 640×200 / 640×256, laced 640×400 / 640×512, Custom | done (ADR-46): one preset table for Screen Format, Picture ▸ Generate.. and MCP; 320×240 is PAL LoRes with a custom screen and is never called standard PAL or NTSC. No ECS (owner decision) |
+| P0 | OCS PAL/NTSC LoRes/HiRes (+ interlace), 2–32 colours, RGB4 palette | done as document rules (ADR-46): 32 colours in LoRes, 16 in HiRes, no SuperHiRes; every OCS colour 12-bit (Screen Format to OCS rounds with a note; older projects with 24-bit colours open as stored with a note) |
 | P1 | AGA LoRes/HiRes/SuperHiRes (+ interlace), up to 256 colours, RGB8 palette | |
 | P2 | EHB (64 = 32 + half-brite), HAM6, HAM8 | ADR-4 |
 | P1 | Page larger than screen (scrolling), aspect-correct preview toggle | |
-| P1 | Change hardware target with validation report (never silent data loss) | |
+| P1 | Change hardware target with validation report (never silent data loss) | partly (ADR-46): Screen Format refuses what the chipset cannot show and says why; IFF exports are checked and refused with the broken rule; custom and overscan screens and the lost chipset are named on export. No separate report requester |
 
 ## 3. Painting tools
 
@@ -75,9 +78,9 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 
 | P | Feature | Notes |
 |---|---|---|
-| P0 | `.dpxproj` save/open — lossless, atomic writes | Picture ▸ Save.. writes the project, Load.. opens it, Export.. writes IFF ILBM / PNG (ADR-23, ADR-27, [PROJECT_FORMAT.md](PROJECT_FORMAT.md)); animation frames saved as format version 2 (ADR-28); one layer, no undo history or spare page yet |
-| P1 | Layers: add/delete/rename/reorder, visibility, lock, opacity, Normal blend | |
-| P1 | Layer groups | |
+| P0 | `.dpxproj` save/open — lossless, atomic writes | Picture ▸ Save.. writes the project, Load.. opens it, Export.. writes IFF ILBM / PNG (ADR-23, ADR-27, [PROJECT_FORMAT.md](PROJECT_FORMAT.md)); animation frames saved as format version 2 (ADR-28); layers as format version 3 (ADR-44); no undo history or spare page in the GUI's project yet |
+| P1 | Layers: add/delete/rename/reorder, visibility, lock, opacity, Normal blend | done without lock and opacity (ADR-44, owner decision: shown or hidden only): add, duplicate, delete, rename, move, merge down, flatten (command only), up to 32 layers shared by every frame; colour 0 transparent above the bottom layer; exports hold the composite with a note; MCP layer tools |
+| P1 | Layer groups | not built (owner decision: no groups yet) |
 | P1 | Autosave & crash recovery | Recovery project after 30 s idle and on quit; "Recover Picture" on start; Quit asks when unsaved (ADR-34) |
 | P3 | Masks, more blend modes, adjustment layers | |
 
@@ -85,8 +88,8 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 
 | P | Format | Import | Export |
 |---|---|---|---|
-| P0 | IFF ILBM (ByteRun1, mask, CMAP, CAMG) | ✓ | ✓ with ExportAnalyzer report |
-| P0 | PNG | ✓ (indexed as is; true colour quantised ✓ ADR-9; Picture ▸ Load.. asks first: fit into the page, centre / top left, colour count or current palette, dither none / Floyd–Steinberg / ordered, true-colour thumbnail ✓ ADR-42; as layer later) | ✓ native resolution |
+| P0 | IFF ILBM (ByteRun1, mask, CMAP, CAMG) | ✓ | ✓ checked against the chipset's limits, refused with the broken rule, notes for custom screens and the lost chipset (ADR-46); visible layers flattened (ADR-44); no ExportAnalyzer report requester |
+| P0 | PNG | ✓ (indexed as is; true colour quantised ✓ ADR-9; Picture ▸ Load.. asks first: fit into the page, centre / top left, colour count or current palette, dither none / Floyd–Steinberg / ordered, true-colour thumbnail ✓ ADR-42; as layer later) | ✓ native resolution, the visible layers flattened (ADR-44) |
 | P0 | JPEG | ✓ (quantised, EXIF orientation; ADR-9; Import requester as for PNG, ADR-42) | ✗ (never) |
 | P2 | ILBM EHB / HAM6 / HAM8, CRNG/CCRT | ✓ (EHB opens as 64 free colours, HAM6/HAM8 decoded and reduced to the screen's palette, ADR-26; save writes plain indexed ILBM) | ✓ (CRNG/CCRT only; EHB/HAM export in Phase 5) |
 | P2 | IFF ANIM (op 5 first) | ✓ | ✓ |
@@ -113,13 +116,26 @@ Range requester (Color ▸ Ranges.., ADR-22): done as a centred modal requester 
 
 ## 8. MCP (automation)
 
-| P | Feature |
-|---|---|
-| P0 | Spike: `app_status`, `new_document`, `get_document_state` (Phase 1) |
-| P1 | Drawing, palette, layer, frame, undo/redo, transaction tools; preview PNG; revision checks |
-| P1 | Import/export + `validate_amiga_export` |
-| P2 | Live bridge to the running GUI with "changed by MCP" indicator |
+| P | Feature | Notes |
+|---|---|---|
+| P0 | Spike: `app_status`, `new_document`, `get_document_state` (Phase 1) | done (ADR-21), replaced by the wave-8 tool set (ADR-43) |
+| P1 | Drawing, palette, layer, frame, undo/redo tools; preview PNG; revision checks | done (ADR-43, ADR-44): 33 tools after the owner's spec §5.2 (document, palette, drawing, layer, file, preview, undo/redo, raw `execute_command` for frames and every other engine command); `expected_revision` and dry runs; calls served one at a time in arrival order. Transactions not built |
+| P1 | Import/export + `validate_amiga_export` | done as part of `import_image` / `export_image` (ADR-43, ADR-46): exports are checked against the chipset's limits before encoding and refused with `HARDWARE_LIMIT`; no separate validate tool |
+| P2 | Live bridge to the running GUI with "changed by MCP" indicator | done (ADR-43): Streamable HTTP on `127.0.0.1` inside the app while Prefs ▸ AI & MCP.. has MCP control on, the stdio bridge `dpx-mcp-bridge` for Claude Code / Claude Desktop, the `.mcpb` extension (`cargo run -p xtask -- mcpb`); MCP changes are undo steps of the shown page (except those whose result says `undoable: false`) and are listed under "Last calls" in Prefs ▸ AI & MCP.. (no indicator on the paint screen). Real Claude clients not yet connected |
+| P1 | Connect without editing JSON: Claude Code by one click and a confirmation, Claude Desktop through its own install dialog | done (ADR-43); tested with a fake `claude` command only |
+| P1 | Security: localhost only, bearer token never in client configs, Host/Origin checks, separate read/edit permissions, approved folders, overwrite questions, revoke | done (ADR-43); see [MCP_API.md](MCP_API.md) |
+| P2 | Image generation tools `generate_image`, `get_generation_status`, `apply_generated_image`, `cancel_generation` | done (ADR-45): in the window only, with the user's generator; Apply asks before replacing a picture |
 
-## 9. Explicitly out of scope
+## 9. AI image generation (a DeluxePainter addition)
+
+| P | Feature | Notes |
+|---|---|---|
+| P2 | Picture ▸ Generate..: description, Resolution (the shared presets), Chipset, Colours, Style; More.. for Palette, Dither, Fit, Scaler, Background, Quality, Target; cost note before generating, progress, Cancel, thumbnail, Again, Apply | done (ADR-45); targets Spare page (default), Picture (undoable), Brush, New layer |
+| P2 | Provider interface (`ImageGenerationProvider`) with OpenAI Images as the first provider; API key in the system keychain (or this session only); Set up.. in Generate and in Prefs ▸ AI & MCP.. | done (ADR-45); never run against the real OpenAI API (no key here); the real keychain untested |
+| P2 | Conversion to exactly the page size, colour count and chipset (Crop or Fit, Smooth / Nearest / Pixel-art scalers, dither, 12-bit OCS palettes) | done (`dpx_core::import::convert`, ADR-45) |
+| P2 | No fake pictures: without a set-up generator nothing is generated and the requester says so | done (ADR-45) |
+| P3 | Local generators, more providers, variants, seeds | not built |
+
+## 10. Explicitly out of scope
 
 Emulation of the original program; GIF/BMP/TIFF/PSD export; JPEG export; web/Electron UI; copying original EA artwork, fonts, icons or manual text; claims of full DPaint feature parity before it is verified.

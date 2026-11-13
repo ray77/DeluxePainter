@@ -201,3 +201,62 @@ Recommendation: implement the decoder as `prev = palette[0]` at x=0 of every row
 10. **CMAP nibble variants**: confirm with real OCS-era files that the left-justified (0xN0) form really occurs in DPaint-written files, and how DPaint IV AGA writes its palette.
 11. **EHB CMAP length** (32 vs 64 entries written by DPaint IV): check real files.
 12. **elowar.com mirror**: the Devices Manual nodes at amigadev.elowar.com have an expired TLS certificate; the content of the ILBM chapter was therefore read from wiki.amigaos.net instead (see sources file).
+
+---
+
+## 11. What DeluxePainter enforces (wave 8, ADR-46)
+
+The sections above are Phase 0 research with confidence levels. This section is what the program does since wave 8 ([ADR-46](adr/0046-modes-presets-and-hardware-rules.md), with its "Integration (wave 8)" section); the rules live in `dpx_core::hardware` and `dpx_core::mode`. Nothing here was checked on real Amiga hardware or in an emulator.
+
+### 11.1 Chipsets
+
+Only **OCS** and **AGA** (owner decision: no ECS). The chipset is part of the document's target: Picture ▸ Screen Format.. chooses it (Chipset gadget, key `h`), MCP's `create_document` takes `chipset`, and a `.dpxproj` stores it. IFF files store no chipset, so every IFF picture opens as AGA.
+
+| Chipset | Low Res (320) | High Res (640) | Super-High Res (1280) | Colour values |
+|---|---|---|---|---|
+| OCS | 2–32 colours | 2–16 colours | not available ("Super-High Res needs AGA") | 12-bit: each channel a multiple of 0x11 (`#RGB`, 4096 colours) |
+| AGA | 2–256 colours | 2–256 colours | 2–256 colours | 24-bit |
+
+Palette sizes are powers of two (whole bitplanes). Laced and non-laced modes have the same limits. EHB and HAM pictures open as indexed pictures (ADR-26); there is no EHB/HAM export yet.
+
+### 11.2 Screen presets
+
+One table, `dpx_core::mode::PRESETS`, used by the Screen Format requester's Preset gadget (key `p`), the Resolution row of Picture ▸ Generate.. and MCP's `preset` argument:
+
+| Preset id | Label | Display mode | Screen | MCP name (alias) |
+|---|---|---|---|---|
+| `ntsc_lores` | NTSC LoRes 320x200 | NTSC:Low Res | 320×200 (standard) | `ntsc_lores` |
+| `pal_lores` | PAL LoRes 320x256 | PAL:Low Res | 320×256 (standard) | `pal_lores` |
+| `pixel_art_320x240` | Pixel art 320x240 (custom) | PAL:Low Res | 320×240 (custom) | `pixelart_320x240` (`pixel_art_320x240`) |
+| `ntsc_hires` | NTSC HiRes 640x200 | NTSC:High Res | 640×200 (standard) | `ntsc_hires` |
+| `pal_hires` | PAL HiRes 640x256 | PAL:High Res | 640×256 (standard) | `pal_hires` |
+| `ntsc_hires_laced` | NTSC HiRes Laced 640x400 | NTSC:High Res Laced | 640×400 (standard) | `ntsc_interlace` (`ntsc_hires_laced`) |
+| `pal_hires_laced` | PAL HiRes Laced 640x512 | PAL:High Res Laced | 640×512 (standard) | `pal_interlace` (`pal_hires_laced`) |
+| `custom` | Custom | (keeps mode and screen) | typed | — |
+
+**320×240 is not a standard Amiga screen** and is never labelled PAL or NTSC. DeluxePainter makes it PAL:Low Res with a custom screen 16 lines shorter than the standard 320×256, because that variant keeps its mode when an OCS ILBM is read back: an OCS CAMG carries no monitor bits, so PAL or NTSC comes from the height, and 240 lines read as PAL (an NTSC 320×240 screen would need vertical overscan and read back as PAL). Picture ▸ Generate.. uses it as its default resolution. MCP's `create_document` with only `width: 320, height: 240` chooses the same.
+
+### 11.3 OCS colours are 12-bit
+
+- `set_palette` (and MCP's `set_palette_color`) on an OCS document refuses a colour that is not 12-bit and names the nearest 12-bit one; nothing is rounded silently.
+- Screen Format to OCS rounds the kept entries of an AGA palette to 12 bits and says how many in a note ("Screen format changed: N colours rounded to 12-bit OCS values"); MCP results count them in `rounded_colors`. Two entries can become the same colour. Undo brings the 24-bit colours back.
+- Every GUI path that writes palette entries on OCS writes 12-bit colours: the Color Mixer's sliders, Spread, Copy and Exchange, Default Palette, Restore Palette, Palette ▸ Load.., Use Brush Palette (rounding with a note where colours change), Import and Generate with a new palette (the quantizer rounds), Generate with the current palette on OCS (a "Picture generated" note counts the rounded entries).
+- A project written before ADR-46 may hold OCS colours that are not 12-bit. It opens with them **as stored** and a note naming the entries, that IFF export refuses the picture until they are 12-bit, and how to fix them (Picture ▸ Screen Format.. with the OCS chipset rounds them all; over MCP `set_palette_color` or `set_format` through `execute_command`). Editing such a palette checks only the entries that change.
+
+### 11.4 Export checks and notes
+
+Before an IFF ILBM or IFF ANIM file is written (Picture ▸ Export.., Anim ▸ Save.., the CLI `convert`, MCP `export_image`), the document is checked, in this order: (1) the chipset shows the mode, (2) the palette has at most the mode's colours, (3) the page is within the mode's page limits (at least the screen, at most 1008×1024 or the overscan size), (4) OCS entries are 12-bit, (5) every pixel of every frame and every layer (hidden ones too) is a palette colour. The file then holds the picture as it shows (visible layers flattened). A broken rule refuses the file with the rule ("not written as IFF: 32 colours exceed the 16 of PAL:High Res on Ocs"); nothing is written and nothing is reduced. Picture and brush files may be smaller than their screen in the GUI and the CLI; MCP keeps the stricter page rule. PNG is a free exchange export (the GUI and the CLI do not check it; MCP's `export_image` checks every format) and the `.dpxproj` project is lossless (not checked).
+
+Notes on export (shown in the "Picture exported" / "Animation saved" note, printed by the CLI as `note: …`, returned by MCP):
+
+- A custom screen: "320x240 is a custom screen size on PAL:Low Res (standard 320x256); exact hardware compatibility is not guaranteed", plus, when the screen is larger than standard, which overscan it uses ("320x240 uses vertical overscan (at most 368x241 on NTSC:Low Res)" for an NTSC 320×240 screen). The full overscan size is named as such. A standard screen gives no note.
+- IFF only: "IFF files store no chipset: this OCS picture reopens as AGA", and when the written CAMG and page size would reopen as another mode, which one ("the file reopens as PAL:Low Res (an OCS display mode carries no PAL/NTSC monitor)").
+- With layers: how many layers were flattened and how many hidden ones left out (`.dpxproj` keeps them).
+
+Round trip (owner's acceptance test 7, verified in tests): a 320×240 OCS 32-colour picture made with the preset, exported as IFF ILBM (CAMG 0, page fields 320×240) and saved as `.dpxproj`, reads back with the same size, mode, screen, palette, pixels and ranges; the ILBM comes back as AGA, the project as OCS. OCS High Res with 32 colours (acceptance test 8) is refused by Screen Format, `create_document` and every IFF export.
+
+### 11.5 Open points
+
+- Whether a 320×240 PAL screen, NTSC vertical overscan and the overscan sizes display as described on real OCS/AGA machines, and how DeluxePaint IV itself opens such files (not checked on hardware or in an emulator).
+- The pixel aspect pairs of PAL, High Res and Super-High Res (section 10, point 6).
+- ECS, EHB/HAM export (out of scope for now).
