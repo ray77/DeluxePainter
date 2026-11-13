@@ -1104,6 +1104,7 @@ dependencies = [
  "dpx-core",
  "dpx-formats",
  "dpx-iff",
+ "dpx-imagegen",
  "getrandom 0.3.4",
  "png",
  "reqwest",

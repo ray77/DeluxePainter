@@ -4,8 +4,10 @@
 //! the Resolution (a preset), the Chipset (OCS / AGA), the number of Colours (up to the
 //! mode's maximum: OCS LoRes 32, OCS HiRes 16, AGA 256) and the Style. "More.." shows the
 //! Palette (New / Current), Dither, Fit (crop to fill / whole picture), Scaler, Background
-//! (opaque / transparent), Quality and the Target (Spare page, Picture, Brush). "Diffusion" is
-//! Floyd-Steinberg error diffusion, "Whole" fits the whole picture with margins (ADR-45).
+//! (opaque / transparent), Quality and the Target (Spare page, Picture, Brush, New layer).
+//! "Diffusion" is Floyd-Steinberg error diffusion, "Whole" fits the whole picture with
+//! margins (ADR-45). A new layer shares the picture's page, format and palette, so with that
+//! target Resolution, Chipset, Colours and Palette show the picture's own and are ghosted.
 //!
 //! The box right of the options says, before anything is generated, where the description
 //! goes and what it costs (or that no generator is set up); while a picture is generated it
@@ -21,6 +23,7 @@
 //! generating: stop waiting).
 
 use dpx_core::import::{COLOR_COUNTS, Framing, PaletteChoice, Scaler};
+use dpx_core::layer::MAX_LAYERS;
 use dpx_core::quantize::Dither;
 use dpx_core::{Chipset, DisplayMode, IndexedImage, Rect, Resolution, RgbaImage, Target, Video};
 
@@ -134,7 +137,6 @@ pub enum GenQuality {
 }
 
 /// Where Apply puts the picture.
-// TODO(wave8-integration): add "New layer" once the layers branch (ADR-44) is merged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GenTarget {
     /// The spare page becomes the picture; the shown page stays untouched.
@@ -144,6 +146,9 @@ pub enum GenTarget {
     Picture,
     /// The picture becomes the custom brush, fitted to the picture palette.
     Brush,
+    /// A new layer above the active one (ADR-44), in the picture's page size and palette
+    /// (one undo step); colour 0 is transparent there, so opaque pixels never take it.
+    NewLayer,
 }
 
 /// Everything the requester asks.
@@ -267,7 +272,7 @@ impl GenRow {
             GenRow::Scaler => vec!["Smooth", "Nearest", "Pixel art"],
             GenRow::Background => vec!["Opaque", "Transparent"],
             GenRow::Quality => vec!["Low", "Medium", "High", "Auto"],
-            GenRow::Target => vec!["Spare page", "Picture", "Brush"],
+            GenRow::Target => vec!["Spare page", "Picture", "Brush", "New layer"],
         }
     }
 }
@@ -284,7 +289,12 @@ const QUALITIES: [GenQuality; 4] = [
     GenQuality::High,
     GenQuality::Auto,
 ];
-const TARGETS: [GenTarget; 3] = [GenTarget::Spare, GenTarget::Picture, GenTarget::Brush];
+const TARGETS: [GenTarget; 4] = [
+    GenTarget::Spare,
+    GenTarget::Picture,
+    GenTarget::Brush,
+    GenTarget::NewLayer,
+];
 
 fn index_of<T: PartialEq>(list: &[T], v: &T) -> usize {
     list.iter().position(|x| x == v).unwrap_or(0)
@@ -357,6 +367,10 @@ pub struct GenerateRequester {
     screen: (i32, i32),
     /// The current document's palette size (shown, ghosted, with Palette: Current).
     doc_colors: u16,
+    /// The current document's target and page size (a new layer is made for them).
+    document: Option<(Target, (u32, u32))>,
+    /// The current document's layer count (a new layer needs room for one more).
+    doc_layers: usize,
     phase: GenPhase,
     provider: ProviderInfo,
     /// The second line under the options, e.g. what Apply will do.
@@ -384,6 +398,8 @@ impl GenerateRequester {
             more: false,
             screen,
             doc_colors,
+            document: None,
+            doc_layers: 1,
             phase: GenPhase::Ask,
             provider,
             message: None,
@@ -460,6 +476,48 @@ impl GenerateRequester {
         self.doc_colors = n;
     }
 
+    /// The current document's target and page size: the New layer target makes the picture
+    /// for them (until this is set, the chosen resolution stands in).
+    pub fn set_document(&mut self, target: Target, page: (u32, u32)) {
+        self.document = Some((target, page));
+    }
+
+    /// The current document's number of layers: with [`MAX_LAYERS`] the New layer target
+    /// cannot be generated for ([`Self::layer_problem`]).
+    pub fn set_doc_layers(&mut self, n: usize) {
+        self.doc_layers = n;
+    }
+
+    /// The target and page size the picture is made for: the document's for a new layer,
+    /// else the chosen resolution on the chosen chipset.
+    pub fn format(&self) -> (Target, (u32, u32)) {
+        match (self.options.target, self.document) {
+            (GenTarget::NewLayer, Some(d)) => d,
+            _ => {
+                let t = self.options.target();
+                (t, t.screen)
+            }
+        }
+    }
+
+    /// The palette the picture is made in: always the current one for a new layer.
+    pub fn palette_choice(&self) -> PaletteChoice {
+        match self.options.target {
+            GenTarget::NewLayer => PaletteChoice::Current,
+            _ => self.options.palette,
+        }
+    }
+
+    /// A row that shows the document's own value and cannot change: Resolution, Chipset,
+    /// Colours and Palette for a new layer (it shares the picture's page and palette).
+    pub fn row_fixed(&self, row: GenRow) -> bool {
+        self.options.target == GenTarget::NewLayer
+            && matches!(
+                row,
+                GenRow::Resolution | GenRow::Chipset | GenRow::Colors | GenRow::Palette
+            )
+    }
+
     /// The requester's size on its screen.
     pub fn size(&self) -> (i32, i32) {
         (
@@ -479,7 +537,7 @@ impl GenerateRequester {
 
     /// The colour count is ghosted while the palette is the current one.
     pub fn colors_enabled(&self) -> bool {
-        self.options.palette == PaletteChoice::New
+        self.palette_choice() == PaletteChoice::New
     }
 
     /// The colour count shown: the chosen one, or the document palette's size.
@@ -491,18 +549,46 @@ impl GenerateRequester {
         }
     }
 
-    /// Why nothing can be generated with these options: Palette Current with a document
-    /// palette larger than the chosen mode shows (generating would be paid for and then not
-    /// convertible). Shown in the box instead of the note; Generate is disabled meanwhile.
-    pub fn palette_problem(&self) -> Option<String> {
-        let max = self.options.max_colors();
-        (self.options.palette == PaletteChoice::Current && self.doc_colors > max).then(|| {
+    /// Why nothing can be generated with these options ([`Self::layer_problem`], else
+    /// [`Self::palette_problem`]): generating would be paid for and then not applicable.
+    /// Shown in the box instead of the note; Generate is disabled meanwhile.
+    pub fn problem(&self) -> Option<String> {
+        self.layer_problem().or_else(|| self.palette_problem())
+    }
+
+    /// New layer on a picture that already has the most layers allowed.
+    pub fn layer_problem(&self) -> Option<String> {
+        (self.options.target == GenTarget::NewLayer && self.doc_layers >= MAX_LAYERS).then(|| {
             format!(
-                "The current palette has {} colours; this mode shows {max} on {}. Choose \
-                 Palette New, AGA or another resolution.",
-                self.doc_colors,
-                self.value(GenRow::Chipset),
+                "The picture has {} layers, the most allowed. Choose another target, or \
+                 delete or merge a layer first.",
+                self.doc_layers
             )
+        })
+    }
+
+    /// Palette Current with a document palette larger than the chosen mode shows (the
+    /// result could not be converted).
+    pub fn palette_problem(&self) -> Option<String> {
+        let (target, _) = self.format();
+        let max = target.mode.max_colors(target.chipset).unwrap_or(16);
+        let current = self.palette_choice() == PaletteChoice::Current;
+        (current && self.doc_colors > max).then(|| {
+            if self.options.target == GenTarget::NewLayer {
+                format!(
+                    "The picture's palette has {} colours; its mode shows {max} on {}, so a \
+                     new layer cannot be made for it. Choose another target.",
+                    self.doc_colors,
+                    self.value(GenRow::Chipset),
+                )
+            } else {
+                format!(
+                    "The current palette has {} colours; this mode shows {max} on {}. Choose \
+                     Palette New, AGA or another resolution.",
+                    self.doc_colors,
+                    self.value(GenRow::Chipset),
+                )
+            }
         })
     }
 
@@ -577,11 +663,11 @@ impl GenerateRequester {
     /// box (inside a one-pixel frame and a one-pixel gap).
     pub fn thumb_size(&self) -> (u32, u32) {
         let area = self.box_rect().inset(2);
-        let p = self.options.preset();
-        let (fx, fy) = p.mode.pixel_shape();
+        let (target, page) = self.format();
+        let (fx, fy) = target.mode.pixel_shape();
         dpx_core::resample::fit_size(
-            p.screen.0 * fx.max(1),
-            p.screen.1 * fy.max(1),
+            page.0 * fx.max(1),
+            page.1 * fy.max(1),
             area.w.max(1) as u32,
             area.h.max(1) as u32,
             (1, 1),
@@ -727,6 +813,18 @@ impl GenerateRequester {
         if row == GenRow::Colors {
             return self.shown_colors().to_string();
         }
+        if self.row_fixed(row) {
+            let (target, (w, h)) = self.format();
+            match row {
+                GenRow::Resolution => return format!("This page {w}x{h}"),
+                GenRow::Chipset => {
+                    let i = index_of(&CHIPSETS, &target.chipset);
+                    return row.choices()[i].to_string();
+                }
+                GenRow::Palette => return "Current".into(),
+                _ => {}
+            }
+        }
         let (i, _) = self.position(row);
         row.choices()[i].to_string()
     }
@@ -754,7 +852,7 @@ impl GenerateRequester {
     pub fn enabled(&self, c: GenControl) -> bool {
         match c {
             GenControl::Prev(row) | GenControl::Next(row) => {
-                if row == GenRow::Colors && !self.colors_enabled() {
+                if (row == GenRow::Colors && !self.colors_enabled()) || self.row_fixed(row) {
                     return false;
                 }
                 let (i, n) = self.position(row);
@@ -767,7 +865,7 @@ impl GenerateRequester {
                 self.provider.ready
                     && !matches!(self.phase, GenPhase::Working { .. })
                     && !self.prompt.text().trim().is_empty()
-                    && self.palette_problem().is_none()
+                    && self.problem().is_none()
             }
             GenControl::SetUp => !matches!(self.phase, GenPhase::Working { .. }),
             GenControl::Apply => self.phase == GenPhase::Result && self.thumb.is_some(),
@@ -889,7 +987,7 @@ impl GenerateRequester {
         let vx = LEFT + Self::label_w();
         for row in [GenRow::Resolution].into_iter().chain(self.rows()) {
             let y = self.row_y(row);
-            let ghosted = row == GenRow::Colors && !self.colors_enabled();
+            let ghosted = (row == GenRow::Colors && !self.colors_enabled()) || self.row_fixed(row);
             let value = self.value(row);
             let vw = Self::value_w(row);
             let tx = vx + ARROW + (vw - font.text_width(&value)) / 2;
@@ -925,9 +1023,9 @@ impl GenerateRequester {
         let inner = b.inset(2);
         let showing_thumb = self.phase == GenPhase::Result && self.thumb.is_some();
         let text_lines: Vec<String> = match self.phase {
-            // A palette the mode cannot show comes first: nothing can be generated until the
-            // options change.
-            GenPhase::Ask => match (self.palette_problem(), &self.error) {
+            // A palette the mode cannot show (or a full picture for a new layer) comes first:
+            // nothing can be generated until the options change.
+            GenPhase::Ask => match (self.problem(), &self.error) {
                 (Some(p), _) => wrap(&p, inner.w - 2),
                 (None, Some(e)) => wrap(e, inner.w - 2),
                 (None, None) => wrap(&self.provider.note, inner.w - 2),
@@ -1449,5 +1547,102 @@ mod tests {
         r.set_options(o);
         let (w, h) = r.thumb_size();
         assert!((w as f64 / h as f64 - 1.25).abs() < 0.05, "{w}x{h}");
+    }
+
+    #[test]
+    fn a_new_layer_takes_the_pictures_page_and_palette_and_says_so() {
+        let p = pens();
+        let mut r = requester((320, 256));
+        r.set_doc_colors(16);
+        // An AGA HiRes picture of 640x400 pixels.
+        let doc = Target::new(
+            Chipset::Aga,
+            DisplayMode::new(Video::Ntsc, Resolution::Hi, true),
+        );
+        r.set_document(doc, (640, 400));
+        click(&mut r, GenControl::More);
+        let chosen = r.options();
+        let plain = r.render(&p);
+        while r.options().target != GenTarget::NewLayer {
+            click(&mut r, GenControl::Next(GenRow::Target));
+        }
+        assert_eq!(r.value(GenRow::Target), "New layer");
+        assert_eq!(r.format(), (doc, (640, 400)));
+        assert_eq!(r.palette_choice(), PaletteChoice::Current);
+        assert_eq!(r.value(GenRow::Resolution), "This page 640x400");
+        assert_eq!(r.value(GenRow::Chipset), "AGA");
+        assert_eq!(r.value(GenRow::Colors), "16");
+        assert_eq!(r.value(GenRow::Palette), "Current");
+        for row in [
+            GenRow::Resolution,
+            GenRow::Chipset,
+            GenRow::Colors,
+            GenRow::Palette,
+        ] {
+            assert!(r.row_fixed(row));
+            for c in [GenControl::Prev(row), GenControl::Next(row)] {
+                assert!(!r.enabled(c), "{c:?} is ghosted");
+                assert_eq!(click(&mut r, c), GenerateResponse::Continue);
+            }
+        }
+        // The other rows still change; the chosen resolution and chipset stay for later.
+        assert!(r.enabled(GenControl::Next(GenRow::Dither)));
+        assert_eq!(r.options().resolution, chosen.resolution);
+        assert_eq!(r.options().chipset, chosen.chipset);
+        assert_ne!(r.render(&p), plain);
+        // The thumbnail has the page's display proportions (HiRes laced: square pixels).
+        let (w, h) = r.thumb_size();
+        assert!((w as f64 / h as f64 - 1.6).abs() < 0.05, "{w}x{h}");
+        // A palette the picture's own mode cannot show blocks Generate.
+        r.set_doc_colors(32);
+        r.set_document(
+            Target::new(
+                Chipset::Ocs,
+                DisplayMode::new(Video::Pal, Resolution::Hi, false),
+            ),
+            (640, 256),
+        );
+        r.set_prompt("a castle");
+        assert!(r.palette_problem().unwrap().contains("new layer cannot"));
+        assert!(!r.enabled(GenControl::Generate));
+        // Back to the spare page: the chosen rows are back and change again.
+        click(&mut r, GenControl::Prev(GenRow::Target));
+        assert!(!r.row_fixed(GenRow::Chipset));
+        assert_eq!(r.format().0, chosen.target());
+        assert!(r.enabled(GenControl::Next(GenRow::Chipset)));
+        assert!(r.enabled(GenControl::Generate));
+    }
+
+    #[test]
+    fn a_full_picture_blocks_generate_for_a_new_layer_only() {
+        let pens = pens();
+        let mut r = requester((320, 200));
+        typed(&mut r, "A tree");
+        click(&mut r, GenControl::More);
+        while r.options().target != GenTarget::NewLayer {
+            click(&mut r, GenControl::Next(GenRow::Target));
+        }
+        r.set_doc_layers(MAX_LAYERS - 1);
+        assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
+        let note = r.render(&pens);
+        r.set_doc_layers(MAX_LAYERS);
+        let why = r.layer_problem().expect("no room for a new layer");
+        assert!(why.starts_with("The picture has 32 layers"), "{why}");
+        assert_eq!(r.problem(), Some(why.clone()));
+        assert!(!r.enabled(GenControl::Generate));
+        assert_eq!(
+            r.handle(ReqEvent::Key(ReqKey::Enter)),
+            GenerateResponse::Continue,
+            "Return does not generate either"
+        );
+        // The reason shows in the box, whole, on the smallest screen.
+        assert_ne!(r.render(&pens).pixels(), note.pixels());
+        let b = r.box_rect().inset(2);
+        let lines = wrap(&why, b.w - 2);
+        let n = lines.len() as i32;
+        assert!(n * LINE_STEP <= b.h, "{n} lines in {}: {lines:?}", b.h);
+        // Any other target generates.
+        click(&mut r, GenControl::Prev(GenRow::Target));
+        assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
     }
 }

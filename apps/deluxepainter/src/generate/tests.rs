@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
 
-use dpx_core::{Chipset, DisplayMode, Rgb8};
+use dpx_core::{Chipset, DisplayMode, IndexedImage, Rgb8};
 use dpx_imagegen::fixture::TestPattern;
 use dpx_imagegen::{CancelToken, Capabilities};
 use dpx_ui::{GenControl, GenRow, SetupControl, SetupField};
@@ -868,7 +868,12 @@ fn the_quality_choice_is_remembered_in_the_settings() {
 #[test]
 fn apply_texts_and_the_summary_fit_their_line() {
     let font = dpx_ui::font::Font::builtin();
-    for t in [GenTarget::Spare, GenTarget::Picture, GenTarget::Brush] {
+    for t in [
+        GenTarget::Spare,
+        GenTarget::Picture,
+        GenTarget::Brush,
+        GenTarget::NewLayer,
+    ] {
         for (frames, fitted) in [(1, 0), (dpx_core::anim::MAX_FRAMES, 256)] {
             let text = apply_text(t, frames, fitted);
             assert!(font.text_width(&text) <= 300, "{text}");
@@ -877,6 +882,17 @@ fn apply_texts_and_the_summary_fit_their_line() {
     assert_eq!(
         apply_text(GenTarget::Picture, 20, 0),
         "Apply: replaces all 20 frames (undoable)"
+    );
+    assert_eq!(
+        apply_text(GenTarget::NewLayer, 20, 0),
+        "Apply: as a new layer (undoable)"
+    );
+    let full = format!("No new layer: {MAX_LAYERS} layers is the most");
+    assert!(font.text_width(&full) <= 300, "{full}");
+    assert_eq!(layer_name(&[Layer::background()]), "Generated");
+    assert_eq!(
+        layer_name(&[Layer::background(), Layer::new("Generated")]),
+        "Generated 2"
     );
     assert_eq!(
         apply_text(GenTarget::Brush, 1, 20),
@@ -936,6 +952,55 @@ fn snapshot_specs_parse_and_bad_ones_are_refused() {
     assert!(!parse_spec("").unwrap().stand_in_keychain);
     // Without colors the default count follows the resolution (OCS HiRes: 16).
     assert_eq!(parse_spec("resolution=3").unwrap().options.colors, 16);
+}
+
+#[test]
+fn the_mcp_question_snapshot_shows_either_question_or_refuses() {
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let page = IndexedImage::new(320, 256, 0);
+    let doc = dpx_core::Document::from_layers(
+        vec![vec![page.clone(), page]; 3],
+        vec![Layer::background(), Layer::new("Sky")],
+        0,
+        1,
+        10,
+        Palette::dpaint_default_32(),
+        dpx_core::Target::default(),
+    )
+    .unwrap();
+    for (which, title, text) in [
+        (
+            "picture",
+            "Replace Picture?",
+            "the picture (all 3 frames, 2 layers)",
+        ),
+        ("spare", "Replace Spare Page?", "spare page (page1)"),
+    ] {
+        let mut ui = UiState::default();
+        snapshot(&args(&["--mcp-gen-question", which]), &doc, &mut ui).unwrap();
+        let q = ui.choice_requester.expect("the question");
+        assert_eq!(q.title(), title);
+        let lines = q.lines().join(" ");
+        assert!(lines.contains(text), "{lines}");
+        assert!(!q.truncated());
+    }
+    let mut ui = UiState::default();
+    assert!(snapshot(&args(&["--mcp-gen-question", "brush"]), &doc, &mut ui).is_err());
+}
+
+#[test]
+fn the_longest_mcp_generation_questions_fit_the_smallest_screen() {
+    // A client name is cut to 24 characters; the most frames and layers and the largest
+    // page and palette.
+    let client = Some("An MCP client named wwwwwwwwwwwwwwwww");
+    for q in [
+        dpx_mcp::tools::replace_question(client, 1280, 512, 256, 9999, 32),
+        dpx_mcp::tools::replace_spare_question(client, dpx_mcp::Slot::Second, 1280, 512, 256),
+    ] {
+        let req = crate::mcp::question_requester(&q);
+        assert!(!req.truncated(), "{:?}", req.lines());
+        assert!(req.height() <= 200, "{}: {:?}", req.height(), req.lines());
+    }
 }
 
 #[test]
@@ -1664,4 +1729,143 @@ fn undo_on_one_page_never_turns_a_spare_of_another_format_into_one_to_drop() {
     ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
     assert_eq!(app.engine.document(), &picture);
     assert_eq!(app.extras, picture_extras);
+}
+
+#[test]
+fn a_new_layer_is_made_in_the_pictures_page_and_palette_as_one_undo_step() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    // Something on the picture, in frame 2 of 3.
+    app.engine.execute(Command::AddFrames { count: 2 }).unwrap();
+    app.engine.execute(Command::GotoFrame { frame: 1 }).unwrap();
+    app.engine.execute(Command::Clear { color: 4 }).unwrap();
+    let before = app.engine.document().clone();
+    let t = generate_for(&mut app, &ctx, "A tree", GenTarget::NewLayer);
+    let r = req(&app);
+    let page = (before.page().width(), before.page().height());
+    assert_eq!(r.format(), (before.target(), page));
+    assert_eq!(r.palette_choice(), PaletteChoice::Current);
+    assert!(!r.enabled(GenControl::Next(GenRow::Chipset)), "fixed");
+    assert_eq!(r.message(), Some("Apply: as a new layer (undoable)"));
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert!(app.ui.generate_requester.is_none(), "applied");
+    let doc = app.engine.document();
+    let names: Vec<&str> = doc.layers().iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Background", "Generated"]);
+    assert_eq!((doc.active_layer(), doc.current_frame()), (1, 1));
+    assert_eq!(doc.target(), before.target());
+    assert_eq!(doc.palette(), before.palette());
+    assert_eq!(doc.cel(1, 0), before.cel(1, 0), "the layer under it stays");
+    // An opaque picture: no pixel is colour 0, the transparent one of upper layers.
+    let cel = doc.cel(1, 1).unwrap();
+    assert_eq!((cel.width(), cel.height()), page);
+    assert!(
+        cel.pixels()
+            .iter()
+            .all(|&p| p != 0 && usize::from(p) < before.palette().len())
+    );
+    for f in [0, 2] {
+        assert!(doc.cel(f, 1).unwrap().pixels().iter().all(|&p| p == 0));
+    }
+    // One Undo takes it all back.
+    ui_pass(&mut app, &ctx, t + 0.3, tap(egui::Key::U));
+    let doc = app.engine.document();
+    assert_eq!(doc.layers().len(), 1);
+    assert_eq!(doc.page(), before.page());
+}
+
+#[test]
+fn the_new_layer_thumbnail_stacks_it_where_apply_puts_it() {
+    // [Background (active), Top (opaque)]: the new layer goes between them, so Top covers
+    // it after Apply, and the thumbnail shows that.
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let doc = app.engine.document();
+    let (w, h) = (doc.page().width(), doc.page().height());
+    app.engine
+        .execute(Command::AddLayer {
+            name: Some("Top".into()),
+        })
+        .unwrap();
+    let mut top = vec![5u8; (w * h) as usize];
+    top[..(w as usize)].fill(0); // one clear row: the new layer shows through there
+    app.engine
+        .execute(Command::SetPage {
+            width: w,
+            height: h,
+            pixels: top,
+        })
+        .unwrap();
+    app.engine
+        .execute(Command::SelectLayer { layer: 0 })
+        .unwrap();
+    let t = generate_for(&mut app, &ctx, "A tree", GenTarget::NewLayer);
+    let thumb = req(&app).thumbnail().expect("a thumbnail").clone();
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert!(app.ui.generate_requester.is_none(), "applied");
+    let doc = app.engine.document();
+    let names: Vec<&str> = doc.layers().iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Background", "Generated", "Top"]);
+    let after = import::thumbnail(
+        &doc.composite(),
+        doc.palette(),
+        thumb.width(),
+        thumb.height(),
+    );
+    assert_eq!(thumb, after, "the thumbnail is the frame after Apply");
+}
+
+#[test]
+fn a_picture_with_the_most_layers_gets_no_new_one_and_says_so() {
+    let counting = Arc::new(Counting::default());
+    let (mut app, ctx) = app_with(Some(counting.clone()));
+    for _ in 1..MAX_LAYERS {
+        app.engine
+            .execute(Command::AddLayer { name: None })
+            .unwrap();
+    }
+    // New layer is not generated for (nothing is sent or billed): the box says why.
+    open_by_menu(&mut app, &ctx, 0.0);
+    type_text(&mut app, &ctx, 0.2, "A tree");
+    click(&mut app, &ctx, 0.3, GenControl::More);
+    let mut t = 0.4;
+    while req(&app).options().target != GenTarget::NewLayer {
+        click(&mut app, &ctx, t, GenControl::Next(GenRow::Target));
+        t += 0.1;
+    }
+    let why = req(&app).problem().expect("the picture is full");
+    assert!(why.starts_with("The picture has 32 layers"), "{why}");
+    assert!(!req(&app).enabled(GenControl::Generate));
+    click(&mut app, &ctx, t, GenControl::Generate);
+    ui_pass(
+        &mut app,
+        &ctx,
+        t + 0.1,
+        vec![key_event(egui::Key::Enter, true)],
+    );
+    app.start_generation();
+    assert!(app.imagegen.jobs.list().is_empty(), "nothing was sent");
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(req(&app).phase(), GenPhase::Ask);
+    // A result made for the brush, then shown for New layer, says so and is not applied.
+    click(&mut app, &ctx, t + 0.2, GenControl::Prev(GenRow::Target));
+    assert_eq!(req(&app).options().target, GenTarget::Brush);
+    click(&mut app, &ctx, t + 0.3, GenControl::Generate);
+    let t = settle(&mut app, &ctx, t + 0.4);
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 1);
+    click(&mut app, &ctx, t + 0.05, GenControl::Next(GenRow::Target));
+    assert_eq!(req(&app).options().target, GenTarget::NewLayer);
+    let full = format!("No new layer: {MAX_LAYERS} layers is the most");
+    assert_eq!(req(&app).message(), Some(full.as_str()));
+    assert!(!req(&app).enabled(GenControl::Generate), "no Again for it");
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert!(app.ui.generate_requester.is_some(), "not applied");
+    let why = format!("Not applied: {}.", layers_full());
+    assert_eq!(req(&app).error(), Some(why.as_str()));
+    assert_eq!(app.engine.document().layers().len(), MAX_LAYERS);
+    // The result stays: another target still takes it.
+    click(&mut app, &ctx, t + 0.2, GenControl::Prev(GenRow::Target));
+    assert_eq!(req(&app).options().target, GenTarget::Brush);
+    let t = settle(&mut app, &ctx, t + 0.3);
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert!(app.ui.generate_requester.is_none(), "applied as the brush");
+    assert!(app.custom_brush.is_some());
 }

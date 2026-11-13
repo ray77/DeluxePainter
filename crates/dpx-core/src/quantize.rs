@@ -483,8 +483,20 @@ pub struct Mapped {
 /// any, opaque pixels do not use colour 0 (it marks transparency, as in [`reduce`]), unless
 /// the palette has no other colour.
 pub fn reduce_to_palette(img: &RgbaImage, palette: &Palette, dither: Dither) -> Mapped {
+    reduce_to_palette_with(img, palette, dither, false)
+}
+
+/// [`reduce_to_palette`]; with `reserve_zero` opaque pixels avoid colour 0 also when the
+/// picture has no transparent pixel (ADR-45: a picture for a layer above the bottom one,
+/// where colour 0 is transparent).
+pub fn reduce_to_palette_with(
+    img: &RgbaImage,
+    palette: &Palette,
+    dither: Dither,
+    reserve_zero: bool,
+) -> Mapped {
     let transparent = img.pixels().iter().any(|&p| is_transparent(p));
-    let first = usize::from(transparent && palette.len() > 1);
+    let first = usize::from((transparent || reserve_zero) && palette.len() > 1);
     let ids: Vec<u8> = (first..palette.len()).map(|i| i as u8).collect();
     let colours: Vec<Rgb8> = ids
         .iter()

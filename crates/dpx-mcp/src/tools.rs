@@ -450,6 +450,9 @@ struct Spec {
     read_only: bool,
     destructive: bool,
     idempotent: bool,
+    /// The tool reaches beyond DeluxePainter (ADR-45: `generate_image` sends the
+    /// description to the image generator's service); `openWorldHint`.
+    open_world: bool,
 }
 
 fn schema<T: JsonSchema + 'static>() -> Arc<JsonObject> {
@@ -471,6 +474,7 @@ const fn read(
         read_only: true,
         destructive: false,
         idempotent: true,
+        open_world: false,
     }
 }
 
@@ -490,6 +494,7 @@ const fn edit(
         read_only: false,
         destructive,
         idempotent: false,
+        open_world: false,
     }
 }
 
@@ -647,6 +652,11 @@ static SPECS: &[Spec] = &[
         schema::<ExecuteArgs>,
         false,
     ),
+    // ADR-45: image generation (`tools_gen.rs`).
+    generation_tools::GENERATE_IMAGE,
+    generation_tools::GET_GENERATION_STATUS,
+    generation_tools::APPLY_GENERATED_IMAGE,
+    generation_tools::CANCEL_GENERATION,
 ];
 
 fn find(name: &str) -> Option<&'static Spec> {
@@ -665,7 +675,7 @@ pub fn definitions() -> Vec<Tool> {
                     Some(s.read_only),
                     Some(s.destructive),
                     Some(s.idempotent),
-                    Some(false),
+                    Some(s.open_world),
                 ))
         })
         .collect()
@@ -856,6 +866,9 @@ async fn dispatch(
         "get_preview" => preview(ctx, parse(args)?).await,
         "get_pixels" => pixels(ctx, parse(args)?).await,
         "execute_command" => execute(ctx, parse(args)?).await,
+        name if generation_tools::handles(name) => {
+            generation_tools::dispatch(ctx, name, args).await
+        }
         other => Err(ToolError::internal(format!("no handler for {other}"))),
     }
 }
@@ -2300,6 +2313,12 @@ pub async fn read_resource(ctx: &ToolCtx, uri: &str) -> Result<ReadResourceResul
     };
     Ok(ReadResourceResult::new(vec![contents]))
 }
+
+// ADR-45: generate_image, get_generation_status, apply_generated_image, cancel_generation.
+#[path = "tools_gen.rs"]
+mod generation_tools;
+#[cfg(feature = "imagegen")]
+pub use generation_tools::{replace_question, replace_spare_question};
 
 #[cfg(test)]
 #[path = "tools_tests.rs"]

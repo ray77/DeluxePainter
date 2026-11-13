@@ -12,6 +12,10 @@ use serde_json::Value;
 use super::*;
 use crate::tests::{click_ui, pointer_button, ui_pass, ui_point};
 
+// ADR-45: generate_image and friends on the GUI workspace, with this Rig.
+#[path = "gen_tests.rs"]
+mod gen_tests;
+
 fn scratch(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);

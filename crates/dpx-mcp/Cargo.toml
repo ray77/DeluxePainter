@@ -17,6 +17,8 @@ base64 = "0.23"
 dpx-core.workspace = true
 dpx-formats.workspace = true
 dpx-iff.workspace = true
+# MCP image generation (ADR-45), behind the `imagegen` feature.
+dpx-imagegen = { workspace = true, optional = true }
 getrandom = "0.3"
 png.workspace = true
 # The bridge's own HTTP client (no proxy): the version and features rmcp's
@@ -43,3 +45,9 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 tokio-util = "0.7"
+
+[features]
+# The image generation tools' work (ADR-45): the app turns it on. The stdio bridge only lists
+# the tools and forwards calls, so it leaves it off and carries no HTTP client, TLS or
+# keychain code for it.
+imagegen = ["dep:dpx-imagegen"]

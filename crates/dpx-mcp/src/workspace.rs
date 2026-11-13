@@ -121,6 +121,19 @@ pub trait Workspace {
     fn bg_color(&self) -> u8 {
         0
     }
+    /// The image generator, its jobs and the Generate requester's choices (ADR-45), shared
+    /// with the GUI's Picture > Generate..; the default (headless) has none.
+    #[cfg(feature = "imagegen")]
+    fn image_generation(&mut self) -> Result<crate::generation::GenHost, ToolError> {
+        Err(crate::generation::unavailable())
+    }
+    /// Applies a converted generated picture as the Generate requester's Apply does (one
+    /// undo step where it lands). Asking the user first is the caller's part.
+    #[cfg(feature = "imagegen")]
+    fn apply_generated(&mut self, apply: crate::generation::GenApply) -> Result<(), ToolError> {
+        let _ = apply;
+        Err(crate::generation::unavailable())
+    }
     /// Asks the user; `answer` is called once with the reply (possibly later, from the
     /// owning thread): `Ok(true)` for `yes`, `Ok(false)` for `no`, or an error when the
     /// question could not be asked or was not answered (`EDITOR_BUSY`,

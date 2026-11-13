@@ -19,6 +19,14 @@
 //!   brush file (Brush ▸ Load: every colour to the nearest picture colour, never onto the
 //!   transparent one; Color ▸ Palette ▸ Use Brush Palette then takes the generated palette).
 //!   The thumbnail shows the fitted brush, and the Apply line how many colours were fitted.
+//! - **New layer** (ADR-44): the picture becomes a new layer above the active one, in the
+//!   picture's page size and palette (`import::convert_for_layer`: colour 0 is transparent on
+//!   that layer, so only transparent pixels take it), in the current frame (the layer is
+//!   clear in the other frames); one undo step (`Command::AddPictureLayer`). The thumbnail
+//!   shows the frame with the new layer on top.
+//!
+//! MCP's `apply_generated_image` (ADR-45, wave-8 integration) applies through the same
+//! function as Apply ([`PainterApp::apply_generated`]).
 //!
 //! "Again" keeps the result shown until the new picture is there: a new generation that fails
 //! or is stopped leaves it (and Apply) as it was.
@@ -32,7 +40,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use dpx_core::import::{self, ConvertOptions, ConvertTarget, Imported, Margins, PaletteChoice};
-use dpx_core::{BrushImage, IndexedImage, Palette, Target};
+use dpx_core::layer::{Layer, MAX_LAYERS};
+use dpx_core::{BrushImage, Command, Palette, Target};
 use dpx_imagegen::openai::{self, DEFAULT_MODEL, ENV_KEY, KEY_ACCOUNT, MODELS_CHECKED};
 use dpx_imagegen::{
     ApiKeys, GenError, GenerationRequest, ImageGenerationProvider, JobId, JobManager, JobState,
@@ -140,6 +149,9 @@ pub(crate) struct ImageGenState {
     /// set up (the test pattern). The GUI never sets it.
     pub(crate) debug_provider: Option<Arc<dyn ImageGenerationProvider>>,
     pub(crate) last: Option<Remembered>,
+    /// The generations MCP clients started (ADR-45, `generate_image`); they share `jobs`
+    /// with the requester, and with it the limit of requests in flight.
+    pub(crate) mcp_plans: dpx_mcp::generation::GenPlans,
     /// The generation running for the requester.
     job: Option<JobId>,
     /// The generated picture (the first variant) and its conversion for the options it was
@@ -167,6 +179,7 @@ impl Default for ImageGenState {
             jobs: JobManager::new(),
             debug_provider: None,
             last: None,
+            mcp_plans: Default::default(),
             job: None,
             picture: None,
             result: None,
@@ -247,33 +260,49 @@ pub(crate) fn apply_text(t: GenTarget, frames: usize, fitted: usize) -> String {
             format!("Apply: as the brush, {fitted} colours fitted")
         }
         GenTarget::Brush => "Apply: becomes the brush".into(),
+        GenTarget::NewLayer => "Apply: as a new layer (undoable)".into(),
+    }
+}
+
+/// Why no new layer can be added: the picture has the most layers allowed.
+pub(crate) fn layers_full() -> String {
+    format!("the picture has {MAX_LAYERS} layers, the most allowed: delete or merge one first")
+}
+
+/// The name of a generated picture's layer: "Generated", or "Generated N" (the smallest N
+/// from 2 that is not taken).
+pub(crate) fn layer_name(layers: &[Layer]) -> String {
+    let taken = |n: &str| layers.iter().any(|l| l.name == n);
+    if !taken("Generated") {
+        return "Generated".into();
+    }
+    (2..)
+        .map(|n| format!("Generated {n}"))
+        .find(|n| !taken(n))
+        .expect("fewer layers than numbers")
+}
+
+/// The conversion of a generated picture for `to` on a document: a new layer is made in the
+/// document's palette with colour 0 kept for transparency ([`import::convert_for_layer`]),
+/// every other target with [`import::convert`]. One entry point for Generate and MCP.
+pub(crate) fn convert_for(
+    picture: &dpx_core::RgbaImage,
+    opts: &ConvertOptions,
+    t: &ConvertTarget,
+    to: GenTarget,
+) -> Result<Imported, dpx_core::CommandError> {
+    match to {
+        GenTarget::NewLayer => import::convert_for_layer(picture, opts, t),
+        _ => import::convert(picture, opts, t),
     }
 }
 
 /// The Brush target's brush: the result as a brush in its own palette, and fitted to the
-/// picture palette `page` like Brush ▸ Load (`brush_menu::fit_brush`), with the number of
-/// colours that had to change.
+/// picture palette `page` like Brush ▸ Load (`Imported::fitted_brush`, which MCP's brush
+/// target uses too), with the number of colours that had to change.
 fn fitted_brush(r: &Imported, page: &Palette) -> (BrushImage, BrushImage, usize) {
-    let own = BrushImage::from_image(&r.page, r.transparent_color);
-    let (fitted, changed) = crate::brush_menu::fit_brush(&own, &r.palette, page);
-    (own, fitted, changed)
-}
-
-/// The fitted brush as the thumbnail shows it: in the picture palette, its transparent pixels
-/// in the result's transparent colour (no opaque pixel uses that number).
-fn brush_preview(r: &Imported, page: &Palette, fitted: &BrushImage) -> (IndexedImage, Palette) {
-    let mut colors = page.colors().to_vec();
-    if let Some(t) = fitted.transparent
-        && let (Some(slot), Some(c)) = (colors.get_mut(usize::from(t)), r.palette.get(t))
-    {
-        *slot = c;
-    }
-    let image = IndexedImage::from_pixels(fitted.width, fitted.height, fitted.pixels.clone())
-        .expect("a brush has width x height pixels");
-    (
-        image,
-        Palette::new(colors).expect("as many entries as the picture palette"),
-    )
+    let b = r.fitted_brush(page);
+    (b.own, b.fitted, b.changed)
 }
 
 /// At most `max` characters of `why`, cut at a word (for the setup's test line).
@@ -302,8 +331,9 @@ pub(crate) fn kept_rects(ui: &UiState) -> Vec<dpx_core::Rect> {
 }
 
 impl PainterApp {
-    /// The provider Generate uses: the debug one in tests, else the one set up.
-    fn imagegen_provider(&self) -> Option<Arc<dyn ImageGenerationProvider>> {
+    /// The provider Generate (and MCP's `generate_image`) uses: the debug one in tests, else
+    /// the one set up.
+    pub(crate) fn imagegen_provider(&self) -> Option<Arc<dyn ImageGenerationProvider>> {
         if let Some(p) = &self.imagegen.debug_provider {
             return Some(p.clone());
         }
@@ -313,6 +343,79 @@ impl PainterApp {
                 self.imagegen.settings.openai.clone(),
                 self.imagegen.keys.clone(),
             ))),
+        }
+    }
+
+    /// What MCP's generation tools share with Picture ▸ Generate.. (ADR-45): the job manager
+    /// (one limit of requests in flight), the generator set up (the keychain is opened
+    /// first when it is OpenAI), its model, the MCP jobs and the defaults: the requester's
+    /// choices of this session, else the shown picture's format with the requester's
+    /// default options.
+    pub(crate) fn mcp_gen_host(&mut self) -> dpx_mcp::generation::GenHost {
+        if self.imagegen.debug_provider.is_none()
+            && self.imagegen.settings.provider == GenProvider::OpenAi
+        {
+            self.imagegen.ensure_keys();
+        }
+        let model = (self.imagegen.debug_provider.is_none()
+            && self.imagegen.settings.provider == GenProvider::OpenAi)
+            .then(|| self.imagegen.settings.openai.model.clone());
+        let defaults = match &self.imagegen.last {
+            Some(l) => {
+                let o = l.options.clamped();
+                let format = o.target();
+                dpx_mcp::generation::GenDefaults {
+                    format,
+                    page: format.screen,
+                    colors: o.colors,
+                    convert: convert_options(&o),
+                    style: style_of(o.style),
+                }
+            }
+            None => {
+                let o = GenerateOptions::default();
+                let format = self.engine.document().target();
+                let max = format.mode.max_colors(format.chipset).unwrap_or(16);
+                let own = self.engine.document().palette().len().min(256) as u16;
+                dpx_mcp::generation::GenDefaults {
+                    format,
+                    page: format.screen,
+                    colors: import::color_count(own.max(2), max),
+                    convert: convert_options(&o),
+                    style: style_of(o.style),
+                }
+            }
+        };
+        dpx_mcp::generation::GenHost {
+            jobs: self.imagegen.jobs.clone(),
+            provider: self.imagegen_provider(),
+            model,
+            plans: self.imagegen.mcp_plans.clone(),
+            defaults,
+        }
+    }
+
+    /// Prefs ▸ AI & MCP..'s state of the image generator, under "Image generation:" (ADR-45):
+    /// which one is set up and whether its key is there (never the key). The keychain is not
+    /// opened for it; while it is not open yet (the AI & MCP requester opens it for OpenAI)
+    /// the line says "key not checked yet".
+    pub(crate) fn generator_line(&self) -> String {
+        match (
+            &self.imagegen.debug_provider,
+            self.imagegen.settings.provider,
+        ) {
+            (Some(p), _) => p.display_name().to_string(),
+            (None, GenProvider::None) => "Not set up".into(),
+            (None, GenProvider::OpenAi) if self.imagegen.system_keys => {
+                "OpenAI, key not checked yet".into()
+            }
+            (None, GenProvider::OpenAi) => {
+                match self.imagegen.keys.status(KEY_ACCOUNT, ENV_KEY).source {
+                    Some(KeySource::Environment) => format!("OpenAI, key from {ENV_KEY}"),
+                    Some(_) => "OpenAI, key set".into(),
+                    None => "OpenAI, no API key".into(),
+                }
+            }
         }
     }
 
@@ -366,6 +469,8 @@ impl PainterApp {
         let doc = self.engine.document();
         let screen = View::of_target(doc.target()).ui_size();
         let doc_colors = doc.palette().len().min(256) as u16;
+        let doc_format = (doc.target(), (doc.page().width(), doc.page().height()));
+        let doc_layers = doc.layer_count();
         let last = self.imagegen.last.clone().unwrap_or_else(|| Remembered {
             options: GenerateOptions {
                 quality: gen_quality(self.imagegen.settings.openai.quality),
@@ -382,14 +487,16 @@ impl PainterApp {
             self.provider_info(),
         );
         req.set_more(last.more);
+        req.set_document(doc_format.0, doc_format.1);
+        req.set_doc_layers(doc_layers);
         self.ui.generate_requester = Some(req);
         self.imagegen.picture = None;
         self.imagegen.result = None;
         self.dirty = true;
     }
 
-    /// Opens the Image Generator setup (over the Generate requester when that is open).
-    // TODO(wave8-integration): Prefs ▸ "AI & MCP.." (ADR-43) gets a button that calls this.
+    /// Opens the Image Generator setup (over the Generate requester, or over Prefs ▸ "AI &
+    /// MCP.." from its "Set up.." button, when one is open; closing it returns there).
     pub(crate) fn open_imagegen_setup(&mut self) {
         self.imagegen.ensure_keys();
         self.finish_stroke();
@@ -537,11 +644,16 @@ impl PainterApp {
         };
         let o = req.options();
         let description = req.prompt();
-        // Nothing is generated (and paid for) that cannot be converted for these options:
-        // a current palette larger than the mode shows (the box says so, Generate is off).
-        let doc_colors = self.engine.document().palette().len();
-        if req.palette_problem().is_some()
-            || (o.palette == PaletteChoice::Current && doc_colors > usize::from(o.max_colors()))
+        let (target, page) = req.format();
+        let palette = req.palette_choice();
+        // Nothing is generated (and paid for) that cannot be converted or applied for these
+        // options: a current palette larger than the mode shows, a new layer on a picture
+        // with the most layers (the box says so, Generate is off).
+        let doc = self.engine.document();
+        let max = target.mode.max_colors(target.chipset).unwrap_or(16);
+        if req.problem().is_some()
+            || (palette == PaletteChoice::Current && doc.palette().len() > usize::from(max))
+            || (o.target == GenTarget::NewLayer && doc.layer_count() >= MAX_LAYERS)
         {
             return;
         }
@@ -549,17 +661,16 @@ impl PainterApp {
         self.imagegen.settings.openai.quality = quality_of(o.quality);
         let info = self.provider_info();
         let provider = self.imagegen_provider().filter(|_| info.ready);
-        let colors = match o.palette {
+        let colors = match palette {
             PaletteChoice::New => o.colors,
             PaletteChoice::Current => self.engine.document().palette().len() as u16,
         };
-        let target = o.target();
         let submitted = provider.map(|p| {
             let prompt = style_of(o.style).prompt(&description, colors);
             let mut request = GenerationRequest::for_page(
                 prompt,
                 &p.capabilities(),
-                target.screen,
+                page,
                 target.mode.pixel_shape(),
             );
             request.transparent_background = o.transparent;
@@ -659,31 +770,45 @@ impl PainterApp {
             return;
         };
         let o = req.options();
-        let target = o.target();
+        let (target, page) = req.format();
         let doc = self.engine.document();
         let t = ConvertTarget {
             target,
-            page: target.screen,
+            page,
             palette: doc.palette(),
             bg: self.ui.bg,
             transparent: files::TRANSPARENT_PINK,
         };
+        let mut opts = convert_options(&o);
+        opts.palette = req.palette_choice();
         req.set_phase(GenPhase::Result);
-        match import::convert(picture, &convert_options(&o), &t) {
+        match convert_for(picture, &opts, &t, o.target) {
             Ok(r) => {
                 let (w, h) = req.thumb_size();
                 let (thumb, fitted) = match o.target {
                     // The brush as Apply makes it: fitted to the picture palette.
                     GenTarget::Brush => {
-                        let (_, brush, fitted) = fitted_brush(&r, doc.palette());
-                        let (page, palette) = brush_preview(&r, doc.palette(), &brush);
-                        (import::thumbnail(&page, &palette, w, h), fitted)
+                        let b = r.fitted_brush(doc.palette());
+                        let (page, palette) = b.preview(&r.palette, doc.palette());
+                        (import::thumbnail(&page, &palette, w, h), b.changed)
+                    }
+                    // The frame as it will show: the new layer right above the active one,
+                    // under the visible layers above that.
+                    GenTarget::NewLayer => {
+                        let shown = dpx_core::layer::composite_with_new_layer(doc, &r.page);
+                        (import::thumbnail(&shown, doc.palette(), w, h), 0)
                     }
                     _ => (import::thumbnail(&r.page, &r.palette, w, h), 0),
                 };
+                let message = match o.target {
+                    GenTarget::NewLayer if doc.layer_count() >= MAX_LAYERS => {
+                        format!("No new layer: {MAX_LAYERS} layers is the most")
+                    }
+                    to => apply_text(to, doc.frame_count(), fitted),
+                };
                 req.set_thumbnail(Some(thumb));
                 req.set_error(None);
-                req.set_message(Some(apply_text(o.target, doc.frame_count(), fitted)));
+                req.set_message(Some(message));
                 self.imagegen.result = Some((o, r));
             }
             Err(e) => {
@@ -701,18 +826,7 @@ impl PainterApp {
         let Some((o, r)) = self.imagegen.result.take() else {
             return;
         };
-        let target = o.target();
-        let applied = match o.target {
-            GenTarget::Spare => {
-                self.spare_from_generated(&r, target, o.palette);
-                Ok(())
-            }
-            GenTarget::Picture => self.picture_from_generated(&r, target, o.palette),
-            GenTarget::Brush => {
-                self.brush_from_generated(&r);
-                Ok(())
-            }
-        };
+        let applied = self.apply_generated(&r, o.target, o.target(), o.palette);
         match applied {
             Ok(()) => self.close_generate(),
             Err(e) => {
@@ -723,6 +837,52 @@ impl PainterApp {
             }
         }
         self.dirty = true;
+    }
+
+    /// A converted generated picture `r` goes to `to` (the requester's Apply and MCP's
+    /// `apply_generated_image`): `format` and `palette` are what it was made for (the spare
+    /// page and the picture take them; a new layer is in the document's page and palette).
+    pub(crate) fn apply_generated(
+        &mut self,
+        r: &Imported,
+        to: GenTarget,
+        format: Target,
+        palette: PaletteChoice,
+    ) -> Result<(), String> {
+        let applied = match to {
+            GenTarget::Spare => {
+                self.spare_from_generated(r, format, palette);
+                Ok(())
+            }
+            GenTarget::Picture => self.picture_from_generated(r, format, palette),
+            GenTarget::Brush => {
+                self.brush_from_generated(r);
+                Ok(())
+            }
+            GenTarget::NewLayer => self.layer_from_generated(r),
+        };
+        self.dirty = true;
+        applied
+    }
+
+    /// New layer: the picture as a new layer above the active one, which it becomes, in the
+    /// current frame (clear in the others): one undo step. The layer panel and the title-bar
+    /// label follow on the redraw this asks for.
+    fn layer_from_generated(&mut self, r: &Imported) -> Result<(), String> {
+        self.finish_stroke();
+        let doc = self.engine.document();
+        if doc.layer_count() >= MAX_LAYERS {
+            return Err(layers_full());
+        }
+        let command = Command::AddPictureLayer {
+            name: Some(layer_name(doc.layers())),
+            pixels: r.page.pixels().to_vec(),
+        };
+        self.engine.execute(command).map_err(|e| e.message)?;
+        self.clamp_colors();
+        self.clamp_scroll();
+        self.dirty = true;
+        Ok(())
     }
 
     /// Spare page: it becomes the picture with its own format and palette (one undo step on
@@ -1006,7 +1166,8 @@ pub(crate) fn overlay(ui: &UiState, rgba: &mut [u8], frame_w: usize, sx: usize, 
 /// (ocs/aga), `colors`, `style` (pixel_art/painted/none), `palette` (new/current), `dither`
 /// (none/diffusion/ordered), `fit` (crop/whole), `scaler` (smooth/nearest/pixel_art),
 /// `background` (opaque/transparent), `quality` (low/medium/high/auto), `target`
-/// (spare/picture/brush), `more`, `provider` (none/openai/test_pattern), `key=placeholder`
+/// (spare/picture/brush/new_layer), `more`, `provider` (none/openai/test_pattern),
+/// `key=placeholder`
 /// (a placeholder key in this session's memory, so OpenAI shows as set up; nothing is sent)
 /// and `keychain=stand_in` (a stand-in in memory where the system keychain would be, so the
 /// setup looks as with a working keychain; without it the snapshot's keys are session-only,
@@ -1115,6 +1276,7 @@ pub(crate) fn parse_spec(spec: &str) -> Result<Spec, String> {
                     "spare" => GenTarget::Spare,
                     "picture" => GenTarget::Picture,
                     "brush" => GenTarget::Brush,
+                    "new_layer" => GenTarget::NewLayer,
                     _ => return Err(bad()),
                 }
             }
@@ -1141,17 +1303,49 @@ pub(crate) fn parse_spec(spec: &str) -> Result<Spec, String> {
     Ok(s)
 }
 
+/// `--mcp-gen-question picture|spare` (snapshots): the question before an MCP client's
+/// generated picture replaces the picture (naming `doc`'s frames and layers) or a picture
+/// on the spare page, for a generated picture of `doc`'s page size and palette size, as
+/// Claude Code would ask it.
+fn snapshot_question(
+    which: &str,
+    doc: &dpx_core::Document,
+) -> Result<dpx_ui::ChoiceRequester, String> {
+    let (w, h) = (doc.page().width(), doc.page().height());
+    let colors = doc.palette().len();
+    let client = Some("claude-code");
+    let q = match which {
+        "picture" => dpx_mcp::tools::replace_question(
+            client,
+            w,
+            h,
+            colors,
+            doc.frame_count(),
+            doc.layer_count(),
+        ),
+        "spare" => {
+            dpx_mcp::tools::replace_spare_question(client, dpx_mcp::Slot::First, w, h, colors)
+        }
+        other => return Err(format!("--mcp-gen-question {other}: picture or spare")),
+    };
+    Ok(crate::mcp::question_requester(&q))
+}
+
 /// Snapshot options (ADR-45): `--generate-requester` shows Picture ▸ Generate.. over the
 /// current screen, `--generate SPEC` sets it up ([`parse_spec`]), `--generate-run` generates
 /// with the **test pattern (not AI, debug only)** and shows the result, `--generate-apply`
-/// shows the picture after Apply instead, and `--imagegen-setup` shows the Image Generator
-/// setup. No key store, network or settings file is touched. Returns the document to show
-/// (the spare page after Apply onto it). Errors carry the exit code 2.
+/// shows the picture after Apply instead, `--imagegen-setup` shows the Image Generator
+/// setup and `--mcp-gen-question picture|spare` an MCP client's question before Apply
+/// ([`snapshot_question`]). No key store, network or settings file is touched. Returns the
+/// document to show (the spare page after Apply onto it). Errors carry the exit code 2.
 pub(crate) fn snapshot(
     args: &[String],
     doc: &dpx_core::Document,
     ui: &mut UiState,
 ) -> Result<dpx_core::Document, (i32, String)> {
+    if let Some(which) = crate::arg_value(args, "--mcp-gen-question") {
+        ui.choice_requester = Some(snapshot_question(&which, doc).map_err(|e| (2, e))?);
+    }
     let has = |f: &str| args.iter().any(|a| a == f);
     let spec = crate::arg_value(args, "--generate");
     let (requester, run, apply, setup) = (

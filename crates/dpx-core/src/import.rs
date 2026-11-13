@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::command::{Command, CommandError, ErrorCode};
 use crate::image::IndexedImage;
 use crate::mode::{Chipset, Target};
+use crate::paint::BrushImage;
 use crate::palette::{Palette, Rgb8};
 use crate::quantize::{self, Dither, PaletteDepth, ReduceOptions, Reduction};
 use crate::resample;
@@ -153,6 +154,17 @@ pub fn place(size: (u32, u32), page: (u32, u32), position: Position) -> (u32, u3
 ///
 /// [`Fitted::reduce`] gives the same and reuses work between calls.
 pub fn reduce_fitted(fitted: &RgbaImage, opts: &ImportOptions, t: &ImportTarget) -> Imported {
+    reduce_fitted_with(fitted, opts, t, false)
+}
+
+/// [`reduce_fitted`]; with `reserve_zero` and the current palette, opaque pixels never take
+/// colour 0 ([`quantize::reduce_to_palette_with`]).
+fn reduce_fitted_with(
+    fitted: &RgbaImage,
+    opts: &ImportOptions,
+    t: &ImportTarget,
+    reserve_zero: bool,
+) -> Imported {
     let mapped = match opts.palette {
         PaletteChoice::New => {
             let ro = new_options(opts, t);
@@ -164,7 +176,7 @@ pub fn reduce_fitted(fitted: &RgbaImage, opts: &ImportOptions, t: &ImportTarget)
                 &extra,
             )
         }
-        PaletteChoice::Current => map_current(fitted, opts, t),
+        PaletteChoice::Current => map_current(fitted, opts, t, reserve_zero),
     };
     mapped.place(t.page, opts.position)
 }
@@ -241,8 +253,13 @@ fn map_new(
     }
 }
 
-fn map_current(fitted: &RgbaImage, opts: &ImportOptions, t: &ImportTarget) -> Mapped {
-    let m = quantize::reduce_to_palette(fitted, t.palette, opts.dither);
+fn map_current(
+    fitted: &RgbaImage,
+    opts: &ImportOptions,
+    t: &ImportTarget,
+    reserve_zero: bool,
+) -> Mapped {
+    let m = quantize::reduce_to_palette_with(fitted, t.palette, opts.dither, reserve_zero);
     Mapped {
         pixels: m.image,
         palette: t.palette.clone(),
@@ -359,7 +376,7 @@ impl Fitted {
                 };
                 map_new(&self.image, &self.palettes[i].1, opts, &extra)
             }
-            PaletteChoice::Current => map_current(&self.image, opts, t),
+            PaletteChoice::Current => map_current(&self.image, opts, t, false),
         };
         let result = mapped.place(t.page, opts.position);
         self.last = Some((key, mapped));
@@ -478,6 +495,32 @@ pub fn convert(
     opts: &ConvertOptions,
     t: &ConvertTarget,
 ) -> Result<Imported, CommandError> {
+    convert_with(img, opts, t, false)
+}
+
+/// [`convert`] for a new layer above the bottom one (ADR-45, the "New layer" target), where
+/// colour 0 is transparent (ADR-44): always in the current palette (`opts.palette` is not
+/// used), and colour 0 goes only to transparent pixels (with `transparent_background`) and
+/// to the margins that are transparent or in BG colour 0. Every opaque pixel takes the
+/// nearest other colour, so nothing the picture shows turns see-through on the layer.
+pub fn convert_for_layer(
+    img: &RgbaImage,
+    opts: &ConvertOptions,
+    t: &ConvertTarget,
+) -> Result<Imported, CommandError> {
+    let opts = ConvertOptions {
+        palette: PaletteChoice::Current,
+        ..*opts
+    };
+    convert_with(img, &opts, t, true)
+}
+
+fn convert_with(
+    img: &RgbaImage,
+    opts: &ConvertOptions,
+    t: &ConvertTarget,
+    reserve_zero: bool,
+) -> Result<Imported, CommandError> {
     let target = t.target;
     let mode = target.mode;
     let max = mode.max_colors(target.chipset).ok_or_else(|| {
@@ -575,13 +618,13 @@ pub fn convert(
             let aspect = resample::display_aspect(t.page, pixel_shape);
             let (x, y, w, h) = resample::crop_to_aspect(source.width(), source.height(), aspect);
             let scaled = scale(&source.crop(x, y, w, h), pw, ph);
-            reduce_fitted(&scaled, &import_opts, &it)
+            reduce_fitted_with(&scaled, &import_opts, &it, reserve_zero)
         }
         Framing::Fit => {
             let (w, h) = fitted_size(source.width(), source.height(), t.page, pixel_shape);
             let scaled = scale(&source, w, h);
             match opts.margins {
-                Margins::Bg => reduce_fitted(&scaled, &import_opts, &it),
+                Margins::Bg => reduce_fitted_with(&scaled, &import_opts, &it, reserve_zero),
                 Margins::Transparent => {
                     // The margins are transparent pixels of a page-sized picture.
                     let at = place((w, h), t.page, Position::Centre);
@@ -593,7 +636,7 @@ pub fn convert(
                             }
                         }
                     }
-                    let mut r = reduce_fitted(&canvas, &import_opts, &it);
+                    let mut r = reduce_fitted_with(&canvas, &import_opts, &it, reserve_zero);
                     r.at = at;
                     r.size = (w, h);
                     r
@@ -633,6 +676,57 @@ impl Imported {
             height: self.page.height(),
             pixels: self.page.pixels().to_vec(),
         }
+    }
+
+    /// The page as a brush the way Brush ▸ Load makes one (ADR-45, the Brush target): in
+    /// its own palette (for Use Brush Palette), and fitted to the picture palette `page`
+    /// ([`crate::brush_palette::fit_loaded_brush`]); transparent pixels are its transparent
+    /// colour.
+    pub fn fitted_brush(&self, page: &Palette) -> FittedBrush {
+        let own = BrushImage::from_image(&self.page, self.transparent_color);
+        let (fitted, changed) = crate::brush_palette::fit_loaded_brush(&own, &self.palette, page);
+        FittedBrush {
+            own,
+            fitted,
+            changed,
+        }
+    }
+}
+
+/// [`Imported::fitted_brush`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FittedBrush {
+    /// The brush in the result's own palette.
+    pub own: BrushImage,
+    /// The brush in the picture palette's colour numbers.
+    pub fitted: BrushImage,
+    /// Colours that had to change to fit.
+    pub changed: usize,
+}
+
+impl FittedBrush {
+    /// The fitted brush as it shows: in the picture palette `page`, its transparent pixels
+    /// in `own`'s (the result's palette) transparent colour, a number no opaque pixel uses.
+    pub fn preview(&self, own: &Palette, page: &Palette) -> (IndexedImage, Palette) {
+        let mut colors = page.colors().to_vec();
+        if let Some(t) = self.fitted.transparent
+            && let (Some(slot), Some(c)) = (colors.get_mut(usize::from(t)), own.get(t))
+        {
+            *slot = c;
+        }
+        (
+            self.fitted.to_image(),
+            Palette::new(colors).expect("as many entries as the picture palette"),
+        )
+    }
+
+    /// Different colour numbers the fitted brush uses (its transparent one included).
+    pub fn colors_used(&self) -> usize {
+        let mut seen = [false; 256];
+        for &p in &self.fitted.pixels {
+            seen[usize::from(p)] = true;
+        }
+        seen.iter().filter(|&&s| s).count()
     }
 }
 
@@ -1421,6 +1515,56 @@ mod tests {
         assert_eq!(r.transparent_color, Some(0));
         assert_eq!(r.page.get(10, 100), Some(0));
         assert_eq!(r.page.get(300, 100), Some(2));
+    }
+
+    #[test]
+    fn a_layer_picture_never_puts_opaque_pixels_on_colour_0() {
+        // ADR-45 "New layer": colour 0 is transparent there (ADR-44).
+        let pal = Palette::new(vec![
+            Rgb8::BLACK,
+            Rgb8::WHITE,
+            Rgb8::new(255, 0, 0),
+            Rgb8::new(16, 16, 16),
+        ])
+        .unwrap();
+        // Black (exactly colour 0) left, red right, a transparent row on top.
+        let img = image(320, 256, |x, y| match (x < 160, y) {
+            (_, 0..=15) => Rgba8::new(0, 0, 0, 0),
+            (true, _) => Rgba8::opaque(0, 0, 0),
+            (false, _) => RED,
+        });
+        let target = Target::new(Chipset::Aga, DisplayMode::PAL_LORES);
+        let t = ctarget(target, (320, 256), &pal);
+        for dither in [Dither::None, Dither::FloydSteinberg, Dither::Ordered] {
+            // A new palette asked for: a layer always takes the current one.
+            let opaque = ConvertOptions {
+                palette: PaletteChoice::New,
+                ..copts(Scaler::Nearest, 4, dither)
+            };
+            let r = convert_for_layer(&img, &opaque, &t).unwrap();
+            assert_eq!(r.palette, pal);
+            assert!(r.page.pixels().iter().all(|&p| p != 0), "{dither:?}");
+            assert_eq!(
+                r.page.get(5, 20),
+                Some(3),
+                "black takes the nearest other colour"
+            );
+            assert_eq!(r.page.get(300, 20), Some(2));
+            // The plain conversion would use colour 0 for black.
+            assert_eq!(convert(&img, &opaque, &t).unwrap().page.get(5, 20), Some(0));
+            // With a transparent background only the transparent pixels are colour 0.
+            let clear = ConvertOptions {
+                transparent_background: true,
+                ..opaque
+            };
+            let r = convert_for_layer(&img, &clear, &t).unwrap();
+            assert_eq!(r.transparent_color, Some(0));
+            for y in 0..256 {
+                for x in 0..320 {
+                    assert_eq!(r.page.get(x, y) == Some(0), y < 16, "{x},{y} {dither:?}");
+                }
+            }
+        }
     }
 
     const BLUE_RGB: Rgb8 = Rgb8::new(0, 0, 255);

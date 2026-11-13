@@ -160,6 +160,26 @@ pub fn with_changes(
     out
 }
 
+/// The current frame of `doc` as it shows once `picture` (the page's size) is a new
+/// visible layer where [`Command::AddPictureLayer`] puts it: right above the active layer,
+/// under the visible layers above that one (ADR-45: the Generate requester's New layer
+/// thumbnail). The same picture as the composite after that command.
+pub fn composite_with_new_layer(doc: &Document, picture: &IndexedImage) -> IndexedImage {
+    let frame = doc.current_frame();
+    let mut visible: Vec<&IndexedImage> = Vec::with_capacity(doc.layer_count() + 1);
+    for (l, layer) in doc.layers().iter().enumerate() {
+        if layer.visible
+            && let Some(cel) = doc.cel(frame, l)
+        {
+            visible.push(cel);
+        }
+        if l == doc.active_layer() {
+            visible.push(picture);
+        }
+    }
+    flatten(&visible, doc.page().width(), doc.page().height())
+}
+
 // ---- Layer commands.
 
 impl Command {
@@ -168,6 +188,7 @@ impl Command {
         matches!(
             self,
             Command::AddLayer { .. }
+                | Command::AddPictureLayer { .. }
                 | Command::DuplicateLayer { .. }
                 | Command::DeleteLayer { .. }
                 | Command::MoveLayer { .. }
@@ -238,6 +259,14 @@ pub(crate) fn validate(cmd: &Command, doc: &Document) -> Result<(), CommandError
                 check_name(name)?;
             }
             room_for_another(doc)
+        }
+        Command::AddPictureLayer { name, pixels } => {
+            if let Some(name) = name {
+                check_name(name)?;
+            }
+            room_for_another(doc)?;
+            let (w, h) = (doc.page.width(), doc.page.height());
+            crate::command::other_page(w, h, pixels, doc.palette.len())
         }
         Command::DuplicateLayer { layer } => {
             layer_exists(doc, *layer, "duplicate")?;
@@ -361,6 +390,22 @@ pub(crate) fn apply(cmd: &Command, doc: &mut Document) {
             let mut frames = doc.frame_cels();
             for f in &mut frames {
                 f.insert(at, Arc::clone(&blank));
+            }
+            let mut layers = doc.layers.clone();
+            let name = name.clone().unwrap_or_else(|| default_name(&layers));
+            layers.insert(at, Layer::new(name));
+            doc.set_layered(frames, layers, current, at);
+        }
+        Command::AddPictureLayer { name, pixels } => {
+            // Transparent in every frame but the current one, which holds the picture.
+            let blank = Arc::new(IndexedImage::new(w, h, 0));
+            let picture = IndexedImage::from_pixels(w, h, pixels.clone());
+            let picture = Arc::new(picture.expect("size checked by validate"));
+            let at = active + 1;
+            let mut frames = doc.frame_cels();
+            for (f, cels) in frames.iter_mut().enumerate() {
+                let cel = if f == current { &picture } else { &blank };
+                cels.insert(at, Arc::clone(cel));
             }
             let mut layers = doc.layers.clone();
             let name = name.clone().unwrap_or_else(|| default_name(&layers));
@@ -1238,6 +1283,125 @@ mod tests {
                 "{w}x{h}, {layers} layers: {:.2} ms per composite",
                 t.elapsed().as_secs_f64() * 1000.0 / f64::from(runs)
             );
+        }
+    }
+
+    #[test]
+    fn a_picture_layer_holds_its_picture_in_the_current_frame_only() {
+        // ADR-45: "New layer" for a generated picture, one undo step.
+        let mut e = engine();
+        e.execute(Command::AddFrames { count: 2 }).unwrap();
+        e.execute(Command::GotoFrame { frame: 1 }).unwrap();
+        e.execute(Command::Clear { color: 4 }).unwrap();
+        let rev = e.document().revision();
+        let pixels = vec![0, 5, 6, 7, 0, 0, 9, 9];
+        e.execute(Command::AddPictureLayer {
+            name: Some("Generated".into()),
+            pixels: pixels.clone(),
+        })
+        .unwrap();
+        let d = e.document();
+        assert_eq!(d.revision(), rev + 1);
+        assert_eq!(names(&e), ["Background", "Generated"]);
+        assert_eq!((d.active_layer(), d.current_frame()), (1, 1));
+        assert_eq!(d.page().pixels(), pixels);
+        for f in [0, 2] {
+            assert!(
+                d.cel(f, 1).unwrap().pixels().iter().all(|&p| p == 0),
+                "frame {f}"
+            );
+        }
+        // Colour 0 is transparent: the composite shows the bottom layer there.
+        assert_eq!(d.composite().pixels(), [4, 5, 6, 7, 4, 4, 9, 9]);
+        e.undo().unwrap();
+        assert_eq!(names(&e), ["Background"]);
+        assert_eq!(e.document().page().pixels(), [4; 8]);
+        e.redo().unwrap();
+        assert_eq!(e.document().page().pixels(), pixels);
+        // Without a name it is "Layer N", like add_layer.
+        e.execute(Command::AddPictureLayer {
+            name: None,
+            pixels: vec![1; 8],
+        })
+        .unwrap();
+        assert_eq!(names(&e), ["Background", "Generated", "Layer 1"]);
+        let json = serde_json::to_value(Command::AddPictureLayer {
+            name: None,
+            pixels: vec![0],
+        })
+        .unwrap();
+        assert_eq!(json["op"], "add_picture_layer");
+    }
+
+    #[test]
+    fn a_picture_layer_is_checked() {
+        let mut e = engine();
+        let bad = |e: &mut Engine, pixels: Vec<u8>| {
+            e.execute(Command::AddPictureLayer { name: None, pixels })
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(bad(&mut e, vec![1; 7]), ErrorCode::InvalidArgument);
+        assert_eq!(bad(&mut e, vec![32; 8]), ErrorCode::PaletteRangeInvalid);
+        assert_eq!(
+            e.execute(Command::AddPictureLayer {
+                name: Some("x".repeat(256)),
+                pixels: vec![1; 8],
+            })
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidArgument
+        );
+        for _ in 1..MAX_LAYERS {
+            e.execute(Command::AddLayer { name: None }).unwrap();
+        }
+        let err = e
+            .execute(Command::AddPictureLayer {
+                name: None,
+                pixels: vec![1; 8],
+            })
+            .unwrap_err();
+        assert!(err.message.contains("at most 32"), "{}", err.message);
+        assert_eq!(e.document().layer_count(), MAX_LAYERS);
+    }
+
+    #[test]
+    fn the_new_layer_preview_is_the_composite_after_add_picture_layer() {
+        // [Background, Top] with Top's pixel 0 opaque, in every choice of active and
+        // hidden layer: the new layer goes right above the active one, under Top.
+        let picture = pic(4, &[0, 7, 7, 7, 0, 0, 7, 7]);
+        for (active, top_visible, bottom_visible) in [
+            (0, true, true),
+            (1, true, true),
+            (0, false, true),
+            (0, true, false),
+            (1, true, false),
+        ] {
+            let mut e = engine();
+            e.execute(Command::Clear { color: 4 }).unwrap();
+            e.execute(Command::AddLayer { name: None }).unwrap();
+            e.execute(Command::SetPage {
+                width: 4,
+                height: 2,
+                pixels: vec![9, 9, 0, 0, 0, 0, 0, 0],
+            })
+            .unwrap();
+            e.execute(Command::SelectLayer { layer: active }).unwrap();
+            for (layer, visible) in [(0, bottom_visible), (1, top_visible)] {
+                e.execute(Command::SetLayerVisible { layer, visible })
+                    .unwrap();
+            }
+            let shown = composite_with_new_layer(e.document(), &picture);
+            e.execute(Command::AddPictureLayer {
+                name: None,
+                pixels: picture.pixels().to_vec(),
+            })
+            .unwrap();
+            let case = (active, top_visible, bottom_visible);
+            assert_eq!(&shown, e.document().composite().as_ref(), "{case:?}");
+            if active == 0 && top_visible {
+                assert_eq!(shown.pixels()[..2], [9, 9], "Top stays on top: {case:?}");
+            }
         }
     }
 }

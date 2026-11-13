@@ -19,6 +19,7 @@ pub mod bundle;
 pub mod codec;
 pub mod endpoint;
 pub mod error;
+pub mod generation;
 pub mod http;
 pub mod jobs;
 pub mod paths;
