@@ -72,6 +72,9 @@ mod animbrush;
 mod autosave;
 mod browse;
 mod brush_menu;
+// The Classic guard of ADR-47.
+#[cfg(test)]
+mod classic_pin_tests;
 // ADR-44: the composite on screen, in exports and in saved projects.
 #[cfg(test)]
 mod composite_tests;
