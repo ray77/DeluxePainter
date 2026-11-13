@@ -98,15 +98,67 @@ pub struct MainLayout {
     pub picture: Rect,
     /// Physical pixels per picture pixel (a whole number, at least 1).
     pub zoom: u32,
+    /// The largest `zoom` at which the whole picture fits the viewport (at least 1).
+    pub fits: u32,
     /// The picture's size in its own pixels (the screen as displayed: pixel shape applied).
     pub picture_size: (u32, u32),
 }
 
+/// The picture quad's image and how large it is wanted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Picture {
+    /// The image's size in its own pixels (the screen as displayed: pixel shape applied).
+    pub size: (u32, u32),
+    /// Image pixels per interface (LoRes) pixel, the same in both directions: 1 for a LoRes
+    /// screen, 2 for HiRes or interlace, 4 for SuperHiRes.
+    pub per_ui_pixel: u32,
+    /// Prefs ▸ Pixel Size: the wanted size of an interface pixel, in half points.
+    pub pixel_size: PixelSize,
+}
+
+/// Physical pixels per picture pixel that `pixel_size` asks for at `scale` physical pixels
+/// per point: whole, rounded down, at least 1. One Pixel Size shows a picture as large as the
+/// Classic skin does, to the whole physical pixel below.
+pub fn wanted_zoom(pixel_size: PixelSize, per_ui_pixel: u32, scale: f32) -> u32 {
+    let points = f32::from(pixel_size.0) / 2.0 / per_ui_pixel.max(1) as f32;
+    (points * scale + 1e-4).floor().max(1.0) as u32
+}
+
+/// The Pixel Size that shows the picture one step larger (`step > 0`) or smaller than
+/// `zoom`: the nearest size whose [`wanted_zoom`] differs in that direction. `None` when no
+/// size does (the picture is at the largest or smallest size already).
+pub fn pixel_size_stepped(
+    zoom: u32,
+    step: i32,
+    per_ui_pixel: u32,
+    scale: f32,
+) -> Option<PixelSize> {
+    let sizes = PixelSize::MIN..=PixelSize::MAX;
+    let wanted = |half| wanted_zoom(PixelSize(half), per_ui_pixel, scale);
+    match step {
+        0 => None,
+        s if s > 0 => sizes.into_iter().find(|&h| wanted(h) > zoom),
+        _ => sizes.rev().find(|&h| wanted(h) < zoom),
+    }
+    .map(PixelSize)
+}
+
+/// The smallest Pixel Size that shows the picture at `zoom` or larger (the largest size when
+/// none reaches it): what "as large as fits" stores.
+pub fn pixel_size_for(zoom: u32, per_ui_pixel: u32, scale: f32) -> PixelSize {
+    PixelSize(
+        (PixelSize::MIN..=PixelSize::MAX)
+            .find(|&h| wanted_zoom(PixelSize(h), per_ui_pixel, scale) >= zoom)
+            .unwrap_or(PixelSize::MAX),
+    )
+}
+
 impl MainLayout {
-    /// Lays out a window of `window` points at `scale` physical pixels per point.
-    /// `palette_len` is the number of colours of the picture's palette; `picture_size` the
-    /// size of the picture quad's image in pixels; `pixel_size` the wanted enlargement (Prefs
-    /// ▸ Pixel Size, in half points per pixel), which is cut down to what fits the viewport.
+    /// Lays out a window of `window` points at `scale` physical pixels per point around a
+    /// LoRes picture: `palette_len` is the number of colours of the picture's palette;
+    /// `picture_size` the size of the picture quad's image in pixels; `pixel_size` the wanted
+    /// enlargement (Prefs ▸ Pixel Size, in half points per pixel), which is cut down to what
+    /// fits the viewport. See [`MainLayout::for_picture`] for other screens.
     pub fn new(
         window: (f32, f32),
         scale: f32,
@@ -115,6 +167,24 @@ impl MainLayout {
         picture_size: (u32, u32),
         pixel_size: PixelSize,
     ) -> MainLayout {
+        let picture = Picture {
+            size: picture_size,
+            per_ui_pixel: 1,
+            pixel_size,
+        };
+        MainLayout::for_picture(window, scale, chrome, palette_len, picture)
+    }
+
+    /// Lays out a window of `window` points at `scale` physical pixels per point around
+    /// `picture`, whose wanted enlargement is cut down to what fits the viewport.
+    pub fn for_picture(
+        window: (f32, f32),
+        scale: f32,
+        chrome: Chrome,
+        palette_len: usize,
+        picture: Picture,
+    ) -> MainLayout {
+        let picture_size = picture.size;
         let scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
@@ -171,7 +241,7 @@ impl MainLayout {
             (viewport.w * scale).round().max(0.0) as u32,
             (viewport.h * scale).round().max(0.0) as u32,
         );
-        let wanted = (f32::from(pixel_size.0) / 2.0 * scale).floor().max(1.0) as u32;
+        let wanted = wanted_zoom(picture.pixel_size, picture.per_ui_pixel, scale);
         let fits = (vw_px / pw).min(vh_px / ph).max(1);
         let zoom = wanted.min(fits);
         let (w_px, h_px) = (pw * zoom, ph * zoom);
@@ -194,6 +264,7 @@ impl MainLayout {
             viewport,
             picture,
             zoom,
+            fits,
             picture_size: (pw, ph),
         }
     }
@@ -479,6 +550,68 @@ mod tests {
         let big = MainLayout::new((800.0, 600.0), 1.0, Chrome::ALL, 32, (1280, 1024), pixel(6));
         assert_eq!(big.zoom, 1);
         assert!(big.picture.x < big.viewport.x && big.picture.y < big.viewport.y);
+    }
+
+    #[test]
+    fn a_hires_picture_is_as_large_as_in_classic() {
+        // 640 × 512 (HiRes interlace: two picture pixels per interface pixel) at Pixel Size
+        // 2x covers 640 × 512 points, one physical pixel per picture pixel at 1x.
+        let picture = Picture {
+            size: (640, 512),
+            per_ui_pixel: 2,
+            pixel_size: PixelSize(4),
+        };
+        let l = MainLayout::for_picture((1280.0, 800.0), 1.0, Chrome::ALL, 32, picture);
+        assert_eq!((l.zoom, l.fits), (1, 1));
+        assert_eq!((l.picture.w, l.picture.h), (640.0, 512.0));
+        let l = MainLayout::for_picture((1280.0, 800.0), 2.0, Chrome::ALL, 32, picture);
+        assert_eq!((l.zoom, l.fits), (2, 3));
+        assert_eq!((l.picture.w, l.picture.h), (640.0, 512.0));
+        // The LoRes default: 3x wanted and fitting in 1280 × 800.
+        let l = MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome::ALL,
+            32,
+            (320, 256),
+            PixelSize(6),
+        );
+        assert_eq!((l.zoom, l.fits), (3, 3));
+    }
+
+    #[test]
+    fn pixel_size_steps_always_change_the_enlargement() {
+        for scale in [1.0, 1.25, 1.5, 2.0, 2.5, 3.0] {
+            for per_ui in [1, 2, 4] {
+                let zoom = |p: PixelSize| wanted_zoom(p, per_ui, scale);
+                // Up from the smallest size to the largest, then down again: every step
+                // changes the enlargement in its direction, and the ends say so.
+                let mut size = PixelSize(PixelSize::MIN);
+                let mut steps = 0;
+                while let Some(next) = pixel_size_stepped(zoom(size), 1, per_ui, scale) {
+                    assert!(zoom(next) > zoom(size), "{scale} {per_ui} {size:?}");
+                    size = next;
+                    steps += 1;
+                }
+                assert_eq!(zoom(size), zoom(PixelSize(PixelSize::MAX)));
+                while let Some(next) = pixel_size_stepped(zoom(size), -1, per_ui, scale) {
+                    assert!(zoom(next) < zoom(size), "{scale} {per_ui} {size:?}");
+                    size = next;
+                    steps -= 1;
+                }
+                assert_eq!(zoom(size), zoom(PixelSize(PixelSize::MIN)));
+                assert_eq!(steps, 0, "as many steps down as up at {scale}, {per_ui}");
+                assert_eq!(pixel_size_stepped(3, 0, per_ui, scale), None);
+            }
+        }
+        // At 1x a LoRes picture steps by whole points: 3x -> 4x -> 3x -> 2x.
+        assert_eq!(pixel_size_stepped(3, 1, 1, 1.0), Some(PixelSize(8)));
+        assert_eq!(pixel_size_stepped(4, -1, 1, 1.0), Some(PixelSize(7)));
+        assert_eq!(pixel_size_stepped(3, -1, 1, 1.0), Some(PixelSize(5)));
+        // "As large as fits" stores the smallest size that reaches the enlargement.
+        assert_eq!(pixel_size_for(3, 1, 1.0), PixelSize(6));
+        assert_eq!(pixel_size_for(3, 1, 2.0), PixelSize(3));
+        assert_eq!(pixel_size_for(99, 1, 1.0), PixelSize(PixelSize::MAX));
     }
 
     #[test]

@@ -134,6 +134,10 @@ const START_H: f32 = 768.0;
 /// (seconds).
 const SNAP_SETTLE: f64 = 0.25;
 
+/// The smallest window of the Classic skin, in points (the Modern skin has its own, larger
+/// minimum while it is shown, ADR-47).
+const CLASSIC_MIN_WINDOW: [f32; 2] = [320.0, 200.0];
+
 /// Room kept free on the monitor for the menu bar, the window title and the Dock (points).
 const MONITOR_MARGIN: egui::Vec2 = egui::vec2(0.0, 100.0);
 
@@ -723,7 +727,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeluxePainter")
             .with_inner_size(start)
-            .with_min_inner_size([320.0, 200.0])
+            .with_min_inner_size(CLASSIC_MIN_WINDOW)
             .with_icon(Arc::new(app_icon())),
         // VSync with one queued frame instead of eframe's default two: the brush follows the
         // pointer a frame sooner (ADR-40). Our GPU work is one textured quad.
@@ -1020,6 +1024,9 @@ struct PainterApp {
     ui_style: dpx_ui::UiStyle,
     /// The Modern skin's theme (ADR-47); the Classic skin ignores it. Remembered likewise.
     theme: dpx_ui::ThemeChoice,
+    /// The Modern skin's live window: region images, hover, the chrome flags during a pass
+    /// (ADR-47, modern.rs).
+    modern: modern::State,
     texture: Option<egui::TextureHandle>,
     dirty: bool,
     /// The drawing-tool gesture in progress (ADR-14).
@@ -1098,6 +1105,7 @@ impl PainterApp {
             ui: UiState::default(),
             ui_style: dpx_ui::UiStyle::default(),
             theme: dpx_ui::ThemeChoice::default(),
+            modern: modern::State::default(),
             texture: None,
             dirty: true,
             stroke: None,
@@ -1452,22 +1460,29 @@ impl PainterApp {
 
     /// The screen currently shown: the requester screen or the document's display mode.
     fn view(&self) -> View {
-        self.layout().0
+        if self.requester.is_some() {
+            View::of(requester::SCREEN)
+        } else {
+            View::of_target(self.engine.document().target())
+        }
     }
 
     /// The screen currently shown and its scale (physical pixels per screen pixel, may be
     /// fractional). The screen is the picture's screen (or the Screen Format requester's own
     /// screen) at the chosen pixel size, or smaller while it does not fit the window (during a
     /// resize, full screen); it is centred in the window (ADR-13).
+    ///
+    /// In the Modern skin (ADR-47) the same screen is the picture quad in the middle of the
+    /// viewport that bar and dock leave free, at a whole number of physical pixels per
+    /// displayed pixel, so everything that maps the pointer to the screen works unchanged.
     fn layout(&self) -> (View, f32) {
-        let view = if self.requester.is_some() {
-            View::of(requester::SCREEN)
-        } else {
-            View::of_target(self.engine.document().target())
-        };
+        let view = self.view();
         let Some(win) = self.window else {
             return (view, 1.0);
         };
+        if let Some(modern) = self.modern_layout() {
+            return (view, modern.zoom as f32);
+        }
         let fit = fit_step(win.points(), view.ui_size());
         let step = if self.free {
             fit
@@ -1485,9 +1500,16 @@ impl PainterApp {
             .map_or(PixelSize::MAX, |m| fit_step(m - MONITOR_MARGIN, ui))
     }
 
-    /// Prefs ▸ Pixel Size and Cmd/Ctrl + `+`, `−`, `0`: the window snaps to the new size.
+    /// Prefs ▸ Pixel Size and Cmd/Ctrl + `+`, `−`, `0`: the window snaps to the new size. In
+    /// the Modern skin the window stays and the picture changes its size in it (ADR-47), so
+    /// the monitor sets no limit there; the layout shows at most what fits the viewport.
     fn set_pixel_size(&mut self, size: PixelSize) {
-        let size = PixelSize(size.0.clamp(PixelSize::MIN, self.largest_step()));
+        let largest = if self.is_modern() {
+            PixelSize::MAX
+        } else {
+            self.largest_step()
+        };
+        let size = PixelSize(size.0.clamp(PixelSize::MIN, largest));
         if self.ui.pixel_size != size {
             self.ui.pixel_size = size;
             self.clamp_scroll();
@@ -1857,6 +1879,17 @@ impl eframe::App for PainterApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // ADR-47: during a Modern pass the classic chrome is off for everything that lays
+        // out, draws or hit-tests the screen; the Modern chrome lies around it.
+        self.modern_begin_pass();
+        self.pass(ui);
+        self.modern_end_pass();
+    }
+}
+
+impl PainterApp {
+    /// One pass of the window: input, keys, then the screen is uploaded and painted.
+    fn pass(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // ADR-44: the time for double-clicks; a held panel button goes up.
         self.layers_pass(&ctx);
@@ -1890,7 +1923,16 @@ impl eframe::App for PainterApp {
         });
         self.free = free;
         self.monitor = monitor;
-        if let Some(size) = self.snap_window(window.points(), now) {
+        let modern = self.modern_window(&ctx);
+        if self.modal_open() {
+            // The chrome takes no input under a requester: nothing in it is raised.
+            self.modern_hover(None);
+        }
+        if modern {
+            // ADR-47: the Modern window is sized freely and never snaps. Forgetting the
+            // snap state lets the window return to screen × pixel size back in Classic.
+            self.snap = Snap::default();
+        } else if let Some(size) = self.snap_window(window.points(), now) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
         if self.snap.resized_at.is_some() {
@@ -1909,10 +1951,15 @@ impl eframe::App for PainterApp {
         let img_h = ((view.screen_h * view.fy) as f32 * scale).round() as i32;
         // ADR-44: a docked layer panel right of the screen is centred with it.
         let frame_w = img_w + self.lay_out_layer_strip(view, scale);
-        let origin_px = egui::vec2(
-            ((window.w - frame_w) / 2) as f32,
-            ((window.h - img_h) / 2) as f32,
-        );
+        // ADR-47: in the Modern skin the screen is the picture quad of its layout.
+        let modern_layout = self.modern_layout();
+        let origin_px = match &modern_layout {
+            Some(l) => egui::vec2((l.picture.x * ppp).round(), (l.picture.y * ppp).round()),
+            None => egui::vec2(
+                ((window.w - frame_w) / 2) as f32,
+                ((window.h - img_h) / 2) as f32,
+            ),
+        };
         let origin = area.min + origin_px / ppp;
         let rect = egui::Rect::from_min_size(origin, egui::vec2(img_w as f32, img_h as f32) / ppp);
 
@@ -2051,20 +2098,35 @@ impl eframe::App for PainterApp {
         } else if let Some(pos) = hover {
             let (sx, sy) = to_screen(pos);
             let (ux, uy) = view.ui_pos((sx, sy));
+            // ADR-47: what the Modern window has under the pointer: its chrome, the picture
+            // quad (the screen) or the canvas around it. `None` in the Classic skin.
+            let spot = modern_layout.as_ref().map(|l| {
+                let p = pos - area.min;
+                dpx_ui_modern::hit(l, p.x, p.y)
+            });
+            let on_screen = matches!(spot, None | Some(dpx_ui_modern::Spot::Picture { .. }));
             // Screen pixels are page pixels, shifted by the scroll position (or magnified,
             // ADR-14; `None` on the Magnify divider). The screen may be larger than the page
             // (ADR-13): there the pointer is off the page.
-            let on = self.screen_to_page(view, (sx, sy));
+            let on = self.screen_to_page(view, (sx, sy)).filter(|_| on_screen);
             if on.is_some() {
                 self.pointer_page = on;
             }
             // Every picture shown has the page's size.
             let page = self.engine.document().page().bounds();
             let inside = on.filter(|&(px, py)| page.contains(px, py));
-            let hit = match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
-                Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
-                h => Some(h),
+            let hit = match spot {
+                // The Modern chrome answers with the Classic skin's hit values.
+                Some(dpx_ui_modern::Spot::Ui(hit)) => Some(hit),
+                Some(dpx_ui_modern::Spot::Canvas) => None,
+                // The screen: in Modern without the classic chrome (see `ui()`), so only
+                // the page and what is still shown in the Classic look inside the quad.
+                _ => match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
+                    Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
+                    h => Some(h),
+                },
             };
+            self.modern_hover(spot);
             // ADR-41 (tooltip.rs).
             self.tooltip_hover(&ctx, hit);
             // ADR-44: the wheel over the layer panel scrolls its list.
@@ -2082,7 +2144,8 @@ impl eframe::App for PainterApp {
             }
             if (press_l || press_r) && self.layer_rename_press(hit) {
                 // ADR-44: the press ended a layer rename (it takes the name, as Return).
-            } else if press_r && hit == Some(Hit::TitleBar) {
+            } else if press_r && hit == Some(Hit::TitleBar) && !modern {
+                // (The Modern bar's pull-downs come with the next slice of ADR-47.)
                 self.ui.menu.open(sw, sh, ux, uy);
                 self.dirty = true;
             } else if press_l || press_r {
@@ -2105,6 +2168,7 @@ impl eframe::App for PainterApp {
             self.hover_brush(None);
             self.tooltip_hover(&ctx, None);
             self.layer_hover(None);
+            self.modern_hover(None);
         }
         if !(down_l || down_r) {
             self.release();
@@ -2134,14 +2198,17 @@ impl eframe::App for PainterApp {
             return;
         }
         ctx.input(|i| {
+            // ADR-47: in a Modern pass the two flags are kept aside (bar and dock).
             if i.key_pressed(egui::Key::F10) {
-                let show = !(self.ui.toolbox_visible || self.ui.title_visible);
-                self.ui.toolbox_visible = show;
-                self.ui.title_visible = show;
+                let (title, toolbox) = self.chrome_flags();
+                let show = !(*toolbox || *title);
+                *toolbox = show;
+                *title = show;
                 self.dirty = true;
             }
             if i.key_pressed(egui::Key::F9) {
-                self.ui.title_visible = !self.ui.title_visible;
+                let (title, _) = self.chrome_flags();
+                *title = !*title;
                 self.dirty = true;
             }
             const MODE_KEYS: [(egui::Key, PaintMode); 8] = [
@@ -2188,7 +2255,8 @@ impl eframe::App for PainterApp {
 impl PainterApp {
     /// DeluxePainter window keys (ADR-13): Cmd/Ctrl + `+` / `−` change the pixel size by half a
     /// step, Cmd/Ctrl + `0` picks the largest that fits on the monitor; Ctrl+Cmd+F (macOS) or
-    /// F11 switch full screen.
+    /// F11 switch full screen. In the Modern skin `+` / `−` make the picture one step larger
+    /// or smaller in the window and `0` as large as fits it (ADR-47).
     fn window_keys(&mut self, ctx: &egui::Context) {
         let (bigger, smaller, auto, full) = ctx.input(|i| {
             let cmd = i.modifiers.command && !i.modifiers.alt;
@@ -2200,14 +2268,27 @@ impl PainterApp {
                 mac_full || i.key_pressed(egui::Key::F11),
             )
         });
-        if bigger {
-            self.step_pixel_size(1);
-        }
-        if smaller {
-            self.step_pixel_size(-1);
-        }
-        if auto {
-            self.set_pixel_size(PixelSize(self.largest_step()));
+        if self.is_modern() {
+            // ADR-47: the same keys zoom the picture; the window keeps its size.
+            if bigger {
+                self.modern_zoom(1);
+            }
+            if smaller {
+                self.modern_zoom(-1);
+            }
+            if auto {
+                self.modern_zoom_to_fit();
+            }
+        } else {
+            if bigger {
+                self.step_pixel_size(1);
+            }
+            if smaller {
+                self.step_pixel_size(-1);
+            }
+            if auto {
+                self.set_pixel_size(PixelSize(self.largest_step()));
+            }
         }
         if full {
             let now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -2756,6 +2837,11 @@ impl PainterApp {
             self.dirty = false;
         }
 
+        // ADR-47: the Modern chrome around the screen instead of the dark surround.
+        if self.is_modern() {
+            self.modern_paint(ui, ctx, rect, area);
+            return;
+        }
         // Outside the screen (less than one UI pixel at the right and bottom, or the bars
         // around the Screen Format requester): the interface's dark pen.
         let pens = Pens::from_palette(self.palette());
@@ -2806,6 +2892,51 @@ mod tests {
         // The font atlas and screen uploads are not needed in a test.
         out.textures_delta.clear();
         out.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
+
+    /// The window of a [`ui_pass_with`] pass (ADR-47: the Modern skin's window is sized
+    /// freely, is drawn at the device scale and follows the system's theme).
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct TestWindow {
+        /// The drawing area in points.
+        pub size: egui::Vec2,
+        /// Physical pixels per point.
+        pub ppp: f32,
+        /// What the system reports as its theme.
+        pub system_theme: Option<egui::Theme>,
+        /// The largest texture side the GPU takes.
+        pub max_texture_side: usize,
+    }
+
+    /// As [`ui_pass`], in `window`. Returns everything the pass asked the window for: its
+    /// commands (a new size, a minimum size) and the repaint delay.
+    pub(crate) fn ui_pass_with(
+        app: &mut PainterApp,
+        ctx: &egui::Context,
+        t: f64,
+        events: Vec<egui::Event>,
+        window: TestWindow,
+    ) -> egui::ViewportOutput {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window.size)),
+            time: Some(t),
+            events,
+            system_theme: window.system_theme,
+            max_texture_side: Some(window.max_texture_side),
+            ..Default::default()
+        };
+        if let Some(root) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+            root.native_pixels_per_point = Some(window.ppp);
+        }
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut out = ctx.run_ui(raw, |ui| {
+            eframe::App::logic(app, ui.ctx(), &mut frame);
+            eframe::App::ui(app, ui, &mut frame)
+        });
+        out.textures_delta.clear();
+        out.viewport_output
+            .remove(&egui::ViewportId::ROOT)
+            .expect("the root viewport")
     }
 
     pub(crate) fn key_event(key: egui::Key, pressed: bool) -> egui::Event {

@@ -185,6 +185,11 @@ impl PainterApp {
         if !self.layer_panel_on() || !self.free || self.requester.is_some() {
             return 0;
         }
+        // ADR-47: the Modern window has no strip beside the screen (its layer column comes
+        // with a later slice; until then the panel lies over the picture as in a window).
+        if self.is_modern() {
+            return 0;
+        }
         let img_w = ((view.screen_w * view.fx) as f32 * scale).round() as i32;
         let strip =
             ((layer_panel::geom::PANEL_W * view.ux * view.fx) as f32 * scale).round() as i32;

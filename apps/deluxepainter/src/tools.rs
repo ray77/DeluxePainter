@@ -1824,9 +1824,10 @@ impl PainterApp {
     }
 
     /// The width at the right of the screen that the classic toolbox covers, in screen
-    /// pixels: what [`Self::magnify_layout`] keeps free while the toolbox is shown.
+    /// pixels: what [`Self::magnify_layout`] keeps free while the toolbox is shown. Nothing
+    /// in the Modern skin, whose dock lies beside the picture (ADR-47).
     pub(crate) fn toolbox_cover(&self, view: View) -> i32 {
-        if self.ui.toolbox_visible {
+        if self.ui.toolbox_visible && !self.is_modern() {
             dpx_ui::screen::geom::TOOLBOX_W * view.ux
         } else {
             0

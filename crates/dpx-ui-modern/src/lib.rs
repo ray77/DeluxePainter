@@ -14,7 +14,8 @@
 //! - [`hit`]: what lies under a point.
 //! - [`build`]: display lists of the bar, the dock and the picture viewport.
 //! - [`raster`]: display list to RGBA8 (`tiny-skia`, `ab_glyph`).
-//! - [`frame`]: a whole window in one call, for headless snapshots.
+//! - [`frame`]: a whole window in one call, for headless snapshots. The live window
+//!   rasterises the same lists region by region ([`Renderer::render_region`]).
 //!
 //! There is no egui here and no pixel logic: the picture arrives as a finished image.
 
@@ -31,6 +32,6 @@ pub mod theme;
 pub use build::{Model, Toggles};
 pub use frame::{Frame, render_window};
 pub use hit::{Spot, hit};
-pub use layout::{Chrome, MainLayout};
+pub use layout::{Chrome, MainLayout, Picture};
 pub use raster::{Image, Renderer};
 pub use theme::{Theme, ThemeKind};

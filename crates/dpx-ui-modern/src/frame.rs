@@ -2,7 +2,7 @@
 //! window uses the same layout, lists and rasteriser.
 
 use crate::build::{self, Model};
-use crate::layout::{Chrome, MainLayout};
+use crate::layout::{Chrome, MainLayout, Picture};
 use crate::raster::{Image, Renderer};
 use crate::theme::Theme;
 
@@ -18,6 +18,9 @@ pub struct Frame<'a> {
     /// The picture quad's image: the screen as the Classic skin composes it without its
     /// chrome, pixel shape applied.
     pub picture: Image<'a>,
+    /// Picture pixels per interface (LoRes) pixel: 1 for a LoRes screen, 2 for HiRes or
+    /// interlace, 4 for SuperHiRes.
+    pub per_ui_pixel: u32,
 }
 
 impl Frame<'_> {
@@ -25,7 +28,7 @@ impl Frame<'_> {
     /// (F9, F10), the picture's enlargement follows Prefs ▸ Pixel Size.
     pub fn layout(&self) -> MainLayout {
         let ui = self.model.ui;
-        MainLayout::new(
+        MainLayout::for_picture(
             self.size,
             self.scale,
             Chrome {
@@ -33,8 +36,11 @@ impl Frame<'_> {
                 dock: ui.toolbox_visible,
             },
             self.model.palette.len(),
-            (self.picture.width, self.picture.height),
-            ui.pixel_size,
+            Picture {
+                size: (self.picture.width, self.picture.height),
+                per_ui_pixel: self.per_ui_pixel,
+                pixel_size: ui.pixel_size,
+            },
         )
     }
 }
@@ -108,6 +114,7 @@ mod tests {
                 height: 256,
                 rgba: &rgba,
             },
+            per_ui_pixel: 1,
         };
         let (w, h, out) = render_window(&frame, &mut Renderer::new());
         assert_eq!((w, h), ((1280.0 * scale) as u32, (800.0 * scale) as u32));
@@ -128,6 +135,93 @@ mod tests {
         (ThemeKind::Light, 1.0),
         (ThemeKind::Light, 2.0),
     ];
+
+    /// The live window keeps one image per region. Each must be that part of the whole
+    /// window's image, at whole and fractional device scales.
+    #[test]
+    fn a_region_rendered_alone_equals_its_part_of_the_window() {
+        let (palette, rgba) = (Palette::dpaint_default_32(), picture());
+        let ui = UiState {
+            tool: Tool::Circle,
+            filled: true,
+            coords: Some((123, 45)),
+            ..UiState::default()
+        };
+        for (kind, scale) in [
+            (ThemeKind::Dark, 1.0),
+            (ThemeKind::Light, 2.0),
+            (ThemeKind::Dark, 1.5),
+        ] {
+            let frame = Frame {
+                size: (1001.0, 640.0),
+                scale,
+                theme: Theme::of(kind),
+                model: Model::new(&ui, &palette),
+                picture: Image {
+                    width: 320,
+                    height: 256,
+                    rgba: &rgba,
+                },
+                per_ui_pixel: 1,
+            };
+            let mut renderer = Renderer::new();
+            let (w, _, whole) = render_window(&frame, &mut renderer);
+            let l = frame.layout();
+            let regions = [
+                (
+                    "bar",
+                    l.bar.expect("bar"),
+                    build::title_bar(&l, &frame.theme, &frame.model),
+                ),
+                (
+                    "dock",
+                    l.dock.as_ref().expect("dock").rect,
+                    build::dock(&l, &frame.theme, &frame.model),
+                ),
+                ("viewport", l.viewport, build::canvas(&l, &frame.theme)),
+            ];
+            for (name, rect, list) in regions {
+                let px = |v: f32| (v * scale).round() as i32;
+                let (x0, y0) = (px(rect.x), px(rect.y));
+                let (rw, rh) = (
+                    (px(rect.right()) - x0) as u32,
+                    (px(rect.bottom()) - y0) as u32,
+                );
+                let part = renderer.render_region(
+                    &list,
+                    &[frame.picture],
+                    (x0, y0),
+                    rw,
+                    rh,
+                    scale,
+                    frame.theme.canvas,
+                );
+                assert_eq!(part.len(), (rw * rh * 4) as usize);
+                let (mut differing, mut worst) = (0u32, 0u8);
+                for y in 0..rh {
+                    let from = (((y0 as u32 + y) * w + x0 as u32) * 4) as usize;
+                    let row = (y * rw * 4) as usize;
+                    let (a, b) = (
+                        &part[row..row + (rw * 4) as usize],
+                        &whole[from..from + (rw * 4) as usize],
+                    );
+                    for (p, q) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+                        if p != q {
+                            differing += 1;
+                            let d = p.iter().zip(q).map(|(x, y)| x.abs_diff(*y)).max();
+                            worst = worst.max(d.unwrap_or(0));
+                        }
+                    }
+                }
+                // tiny-skia flattens a curve a little differently when it is moved, so a
+                // few anti-aliased edge pixels of icons differ slightly; nothing else does.
+                assert!(
+                    differing * 2000 <= rw * rh && worst <= 64,
+                    "{name}, {kind:?} at {scale}x: {differing} pixels differ, by up to {worst}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_pixel_is_opaque() {
@@ -385,6 +479,7 @@ mod tests {
                     height: 256,
                     rgba: &rgba,
                 },
+                per_ui_pixel: 1,
             };
             let (w, _, out) = render_window(&frame, &mut Renderer::new());
             (

@@ -65,17 +65,37 @@ fn sk_paint(c: Color) -> Paint<'static> {
     paint
 }
 
-/// The outline in physical pixels.
-fn sk_path(path: &Path, scale: f32) -> Option<tiny_skia::Path> {
+/// Where a list lands in the image: `scale` physical pixels per point, then moved so that
+/// the physical pixel `origin` of the window becomes the image's (0, 0). The origin is in
+/// whole pixels, so a region is rasterised as the same part of the whole window (flat
+/// surfaces, text and pictures exactly; a few anti-aliased pixels of curves may differ slightly).
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    scale: f32,
+    ox: f32,
+    oy: f32,
+}
+
+impl Place {
+    fn x(self, x: f32) -> f32 {
+        x * self.scale - self.ox
+    }
+
+    fn y(self, y: f32) -> f32 {
+        y * self.scale - self.oy
+    }
+}
+
+/// The outline in physical pixels of the image.
+fn sk_path(path: &Path, at: Place) -> Option<tiny_skia::Path> {
     let mut b = PathBuilder::new();
-    let s = scale;
     for seg in &path.0 {
         match *seg {
-            Seg::Move(x, y) => b.move_to(x * s, y * s),
-            Seg::Line(x, y) => b.line_to(x * s, y * s),
-            Seg::Quad(cx, cy, x, y) => b.quad_to(cx * s, cy * s, x * s, y * s),
+            Seg::Move(x, y) => b.move_to(at.x(x), at.y(y)),
+            Seg::Line(x, y) => b.line_to(at.x(x), at.y(y)),
+            Seg::Quad(cx, cy, x, y) => b.quad_to(at.x(cx), at.y(cy), at.x(x), at.y(y)),
             Seg::Cubic(ax, ay, bx, by, x, y) => {
-                b.cubic_to(ax * s, ay * s, bx * s, by * s, x * s, y * s);
+                b.cubic_to(at.x(ax), at.y(ay), at.x(bx), at.y(by), at.x(x), at.y(y));
             }
             Seg::Close => b.close(),
         }
@@ -93,8 +113,13 @@ fn sk_stroke(width: f32) -> SkStroke {
 }
 
 /// The rectangle in whole physical pixels, when all four of its edges lie on pixel edges.
-fn pixel_aligned(rect: &Rect, scale: f32) -> Option<tiny_skia::Rect> {
-    let edges = [rect.x, rect.y, rect.right(), rect.bottom()].map(|v| v * scale);
+fn pixel_aligned(rect: &Rect, at: Place) -> Option<tiny_skia::Rect> {
+    let edges = [
+        at.x(rect.x),
+        at.y(rect.y),
+        at.x(rect.right()),
+        at.y(rect.bottom()),
+    ];
     edges
         .iter()
         .all(|v| (v - v.round()).abs() < 1e-3)
@@ -127,6 +152,29 @@ impl Renderer {
         scale: f32,
         background: Color,
     ) -> Vec<u8> {
+        self.render_region(list, images, (0, 0), width, height, scale, background)
+    }
+
+    /// Renders the part of `list` that starts at the physical pixel `origin` of the window
+    /// and is `width` × `height` physical pixels large; otherwise as [`Renderer::render`].
+    /// The result is that part of the whole window's image, so the live window can keep one
+    /// image per region (bar, dock, viewport) and redo only the one that changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_region(
+        &mut self,
+        list: &List,
+        images: &[Image<'_>],
+        origin: (i32, i32),
+        width: u32,
+        height: u32,
+        scale: f32,
+        background: Color,
+    ) -> Vec<u8> {
+        let at = Place {
+            scale,
+            ox: origin.0 as f32,
+            oy: origin.1 as f32,
+        };
         let Some(mut pixmap) = Pixmap::new(width, height) else {
             return Vec::new();
         };
@@ -145,7 +193,7 @@ impl Renderer {
                     stroke,
                 } => {
                     if let Some(fill) = fill {
-                        match pixel_aligned(rect, scale).filter(|_| *radius <= 0.0) {
+                        match pixel_aligned(rect, at).filter(|_| *radius <= 0.0) {
                             // A flat surface on whole pixels: no anti-aliasing, exact colour.
                             Some(r) => {
                                 let mut paint = sk_paint(*fill);
@@ -154,7 +202,7 @@ impl Renderer {
                             }
                             None => {
                                 let path = Path::new().round_rect(*rect, *radius);
-                                fill_path(&mut pixmap, &path, *fill, scale, clip.as_ref());
+                                fill_path(&mut pixmap, &path, *fill, at, clip.as_ref());
                             }
                         }
                     }
@@ -163,19 +211,19 @@ impl Renderer {
                         let half = stroke.width / 2.0;
                         let path =
                             Path::new().round_rect(rect.inset(half), (radius - half).max(0.0));
-                        stroke_path(&mut pixmap, &path, *stroke, scale, clip.as_ref());
+                        stroke_path(&mut pixmap, &path, *stroke, at, clip.as_ref());
                     }
                 }
                 Op::Line { from, to, stroke } => {
                     let path = Path::new().segment(from.0, from.1, to.0, to.1);
-                    stroke_path(&mut pixmap, &path, *stroke, scale, clip.as_ref());
+                    stroke_path(&mut pixmap, &path, *stroke, at, clip.as_ref());
                 }
                 Op::Path { path, fill, stroke } => {
                     if let Some(fill) = fill {
-                        fill_path(&mut pixmap, path, *fill, scale, clip.as_ref());
+                        fill_path(&mut pixmap, path, *fill, at, clip.as_ref());
                     }
                     if let Some(stroke) = stroke {
-                        stroke_path(&mut pixmap, path, *stroke, scale, clip.as_ref());
+                        stroke_path(&mut pixmap, path, *stroke, at, clip.as_ref());
                     }
                 }
                 Op::Text {
@@ -188,7 +236,7 @@ impl Renderer {
                 } => self.text(
                     &mut pixmap,
                     clip.as_ref(),
-                    (*x * scale, *baseline * scale),
+                    (at.x(*x), at.y(*baseline)),
                     text,
                     *size * scale,
                     *weight,
@@ -196,13 +244,13 @@ impl Renderer {
                 ),
                 Op::Image { rect, image } => {
                     if let Some(image) = images.get(*image) {
-                        blit_nearest(&mut pixmap, clip.as_ref(), rect, scale, image);
+                        blit_nearest(&mut pixmap, clip.as_ref(), rect, at, image);
                     }
                 }
                 Op::Clip(None) => clip = None,
                 Op::Clip(Some(path)) => {
                     clip = Mask::new(width, height).map(|mut mask| {
-                        if let Some(p) = sk_path(path, scale) {
+                        if let Some(p) = sk_path(path, at) {
                             mask.fill_path(&p, FillRule::Winding, true, identity);
                         }
                         mask
@@ -308,8 +356,8 @@ fn blend(pixel: &mut [u8], color: Color, a: u32) {
     pixel[3] = over(255, pixel[3]);
 }
 
-fn fill_path(pixmap: &mut Pixmap, path: &Path, color: Color, scale: f32, clip: Option<&Mask>) {
-    if let Some(p) = sk_path(path, scale) {
+fn fill_path(pixmap: &mut Pixmap, path: &Path, color: Color, at: Place, clip: Option<&Mask>) {
+    if let Some(p) = sk_path(path, at) {
         pixmap.fill_path(
             &p,
             &sk_paint(color),
@@ -320,12 +368,12 @@ fn fill_path(pixmap: &mut Pixmap, path: &Path, color: Color, scale: f32, clip: O
     }
 }
 
-fn stroke_path(pixmap: &mut Pixmap, path: &Path, stroke: Stroke, scale: f32, clip: Option<&Mask>) {
-    if let Some(p) = sk_path(path, scale) {
+fn stroke_path(pixmap: &mut Pixmap, path: &Path, stroke: Stroke, at: Place, clip: Option<&Mask>) {
+    if let Some(p) = sk_path(path, at) {
         pixmap.stroke_path(
             &p,
             &sk_paint(stroke.color),
-            &sk_stroke(stroke.width * scale),
+            &sk_stroke(stroke.width * at.scale),
             Transform::identity(),
             clip,
         );
@@ -338,17 +386,17 @@ fn blit_nearest(
     pixmap: &mut Pixmap,
     clip: Option<&Mask>,
     rect: &Rect,
-    scale: f32,
+    at: Place,
     image: &Image<'_>,
 ) {
     let (sw, sh) = (i64::from(image.width), i64::from(image.height));
     if sw == 0 || sh == 0 || (image.rgba.len() as i64) < sw * sh * 4 {
         return;
     }
-    let x0 = (rect.x * scale).round() as i64;
-    let y0 = (rect.y * scale).round() as i64;
-    let dw = (rect.right() * scale).round() as i64 - x0;
-    let dh = (rect.bottom() * scale).round() as i64 - y0;
+    let x0 = at.x(rect.x).round() as i64;
+    let y0 = at.y(rect.y).round() as i64;
+    let dw = at.x(rect.right()).round() as i64 - x0;
+    let dh = at.y(rect.bottom()).round() as i64 - y0;
     if dw <= 0 || dh <= 0 {
         return;
     }

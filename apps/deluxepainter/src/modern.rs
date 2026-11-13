@@ -1,12 +1,409 @@
-//! The app side of the Modern skin (ADR-47). For now the headless snapshot only: the
-//! `--snapshot` flags of the Modern main window and the picture that goes into its quad. The
-//! live window follows in the next slice.
+//! The app side of the Modern skin (ADR-47): the live window and the headless snapshot.
+//!
+//! The live window is the Classic window with other surroundings. The picture quad of the
+//! Modern layout is the classic screen rectangle, composed without the classic chrome and
+//! shown as the same nearest-neighbour texture, so every mapping from the pointer to the
+//! screen and the page, every tool, key and requester works unchanged. Around it the bar and
+//! the dock are drawn by `dpx-ui-modern` on the CPU, each into its own image that is redone
+//! only when its display list changes; the dock answers a click with the Classic skin's
+//! [`Hit`] values, so `handle_press` does not know which skin it came from.
+//!
+//! During a Modern pass the two classic chrome flags (`title_visible`, `toolbox_visible`)
+//! are switched off in the shared state and kept aside here: the classic code then lays
+//! out, draws and hit-tests a screen without title bar and toolbox. They still mean "bar
+//! shown" and "dock shown" (F9, F10) and are back in the shared state after the pass.
 
 use dpx_core::Document;
-use dpx_ui::UiState;
-use dpx_ui_modern::{Frame, Image, Model, Renderer, Spot, Theme, ThemeKind};
+use dpx_ui::{Hit, PixelSize, UiState, UiStyle};
+use dpx_ui_modern::paint::{List, Rect};
+use dpx_ui_modern::{
+    Chrome, Frame, Image, MainLayout, Model, Picture, Renderer, Spot, Theme, ThemeKind, Toggles,
+    build, layout,
+};
+use eframe::egui;
 
-use crate::{View, arg_value, snapshot_rgba, write_png};
+use crate::{CLASSIC_MIN_WINDOW, PainterApp, View, arg_value, snapshot_rgba, write_png};
+
+/// The parts of the window that are rasterised on their own, in painting order.
+const REGIONS: usize = 3;
+/// Index of each region in [`State::regions`] (and of its count in `State::renders`).
+const VIEWPORT: usize = 0;
+#[cfg(test)]
+const DOCK: usize = 1;
+#[cfg(test)]
+const BAR: usize = 2;
+const REGION_NAMES: [&str; REGIONS] = ["modern-viewport", "modern-dock", "modern-bar"];
+
+/// One region's image as it is on the GPU: one texture, or several tiles when the region is
+/// larger than the GPU's largest texture (a 4K or 5K window at device scale 2).
+#[derive(Default)]
+struct Region {
+    /// What the image was made from: the list's fingerprint with place, size, device scale,
+    /// background and tile size.
+    key: Option<u64>,
+    /// The tiles row by row, each with its rectangle in physical pixels of the window.
+    tiles: Vec<([i32; 4], egui::TextureHandle)>,
+    /// How often the region was rasterised.
+    renders: u64,
+}
+
+/// `px` (left, top, width, height) cut into tiles of at most `side` × `side`, row by row.
+fn tiles(px: [i32; 4], side: i32) -> Vec<[i32; 4]> {
+    let side = side.max(1);
+    let mut out = Vec::new();
+    let mut y = 0;
+    while y < px[3] {
+        let h = side.min(px[3] - y);
+        let mut x = 0;
+        while x < px[2] {
+            let w = side.min(px[2] - x);
+            out.push([px[0] + x, px[1] + y, w, h]);
+            x += w;
+        }
+        y += h;
+    }
+    out
+}
+
+/// What the live Modern window keeps between passes.
+#[derive(Default)]
+pub(crate) struct State {
+    /// During a pass: the bar and dock flags, taken out of the shared state.
+    held: Option<Chrome>,
+    /// The part of the chrome under the pointer, drawn raised.
+    hover: Option<Hit>,
+    renderer: Renderer,
+    regions: [Region; REGIONS],
+    /// The window's minimum size is the Modern one.
+    min_size: bool,
+    /// The theme of the last painted pass.
+    #[cfg(test)]
+    theme: Option<ThemeKind>,
+}
+
+impl State {
+    /// How often each region was rasterised so far, by [`VIEWPORT`], [`DOCK`], [`BAR`].
+    #[cfg(test)]
+    pub(crate) fn renders(&self) -> [u64; REGIONS] {
+        [VIEWPORT, DOCK, BAR].map(|i| self.regions[i].renders)
+    }
+
+    /// The theme the last pass was painted in.
+    #[cfg(test)]
+    pub(crate) fn theme(&self) -> Option<ThemeKind> {
+        self.theme
+    }
+}
+
+/// A fingerprint of everything a region's image depends on.
+fn region_key(
+    list: &List,
+    px: [i32; 4],
+    scale: f32,
+    background: dpx_ui_modern::paint::Color,
+    tile: i32,
+) -> u64 {
+    let mut h = list.fingerprint();
+    let mut word = |v: u32| {
+        for b in v.to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    px.iter().for_each(|&v| word(v as u32));
+    word(tile as u32);
+    word(scale.to_bits());
+    word(u32::from_le_bytes([
+        background.r,
+        background.g,
+        background.b,
+        background.a,
+    ]));
+    h
+}
+
+/// The rectangle in whole physical pixels: left, top, width, height.
+fn pixels(rect: &Rect, scale: f32) -> [i32; 4] {
+    let px = |v: f32| (v * scale).round() as i32;
+    let (x, y) = (px(rect.x), px(rect.y));
+    [x, y, px(rect.right()) - x, px(rect.bottom()) - y]
+}
+
+impl PainterApp {
+    /// The Modern skin is the one shown.
+    pub(crate) fn is_modern(&self) -> bool {
+        self.ui_style == UiStyle::Modern
+    }
+
+    /// Before a pass: in the Modern skin the classic chrome flags move aside (see the module
+    /// text), so nothing of the classic title bar and toolbox is laid out, drawn or hit.
+    pub(crate) fn modern_begin_pass(&mut self) {
+        if self.is_modern() && self.modern.held.is_none() {
+            self.modern.held = Some(Chrome {
+                bar: std::mem::replace(&mut self.ui.title_visible, false),
+                dock: std::mem::replace(&mut self.ui.toolbox_visible, false),
+            });
+        }
+    }
+
+    /// After a pass: the flags are back in the shared state, with what F9 and F10 did.
+    pub(crate) fn modern_end_pass(&mut self) {
+        if let Some(chrome) = self.modern.held.take() {
+            self.ui.title_visible = chrome.bar;
+            self.ui.toolbox_visible = chrome.dock;
+        }
+    }
+
+    /// The flags "title bar (bar) shown" and "toolbox (dock) shown", wherever they are now.
+    pub(crate) fn chrome_flags(&mut self) -> (&mut bool, &mut bool) {
+        match &mut self.modern.held {
+            Some(chrome) => (&mut chrome.bar, &mut chrome.dock),
+            None => (&mut self.ui.title_visible, &mut self.ui.toolbox_visible),
+        }
+    }
+
+    /// Which parts of the Modern chrome are shown.
+    fn modern_chrome(&self) -> Chrome {
+        self.modern.held.unwrap_or(Chrome {
+            bar: self.ui.title_visible,
+            dock: self.ui.toolbox_visible,
+        })
+    }
+
+    /// The layout of the Modern window as of the last pass's window size; `None` in the
+    /// Classic skin and before the first pass.
+    pub(crate) fn modern_layout(&self) -> Option<MainLayout> {
+        if !self.is_modern() {
+            return None;
+        }
+        let win = self.window?;
+        let view = self.view();
+        Some(MainLayout::for_picture(
+            (win.w as f32 / win.ppp, win.h as f32 / win.ppp),
+            win.ppp,
+            self.modern_chrome(),
+            self.palette().len(),
+            picture_of(view, self.ui.pixel_size),
+        ))
+    }
+
+    /// Once per pass: whether the Modern skin is shown. A change of the skin changes the
+    /// window's minimum size (the Modern layout needs more room than a 1x LoRes screen).
+    pub(crate) fn modern_window(&mut self, ctx: &egui::Context) -> bool {
+        let modern = self.is_modern();
+        if self.modern.min_size != modern {
+            self.modern.min_size = modern;
+            let (w, h) = layout::MIN_WINDOW;
+            let min = if modern { [w, h] } else { CLASSIC_MIN_WINDOW };
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min.into()));
+            if !modern {
+                // Back in Classic: the region images are not needed any more.
+                self.modern.regions = Default::default();
+                self.modern.hover = None;
+            }
+            self.dirty = true;
+        }
+        modern
+    }
+
+    /// The pointer is over `spot` (`None`: outside the window, or the Classic skin): the
+    /// part of the chrome under it is drawn raised.
+    pub(crate) fn modern_hover(&mut self, spot: Option<Spot>) {
+        self.modern.hover = match spot {
+            Some(Spot::Ui(hit)) => Some(hit),
+            _ => None,
+        };
+    }
+
+    /// Cmd/Ctrl + `+` / `−` in the Modern skin: the picture one step larger or smaller.
+    /// Steps are counted from what is shown (a small window may show less than Prefs ▸ Pixel
+    /// Size asks for), and every step changes the picture by at least one physical pixel
+    /// per pixel; the window is not resized.
+    pub(crate) fn modern_zoom(&mut self, step: i32) {
+        let Some(l) = self.modern_layout() else {
+            return;
+        };
+        if step > 0 && l.zoom >= l.fits {
+            return;
+        }
+        let per_ui = picture_of(self.view(), self.ui.pixel_size).per_ui_pixel;
+        if let Some(size) = layout::pixel_size_stepped(l.zoom, step, per_ui, l.scale) {
+            self.set_pixel_size(size);
+        }
+    }
+
+    /// Cmd/Ctrl + `0` in the Modern skin: the picture as large as fits the viewport.
+    pub(crate) fn modern_zoom_to_fit(&mut self) {
+        let Some(l) = self.modern_layout() else {
+            return;
+        };
+        let per_ui = picture_of(self.view(), self.ui.pixel_size).per_ui_pixel;
+        self.set_pixel_size(layout::pixel_size_for(l.fits, per_ui, l.scale));
+    }
+
+    /// The theme to paint in: the fixed choice, or the system's (dark when it says nothing).
+    fn modern_theme(&self, ctx: &egui::Context) -> ThemeKind {
+        let system_dark = ctx.system_theme().map(|t| t == egui::Theme::Dark);
+        ThemeKind::resolve(self.theme, system_dark)
+    }
+
+    /// The display lists of the regions with their rectangles, in painting order: viewport
+    /// (canvas colour and the picture's shadow), dock, bar. A hidden region has no entry.
+    fn modern_lists(&self, l: &MainLayout, theme: &Theme) -> [Option<(Rect, List)>; REGIONS] {
+        let model = Model {
+            ui: &self.ui,
+            palette: self.palette(),
+            custom_brush: self.custom_brush.is_some(),
+            toggles: Toggles {
+                grid: self.tools.grid,
+                symmetry: self.tools.symmetry,
+                magnify: self.tools.magnify.is_some(),
+            },
+            hover: self.modern.hover,
+        };
+        [
+            (l.viewport.w > 0.0 && l.viewport.h > 0.0)
+                .then(|| (l.viewport, build::canvas(l, theme))),
+            l.dock
+                .as_ref()
+                .map(|dock| (dock.rect, build::dock(l, theme, &model))),
+            l.bar.map(|bar| (bar, build::title_bar(l, theme, &model))),
+        ]
+    }
+
+    /// Paints the Modern window: the regions' images one to one, and the screen texture
+    /// (uploaded by `upload_and_paint` as in Classic) into the picture quad `rect`. A region
+    /// is rasterised again only when what it shows, its place or the device scale changed.
+    pub(crate) fn modern_paint(
+        &mut self,
+        ui: &egui::Ui,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        area: egui::Rect,
+    ) {
+        let Some(l) = self.modern_layout() else {
+            return;
+        };
+        let kind = self.modern_theme(ctx);
+        #[cfg(test)]
+        {
+            self.modern.theme = Some(kind);
+        }
+        let theme = Theme::of(kind);
+        let lists = self.modern_lists(&l, &theme);
+        let painter = ui.painter();
+        let color = |c: dpx_ui_modern::paint::Color| egui::Color32::from_rgb(c.r, c.g, c.b);
+        painter.rect_filled(area, 0.0, color(theme.canvas));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let to_points = |px: [i32; 4]| {
+            egui::Rect::from_min_size(
+                area.min + egui::vec2(px[0] as f32, px[1] as f32) / l.scale,
+                egui::vec2(px[2] as f32, px[3] as f32) / l.scale,
+            )
+        };
+        // The largest texture the GPU takes; a larger region is cut into tiles.
+        let side = ctx.input(|i| i.max_texture_side).min(i32::MAX as usize) as i32;
+        for (i, entry) in lists.iter().enumerate() {
+            let region = &mut self.modern.regions[i];
+            let px = entry.as_ref().map(|(bounds, _)| pixels(bounds, l.scale));
+            let (Some((_, list)), Some(px)) = (entry, px.filter(|p| p[2] > 0 && p[3] > 0)) else {
+                // Hidden (F9, F10): its image goes.
+                region.key = None;
+                region.tiles.clear();
+                continue;
+            };
+            let key = region_key(list, px, l.scale, theme.canvas, side);
+            if region.key != Some(key) {
+                let cut = tiles(px, side);
+                if cut.len() != region.tiles.len() {
+                    region.tiles.clear();
+                }
+                for (n, tile) in cut.into_iter().enumerate() {
+                    // The picture is not among the list's images: the quad is a texture of
+                    // its own, painted below.
+                    let rgba = self.modern.renderer.render_region(
+                        list,
+                        &[],
+                        (tile[0], tile[1]),
+                        tile[2] as u32,
+                        tile[3] as u32,
+                        l.scale,
+                        theme.canvas,
+                    );
+                    // Opaque, so premultiplied and straight alpha are the same bytes.
+                    let image = egui::ColorImage::from_rgba_premultiplied(
+                        [tile[2] as usize, tile[3] as usize],
+                        &rgba,
+                    );
+                    match region.tiles.get_mut(n) {
+                        Some((at, texture)) => {
+                            *at = tile;
+                            texture.set(image, egui::TextureOptions::NEAREST);
+                        }
+                        None => region.tiles.push((
+                            tile,
+                            ctx.load_texture(REGION_NAMES[i], image, egui::TextureOptions::NEAREST),
+                        )),
+                    }
+                }
+                region.key = Some(key);
+                region.renders += 1;
+            }
+            for (at, texture) in &region.tiles {
+                painter.image(texture.id(), to_points(*at), uv, egui::Color32::WHITE);
+            }
+            if i == VIEWPORT
+                && let Some(screen) = &self.texture
+            {
+                // The picture: over the canvas and its shadow, never over bar or dock.
+                painter.with_clip_rect(to_points(px)).image(
+                    screen.id(),
+                    rect,
+                    uv,
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    /// The Modern window as one image, made from the same layout, lists and screen as the
+    /// live window paints: width, height (physical pixels) and RGBA8. For tests, which
+    /// cannot read the window's textures back.
+    #[cfg(test)]
+    pub(crate) fn modern_window_image(&mut self, kind: ThemeKind) -> (u32, u32, Vec<u8>) {
+        self.modern_begin_pass();
+        let l = self.modern_layout().expect("a Modern window after a pass");
+        let theme = Theme::of(kind);
+        let mut list = List::new();
+        for (_, part) in self.modern_lists(&l, &theme).into_iter().flatten() {
+            list.append(part);
+        }
+        let screen = self.compose_screen();
+        let rgba = dpx_ui::to_rgba(&screen, self.palette(), 1, 1);
+        self.modern_end_pass();
+        let picture = Image {
+            width: screen.width(),
+            height: screen.height(),
+            rgba: &rgba,
+        };
+        let px = pixels(&l.window, l.scale);
+        let (w, h) = (px[2] as u32, px[3] as u32);
+        let out = Renderer::new().render(&list, &[picture], w, h, l.scale, theme.canvas);
+        (w, h, out)
+    }
+}
+
+/// The picture quad's image for the screen `view` at Prefs ▸ Pixel Size `pixel_size`: the
+/// screen with its pixel shape applied.
+fn picture_of(view: View, pixel_size: PixelSize) -> Picture {
+    Picture {
+        size: (
+            (view.screen_w * view.fx) as u32,
+            (view.screen_h * view.fy) as u32,
+        ),
+        per_ui_pixel: (view.fx * view.ux) as u32,
+        pixel_size,
+    }
+}
 
 /// The window a Modern snapshot shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -124,6 +521,7 @@ pub(crate) fn snapshot_image(
             height: ph,
             rgba: &picture,
         },
+        per_ui_pixel: (view.fx * view.ux) as u32,
     };
     if let Some((x, y)) = options.pointer
         && let Spot::Ui(hit) = dpx_ui_modern::hit(&frame.layout(), x, y)
@@ -151,7 +549,7 @@ pub(crate) fn snapshot(
 mod tests {
     use super::*;
     use dpx_core::{DisplayMode, Palette};
-    use dpx_ui::Tool;
+    use dpx_ui::{Action, Tool};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -268,5 +666,770 @@ mod tests {
         let hover = [theme.hover.r, theme.hover.g, theme.hover.b];
         assert_eq!(pixel(&rgba, iw, 1199, 141), accent);
         assert_eq!(pixel(&rgba, iw, 1199, 99), hover);
+    }
+
+    // ---- The live window (slice 1b of ADR-47) ----
+
+    use crate::tests::{TestWindow, chord, pointer_button, tap, ui_pass_with, ui_point};
+    use dpx_ui::toolbox::TOOL_ROWS;
+    use dpx_ui::{Pref, Screen};
+    use egui::PointerButton::{Primary, Secondary};
+
+    /// Something to point at, in either skin.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(crate) enum Place {
+        /// A tool button; `true`: its lower-right (filled) half.
+        Tool(Tool, bool),
+        /// A built-in brush, by index.
+        Brush(usize),
+        /// A palette cell, by colour.
+        Cell(u8),
+        /// A page pixel shown on the screen (no Magnify).
+        Page(i32, i32),
+    }
+
+    /// The window point over `place` in the Modern window, `(fx, fy)` of the way across the
+    /// button, cell or page pixel (0.5, 0.5: its centre), after a pass has laid it out.
+    pub(crate) fn modern_point_at(
+        app: &PainterApp,
+        place: Place,
+        (fx, fy): (f32, f32),
+    ) -> egui::Pos2 {
+        let l = app.modern_layout().expect("a Modern window after a pass");
+        let dock = l.dock.as_ref();
+        let within = |r: Rect| egui::pos2(r.x + r.w * fx, r.y + r.h * fy);
+        match place {
+            Place::Tool(tool, filled) => {
+                let r = l.tool_button(tool).expect("the dock is shown");
+                let f = if filled { 0.72 } else { 0.28 };
+                egui::pos2(r.x + r.w * f, r.y + r.h * f)
+            }
+            Place::Brush(i) => within(dock.expect("the dock is shown").brushes[i]),
+            Place::Cell(i) => within(dock.expect("the dock is shown").cells[usize::from(i)]),
+            Place::Page(x, y) => {
+                let view = app.view();
+                // One screen pixel is `fx` × `fy` picture pixels of `zoom` physical pixels.
+                let step = l.zoom as f32 / l.scale;
+                let (sx, sy) = ((x - app.scroll.0) as f32, (y - app.scroll.1) as f32);
+                egui::pos2(
+                    l.picture.x + (sx + fx) * view.fx as f32 * step,
+                    l.picture.y + (sy + fy) * view.fy as f32 * step,
+                )
+            }
+        }
+    }
+
+    /// The window point over the middle of `place` in the Modern window.
+    pub(crate) fn modern_point(app: &PainterApp, place: Place) -> egui::Pos2 {
+        modern_point_at(app, place, (0.5, 0.5))
+    }
+
+    /// The window point over `place` in the Classic window (a LoRes screen): a UI pixel the
+    /// classic hit test answers for it, from the middle of all that do.
+    fn classic_point(app: &PainterApp, place: Place) -> egui::Pos2 {
+        let view = app.view();
+        assert_eq!((view.ux, view.uy), (1, 1), "a LoRes screen");
+        let wanted = match place {
+            Place::Page(x, y) => return ui_point(app, (x - app.scroll.0, y - app.scroll.1)),
+            Place::Tool(tool, filled_half) => Hit::Tool { tool, filled_half },
+            Place::Brush(i) => Hit::Brush(i),
+            Place::Cell(i) => Hit::PaletteCell(i),
+        };
+        let (w, h) = view.ui_size();
+        let screen = Screen::new(w, h);
+        let all: Vec<(i32, i32)> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| screen.hit_test(app.palette().len(), &app.ui, x, y) == wanted)
+            .collect();
+        assert!(!all.is_empty(), "{place:?} is on the classic screen");
+        ui_point(app, all[all.len() / 2])
+    }
+
+    /// A window of one skin that tests drive with real `ui()` passes.
+    struct Rig {
+        app: PainterApp,
+        ctx: egui::Context,
+        t: f64,
+        size: egui::Vec2,
+        ppp: f32,
+        system: Option<egui::Theme>,
+        /// The largest texture side the window reports.
+        max_texture_side: usize,
+        /// The window commands of all passes so far.
+        commands: Vec<egui::ViewportCommand>,
+    }
+
+    impl Rig {
+        fn new(style: UiStyle, size: (f32, f32), ppp: f32) -> Rig {
+            let mut app = PainterApp::new();
+            app.ui_style = style;
+            let ctx = egui::Context::default();
+            // As `main()`: Cmd/Ctrl +/− are ours, not egui's zoom.
+            ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            let mut rig = Rig {
+                app,
+                ctx,
+                t: 0.0,
+                size: size.into(),
+                ppp,
+                system: None,
+                max_texture_side: 8192,
+                commands: Vec::new(),
+            };
+            rig.pass(vec![]);
+            rig
+        }
+
+        fn classic() -> Rig {
+            Rig::new(UiStyle::Classic, (1280.0, 1024.0), 1.0)
+        }
+
+        fn modern() -> Rig {
+            Rig::new(UiStyle::Modern, (1280.0, 800.0), 1.0)
+        }
+
+        fn pass(&mut self, events: Vec<egui::Event>) {
+            self.t += 0.02;
+            let window = TestWindow {
+                size: self.size,
+                ppp: self.ppp,
+                system_theme: self.system,
+                max_texture_side: self.max_texture_side,
+            };
+            let out = ui_pass_with(&mut self.app, &self.ctx, self.t, events, window);
+            self.commands.extend(out.commands);
+        }
+
+        fn point(&self, place: Place) -> egui::Pos2 {
+            if self.app.is_modern() {
+                modern_point(&self.app, place)
+            } else {
+                classic_point(&self.app, place)
+            }
+        }
+
+        fn move_to(&mut self, place: Place) {
+            let pos = self.point(place);
+            self.pass(vec![egui::Event::PointerMoved(pos)]);
+        }
+
+        fn click(&mut self, place: Place, button: egui::PointerButton) {
+            let pos = self.point(place);
+            self.pass(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, button, true),
+            ]);
+            self.pass(vec![pointer_button(pos, button, false)]);
+        }
+
+        /// Press on the first place, move over the others, let go on the last.
+        fn drag(&mut self, path: &[Place], button: egui::PointerButton) {
+            let first = self.point(path[0]);
+            self.pass(vec![
+                egui::Event::PointerMoved(first),
+                pointer_button(first, button, true),
+            ]);
+            let mut last = first;
+            for &place in &path[1..] {
+                last = self.point(place);
+                self.pass(vec![egui::Event::PointerMoved(last)]);
+            }
+            self.pass(vec![pointer_button(last, button, false)]);
+        }
+
+        /// A character key as typed on a US keyboard (capitals with Shift).
+        fn key(&mut self, c: char) {
+            let name = match c {
+                '/' => "Slash".to_string(),
+                '<' => "Comma".to_string(),
+                '>' | '.' => "Period".to_string(),
+                '[' => "OpenBracket".to_string(),
+                ']' => "CloseBracket".to_string(),
+                '=' => "Equals".to_string(),
+                '-' => "Minus".to_string(),
+                c => c.to_ascii_uppercase().to_string(),
+            };
+            let key = egui::Key::from_name(&name).unwrap_or_else(|| panic!("a key for '{c}'"));
+            let shift = c.is_ascii_uppercase() || matches!(c, '<' | '>');
+            let modifiers = if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            };
+            self.pass(chord(key, key, modifiers, &c.to_string()));
+        }
+
+        fn tap(&mut self, key: egui::Key) {
+            self.pass(tap(key));
+        }
+
+        /// Cmd/Ctrl + `key`.
+        fn command(&mut self, key: egui::Key) {
+            let held = egui::Modifiers::COMMAND;
+            let mut events = vec![egui::Event::ModifiersChanged(held)];
+            events.extend(chord(key, key, held, ""));
+            self.pass(events);
+            self.pass(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        }
+
+        fn sizes_asked(&self) -> usize {
+            self.commands
+                .iter()
+                .filter(|c| matches!(c, egui::ViewportCommand::InnerSize(_)))
+                .count()
+        }
+
+        /// Everything a click or key may change that both skins must agree on: the whole
+        /// interface state, the tool settings, the picture, the brush, undo, the scroll
+        /// position and what is open.
+        fn state(&self) -> String {
+            let app = &self.app;
+            format!(
+                "{:?}",
+                (
+                    &app.ui,
+                    &app.tools,
+                    app.page().into_owned(),
+                    app.engine.document().palette(),
+                    app.custom_brush.is_some(),
+                    (app.engine.can_undo(), app.engine.can_redo()),
+                    app.scroll,
+                    app.modal_open(),
+                )
+            )
+        }
+    }
+
+    /// Runs `script` in a Classic and in a Modern window; after every step both must be in
+    /// the same state. `script` reports each step through its second argument.
+    fn in_both_skins(modern: Rig, script: impl Fn(&mut Rig, &mut dyn FnMut(&mut Rig, String))) {
+        let run = |mut rig: Rig| {
+            let mut states = vec![("start".to_string(), rig.state())];
+            script(&mut rig, &mut |rig: &mut Rig, step: String| {
+                states.push((step, rig.state()));
+            });
+            states
+        };
+        let (classic, modern) = (run(Rig::classic()), run(modern));
+        assert_eq!(classic.len(), modern.len());
+        assert!(classic.len() > 1, "the script reported its steps");
+        for ((step, c), (_, m)) in classic.iter().zip(&modern) {
+            if c != m {
+                // The first difference, not two whole states.
+                let at = c
+                    .bytes()
+                    .zip(m.bytes())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                let from = at.saturating_sub(120);
+                panic!(
+                    "the skins differ after '{step}':\n classic ..{}\n modern  ..{}",
+                    &c[from..(at + 120).min(c.len())],
+                    &m[from..(at + 120).min(m.len())]
+                );
+            }
+        }
+    }
+
+    /// Every tool button with both buttons (split tools: both halves), every built-in brush
+    /// and palette cells with both buttons.
+    fn click_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
+        // Something on the page for Undo and Clear to act on.
+        rig.click(Place::Page(40, 40), Primary);
+        seen(rig, "a dot on the page".into());
+        for tool in TOOL_ROWS.into_iter().flatten() {
+            for filled in [false, true] {
+                if filled && !tool.is_split() {
+                    continue;
+                }
+                for button in [Primary, Secondary] {
+                    rig.click(Place::Tool(tool, filled), button);
+                    seen(
+                        rig,
+                        format!("{button:?} on {tool:?} (filled half: {filled})"),
+                    );
+                    // A right click may have opened the tool's requester: Esc closes it.
+                    if rig.app.modal_open() {
+                        rig.tap(egui::Key::Escape);
+                        assert!(
+                            !rig.app.modal_open(),
+                            "Esc closes the requester of {tool:?}"
+                        );
+                        seen(rig, format!("Esc after {tool:?}"));
+                    }
+                }
+            }
+        }
+        for brush in 0..10 {
+            rig.click(Place::Brush(brush), Primary);
+            assert_eq!(rig.app.ui.brush, brush);
+            seen(rig, format!("brush {brush}"));
+        }
+        rig.click(Place::Brush(3), Secondary);
+        seen(rig, "right button on brush 3".into());
+        for colour in [0u8, 1, 7, 15, 16, 30, 31] {
+            rig.click(Place::Cell(colour), Primary);
+            assert_eq!(rig.app.ui.fg, colour);
+            seen(rig, format!("foreground {colour}"));
+            let other = 31 - colour;
+            rig.click(Place::Cell(other), Secondary);
+            assert_eq!(rig.app.ui.bg, other);
+            seen(rig, format!("background {other}"));
+        }
+    }
+
+    #[test]
+    fn every_tool_brush_and_palette_click_does_the_same_in_both_skins() {
+        in_both_skins(Rig::modern(), click_script);
+    }
+
+    /// The same clicks at twice the device scale and in an odd window at 1.5.
+    #[test]
+    fn clicks_do_the_same_at_other_device_scales() {
+        in_both_skins(
+            Rig::new(UiStyle::Modern, (1280.0, 800.0), 2.0),
+            click_script,
+        );
+        in_both_skins(
+            Rig::new(UiStyle::Modern, (1001.0, 700.0), 1.5),
+            click_script,
+        );
+    }
+
+    /// Keys of every kind (tools, toggles, paint modes, chrome, colours, brush size, undo,
+    /// scrolling, a requester) and strokes on the page between them.
+    fn key_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
+        use egui::Key;
+        let line = [
+            Place::Page(20, 30),
+            Place::Page(60, 50),
+            Place::Page(110, 90),
+        ];
+        for c in ['v', 'R', 'c', 'E', 'D', 's', 'q', 'f', 'b', 'd'] {
+            rig.key(c);
+            seen(rig, format!("key {c}"));
+        }
+        rig.drag(&line, Primary);
+        seen(rig, "a freehand stroke".into());
+        rig.key('R');
+        rig.drag(&[Place::Page(150, 100), Place::Page(200, 160)], Secondary);
+        seen(rig, "a filled rectangle with the right button".into());
+        for c in ['g', '/'] {
+            rig.key(c);
+            seen(rig, format!("key {c}"));
+        }
+        // Magnify around the page pixel under the pointer. It splits the screen differently
+        // in the two skins (Classic keeps the part under its toolbox free), so the pointer
+        // then waits on a button, where both skins see no page pixel.
+        rig.move_to(Place::Page(100, 100));
+        rig.key('m');
+        assert_eq!(rig.app.tools.magnify, Some((100, 100)));
+        seen(rig, "key m".into());
+        rig.move_to(Place::Tool(Tool::Undo, false));
+        for c in [
+            '>', '>', '<', 'm', '/', 'g', ']', ']', '[', '=', '=', '-', '.',
+        ] {
+            rig.key(c);
+            seen(rig, format!("key {c}"));
+        }
+        for key in [
+            Key::F2,
+            Key::F3,
+            Key::F6,
+            Key::F1,
+            Key::F9,
+            Key::F9,
+            Key::F10,
+        ] {
+            rig.tap(key);
+            seen(rig, format!("{key:?}"));
+        }
+        // Without bar and dock: the stroke still lands on the same page pixels.
+        rig.key('v');
+        rig.drag(&[Place::Page(300, 10), Place::Page(250, 200)], Primary);
+        seen(rig, "a line under where the toolbox was".into());
+        rig.tap(Key::F10);
+        seen(rig, "F10 again".into());
+        // The Modern picture moved when bar and dock came back; the pointer follows it.
+        rig.move_to(Place::Page(250, 200));
+        for c in ['u', 'u', 'U', 'j', 'j', 'K', 'u'] {
+            rig.key(c);
+            seen(rig, format!("key {c}"));
+        }
+        // A requester by key and away again; then the page pixel under the pointer.
+        rig.key('p');
+        assert!(rig.app.ui.palette_requester.is_some(), "the Color Mixer");
+        seen(rig, "p".into());
+        rig.tap(Key::Escape);
+        seen(rig, "Esc".into());
+        rig.app.ui.prefs.set(Pref::Coords, true);
+        rig.move_to(Place::Page(77, 99));
+        assert_eq!(rig.app.ui.coords, Some((77, 99)));
+        seen(rig, "the pointer on the page with Coords".into());
+        rig.key(',');
+        seen(rig, "comma picks the colour under the pointer".into());
+        for key in [Key::ArrowRight, Key::ArrowDown, Key::Tab, Key::Tab] {
+            rig.tap(key);
+            seen(rig, format!("{key:?}"));
+        }
+    }
+
+    #[test]
+    fn a_key_script_with_strokes_does_the_same_in_both_skins() {
+        in_both_skins(Rig::modern(), key_script);
+        in_both_skins(Rig::new(UiStyle::Modern, (1280.0, 800.0), 2.0), key_script);
+    }
+
+    fn zoom(rig: &Rig) -> (u32, u8) {
+        let l = rig.app.modern_layout().expect("layout");
+        (l.zoom, rig.app.ui.pixel_size.0)
+    }
+
+    #[test]
+    fn command_plus_minus_and_zero_zoom_the_picture_and_never_resize_the_window() {
+        use egui::Key;
+        let mut rig = Rig::modern();
+        // 320 × 256 at Pixel Size 3x in a 1188 × 770 viewport: three pixels per pixel.
+        assert_eq!(zoom(&rig), (3, 6));
+        let quad = |rig: &Rig| rig.app.modern_layout().expect("layout").picture;
+        assert_eq!((quad(&rig).w, quad(&rig).h), (960.0, 768.0));
+        // Each press changes what is shown: at 1x by a whole pixel per pixel.
+        rig.command(Key::Minus);
+        assert_eq!(zoom(&rig), (2, 5));
+        assert_eq!((quad(&rig).w, quad(&rig).h), (640.0, 512.0));
+        rig.command(Key::Minus);
+        assert_eq!(zoom(&rig), (1, 3));
+        rig.command(Key::Minus);
+        assert_eq!(zoom(&rig), (1, 3), "1x is the smallest");
+        rig.command(Key::Plus);
+        assert_eq!(zoom(&rig), (2, 4));
+        rig.command(Key::Equals);
+        assert_eq!(zoom(&rig), (3, 6));
+        rig.command(Key::Plus);
+        assert_eq!(zoom(&rig), (3, 6), "no larger than fits the viewport");
+        rig.command(Key::Minus);
+        rig.command(Key::Num0);
+        assert_eq!(zoom(&rig), (3, 6), "Cmd/Ctrl+0: as large as fits");
+        // Prefs ▸ Pixel Size is the same value: more than fits is cut down, and the next
+        // step down starts from what is shown.
+        rig.app
+            .run_action(Action::PixelSize(PixelSize(16)), &rig.ctx.clone());
+        rig.pass(vec![]);
+        assert_eq!(zoom(&rig), (3, 16));
+        rig.command(Key::Minus);
+        assert_eq!(zoom(&rig), (2, 5));
+        // The picture stays centred and the page follows the pointer at every size.
+        rig.key('s');
+        rig.click(Place::Page(310, 250), Primary);
+        assert_eq!(rig.app.page().get(310, 250), Some(rig.app.ui.fg));
+        // Idle passes past the Classic skin's snap delay: the window was never asked to
+        // change its size.
+        for _ in 0..30 {
+            rig.pass(vec![]);
+        }
+        assert_eq!(rig.sizes_asked(), 0, "{:?}", rig.commands);
+
+        // The Classic skin, for contrast: the same key resizes the window.
+        let mut classic = Rig::classic();
+        classic.commands.clear();
+        classic.command(Key::Minus);
+        classic.pass(vec![]);
+        assert_eq!(classic.app.ui.pixel_size, PixelSize(5));
+        assert!(classic.sizes_asked() > 0, "{:?}", classic.commands);
+    }
+
+    #[test]
+    fn zoom_steps_are_single_physical_pixels_at_2x() {
+        use egui::Key;
+        let mut rig = Rig::new(UiStyle::Modern, (1280.0, 800.0), 2.0);
+        assert_eq!(zoom(&rig), (6, 6));
+        rig.command(Key::Minus);
+        assert_eq!(zoom(&rig), (5, 5));
+        rig.command(Key::Minus);
+        assert_eq!(zoom(&rig), (4, 4));
+        rig.command(Key::Num0);
+        assert_eq!(zoom(&rig), (6, 6));
+        assert_eq!(rig.sizes_asked(), 0);
+    }
+
+    #[test]
+    fn the_modern_window_does_not_snap_and_the_classic_one_snaps_again_afterwards() {
+        // A window no pixel size fits exactly; in Classic it would snap after the delay.
+        let mut rig = Rig::new(UiStyle::Modern, (1100.0, 730.0), 1.0);
+        for _ in 0..40 {
+            rig.pass(vec![]);
+        }
+        assert_eq!(rig.sizes_asked(), 0, "{:?}", rig.commands);
+        let (w, h) = layout::MIN_WINDOW;
+        let minimum = |rig: &Rig| {
+            rig.commands
+                .iter()
+                .filter_map(|c| match c {
+                    egui::ViewportCommand::MinInnerSize(s) => Some((s.x, s.y)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(minimum(&rig), [(w, h)], "the Modern minimum, sent once");
+        // Back in Classic the window returns to the screen at the pixel size.
+        rig.app.ui_style = UiStyle::Classic;
+        rig.pass(vec![]);
+        assert!(
+            rig.commands
+                .contains(&egui::ViewportCommand::InnerSize(egui::vec2(960.0, 768.0)))
+        );
+        assert_eq!(
+            minimum(&rig),
+            [(w, h), (CLASSIC_MIN_WINDOW[0], CLASSIC_MIN_WINDOW[1])]
+        );
+    }
+
+    #[test]
+    fn the_chrome_flags_are_the_shared_ones_between_passes() {
+        let mut rig = Rig::modern();
+        // After a pass the shared state says what is shown, as in Classic.
+        assert!(rig.app.ui.title_visible && rig.app.ui.toolbox_visible);
+        let l = rig.app.modern_layout().expect("layout");
+        assert!(l.bar.is_some() && l.dock.is_some());
+        rig.tap(egui::Key::F10);
+        assert!(!rig.app.ui.title_visible && !rig.app.ui.toolbox_visible);
+        let l = rig.app.modern_layout().expect("layout");
+        assert!(l.bar.is_none() && l.dock.is_none());
+        assert_eq!(l.viewport, l.window);
+        rig.tap(egui::Key::F9);
+        assert!(rig.app.ui.title_visible && !rig.app.ui.toolbox_visible);
+        rig.tap(egui::Key::F10);
+        assert!(!rig.app.ui.title_visible && !rig.app.ui.toolbox_visible);
+        rig.tap(egui::Key::F10);
+        assert!(rig.app.ui.title_visible && rig.app.ui.toolbox_visible);
+        // The picture has the whole screen: Magnify splits it over its full width.
+        rig.key('m');
+        let view = rig.app.view();
+        let m = rig
+            .app
+            .magnify_layout(view, rig.app.toolbox_cover(view))
+            .expect("Magnify is on");
+        assert_eq!(m.end, view.screen_w);
+    }
+
+    #[test]
+    fn every_corner_of_a_page_pixel_is_that_pixel_at_every_device_scale() {
+        for (size, ppp) in [
+            ((1280.0, 800.0), 1.0),
+            ((1280.0, 800.0), 2.0),
+            ((1001.0, 700.0), 1.5),
+            ((900.0, 620.0), 1.25),
+        ] {
+            let mut rig = Rig::new(UiStyle::Modern, size, ppp);
+            rig.app.ui.prefs.set(Pref::Coords, true);
+            for (x, y) in [(0, 0), (319, 255), (17, 23), (160, 128)] {
+                for corner in [(0.02, 0.02), (0.98, 0.02), (0.02, 0.98), (0.98, 0.98)] {
+                    let pos = modern_point_at(&rig.app, Place::Page(x, y), corner);
+                    rig.pass(vec![egui::Event::PointerMoved(pos)]);
+                    assert_eq!(
+                        rig.app.ui.coords,
+                        Some((x, y)),
+                        "corner {corner:?} at {ppp}x in {size:?}"
+                    );
+                }
+            }
+            // Just outside the quad there is canvas: no page pixel, no stroke.
+            let l = rig.app.modern_layout().expect("layout");
+            let outside = egui::pos2(l.picture.x - 0.6 / ppp, l.picture.y + 5.0);
+            rig.pass(vec![
+                egui::Event::PointerMoved(outside),
+                pointer_button(outside, Primary, true),
+            ]);
+            rig.pass(vec![pointer_button(outside, Primary, false)]);
+            assert_eq!(rig.app.ui.coords, None);
+            assert!(
+                !rig.app.engine.can_undo(),
+                "a click on the canvas paints nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_region_is_rasterised_again_only_when_it_changes() {
+        let mut rig = Rig::modern();
+        // The first pass made every region once.
+        assert_eq!(rig.app.modern.renders(), [1, 1, 1]);
+        for _ in 0..5 {
+            rig.pass(vec![]);
+        }
+        assert_eq!(rig.app.modern.renders(), [1, 1, 1], "idle passes");
+        // The pointer on a tool button raises it: the dock only.
+        rig.move_to(Place::Tool(Tool::Curve, false));
+        assert_eq!(rig.app.modern.renders(), [1, 2, 1]);
+        rig.move_to(Place::Tool(Tool::Curve, false));
+        assert_eq!(rig.app.modern.renders(), [1, 2, 1], "the same button again");
+        // Selecting it: the dock again.
+        rig.click(Place::Tool(Tool::Curve, false), Primary);
+        assert_eq!(rig.app.modern.renders(), [1, 3, 1]);
+        // Painting changes the picture, which is no region: nothing is rasterised.
+        rig.key('s');
+        let before = rig.app.modern.renders();
+        rig.drag(
+            &[
+                Place::Page(10, 10),
+                Place::Page(90, 70),
+                Place::Page(200, 30),
+            ],
+            Primary,
+        );
+        assert!(rig.app.engine.can_undo());
+        assert_eq!(rig.app.modern.renders()[VIEWPORT], 1);
+        assert_eq!(rig.app.modern.renders()[BAR], before[BAR]);
+        // The coordinates in the bar follow the pointer: the bar only.
+        rig.app.ui.prefs.set(Pref::Coords, true);
+        rig.move_to(Place::Page(5, 5));
+        let before = rig.app.modern.renders();
+        rig.move_to(Place::Page(6, 5));
+        let after = rig.app.modern.renders();
+        assert_eq!(after[BAR], before[BAR] + 1);
+        assert_eq!(
+            (after[VIEWPORT], after[DOCK]),
+            (before[VIEWPORT], before[DOCK])
+        );
+        // A paint mode shows in the bar only; a zoom step moves the picture's shadow.
+        rig.tap(egui::Key::F4);
+        let moded = rig.app.modern.renders();
+        assert_eq!(moded, [after[0], after[1], after[2] + 1]);
+        rig.command(egui::Key::Minus);
+        assert_eq!(rig.app.modern.renders()[VIEWPORT], moded[VIEWPORT] + 1);
+        // A new window size or device scale redoes everything.
+        let before = rig.app.modern.renders();
+        rig.size = egui::vec2(1000.0, 700.0);
+        rig.pass(vec![]);
+        rig.ppp = 2.0;
+        rig.pass(vec![]);
+        let after = rig.app.modern.renders();
+        for i in [VIEWPORT, DOCK, BAR] {
+            assert_eq!(after[i], before[i] + 2, "region {i}");
+        }
+    }
+
+    #[test]
+    fn the_theme_follows_the_system_unless_it_is_fixed() {
+        use dpx_ui::ThemeChoice;
+        let mut rig = Rig::modern();
+        assert_eq!(
+            rig.app.modern.theme(),
+            Some(ThemeKind::Dark),
+            "nothing known: dark"
+        );
+        rig.system = Some(egui::Theme::Light);
+        rig.pass(vec![]);
+        // egui learns the system's theme in the pass that brings it.
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Light));
+        rig.system = Some(egui::Theme::Dark);
+        rig.pass(vec![]);
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Dark));
+        rig.app.theme = ThemeChoice::Light;
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Light), "fixed");
+        rig.app.theme = ThemeChoice::Dark;
+        rig.system = Some(egui::Theme::Light);
+        rig.pass(vec![]);
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Dark), "fixed");
+    }
+
+    /// What the live window shows, as an image: probes, and PNGs for a look at them when
+    /// `DPX_MODERN_SHOTS` names a directory.
+    #[test]
+    fn the_live_window_shows_the_state_it_shares_with_classic() {
+        let shot = |rig: &mut Rig, kind: ThemeKind, name: &str| {
+            let (w, h, rgba) = rig.app.modern_window_image(kind);
+            if let Ok(dir) = std::env::var("DPX_MODERN_SHOTS") {
+                let path = format!("{dir}/{name}.png");
+                write_png(&path, w, h, &rgba).expect("a writable directory");
+            }
+            (w, rgba)
+        };
+        let at = |(w, rgba): &(u32, Vec<u8>), l: &MainLayout, x: f32, y: f32| {
+            pixel(rgba, *w, (x * l.scale) as u32, (y * l.scale) as u32)
+        };
+        let rgb = |c: dpx_ui_modern::paint::Color| [c.r, c.g, c.b];
+        for (kind, ppp) in [(ThemeKind::Dark, 1.0), (ThemeKind::Light, 2.0)] {
+            let theme = Theme::of(kind);
+            let mut rig = Rig::new(UiStyle::Modern, (1280.0, 800.0), ppp);
+            // A filled circle in colour 5, selected by key and drawn with the pointer.
+            rig.click(Place::Cell(5), Primary);
+            rig.key('C');
+            rig.drag(&[Place::Page(160, 128), Place::Page(200, 128)], Primary);
+            rig.key('g');
+            rig.move_to(Place::Tool(Tool::Text, false));
+            let name = format!("live-{kind:?}-{ppp}x").to_lowercase();
+            let image = shot(&mut rig, kind, &name);
+            let l = rig.app.modern_layout().expect("layout");
+            let colour = |i: u8| {
+                let c = rig.app.palette().get(i).expect("colour");
+                [c.r, c.g, c.b]
+            };
+            // The picture: the circle's middle and the page beside it, at the quad's place.
+            let page = |x: i32, y: i32| {
+                let p = modern_point(&rig.app, Place::Page(x, y));
+                at(&image, &l, p.x, p.y)
+            };
+            assert_eq!(page(160, 128), colour(5), "{name}");
+            assert_eq!(page(190, 128), colour(5), "{name}");
+            assert_eq!(page(10, 10), colour(0), "{name}");
+            // The chrome: the chosen half of Circle on the accent, Grid ringed, Text raised
+            // under the pointer, bar and canvas in the theme's colours.
+            let circle = l.tool_button(Tool::Circle).expect("button");
+            assert_eq!(
+                at(&image, &l, circle.right() - 4.5, circle.bottom() - 9.5),
+                rgb(theme.accent),
+                "{name}"
+            );
+            let text = l.tool_button(Tool::Text).expect("button");
+            assert_eq!(
+                at(&image, &l, text.x + 4.5, text.y + 9.5),
+                rgb(theme.hover),
+                "{name}"
+            );
+            let grid = l.tool_button(Tool::Grid).expect("button");
+            assert_eq!(
+                at(&image, &l, grid.x + grid.w / 2.0, grid.y + 0.7),
+                rgb(theme.accent),
+                "{name}: the ring of a toggle that is on"
+            );
+            let bar = l.bar.expect("bar");
+            assert_eq!(
+                at(&image, &l, bar.right() - 3.0, bar.y + 3.0),
+                rgb(theme.panel)
+            );
+            assert_eq!(
+                at(&image, &l, l.viewport.x + 3.0, l.viewport.y + 3.0),
+                rgb(theme.canvas)
+            );
+            // Nothing of the classic chrome is in the picture: its top-left and top-right
+            // corners are page.
+            assert_eq!(page(0, 0), colour(0), "{name}");
+            assert_eq!(page(319, 0), colour(0), "{name}");
+        }
+        // Magnify, a requester and the Control Panel are shown in the Classic look inside
+        // the quad for now.
+        let mut rig = Rig::modern();
+        rig.key('s');
+        rig.drag(&[Place::Page(150, 120), Place::Page(170, 135)], Primary);
+        rig.key('m');
+        shot(&mut rig, ThemeKind::Dark, "live-magnify");
+        rig.key('m');
+        rig.click(Place::Tool(Tool::Grid, false), Secondary);
+        assert!(rig.app.ui.tool_requester.is_some());
+        shot(&mut rig, ThemeKind::Light, "live-requester");
+        rig.tap(egui::Key::Escape);
+        rig.pass(chord(egui::Key::A, egui::Key::A, egui::Modifiers::ALT, ""));
+        assert!(
+            rig.app.ui.anim_panel.is_some(),
+            "Alt-a shows the Control Panel"
+        );
+        shot(&mut rig, ThemeKind::Dark, "live-anim-panel");
+        rig.tap(egui::Key::F10);
+        shot(&mut rig, ThemeKind::Dark, "live-f10");
     }
 }
