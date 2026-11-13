@@ -1,6 +1,6 @@
 # Architecture
 
-Status: Phase 0 draft, 2026-11-09. Decisions marked **ADR-n** are recorded in `docs/adr/`.
+Status: Phase 0 draft, 2026-11-09; sections 2, 3, 7, 7a, 8 and 9 brought up to date for wave 8 (2026-11-13: live MCP, layers, AI image generation, hardware rules); sections 4–6 still show parts of the Phase-0 sketch (see the ADRs for what was built). Decisions marked **ADR-n** are recorded in `docs/adr/`.
 
 ## 1. Goals that shape the architecture
 
@@ -12,30 +12,39 @@ Status: Phase 0 draft, 2026-11-09. Decisions marked **ADR-n** are recorded in `d
 
 ## 2. Workspace layout
 
+As built (wave 8):
+
 ```text
 crates/
-  dpx-core      Document model, HardwareTarget, Palette, Layers/Frames/Cels,
-                Command enum, Engine (execute/undo/redo/transactions), errors
-  dpx-raster    Pure pixel algorithms on index buffers: line, ellipse, polygon,
-                flood fill, brush stamping, spacing, symmetry, gradients, dither
-                (until it is split out: `dpx_core::raster`; colour reduction and
-                resampling of true-colour pictures: `dpx_core::quantize`/`resample`)
-  dpx-iff       IFF container, ILBM (BMHD/CMAP/CAMG/BODY/CRNG/CCRT/GRAB…),
-                ByteRun1, EHB/HAM6/HAM8 codecs, later ANIM
-  dpx-formats   PNG import/export, JPEG import (decoders only), ExportAnalyzer
-  dpx-project   .dpxproj read/write/migrate (ZIP + JSON manifest + zstd blobs)
-  dpx-render    Compositing layers → indexed/RGBA frame, colour-cycling preview
-  dpx-ui        RetroUi: framebuffer, bitmap font, widgets, toolbox, menus,
-                requesters; tool interaction state machines; eframe adapter
-  dpx-mcp       MCP server (rmcp), IPC bridge to a running GUI, tool schemas
+  dpx-core      Document model (frames, layers, palette, HardwareTarget), Command enum,
+                Engine (execute/undo/redo, revisions, dry runs), raster algorithms
+                (`raster`), colour reduction and resampling (`quantize`, `resample`),
+                import and generated-picture conversion (`import`), hardware rules and
+                export notes (`hardware`), display modes and screen presets (`mode`)
+  dpx-iff       IFF container, ILBM (BMHD/CMAP/CAMG/BODY/CRNG/CCRT/GRAB…), ByteRun1,
+                ANIM op 5
+  dpx-formats   PNG import/export, JPEG import (decoders only), EHB/HAM6/HAM8 codecs, the
+                .dpxproj project (`project.rs`: ZIP + JSON manifest + one indexed PNG per
+                layer and frame)
+  dpx-ui        RetroUi: framebuffer, bitmap font, widgets, toolbox, menus, requesters
+                (incl. the layer panel, Prefs > AI & MCP.., Generate, Image Generator setup)
+  dpx-mcp       MCP (rmcp): tools and resources, the Workspace trait and job queue, the
+                Streamable HTTP server on 127.0.0.1, endpoint files, the stdio bridge,
+                the .mcpb names; feature `imagegen` for the generation tools
+  dpx-imagegen  AI image generation: ImageGenerationProvider trait, OpenAI Images (ureq,
+                native TLS), API keys (keychain via `keyring`), worker-thread jobs
 apps/
-  deluxepainter Single binary: GUI by default; `deluxepainter mcp` = MCP stdio
-                server; `deluxepainter cli …` = headless inspect/convert
+  deluxepainter  The GUI (eframe) by default; `deluxepainter mcp [--http]` = headless MCP
+                 server; `deluxepainter mcp-bridge` = the stdio bridge; `info`/`convert` CLI
+  dpx-mcp-bridge The stdio bridge alone (no eframe), the binary in the .mcpb extension
+xtask           `cargo run -p xtask -- mcpb` packs the Claude Desktop extension
 ```
 
-Dependency direction (no cycles): `core ← raster ← render ← ui ← app`, `core ← iff/formats/project ← app`, `core ← mcp ← app`. `dpx-ui` never touches files directly; it issues commands.
+Planned in Phase 0 but not split out: `dpx-raster` (in `dpx_core::raster`), `dpx-project` (in `dpx-formats`), `dpx-render` (compositing is `dpx_core::layer`, the screen is drawn by `dpx-ui` and the app).
 
-One binary instead of a separate MCP binary (ADR-5): simpler install, one version, and the MCP client config just runs `deluxepainter mcp`.
+Dependency direction (no cycles): `core ← iff/formats ← app`, `core ← ui ← app`, `core/formats ← imagegen ← app`, `core/formats/iff ← mcp ← app/bridge/xtask` (`mcp` → `imagegen` only with its `imagegen` feature, which the app turns on and the bridge leaves off). `dpx-ui` never touches files directly; it issues commands. No pixel logic outside `dpx-core`.
+
+One binary for the GUI, the CLI and the headless MCP server (ADR-5); since ADR-43 there is also the small `dpx-mcp-bridge` binary, so a client configuration can start a process without the GUI toolkit (the same bridge is `deluxepainter mcp-bridge`).
 
 ## 3. Document model (ADR-1)
 
@@ -56,6 +65,8 @@ struct Document {
 ```
 
 - **Frames (ADR-28, implemented)**: `Document` holds 1..N frames of one size, one page each; the current frame is `page()` and every page command acts on it; the other frames sit behind `Arc` (shared by undo snapshots and copies). Frame commands are undo steps; `GotoFrame`/`SetFrameRate` are settings without one.
+- **Layers (ADR-44, implemented; the sketch above is not what was built)**: one flat layer stack per document, shared by every frame (`Layer { name, visible }`, bottom first, at most 32); every frame holds one indexed picture per layer, all in the document palette. `page()` is the active layer of the current frame, so every page command paints it. Above the bottom layer colour 0 is transparent; the bottom layer is opaque. `Document::composite()` flattens the visible layers (borrowed, no copy, for a single visible layer); the screen, previews, MCP reads and every export use it. Layers are shown or hidden only (no opacity, lock, blend modes or groups: owner decision). Layer commands are undo steps; `select_layer` is a setting. Project format version 3 stores them.
+- **Chipset and hardware rules (ADR-46)**: the target's chipset (OCS or AGA) is a document rule: OCS shows 32 colours in Low Res, 16 in High Res, no Super-High Res, and its palette entries are 12-bit. `dpx_core::hardware` holds the rules and the export notes; `dpx_core::mode::PRESETS` is the one preset table for Screen Format, Generate and MCP.
 - **Palette is per document** in V1 (DPaint behaviour). Per-frame palettes are an ANIM-import concern and are deferred; the data model reserves `Frame::palette_override: Option<PaletteId>`.
 - **Pixel buffers** are either `Indexed` (u8 index + 1-bit transparency mask) or `Rgba8` (imported references). Indexed is the normal painting format so palette edits and colour cycling stay live.
 - Buffers are stored as **64×64 tiles behind `Arc`** (copy-on-write). Duplicating a frame or snapshotting for undo copies pointers, not pixels.
@@ -101,7 +112,7 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
 - The **whole visible UI**, including the zoomed canvas viewport, is software-rendered into one RGBA framebuffer at "Amiga screen" resolution. egui only provides the window, input, clipboard and the GPU blit.
 - Pixel size in whole and half points per UI pixel (Prefs ▸ Pixel Size 1x–8x), drawn in **physical** pixels (Retina: every step sharp; 1× displays: half steps give uneven nearest-neighbour pixels, never blur).
 - Screen size: exactly the document's screen; the window snaps to screen × pixel size after a resize. Full screen centres it at the largest step that fits (ADR-13).
-- Because rendering is pure CPU code, **UI screenshots are deterministic** and testable headless (golden PNGs) and available to MCP (`get_ui_screenshot`).
+- Because rendering is pure CPU code, **UI screenshots are deterministic** and testable headless (golden PNGs, `deluxepainter --snapshot`). MCP clients see the picture (`get_preview`, `dpx://document/preview.png`), not the UI; the planned `get_ui_screenshot` tool was not built.
 - Colour cycling is a display-time palette rotation; document pixels never change while cycling.
 - Font: an **original** 8×8 / 8×9 bitmap font drawn for this project (Topaz and other Amiga ROM fonts are not redistributable). Icons are original pixel art drawn in the spirit of DPaint IV, not copied.
 
@@ -115,25 +126,35 @@ struct Outcome { new_revision, affected_rect: Option<Rect>, warnings: Vec<Warnin
 | PNG | dpx-formats | Import (indexed as is; true colour reduced by `dpx_core::quantize`, ADR-9; the GUI's Picture ▸ Load.. goes through the Import requester and `dpx_core::import`, ADR-42; later also as RGBA layer), export composited native resolution. |
 | JPEG | dpx-formats | Import only (zune-jpeg, EXIF orientation), reduced like true-colour PNG (ADR-9; Import requester in the GUI, ADR-42). |
 
-## 7. MCP (ADR-5)
+## 7. MCP (ADR-43; supersedes ADR-5's socket plan)
 
 ```text
-MCP client ──stdio──► deluxepainter mcp ──local socket / named pipe──► running GUI (Engine)
-                                    └── no GUI running → in-process headless Engine
+Claude Desktop / Claude Code ──stdio──► dpx-mcp-bridge ──Streamable HTTP, 127.0.0.1, bearer token──► running GUI
+                                         (reads <config dir>/mcp-endpoint.json)                       (JobQueue in App::logic)
+scripts / tests ──stdio or HTTP──► deluxepainter mcp [--http] ──► headless engine (worker thread)
 ```
 
-- rmcp 3.9.x (pinned), protocol versions negotiated per the current MCP spec (stateless `2026-07-28` era plus legacy `initialize` clients — see `docs/research/dependencies.md`).
-- Tools = thin wrappers mapping JSON params → `Command`, returning `Outcome` + stable error codes. Resources for document state, palette, layers, preview PNG.
-- MCP is **off by default**; enabled by preference or `--mcp`. File access restricted to user-approved directories (canonicalised, symlink-safe). Logs to stderr only.
+- ADR-5 planned `deluxepainter mcp` to reach the GUI over a local socket / named pipe (`interprocess`). ADR-43 replaced that: the GUI runs rmcp's Streamable HTTP server itself (axum, `127.0.0.1` only, stateless, JSON responses) while MCP control is on, and a stdio bridge forwards to it with rmcp's own HTTP client. One protocol end to end, no `interprocess` dependency; the HTTP endpoint can also be used directly.
+- **Tools never own editor state.** `dpx_mcp::Workspace` is the editor state a tool needs (the shown page's engine, the spare page, the brush, the picture's name, questions, the image generator). A tool sends boxed jobs over a channel; the owner thread runs them: the GUI in `App::logic` (every pass, also while the window is hidden), the headless server on its worker thread. File I/O, encoding, decoding and conversions run on the server's threads, so a frame never waits for disk or a long conversion. Calls are serialised in arrival order (`dpx_mcp::seq`).
+- **Same commands as the GUI.** Every change is a `dpx-core` command run as a menu command (gestures committed first, Stencil > Paint ended), one undo step of the shown page; `U` undoes MCP changes and MCP `undo` the user's. Changes are refused (`EDITOR_BUSY`) while a requester is open and held while the user paints.
+- **Security:** off by default; `127.0.0.1` only; Host and Origin checks; a 32-byte bearer token kept in the config directory (0600 on Unix) and never in a client configuration (the bridge reads the endpoint file, trusted only while its server holds `mcp-endpoint.lock`); separate read and edit permissions; file tools only in approved directories; replacing a file needs `overwrite: true` and the user's click; Revoke access rotates the token and turns the permissions off; no tool runs a shell command.
+- **Connecting:** Prefs > AI & MCP.. runs `claude mcp add --scope user deluxe-painter -- <app> mcp-bridge` after the user confirmed it, or opens the `.mcpb` extension (built by `xtask`, one platform per bundle) so Claude Desktop shows its install dialog.
+- rmcp 3.9; only `initialize`-based (2025 protocol era) clients have been exercised. Tools, parameters, error codes and the security model in detail: [`MCP_API.md`](MCP_API.md).
+
+## 7a. AI image generation (ADR-45)
+
+- `dpx-imagegen`: the `ImageGenerationProvider` trait (requests, capabilities, typed errors with stable codes), OpenAI Images as the first provider (blocking `ureq` with native TLS on a worker thread; rustls is avoided because its crates are ISC-licensed), API keys in the OS keychain (`keyring`) or for the session only, never in a file, and a `JobManager` (worker threads, cancel, at most 2 requests in flight) shared by the GUI and MCP.
+- The conversion of a generated picture to the page (crop or fit, scalers, colour reduction, 12-bit OCS palettes) is `dpx_core::import::convert` (pixel logic stays in `dpx-core`); applying it is one undo step (`Command::ReplacePicture`, `Command::AddPictureLayer`, the spare page's engine, or the brush).
+- Picture > Generate.. and the MCP generation tools (in the window only, through `Workspace::image_generation`) use the same generator, jobs and conversion. Without a set-up generator nothing is generated; a test pattern exists for tests and snapshots only.
 
 ## 8. Testing strategy
 
 - Unit + property tests (proptest) for raster algorithms, ByteRun1, IFF parsing with fuzzed bytes.
 - Golden files: ILBM fixtures we generate ourselves + a small set of redistributable third-party files (licence checked), compared pixel-by-pixel after decode.
 - UI golden screenshots rendered headless by `dpx-ui`.
-- MCP acceptance scenario (`docs/MCP_API.md`, Bauplan §7.5) as an integration test against the headless engine.
+- MCP: tool tests on the headless workspace, ui-loop tests on the GUI workspace, integration tests against the real `deluxepainter mcp` (stdio and HTTP) and the real bridge binary; see [`MCP_API.md`](MCP_API.md) §9.
 - CI: `fmt --check`, `clippy -D warnings`, `test`, release build on macOS, Windows, Linux.
 
 ## 9. Toolchain
 
-Current eframe/egui (0.37) needs rustc ≥ 1.95; the local Homebrew toolchain is 1.90. The repo will pin the toolchain in `rust-toolchain.toml`; how it gets installed (rustup vs. Homebrew upgrade) is an open owner decision. Fallback: eframe 0.33.3 on 1.90 behind a thin adapter (the `App` trait changed between 0.33 and 0.37).
+eframe/egui 0.37 needs rustc ≥ 1.95, the workspace's `rust-version`. The toolchain is pinned in `rust-toolchain.toml` (Rust 1.99.1, installed with rustup; owner decision, see ROADMAP "Open owner decisions"). The Phase-0 fallback (eframe 0.33.3 on the Homebrew 1.90 toolchain) was not needed.
