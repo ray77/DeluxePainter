@@ -1802,7 +1802,7 @@ impl PainterApp {
         );
         self.tools.magnify = Some(c);
         // The normal half follows, so the magnified part stays in view.
-        if let Some(m) = self.magnify_layout(self.view()) {
+        if let Some(m) = self.magnify_layout(self.view(), self.toolbox_cover(self.view())) {
             let s = m.source;
             let (vw, vh) = (m.split, self.view().screen_h);
             let seen = Rect::new(self.scroll.0, self.scroll.1, vw, vh);
@@ -1823,15 +1823,22 @@ impl PainterApp {
         self.dirty = true;
     }
 
-    /// The halves of the screen while Magnify is on.
-    pub(crate) fn magnify_layout(&self, view: View) -> Option<MagnifyLayout> {
-        let (cx, cy) = self.tools.magnify?;
-        let toolbox = if self.ui.toolbox_visible {
+    /// The width at the right of the screen that the classic toolbox covers, in screen
+    /// pixels: what [`Self::magnify_layout`] keeps free while the toolbox is shown.
+    pub(crate) fn toolbox_cover(&self, view: View) -> i32 {
+        if self.ui.toolbox_visible {
             dpx_ui::screen::geom::TOOLBOX_W * view.ux
         } else {
             0
-        };
-        let end = view.screen_w - toolbox;
+        }
+    }
+
+    /// The halves of the screen while Magnify is on. `covered`: screen pixels at the right
+    /// edge that the interface covers ([`Self::toolbox_cover`] in the Classic skin; the Modern
+    /// skin of ADR-47 has its toolbox outside the picture and passes 0).
+    pub(crate) fn magnify_layout(&self, view: View, covered: i32) -> Option<MagnifyLayout> {
+        let (cx, cy) = self.tools.magnify?;
+        let end = view.screen_w - covered;
         let split = end / 3 / view.ux * view.ux;
         let start = split + DIVIDER * view.ux;
         let zoom = ZOOMS[self.tools.zoom];
@@ -1853,7 +1860,7 @@ impl PainterApp {
 
     /// The page pixel under screen pixel (`sx`, `sy`); `None` on the Magnify divider.
     pub(crate) fn screen_to_page(&self, view: View, (sx, sy): (i32, i32)) -> Option<(i32, i32)> {
-        match self.magnify_layout(view) {
+        match self.magnify_layout(view, self.toolbox_cover(view)) {
             Some(m) if (m.split..m.start).contains(&sx) => None,
             Some(m) if (m.start..m.end).contains(&sx) => Some((
                 m.source.x + (sx - m.start) / m.zoom,
@@ -1870,7 +1877,7 @@ impl PainterApp {
         let palette = self.palette();
         let pens = Pens::from_palette(palette);
         let (w, h) = (view.screen_w, view.screen_h);
-        let magnify = self.magnify_layout(view);
+        let magnify = self.magnify_layout(view, self.toolbox_cover(view));
         // The picture as shown (all visible layers, ADR-44), made once for both halves.
         let page = self.page();
         let mut shown = match magnify {
@@ -2070,7 +2077,10 @@ impl PainterApp {
             }
             ToolKey::Escape => self.cancel_stroke(),
             ToolKey::Arrow(dx, dy) => {
-                if let (Some(c), Some(m)) = (self.tools.magnify, self.magnify_layout(self.view())) {
+                if let (Some(c), Some(m)) = (
+                    self.tools.magnify,
+                    self.magnify_layout(self.view(), self.toolbox_cover(self.view())),
+                ) {
                     let step = (m.source.w / 4).max(1);
                     self.magnify_at((c.0 + dx * step, c.1 + dy * step));
                 }
@@ -2529,9 +2539,23 @@ mod tests {
         app.pointer_page = Some((100, 100));
         app.tool_key(ToolKey::Char('m'));
         let view = app.view();
-        let m = app.magnify_layout(view).expect("magnify on");
+        let m = app
+            .magnify_layout(view, app.toolbox_cover(view))
+            .expect("magnify on");
         assert_eq!((m.split, m.start, m.end, m.zoom), (98, 101, 296, 4));
         assert_eq!(m.source, Rect::new(76, 68, 49, 64));
+        // ADR-47: with nothing covered (the Modern skin's picture) the halves use the whole
+        // screen width, and hiding the classic toolbox gives the same layout.
+        let free = app.magnify_layout(view, 0).expect("magnify on");
+        assert_eq!((free.split, free.start, free.end), (106, 109, 320));
+        app.ui.toolbox_visible = false;
+        assert_eq!(app.toolbox_cover(view), 0);
+        let hidden = app.magnify_layout(view, app.toolbox_cover(view)).unwrap();
+        assert_eq!(
+            (hidden.split, hidden.start, hidden.end, hidden.source),
+            (free.split, free.start, free.end, free.source)
+        );
+        app.ui.toolbox_visible = true;
         // Normal half, divider, magnified half.
         assert_eq!(app.screen_to_page(view, (10, 20)), Some((10, 20)));
         assert_eq!(app.screen_to_page(view, (99, 20)), None);

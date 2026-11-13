@@ -988,6 +988,11 @@ struct PainterApp {
     /// The document; every change goes through its command engine.
     engine: Engine,
     ui: UiState,
+    /// The skin of the main window (ADR-47); Classic until the owner switches. Remembered in
+    /// the settings file.
+    ui_style: dpx_ui::UiStyle,
+    /// The Modern skin's theme (ADR-47); the Classic skin ignores it. Remembered likewise.
+    theme: dpx_ui::ThemeChoice,
     texture: Option<egui::TextureHandle>,
     dirty: bool,
     /// The drawing-tool gesture in progress (ADR-14).
@@ -1064,6 +1069,8 @@ impl PainterApp {
         Self {
             engine: Engine::new(doc),
             ui: UiState::default(),
+            ui_style: dpx_ui::UiStyle::default(),
+            theme: dpx_ui::ThemeChoice::default(),
             texture: None,
             dirty: true,
             stroke: None,

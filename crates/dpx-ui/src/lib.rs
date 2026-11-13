@@ -31,6 +31,8 @@ pub mod range_requester;
 pub mod requester;
 pub mod screen;
 pub mod show_page;
+// Classic or Modern, and the Modern theme (ADR-47).
+pub mod skin;
 pub mod stencil_requester;
 pub mod tool_requesters;
 pub mod toolbox;
@@ -71,6 +73,7 @@ pub use range_requester::{RangeData, RangeRequester, RangeResponse};
 pub use requester::{ReqEvent, ReqKey, ReqResponse, ScreenFormatRequester, paste_keys};
 pub use screen::{Hit, PaintMode, Screen, UiState};
 pub use show_page::{ShowPage, ShowPageResponse};
+pub use skin::{ThemeChoice, UiStyle};
 pub use stencil_requester::StencilRequester;
 pub use tool_requesters::{
     FillRequester, FillSettings, GridRequester, GridSettings, SpacingMode, SpacingRequester,

@@ -12,7 +12,7 @@ use dpx_ui::tool_requesters::{
     AIRBRUSH_RANGE, FillSettings, GRID_RANGE, GridSettings, SPACING_RANGE, SYMMETRY_RANGE,
     SpacingMode, SpacingSettings, SymmetrySettings, TRANSLUCENCY_RANGE,
 };
-use dpx_ui::{PixelSize, Pref, Prefs};
+use dpx_ui::{PixelSize, Pref, Prefs, ThemeChoice, UiStyle};
 use serde_json::{Map, Value, json};
 
 use crate::PainterApp;
@@ -31,6 +31,10 @@ pub const DRAWER_PICTURE: &str = "picture";
 /// Everything that is remembered.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
+    /// The skin of the main window (ADR-47): key `ui_style`, `"classic"` or `"modern"`.
+    pub ui_style: UiStyle,
+    /// The Modern skin's theme (ADR-47): key `theme`, `"system"`, `"dark"` or `"light"`.
+    pub theme: ThemeChoice,
     pub pixel_size: u8,
     pub prefs: Prefs,
     /// Last drawer per requester kind.
@@ -60,6 +64,8 @@ impl Default for Config {
         let effects = crate::effects::Effects::default();
         let anim = crate::anim::AnimState::default();
         Self {
+            ui_style: UiStyle::default(),
+            theme: ThemeChoice::default(),
             pixel_size: PixelSize::default().0,
             prefs: Prefs::default(),
             drawers: BTreeMap::new(),
@@ -105,6 +111,15 @@ impl Config {
         let o = v.as_object()?;
         let d = Config::default();
         let mut c = d.clone();
+        // ADR-47: files from before it lack both keys and read as Classic and System; so does
+        // a name this version does not know.
+        let name = |key: &str| o.get(key).and_then(Value::as_str);
+        c.ui_style = name("ui_style")
+            .and_then(UiStyle::from_key)
+            .unwrap_or(d.ui_style);
+        c.theme = name("theme")
+            .and_then(ThemeChoice::from_key)
+            .unwrap_or(d.theme);
         c.pixel_size = get_int(
             o,
             "pixel_size",
@@ -225,6 +240,8 @@ impl Config {
         };
         json!({
             "version": VERSION,
+            "ui_style": self.ui_style.key(),
+            "theme": self.theme.key(),
             "pixel_size": self.pixel_size,
             "prefs": prefs,
             "drawers": self.drawers,
@@ -273,6 +290,8 @@ impl Config {
             drawers.insert(DRAWER_PICTURE.to_owned(), d.clone());
         }
         Config {
+            ui_style: app.ui_style,
+            theme: app.theme,
             pixel_size: app.ui.pixel_size.0,
             prefs: app.ui.prefs,
             drawers,
@@ -295,6 +314,8 @@ impl Config {
     /// Puts the settings into a fresh app. A remembered drawer that no longer exists is
     /// dropped.
     pub fn apply(&self, app: &mut PainterApp) {
+        app.ui_style = self.ui_style;
+        app.theme = self.theme;
         app.ui.pixel_size = PixelSize(self.pixel_size);
         app.ui.prefs = self.prefs;
         app.last_drawer = self
@@ -442,6 +463,8 @@ mod tests {
 
     fn changed() -> Config {
         let mut c = Config {
+            ui_style: UiStyle::Modern,
+            theme: ThemeChoice::Light,
             pixel_size: 9,
             ..Config::default()
         };
@@ -510,6 +533,91 @@ mod tests {
         assert_eq!(ConfigStore::open(&d).1.import.colors, Some(256));
         std::fs::write(d.join(FILE), r#"{"import": {"colors": -3}}"#).unwrap();
         assert_eq!(ConfigStore::open(&d).1.import.colors, Some(2));
+    }
+
+    #[test]
+    fn skin_and_theme_round_trip_and_old_files_are_classic() {
+        // ADR-47. Every combination survives the file.
+        for ui_style in UiStyle::ALL {
+            for theme in ThemeChoice::ALL {
+                let d = dir("skin");
+                let c = Config {
+                    ui_style,
+                    theme,
+                    ..Config::default()
+                };
+                let v = c.to_json();
+                assert_eq!(v["ui_style"], ui_style.key());
+                assert_eq!(v["theme"], theme.key());
+                assert_eq!(Config::from_json(&v), Some(c.clone()));
+                // Through the file (the defaults are what a missing file gives, so they
+                // are not written).
+                let (mut store, _) = ConfigStore::open(&d);
+                store.flush(c.clone());
+                assert_eq!(d.join(FILE).exists(), c != Config::default());
+                assert_eq!(ConfigStore::open(&d).1, c);
+            }
+        }
+        // A first start and a file from before ADR-47: Classic, theme from the system.
+        assert_eq!(Config::default().ui_style, UiStyle::Classic);
+        assert_eq!(Config::default().theme, ThemeChoice::System);
+        let d = dir("skin-old");
+        std::fs::write(d.join(FILE), r#"{"version": 1, "pixel_size": 6}"#).unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert_eq!(
+            (c.ui_style, c.theme),
+            (UiStyle::Classic, ThemeChoice::System)
+        );
+        // Each key is read on its own.
+        std::fs::write(d.join(FILE), r#"{"ui_style": "modern"}"#).unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert_eq!(
+            (c.ui_style, c.theme),
+            (UiStyle::Modern, ThemeChoice::System)
+        );
+        std::fs::write(d.join(FILE), r#"{"theme": "dark"}"#).unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert_eq!((c.ui_style, c.theme), (UiStyle::Classic, ThemeChoice::Dark));
+        // Unknown names and wrong types fall back and do not break the file.
+        std::fs::write(
+            d.join(FILE),
+            r#"{"ui_style": "neon", "theme": 3, "pixel_size": 10}"#,
+        )
+        .unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert!(d.join(FILE).exists(), "readable file is not moved");
+        assert_eq!(
+            (c.ui_style, c.theme),
+            (UiStyle::Classic, ThemeChoice::System)
+        );
+        assert_eq!(c.pixel_size, 10);
+        std::fs::write(d.join(FILE), r#"{"ui_style": true, "theme": "LIGHT"}"#).unwrap();
+        let (_, c) = ConfigStore::open(&d);
+        assert_eq!(
+            (c.ui_style, c.theme),
+            (UiStyle::Classic, ThemeChoice::System)
+        );
+    }
+
+    #[test]
+    fn skin_and_theme_reach_the_app_and_come_back() {
+        let mut app = PainterApp::new();
+        assert_eq!(
+            (app.ui_style, app.theme),
+            (UiStyle::Classic, ThemeChoice::System),
+            "a fresh app is Classic"
+        );
+        let c = Config {
+            ui_style: UiStyle::Modern,
+            theme: ThemeChoice::Dark,
+            ..Config::default()
+        };
+        c.apply(&mut app);
+        assert_eq!(
+            (app.ui_style, app.theme),
+            (UiStyle::Modern, ThemeChoice::Dark)
+        );
+        assert_eq!(Config::capture(&app), c);
     }
 
     #[test]

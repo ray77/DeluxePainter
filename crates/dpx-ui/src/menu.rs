@@ -810,15 +810,17 @@ pub const IMPLEMENTED: &[&str] = &[
 ];
 
 impl Item {
-    fn action(&self) -> Option<Action> {
+    /// What the item does; `None` for an item that opens a submenu. Public for the Modern
+    /// skin's own menu drawing (ADR-47).
+    pub fn action(&self) -> Option<Action> {
         match self.entry {
             Entry::Action(a) => Some(a),
             Entry::Submenu(_) => None,
         }
     }
 
-    /// A submenu item is ghosted when all of its items are.
-    fn enabled(&self, ctx: &MenuContext) -> bool {
+    /// A submenu item is ghosted when all of its items are. Public like [`Self::action`].
+    pub fn enabled(&self, ctx: &MenuContext) -> bool {
         match self.entry {
             Entry::Action(a) => a.enabled(ctx),
             Entry::Submenu(items) => items.iter().any(|it| it.enabled(ctx)),

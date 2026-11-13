@@ -7,7 +7,7 @@
 //! The scenes avoid the Prefs menu, which ADR-47 makes two rows taller.
 
 use dpx_core::{Command, Shape};
-use dpx_ui::{Pref, Tool};
+use dpx_ui::{Pref, ThemeChoice, Tool, UiStyle};
 use eframe::egui;
 
 use crate::tests::ui_pass;
@@ -169,4 +169,39 @@ fn the_scenes_differ_and_the_hash_sees_one_pixel() {
     let after = pins(&app);
     assert_ne!(before.0, after.0);
     assert_ne!(before.1, after.1);
+}
+
+#[test]
+fn switching_to_modern_and_back_leaves_classic_alone() {
+    // Classic -> Modern -> Classic, with real `ui()` passes in between; then every scene
+    // still has its pinned look. The theme belongs to the Modern skin only.
+    let ctx = egui::Context::default();
+    for (name, mut app, _) in scenes() {
+        let before = pins(&app);
+        let (menu, requester) = (app.ui.menu, app.ui.page_size_requester.take());
+        app.ui.menu.close();
+        let coords = app.ui.coords;
+        for (i, (style, theme)) in [
+            (UiStyle::Modern, ThemeChoice::Light),
+            (UiStyle::Modern, ThemeChoice::Dark),
+            (UiStyle::Classic, ThemeChoice::Dark),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.ui_style = style;
+            app.theme = theme;
+            app.dirty = true;
+            ui_pass(&mut app, &ctx, 1.0 + i as f64, vec![]);
+        }
+        assert_eq!(app.ui_style, UiStyle::Classic);
+        app.ui.menu = menu;
+        app.ui.page_size_requester = requester;
+        app.ui.coords = coords;
+        assert_eq!(
+            pins(&app),
+            before,
+            "classic scene '{name}' after the round trip"
+        );
+    }
 }

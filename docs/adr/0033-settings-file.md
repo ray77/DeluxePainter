@@ -9,6 +9,7 @@
   - **Saving:** every frame the current settings are compared with what was last written; once they have stopped changing for 1 s they are written (temp file `settings.json.<pid>.tmp`, then rename), and again at quit (`on_exit`). A write error is a stderr note, never a crash or a retry every frame.
   - **Who reads it:** only the GUI start. `--snapshot`, `info`, `convert`, `mcp` and `--font-preview` return before it is opened; `--no-settings` skips it for the GUI. Tests use `ConfigStore::open(dir)` with their own temp directories.
   - **Start window:** sized from the saved pixel size (then ADR-13's snapping applies).
+- Update (ADR-47): two more top-level keys, still version 1: `ui_style` (`"classic"` or `"modern"`) and `theme` (`"system"`, `"dark"`, `"light"`). A file without them, or with a name this version does not know, reads as Classic and System.
 - Not done: full-screen state and window position are not saved; the file is loaded once (no live reload; two running instances overwrite each other, last writer wins).
 - Verified (tests, run twice): defaults without a file, round trip with every field, apply/capture agreement, broken file kept as `.bak`, unknown fields and bad values, debounce timing, unwritable directory.
 - Not verified: the GUI by hand across a restart; Windows and Linux paths.

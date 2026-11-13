@@ -116,7 +116,9 @@ fn magnify_light_table_and_show_page_show_the_composite() {
     // Magnify: the right half shows the page as it looks.
     app.tools.magnify = Some((15, 15));
     let view = app.view();
-    let m = app.magnify_layout(view).expect("magnify is on");
+    let m = app
+        .magnify_layout(view, app.toolbox_cover(view))
+        .expect("magnify is on");
     let screen = app.compose_screen();
     let at = |px: i32, py: i32| {
         let (sx, sy) = (
