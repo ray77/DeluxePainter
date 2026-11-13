@@ -1,6 +1,6 @@
 # ADR-47: Modern UI skin
 
-- Status: accepted (2026-11-13). Written from three design proposals and three code maps at HEAD f4d9512. Slice 0 (groundwork, no visible change) is implemented; the Modern skin itself is not built yet, so everything from "Frame in Modern mode" on describes the plan, not the program.
+- Status: accepted (2026-11-13). Written from three design proposals and three code maps at HEAD f4d9512. Slice 0 (groundwork, no visible change) and slice 1a (the renderer crate `dpx-ui-modern`, the bundled font and headless snapshots of bar, dock and picture) are implemented; the live window, menus, tooltips, the switch and the layer column are not built yet, so for them this ADR describes the plan, not the program.
 - Amends: ADR-3 (whole UI software-rendered into a low-res framebuffer), ADR-13 (the screen fills the window), ADR-33 (settings file: two new keys), and the first non-negotiable of `CLAUDE.md`.
 
 ## Context
@@ -33,6 +33,8 @@ The owner was not asked again about these visible points; each is a small, local
 5. In Modern, Cmd/Ctrl +, − and 0 and Prefs ▸ Pixel Size zoom the picture instead of resizing the window.
 6. Slice 1 shows one Amiga screen of the picture centred in the window (larger pictures scroll as today), and the Animation Control Panel stays in pixel look inside the picture quad until slice 2.
 7. The font is Go (Regular and Medium, BSD-3-Clause). Roboto is not used and nothing is downloaded for the skin.
+8. (Slice 1a.) The ink on the accent is dark (#1A1206) in both themes. The draft had white for the light theme, but white on #D66214 reaches only 3.7:1, below the 4.5:1 this ADR demands; the accent itself (decision 3) is kept.
+9. (Slice 1a.) Details of the dock: the built-in brushes sit in a 2 × 5 well (round 1, 3, 5, 7 over square 2, 3, 4, 5, the two scatter brushes in the last column); the Clear button shows the letters CLR drawn in our own strokes, as a nod to the DeluxePaint button; every palette swatch has a fine rim so that colours close to the panel's keep their shape; in a low window the palette cells shrink first (to 7 pt), then the tool buttons' height (to 22 pt).
 
 ## Options considered
 
@@ -65,7 +67,7 @@ Why A and not B: the project's working rule is that the screenshot the owner see
 - **New crate `crates/dpx-ui-modern`** (depends on `dpx-core`, `dpx-ui` for model types only, `tiny-skia`, `ab_glyph`; no egui):
   - `paint`: a display list `List` of `Op::{RoundRect, Line, Path, Text, Image, Clip}` in points (f32). The list is what layout code produces, what the per-region cache hashes, and what most tests assert on (it is bit-identical on every OS).
   - `raster`: `render(&List, scale) -> RGBA8` with tiny-skia; text through `ab_glyph` outlines and a glyph cache keyed by glyph id, pixel size and quarter-pixel bin. The same `font::measure` serves layout and raster.
-  - `theme`, `font`, `icons`, `layout` (`MainLayout`), `hit` (returns `dpx_ui::Hit`), `menu` (own geometry, writes `MenuState.menu/item/sub_item`), `build` (`title_bar`, `dock`, `layers`, `overlay` → `List`), `frame` (`render_window(..) -> RGBA8` for snapshots).
+  - `theme`, `font`, `icons`, `layout` (`MainLayout`), `hit` (returns `Spot`: `Ui(dpx_ui::Hit)` for the chrome, `Picture { x, y }` for a pixel of the picture quad's image, which the app maps to the page as in Classic, or `Canvas`), `menu` (own geometry, writes `MenuState.menu/item/sub_item`), `build` (`title_bar`, `dock`, `layers`, `overlay` → `List`), `frame` (`render_window(..) -> RGBA8` for snapshots).
 - **`dpx-ui`**: classic drawing, geometry and hit testing are not touched. Additions only: the model types `UiStyle` and `ThemeChoice` with their settings-file names (`skin.rs`), `pub` on `Item::action`/`Item::enabled` (`menu.rs`), `Action::UiStyle` and `Action::Theme(ThemeChoice)`, two `MenuContext` fields, two Prefs entries.
 - **App**: new `apps/deluxepainter/src/modern.rs` (frame branch, picture and region textures, modal hosting, snapshot branch); small branches in `main.rs` (`ui()`, `layout()`, `window_keys`, `dispatch_action`, the `--snapshot` flags), `config.rs` (two fields), `tools.rs` (`magnify_layout` gets a covered-width parameter: `toolbox_cover(view)` in Classic, 0 in Modern).
 - **Dependencies added as direct ones**: `tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }` (no png 0.17), `ab_glyph = "0.2.32"`. Both versions are the ones already in `Cargo.lock`; tiny-skia becomes part of the macOS and Windows builds (today it is Linux-only, transitive).
@@ -128,7 +130,8 @@ Fixed RGBA values, never picture-palette pens. The picture never changes with th
 | `text_dim` | #9A9FAA | #5E636E | idle menu titles, shortcuts |
 | `disabled` | #5C606A | #A4A8B1 | ghosted items and buttons |
 | `accent` | #FF8A1F | #D66214 | selection, menu hover, toggle rings |
-| `on_accent` | #1A1206 | #FFFFFF | ink on the accent |
+| `on_accent` | #1A1206 | #1A1206 | ink on the accent (lead decision 8) |
+| `hover` | #3D414A | #E3E6EC | a button under the pointer |
 | `scrim` | #000000 at 45 % | #14161C at 30 % | chrome under a modal |
 | `shadow` | #000000 at 40 % | #000000 at 18 % | menu cards, picture edge |
 
@@ -136,10 +139,10 @@ Fixed RGBA values, never picture-palette pens. The picture never changes with th
 
 ### Fonts and icons
 
-- **Font:** one bundled family in `assets/fonts/` with its licence text beside it, loaded with `include_bytes!`; no system fonts, so metrics are the same on every OS and in tests. The family is **Go** (Regular and Medium; BSD-3-Clause, Bigelow & Holmes), lead decision 7. The vendoring step (slice 1a) must read the licence string in each font file's name table before committing. Roboto 2 (Apache-2.0) was the draft's first proposal and is not used; Roboto from Google Fonts or `roboto-3-classic` is OFL and must never be used.
+- **Font:** one bundled family in `assets/fonts/` with its licence text beside it, loaded with `include_bytes!`; no system fonts, so metrics are the same on every OS and in tests. The family is **Go** (Regular and Medium; BSD-3-Clause, Bigelow & Holmes), lead decision 7. The vendoring step (slice 1a) read the licence record in each font file's name table (name ID 13): a BSD-3-Clause style text, identical in both files, shipped verbatim as `assets/fonts/LICENSE-Go.txt`; a unit test compares the two. Roboto 2 (Apache-2.0) was the draft's first proposal and is not used; Roboto from Google Fonts or `roboto-3-classic` is OFL and must never be used.
 - Sizes: 13.5 pt bar and menus, 12 pt panels and tooltips.
 - egui's bundled fonts stay unused, as today. Dropping eframe's `default_fonts` feature is a separate clean-up outside this ADR's slices (unverified on Linux and Windows).
-- **Icons:** own vector artwork as path data on a 24-unit grid in `dpx-ui-modern/src/icons.rs`, 1.75-unit round-capped strokes, filled variants for the filled halves; designed from each tool's meaning, never traced from the 9×9 bitmaps, the original program or the manuals. 18 tools, eye, six layer buttons, scroll chevrons, check mark, radio dot, submenu chevron, a key-cap glyph for Amiga-key shortcuts. Built-in brushes are discs and squares sized from the core brush dimensions.
+- **Icons:** own vector artwork as path data on a 24-unit grid in `dpx-ui-modern/src/icons.rs`, 1.75-unit round-capped strokes, filled variants for the filled halves; designed from each tool's meaning, never traced from the 9×9 bitmaps, the original program or the manuals. 18 tools (slice 1a); eye, six layer buttons, scroll chevrons, check mark, radio dot, submenu chevron and a key-cap glyph for Amiga-key shortcuts follow with the slices that draw them. Built-in brushes are discs, squares and dots sized from the brushes' real footprints. A split tool shows its outline with the lower-right half filled; when it is selected, only the chosen half of the button takes the accent.
 
 ### Runtime switch and settings
 
@@ -153,7 +156,7 @@ Fixed RGBA values, never picture-palette pens. The picture never changes with th
 
 ### Testing and snapshots
 
-- **Snapshot flags** on the existing `--snapshot` branch: `--ui modern`, `--theme dark|light` (default dark; never the machine's setting), `--size WxH` in points (default 1280x800), `--device-scale 1|2`. The modern branch builds `Document` and `UiState` from the existing flags (`--tool`, `--fg`, `--menu M:I:S`, `--hover`, `--layers-panel`), calls `dpx_ui_modern::frame::render_window` and the existing `write_png`. Without `--ui modern` nothing changes, so every classic screenshot regenerates identically. As in Classic, snapshots show no stroke preview and no Magnify split.
+- **Snapshot flags** on the existing `--snapshot` branch: `--ui modern`, `--theme dark|light` (default dark; never the machine's setting), `--size WxH` in points (default 1280x800), `--device-scale 1|2`. The modern branch builds `Document` and `UiState` from the existing flags, calls `dpx_ui_modern::frame::render_window` and the existing `write_png`. As of slice 1a it honours the document flags, `--tool`, `--fg` and `--pointer X,Y` (a resting pointer in window points, which shows the hover state; the classic `--hover` is in UI pixels and stays Classic's); `--menu`, tooltips and `--layers-panel` are not drawn by the Modern skin before slices 1c and 1d, and `--show-page` and `--requester` (full-screen views) are refused with `--ui modern`. The Modern flags without `--ui modern` are an error, not ignored. Without `--ui modern` nothing changes, so every classic screenshot regenerates identically. As in Classic, snapshots show no stroke preview and no Magnify split.
 - **Crate tests (no GPU, no egui):** list-level assertions (bit-identical everywhere): layout rectangles lie in the window and do not overlap at the minimum size; the centre of every tool, half, brush and palette rectangle hits the expected `Hit`; every `MENUS` item is reachable and sets the right `MenuState`; contrast of the theme tokens. Raster assertions as probes, not image hashes (tiny-skia's SIMD paths may differ by a level between architectures; not verified): palette swatch centres equal the palette colour, the selected tool's centre is the accent, the bar has the panel colour, text has ink inside its rectangle, the picture at factor N has exact N-pixel blocks.
 - **ui-loop tests:** `ui_pass_with(app, ctx, t, events, size, ppp, system_theme)` beside the untouched `ui_pass`; `modern_point(app, Region)` beside `ui_point`; `pick_modern` beside `pick`. Parity tests run the same key script and the same clicks in both skins and compare document and `UiState` (every tool button left and right, palette left and right, a menu pick by item id); the tooltip key-equals-click test runs in both skins; switch by F12 and by menu with a config round trip in a temp directory; system theme injected Dark and Light, fixed themes ignore it; a classic requester opened in Modern takes a click.
 - **Classic guard:** before any other change, `apps/deluxepainter/src/classic_pin_tests.rs` pins `compose_screen()` and `snapshot_rgba()` by hash for four fixed scenes (start, a painted page with the Mode menu held open, two layers with the layer panel and Magnify, a requester); it also runs after a Classic → Modern → Classic round trip through real `ui()` passes. The scenes avoid the Prefs menu, which decision 1 of the lead makes two rows taller.
@@ -167,10 +170,11 @@ Slice 1 of the owner's decision 3 is slices 1a–1d here. Each slice ends with t
 - Files: `docs/adr/0047-modern-ui-skin.md`, update notes in `docs/adr/0003-*.md` and `docs/adr/0033-*.md`, `CLAUDE.md` (the wording below; the owner asked for the skin); `apps/deluxepainter/src/classic_pin_tests.rs` (the pin test); `apps/deluxepainter/src/config.rs`; `apps/deluxepainter/src/main.rs` (two fields; only the settings file reads them yet); `apps/deluxepainter/src/tools.rs` (`magnify_layout` parameter and `toolbox_cover` only); `crates/dpx-ui/src/skin.rs` (the two model types) and `crates/dpx-ui/src/menu.rs` (the two `pub` accessors only).
 - Acceptance: the pin test is committed first and passes unchanged after the other commits; config round-trip tests cover both keys, a file without them gives Classic/System; no screenshot changes.
 
-**Slice 1a – renderer crate and first screenshots.**
+**Slice 1a – renderer crate and first screenshots (done).**
 - Files: `Cargo.toml` (workspace member, two dependencies), `crates/dpx-ui-modern/**`, `assets/fonts/**` (font files + licence text), `docs/research/dependencies.md` (rows for tiny-skia, ab_glyph, the font); `apps/deluxepainter/src/modern.rs` (snapshot function only) and the `--snapshot` flag parsing in `main.rs`.
 - Delegable in parallel with fixed file scope: `icons.rs` (18 tools + panel glyphs), `theme.rs`, `layout.rs` + `hit.rs`, `raster.rs` + `font.rs`.
 - Acceptance: `--snapshot --ui modern` writes bar, dock with own icons, palette and the nearest-scaled picture, dark and light, at 1x and 2x, in the Go font; crate tests as listed; `cargo tree` shows no new licence outside the list.
+- Result: `docs/design/screenshots/modern-{dark,light}-{1x,2x}.png` and `modern-dark-compact.png` (720×520). Not in this slice: the `menu` module, the layer column, the `overlay` list (menu cards, tooltips), the scrim under a requester and the per-region cache; the crate tests on menu reachability come with slice 1c.
 
 **Slice 1b – live window.**
 - Files: `apps/deluxepainter/src/modern.rs`, `main.rs` (`ui()` branch, `layout()` arm, `window_keys`, test helpers), `tools.rs` (callers of `magnify_layout`), `layers.rs` only if `layer_strip_px` needs a Modern guard.
@@ -220,7 +224,9 @@ Added to the licence line:
 ## Not verified
 
 - Only slice 0 was built and run in the repository (macOS; the gate of `CLAUDE.md`). Its pinned hashes were made on one Apple-silicon Mac; the classic renderer is integer code, but the values were not yet seen on the Windows and Linux runners. Line numbers in this ADR are from the code maps at HEAD f4d9512. The three prototypes are standalone projects with placeholder icons and stand-in fonts; of their PNGs none was inspected for this ADR.
-- The licence string inside the Go TTF files (only the README beside them was read); slice 1a reads the name tables before vendoring.
+- Where the Go font files came from: they were taken from the prototype's working copy, not downloaded again, and not compared with an upstream release. Their licence was read from the files themselves (slice 1a).
+- Slice 1a was built and run on one Apple-silicon Mac only. Of the committed classic screenshots, `phase1-lores-default.png` and `phase1-lores-gold16.png` were regenerated and are byte-identical; the others were not regenerated (their exact flags are not recorded), so classic identity rests on the pin test.
+- Rendering times of the production renderer (the 1.5 ms above is the prototype's).
 - Whether tiny-skia's output is bit-identical on the three CI platforms; timings on Windows, Linux, debug builds and 4K/5K windows.
 - Whether any requester positions itself relative to the classic toolbox or title bar in a way that the chrome-less compose shifts (Import has `under_import_requester`); to be checked per requester in slice 1d.
 - `RawInput.system_theme` at runtime on each OS; F12 availability on each OS.

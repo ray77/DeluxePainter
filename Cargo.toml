@@ -17,10 +17,15 @@ dpx-iff = { path = "crates/dpx-iff" }
 dpx-imagegen = { path = "crates/dpx-imagegen" }
 dpx-mcp = { path = "crates/dpx-mcp" }
 dpx-ui = { path = "crates/dpx-ui" }
+dpx-ui-modern = { path = "crates/dpx-ui-modern" }
+# Glyph outlines for the Modern skin (ADR-47).
+ab_glyph = "0.2.32"
 eframe = "0.37"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CPU rasteriser of the Modern skin (ADR-47); without its PNG support (png 0.17).
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 zune-jpeg = "0.5"
 

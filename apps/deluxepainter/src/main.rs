@@ -52,6 +52,12 @@
 //!                                       code-confirm, code-replace, code-missing,
 //!                                       desktop-missing or disconnect (ADR-43), generator
 //!                                       (OpenAI set up) or imagegen-setup (Set up..; ADR-45)
+//!     [--ui modern]                     the Modern skin's main window (ADR-47) instead: the
+//!                                       picture in a vector interface, with
+//!     [--theme dark|light]              … its colour scheme (default dark),
+//!     [--size WxH]                      … the window's size in points (default 1280x800),
+//!     [--device-scale 1|2]              … physical pixels per point (default 1) and
+//!     [--pointer X,Y]                   … a pointer resting at window point X,Y
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -89,6 +95,8 @@ mod layers;
 mod mcp;
 mod mcp_prefs;
 mod menu_actions;
+// The Modern skin's app side (ADR-47).
+mod modern;
 mod palette_stencil;
 mod perspective;
 mod recovery;
@@ -305,6 +313,19 @@ fn main() -> eframe::Result {
         let scale = arg_value(&args, "--scale")
             .and_then(|s| s.parse().ok())
             .unwrap_or(2);
+        // ADR-47: the Modern skin's main window instead of the classic screen.
+        let modern = modern::snapshot_options(&args).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        if modern.is_some()
+            && let Some(flag) = ["--show-page", "--requester"]
+                .into_iter()
+                .find(|f| args.iter().any(|a| a == f))
+        {
+            eprintln!("{flag} is a full-screen view the Modern skin does not host yet");
+            std::process::exit(2);
+        }
         let doc = match &opened {
             Some((_, doc, _, _)) => doc.clone(),
             None => {
@@ -654,7 +675,13 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
-        if let Err(e) = snapshot(path, scale, &doc, view, scroll, &ui, picked.is_some()) {
+        let written = match &modern {
+            Some(options) => {
+                modern::snapshot(path, options, &doc, view, scroll, &ui, picked.is_some())
+            }
+            None => snapshot(path, scale, &doc, view, scroll, &ui, picked.is_some()),
+        };
+        if let Err(e) = written {
             eprintln!("snapshot failed: {e}");
             std::process::exit(1);
         }

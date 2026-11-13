@@ -317,3 +317,45 @@ Rule: a package passes when its licence expression can be satisfied with MIT, Ap
 | zerovec-derive | 0.11.7 | Unicode-3.0 | as the ICU crates (a proc macro) | all |
 
 Notes: ADR-45's sentence "The only flagged crate in the graph is `unicode-ident`" holds for the graph of `dpx-imagegen` (whose own dependencies reach no other flagged package), not for the workspace; ADR-43's "No ISC-only crate was added" holds for what `dpx-mcp` added (it added Unicode-3.0 paths, but no package). This is the first scan over the whole graph. ISC, BSL-1.0, OFL-1.1, Ubuntu-font-1.0 and Unicode-3.0 are permissive licences but not on CLAUDE.md's list; they all come through `eframe` or through `url` (which `eframe` already used), except `unicode-ident` (Unicode-3.0), which every workspace crate reaches through `proc-macro2` (`serde_derive` and other proc macros; `dpx-core`, `dpx-formats`, `dpx-iff`, `dpx-ui` and `dpx-imagegen` reach it without `eframe` or `url`), and whether they are acceptable is the owner's call (no dependency was changed). `epaint_default_fonts` holds egui's built-in fonts; DeluxePainter draws its own bitmap font. The third-party notices for a binary release still have to be generated (`cargo about` or `cargo deny`, section 1).
+
+## 8. Modern skin: renderer crates and the bundled font (2026-11-13, ADR-47)
+
+Slice 1a of ADR-47 added the workspace crate `dpx-ui-modern` (the CPU-rendered Modern skin), two direct dependencies and one bundled font family. **No package was added to `Cargo.lock`**: both crates and everything they need were already in it as transitive dependencies of `eframe` (the lock's only change is the new workspace crate and its edges). What is new is that `tiny-skia` now builds on macOS and Windows too; before, only the Linux build reached it.
+
+| What | Version | Licence | Used by | Purpose | How the licence was checked |
+|---|---|---|---|---|---|
+| tiny-skia | 0.11.4, `default-features = false`, features `std`, `simd` (no `png-format`, so no `png` 0.17) | BSD-3-Clause | `dpx-ui-modern` | Anti-aliased fills, strokes and clip masks of the display list | `cargo tree` licence field; `Cargo.toml` in the local registry |
+| ab_glyph | 0.2.32 | Apache-2.0 | `dpx-ui-modern` | Glyph outlines, advances and kerning of the bundled font | as above |
+| Go Regular, Go Medium (`assets/fonts/Go-Regular.ttf`, `Go-Medium.ttf`) | 2.010 (name table) | BSD-3-Clause style ("Neither the name of Google Inc. …"), copyright 2016 Bigelow & Holmes Inc. | `dpx-ui-modern` (`include_bytes!`) | The Modern skin's only font; no system font is used | The licence record inside each TTF (name table, name ID 13) was read; it is identical in both files and is shipped verbatim as `assets/fonts/LICENSE-Go.txt`. A unit test (`font::tests::the_bundled_fonts_carry_the_licence_that_is_shipped_beside_them`) parses the name table of the bundled files and compares. |
+
+Font file checksums (SHA-256), as vendored:
+
+- `Go-Regular.ttf`: `197d9f3703b4c00af609178876a8d73e396f64fe438b2c871778566632374be3`
+- `Go-Medium.ttf`: `e687b22d748d54f9fa10dbae599d08ae31f0b305f8bea52fb2d3639c1565ae78`
+
+The files were not downloaded for this slice; they were taken from the working copy the ADR's feasibility prototype had used. Their origin was not re-traced to an upstream release; the licence statement above rests on the text stored in the files themselves.
+
+Normal (non-build, non-dev) dependency graph of `dpx-ui-modern`, from `cargo tree -p dpx-ui-modern -e normal --format "{p} | {l}"`:
+
+| Package | Version | Licence |
+|---|---|---|
+| ab_glyph | 0.2.32 | Apache-2.0 |
+| ab_glyph_rasterizer | 0.1.10 | Apache-2.0 |
+| owned_ttf_parser | 0.25.1 | Apache-2.0 |
+| ttf-parser | 0.25.1 | MIT OR Apache-2.0 |
+| tiny-skia | 0.11.4 | BSD-3-Clause |
+| tiny-skia-path | 0.11.4 | BSD-3-Clause |
+| arrayref | 0.3.9 | BSD-2-Clause |
+| arrayvec | 0.7.8 | MIT OR Apache-2.0 |
+| bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT |
+| strict-num | 0.1.1 | MIT |
+| cfg-if | 1.0.5 | MIT OR Apache-2.0 |
+| log | 0.4.35 | MIT OR Apache-2.0 |
+
+The rest of its graph comes through `dpx-core` (serde and its proc macros, among them `unicode-ident`, which section 7.3 already lists for every workspace crate). Nothing outside MIT, Apache-2.0, BSD and Zlib is new.
+
+Notes:
+
+- `tiny-skia` uses `unsafe` internally (SIMD); the workspace's `forbid(unsafe_code)` covers our crates only.
+- Not verified: whether `tiny-skia`'s anti-aliased output is bit-identical on the three CI platforms. The crate's raster tests therefore probe colours at chosen points (flat areas, pixel-aligned rectangles, the nearest-neighbour picture) instead of hashing images.
+- `egui`'s bundled fonts (`epaint_default_fonts`, section 7.3) are still in the graph and still unused.

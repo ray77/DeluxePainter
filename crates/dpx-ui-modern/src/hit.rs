@@ -1,0 +1,266 @@
+//! What lies under a point of the Modern main window. The chrome answers with the same
+//! [`Hit`] values as the Classic skin, so everything behind a click (`handle_press` and the
+//! tool, brush, palette and indicator actions) is shared; a point on the picture answers with
+//! the picture pixel, which the app maps to the page exactly as in Classic.
+
+use dpx_ui::Hit;
+use dpx_ui::toolbox::TOOL_ROWS;
+
+use crate::layout::MainLayout;
+use crate::paint::Rect;
+
+/// What a point of the window is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spot {
+    /// The chrome: the bar or a part of the dock.
+    Ui(Hit),
+    /// The picture quad, at pixel (`x`, `y`) of its image.
+    Picture { x: i32, y: i32 },
+    /// The canvas around the picture, or a point outside the window.
+    Canvas,
+}
+
+/// Whether a point at (`x`, `y`) of button `rect` is in the lower-right half, which selects
+/// the filled variant of a split tool. The button is divided from its upper-right to its
+/// lower-left corner.
+pub fn in_filled_half(rect: &Rect, x: f32, y: f32) -> bool {
+    (x - rect.x) / rect.w + (y - rect.y) / rect.h >= 1.0
+}
+
+/// What is under the window point (`x`, `y`).
+pub fn hit(layout: &MainLayout, x: f32, y: f32) -> Spot {
+    if !layout.window.contains(x, y) {
+        return Spot::Canvas;
+    }
+    if layout.bar.is_some_and(|bar| bar.contains(x, y)) {
+        return Spot::Ui(Hit::TitleBar);
+    }
+    if let Some(dock) = layout.dock.as_ref().filter(|d| d.rect.contains(x, y)) {
+        if let Some(i) = dock.tools.iter().position(|r| r.contains(x, y)) {
+            let tool = TOOL_ROWS[i / 2][i % 2];
+            return Spot::Ui(Hit::Tool {
+                tool,
+                filled_half: tool.is_split() && in_filled_half(&dock.tools[i], x, y),
+            });
+        }
+        if let Some(i) = dock.brushes.iter().position(|r| r.contains(x, y)) {
+            return Spot::Ui(Hit::Brush(i));
+        }
+        if dock.indicator.contains(x, y) {
+            return Spot::Ui(Hit::Indicator);
+        }
+        if let Some(i) = dock.cells.iter().position(|r| r.contains(x, y)) {
+            return Spot::Ui(Hit::PaletteCell(i as u8));
+        }
+        return Spot::Ui(Hit::ToolboxBackground);
+    }
+    if layout.viewport.contains(x, y) && layout.picture.contains(x, y) {
+        // In physical pixels, where the picture is an exact enlargement.
+        let px = ((x - layout.picture.x) * layout.scale).floor() as i64;
+        let py = ((y - layout.picture.y) * layout.scale).floor() as i64;
+        let zoom = i64::from(layout.zoom.max(1));
+        let (w, h) = layout.picture_size;
+        return Spot::Picture {
+            x: (px / zoom).clamp(0, i64::from(w) - 1) as i32,
+            y: (py / zoom).clamp(0, i64::from(h) - 1) as i32,
+        };
+    }
+    Spot::Canvas
+}
+
+/// The index of the menu whose title in the bar is under (`x`, `y`).
+pub fn menu_title(layout: &MainLayout, x: f32, y: f32) -> Option<usize> {
+    let bar = layout.bar?;
+    // The whole height of the bar belongs to a title: the pointer comes from below.
+    layout
+        .menu_titles
+        .iter()
+        .position(|r| bar.contains(x, y) && x >= r.x && x < r.right())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Chrome;
+    use dpx_ui::{PixelSize, Tool};
+
+    fn layout(window: (f32, f32), scale: f32, colours: usize) -> MainLayout {
+        MainLayout::new(
+            window,
+            scale,
+            Chrome::ALL,
+            colours,
+            (320, 256),
+            PixelSize::default(),
+        )
+    }
+
+    const CASES: [((f32, f32), f32, usize); 5] = [
+        ((1280.0, 800.0), 1.0, 32),
+        ((1280.0, 800.0), 2.0, 64),
+        ((720.0, 520.0), 1.0, 64),
+        ((1001.0, 640.0), 1.5, 16),
+        ((900.0, 600.0), 1.25, 2),
+    ];
+
+    #[test]
+    fn the_centre_of_every_tool_half_hits_that_tool() {
+        for (window, scale, colours) in CASES {
+            let l = layout(window, scale, colours);
+            let dock = l.dock.as_ref().expect("dock");
+            for (i, r) in dock.tools.iter().enumerate() {
+                let tool = TOOL_ROWS[i / 2][i % 2];
+                // A quarter in from the upper-left and from the lower-right corner.
+                let upper = (r.x + r.w * 0.25, r.y + r.h * 0.25);
+                let lower = (r.x + r.w * 0.75, r.y + r.h * 0.75);
+                assert_eq!(
+                    hit(&l, upper.0, upper.1),
+                    Spot::Ui(Hit::Tool {
+                        tool,
+                        filled_half: false
+                    }),
+                    "{tool:?} upper half, {window:?} at {scale}x"
+                );
+                assert_eq!(
+                    hit(&l, lower.0, lower.1),
+                    Spot::Ui(Hit::Tool {
+                        tool,
+                        filled_half: tool.is_split()
+                    }),
+                    "{tool:?} lower half, {window:?} at {scale}x"
+                );
+                assert_eq!(l.tool_button(tool), Some(*r));
+            }
+        }
+    }
+
+    #[test]
+    fn the_centre_of_every_brush_cell_and_palette_cell_hits_it() {
+        for (window, scale, colours) in CASES {
+            let l = layout(window, scale, colours);
+            let dock = l.dock.as_ref().expect("dock");
+            for (i, r) in dock.brushes.iter().enumerate() {
+                let (x, y) = r.center();
+                assert_eq!(
+                    hit(&l, x, y),
+                    Spot::Ui(Hit::Brush(i)),
+                    "{window:?} at {scale}x"
+                );
+            }
+            assert_eq!(dock.cells.len(), colours.min(64));
+            for (i, r) in dock.cells.iter().enumerate() {
+                let (x, y) = r.center();
+                assert_eq!(
+                    hit(&l, x, y),
+                    Spot::Ui(Hit::PaletteCell(i as u8)),
+                    "{window:?} at {scale}x with {colours} colours"
+                );
+            }
+            let (x, y) = dock.indicator.center();
+            assert_eq!(hit(&l, x, y), Spot::Ui(Hit::Indicator));
+        }
+    }
+
+    #[test]
+    fn bar_dock_gaps_canvas_and_outside() {
+        let l = layout((1280.0, 800.0), 1.0, 32);
+        let dock = l.dock.as_ref().expect("dock");
+        assert_eq!(hit(&l, 600.0, 15.0), Spot::Ui(Hit::TitleBar));
+        // The bar runs over the dock's column too.
+        assert_eq!(hit(&l, 1270.0, 15.0), Spot::Ui(Hit::TitleBar));
+        // Between the two tool columns, and in the dock's padding.
+        let gap = (dock.tools[0].right() + 3.0, dock.tools[0].y + 10.0);
+        assert_eq!(hit(&l, gap.0, gap.1), Spot::Ui(Hit::ToolboxBackground));
+        assert_eq!(hit(&l, 1190.0, 400.0), Spot::Ui(Hit::ToolboxBackground));
+        // Below the palette.
+        assert_eq!(hit(&l, 1230.0, 795.0), Spot::Ui(Hit::ToolboxBackground));
+        // Left of the picture: canvas.
+        assert_eq!(hit(&l, 50.0, 400.0), Spot::Canvas);
+        for (x, y) in [(-1.0, 10.0), (10.0, -1.0), (1280.0, 10.0), (10.0, 800.0)] {
+            assert_eq!(
+                hit(&l, x, y),
+                Spot::Canvas,
+                "({x}, {y}) is outside the window"
+            );
+        }
+    }
+
+    #[test]
+    fn a_point_on_the_picture_gives_its_pixel() {
+        for scale in [1.0, 2.0] {
+            let l = layout((1280.0, 800.0), scale, 32);
+            // 3 points per pixel at both scales.
+            let p = l.picture;
+            assert_eq!(hit(&l, p.x, p.y), Spot::Picture { x: 0, y: 0 });
+            assert_eq!(hit(&l, p.x + 2.9, p.y + 2.9), Spot::Picture { x: 0, y: 0 });
+            assert_eq!(hit(&l, p.x + 3.0, p.y + 6.0), Spot::Picture { x: 1, y: 2 });
+            assert_eq!(
+                hit(&l, p.right() - 0.1, p.bottom() - 0.1),
+                Spot::Picture { x: 319, y: 255 }
+            );
+            assert_eq!(hit(&l, p.right(), p.y + 5.0), Spot::Canvas);
+            let (cx, cy) = p.center();
+            assert_eq!(hit(&l, cx, cy), Spot::Picture { x: 160, y: 128 });
+        }
+    }
+
+    #[test]
+    fn hidden_chrome_takes_no_clicks() {
+        let l = MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome {
+                bar: false,
+                dock: false,
+            },
+            32,
+            (320, 256),
+            PixelSize::default(),
+        );
+        assert_eq!(hit(&l, 600.0, 2.0), Spot::Canvas);
+        assert!(matches!(hit(&l, 640.0, 400.0), Spot::Picture { .. }));
+        assert_eq!(menu_title(&l, 20.0, 10.0), None);
+    }
+
+    #[test]
+    fn the_split_follows_the_diagonal_of_a_button_that_is_not_square() {
+        let l = layout((720.0, 520.0), 1.0, 64);
+        let r = l.tool_button(Tool::Rectangle).expect("dock");
+        assert!(r.h < r.w, "the smallest window has low buttons");
+        // Just inside the upper-right and the lower-left corner: on the diagonal's two sides.
+        assert!(!in_filled_half(&r, r.x + 1.0, r.y + 1.0));
+        assert!(in_filled_half(&r, r.right() - 1.0, r.bottom() - 1.0));
+        assert!(!in_filled_half(
+            &r,
+            r.x + r.w * 0.5 - 1.0,
+            r.y + r.h * 0.5 - 1.0
+        ));
+        assert!(in_filled_half(
+            &r,
+            r.x + r.w * 0.5 + 1.0,
+            r.y + r.h * 0.5 + 1.0
+        ));
+    }
+
+    #[test]
+    fn each_menu_title_answers_over_the_whole_bar_height() {
+        let l = layout((1280.0, 800.0), 1.0, 32);
+        for (i, r) in l.menu_titles.iter().enumerate() {
+            let (cx, _) = r.center();
+            for y in [0.0, 15.0, 29.0] {
+                assert_eq!(
+                    menu_title(&l, cx, y),
+                    Some(i),
+                    "{}",
+                    dpx_ui::menu::MENUS[i].title
+                );
+            }
+            assert_eq!(menu_title(&l, cx, 31.0), None, "below the bar");
+        }
+        assert_eq!(
+            menu_title(&l, l.status_x() + 5.0, 15.0),
+            None,
+            "on the status text"
+        );
+    }
+}

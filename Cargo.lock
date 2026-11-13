@@ -970,6 +970,7 @@ dependencies = [
  "dpx-imagegen",
  "dpx-mcp",
  "dpx-ui",
+ "dpx-ui-modern",
  "eframe",
  "png",
  "serde_json",
@@ -1129,6 +1130,16 @@ name = "dpx-ui"
 version = "0.1.0"
 dependencies = [
  "dpx-core",
+]
+
+[[package]]
+name = "dpx-ui-modern"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "dpx-core",
+ "dpx-ui",
+ "tiny-skia",
 ]
 
 [[package]]

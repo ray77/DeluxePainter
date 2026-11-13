@@ -1,0 +1,18 @@
+[package]
+name = "dpx-ui-modern"
+description = "DeluxePainter Modern skin: a resolution-independent vector UI rendered on the CPU (ADR-47)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ab_glyph.workspace = true
+dpx-core.workspace = true
+dpx-ui.workspace = true
+tiny-skia.workspace = true
+
+[lints]
+workspace = true
