@@ -170,6 +170,35 @@ impl Renderer {
         scale: f32,
         background: Color,
     ) -> Vec<u8> {
+        self.draw(list, images, origin, width, height, scale, Some(background))
+    }
+
+    /// Renders the part of `list` that starts at the physical pixel `origin` of the window
+    /// over nothing: where the list draws nothing the image stays transparent. Returns RGBA8
+    /// with premultiplied alpha, for what lies over the window's regions (menu cards and
+    /// tooltips with their soft shadows).
+    pub fn render_overlay(
+        &mut self,
+        list: &List,
+        origin: (i32, i32),
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> Vec<u8> {
+        self.draw(list, &[], origin, width, height, scale, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &mut self,
+        list: &List,
+        images: &[Image<'_>],
+        origin: (i32, i32),
+        width: u32,
+        height: u32,
+        scale: f32,
+        background: Option<Color>,
+    ) -> Vec<u8> {
         let at = Place {
             scale,
             ox: origin.0 as f32,
@@ -178,10 +207,12 @@ impl Renderer {
         let Some(mut pixmap) = Pixmap::new(width, height) else {
             return Vec::new();
         };
-        pixmap.fill(sk_color(Color {
-            a: 255,
-            ..background
-        }));
+        if let Some(background) = background {
+            pixmap.fill(sk_color(Color {
+                a: 255,
+                ..background
+            }));
+        }
         let identity = Transform::identity();
         let mut clip: Option<Mask> = None;
         for op in list.ops() {
@@ -258,7 +289,8 @@ impl Renderer {
                 }
             }
         }
-        // Everything is drawn over an opaque background, so premultiplied equals straight.
+        // Over an opaque background premultiplied equals straight; without a background the
+        // bytes are premultiplied.
         pixmap.take()
     }
 
@@ -667,5 +699,49 @@ mod tests {
         assert_eq!(pixel(&out, 6, 1, 1), Color::rgb(255, 255, 255));
         assert_eq!(pixel(&out, 6, 2, 2), BG);
         assert_eq!(pixel(&out, 6, 3, 3), BG, "the short picture drew nothing");
+    }
+
+    /// An overlay is transparent where its list draws nothing, opaque and exact on flat
+    /// surfaces, and premultiplied in between (a soft shadow), so it can lie over the
+    /// regions of the window.
+    #[test]
+    fn an_overlay_is_transparent_around_what_it_draws() {
+        let card = Color::hex(0x30333A);
+        let shadow = Color::hex(0x000000).with_opacity(40);
+        let mut list = List::new();
+        list.round_rect(Rect::new(104.0, 204.0, 32.0, 24.0), 6.0, shadow);
+        list.rect(Rect::new(110.0, 210.0, 20.0, 12.0), card);
+        list.text(
+            112.0,
+            219.0,
+            "Hi",
+            9.0,
+            Weight::Regular,
+            Color::rgb(255, 255, 255),
+        );
+        // The region starts at the window's pixel (200, 400) at 2 pixels per point.
+        let out = Renderer::new().render_overlay(&list, (200, 400), 80, 64, 2.0);
+        assert_eq!(out.len(), 80 * 64 * 4);
+        let at = |x: u32, y: u32| pixel(&out, 80, x, y);
+        assert_eq!(at(0, 0).a, 0, "nothing drawn: transparent");
+        assert_eq!(at(79, 63).a, 0);
+        // The card: opaque, exact.
+        assert_eq!(at(22, 22), card);
+        assert_eq!(at(58, 42), card);
+        // The shadow beside it: its own opacity, colour premultiplied.
+        let s = at(12, 30);
+        assert_eq!((s.r, s.g, s.b), (0, 0, 0));
+        assert!((100..=104).contains(&s.a), "{s:?}");
+        // Text on the card keeps the image opaque there and leaves ink.
+        let ink = (24..40)
+            .flat_map(|x| (22..40).map(move |y| (x, y)))
+            .filter(|&(x, y)| at(x, y) != card)
+            .inspect(|&(x, y)| assert_eq!(at(x, y).a, 255))
+            .count();
+        assert!(ink > 10, "{ink} ink pixels");
+        // The same list over a background is the same card.
+        let over = Renderer::new().render_region(&list, &[], (200, 400), 80, 64, 2.0, BG);
+        assert_eq!(pixel(&over, 80, 22, 22), card);
+        assert_eq!(pixel(&over, 80, 0, 0), BG);
     }
 }

@@ -290,8 +290,8 @@ impl Config {
             drawers.insert(DRAWER_PICTURE.to_owned(), d.clone());
         }
         Config {
-            ui_style: app.ui_style,
-            theme: app.theme,
+            ui_style: app.ui.ui_style,
+            theme: app.ui.theme,
             pixel_size: app.ui.pixel_size.0,
             prefs: app.ui.prefs,
             drawers,
@@ -314,8 +314,8 @@ impl Config {
     /// Puts the settings into a fresh app. A remembered drawer that no longer exists is
     /// dropped.
     pub fn apply(&self, app: &mut PainterApp) {
-        app.ui_style = self.ui_style;
-        app.theme = self.theme;
+        app.ui.ui_style = self.ui_style;
+        app.ui.theme = self.theme;
         app.ui.pixel_size = PixelSize(self.pixel_size);
         app.ui.prefs = self.prefs;
         app.last_drawer = self
@@ -603,7 +603,7 @@ mod tests {
     fn skin_and_theme_reach_the_app_and_come_back() {
         let mut app = PainterApp::new();
         assert_eq!(
-            (app.ui_style, app.theme),
+            (app.ui.ui_style, app.ui.theme),
             (UiStyle::Classic, ThemeChoice::System),
             "a fresh app is Classic"
         );
@@ -614,7 +614,7 @@ mod tests {
         };
         c.apply(&mut app);
         assert_eq!(
-            (app.ui_style, app.theme),
+            (app.ui.ui_style, app.ui.theme),
             (UiStyle::Modern, ThemeChoice::Dark)
         );
         assert_eq!(Config::capture(&app), c);

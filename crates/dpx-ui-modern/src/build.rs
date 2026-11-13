@@ -1,15 +1,17 @@
 //! Builds the display lists of the Modern main window from the shared interface state
-//! (ADR-47): the canvas with the picture, the bar and the dock. What the lists show is the
+//! (ADR-47): the canvas with the picture, the bar, the dock and what lies over them (the
+//! menu that is held open, a tooltip). What the lists show is the
 //! same state the Classic skin draws; only the look differs.
 
 use dpx_core::Palette;
 use dpx_ui::screen::APP_TITLE;
 use dpx_ui::toolbox::TOOL_ROWS;
-use dpx_ui::{Hit, Pref, Tool, UiState};
+use dpx_ui::{Hit, Pref, Tool, Tooltip, TooltipTarget, UiState};
 
 use crate::font;
 use crate::icons::{self, Ink};
 use crate::layout::{Dock, MainLayout};
+use crate::menu::{self, TitleLook};
 use crate::paint::{Color, List, Path, Rect, Weight};
 use crate::theme::Theme;
 
@@ -74,12 +76,120 @@ fn rgb(palette: &Palette, index: u8) -> Color {
         .map_or(Color::rgb(0, 0, 0), |c| Color::rgb(c.r, c.g, c.b))
 }
 
-/// The whole window: canvas and picture, dock, bar.
+/// The whole window: canvas and picture, dock, bar, and over them the open menu or the
+/// tooltip.
 pub fn window(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List {
     let mut list = canvas(layout, theme);
     list.append(dock(layout, theme, model));
     list.append(title_bar(layout, theme, model));
+    if let Some((_, over)) = overlay(layout, theme, model) {
+        list.append(over);
+    }
     list
+}
+
+/// What lies over bar, dock and picture: the cards of the menu that is held open, or the
+/// tooltip of the dock button the pointer rests on. With the rectangle the drawing covers
+/// (shadows included, cut to the window); `None` when there is nothing to show.
+pub fn overlay(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> Option<(Rect, List)> {
+    let ui = model.ui;
+    let mut list = List::new();
+    let bounds = if ui.menu.active {
+        menu::draw(&mut list, layout, theme, &ui.menu_context(), &ui.menu)
+    } else {
+        ui.tooltip
+            .as_ref()
+            .and_then(|tip| tooltip(&mut list, layout, theme, tip))
+    }?;
+    // Whole physical pixels, inside the window.
+    let scale = layout.scale;
+    let (x0, y0) = (
+        ((bounds.x * scale).floor() / scale).max(0.0),
+        ((bounds.y * scale).floor() / scale).max(0.0),
+    );
+    let (x1, y1) = (
+        ((bounds.right() * scale).ceil() / scale).min(layout.window.right()),
+        ((bounds.bottom() * scale).ceil() / scale).min(layout.window.bottom()),
+    );
+    (x1 > x0 && y1 > y0).then(|| (Rect::new(x0, y0, x1 - x0, y1 - y0), list))
+}
+
+/// Height of a tooltip and the space it keeps to the dock.
+const TIP_H: f32 = 28.0;
+const TIP_GAP: f32 = 8.0;
+/// Free space left and right of a tooltip's content, and between name and key.
+const TIP_PAD: f32 = 10.0;
+const TIP_KEY_GAP: f32 = 9.0;
+
+/// The rectangle of the tooltip of a dock button: left of the dock, centred on the button,
+/// inside the window. `None` for a target the Modern skin does not draw itself (the
+/// Animation Control Panel and the layer panel are still shown in the Classic look, with
+/// their Classic tooltips) and while the dock is hidden.
+pub fn tooltip_rect(layout: &MainLayout, tip: &Tooltip) -> Option<Rect> {
+    let TooltipTarget::Tool { tool, .. } = tip.target else {
+        return None;
+    };
+    let button = layout.tool_button(tool)?;
+    let dock = layout.dock.as_ref()?;
+    let (name, key) = tooltip_parts(tip);
+    let size = font::SIZE_PANEL;
+    let mut w = 2.0 * TIP_PAD + font::measure(name, size, Weight::Regular);
+    if let Some(key) = key {
+        w += TIP_KEY_GAP + key_chip_width(key);
+    }
+    let snap = |v: f32| (v * layout.scale).round() / layout.scale;
+    let w = snap(w.ceil());
+    let x = (dock.rect.x - TIP_GAP - w).max(0.0);
+    let y = (button.center().1 - TIP_H / 2.0)
+        .min(layout.window.bottom() - TIP_H - 4.0)
+        .max(layout.bar.map_or(4.0, |b| b.bottom() + 4.0));
+    Some(Rect::new(snap(x), snap(y), w, snap(TIP_H)))
+}
+
+/// The name a tooltip shows and, when the key does the button's job now, its key.
+fn tooltip_parts(tip: &Tooltip) -> (&'static str, Option<&'static str>) {
+    (
+        tip.target.name(),
+        tip.target.key().filter(|k| tip.keys.keeps(k)),
+    )
+}
+
+fn key_chip_width(key: &str) -> f32 {
+    (font::measure(key, font::SIZE_PANEL, Weight::Medium) + 10.0).max(18.0)
+}
+
+/// Draws the tooltip of a dock button: its name and, on a chip, its key. Returns the
+/// rectangle the drawing covers.
+fn tooltip(list: &mut List, layout: &MainLayout, theme: &Theme, tip: &Tooltip) -> Option<Rect> {
+    let rect = tooltip_rect(layout, tip)?;
+    let (name, key) = tooltip_parts(tip);
+    menu::card_ground(list, theme, rect, RADIUS);
+    let size = font::SIZE_PANEL;
+    let mid = rect.y + rect.h / 2.0;
+    list.text(
+        rect.x + TIP_PAD,
+        font::baseline_centered(mid, size, Weight::Regular),
+        name,
+        size,
+        Weight::Regular,
+        theme.text,
+    );
+    if let Some(key) = key {
+        let w = key_chip_width(key);
+        let chip = Rect::new(rect.right() - TIP_PAD - w, mid - 9.0, w, 18.0);
+        list.round_rect(chip, RADIUS_SMALL, theme.panel);
+        list.ring(chip, RADIUS_SMALL, theme.hairline, 1.0);
+        let text_w = font::measure(key, size, Weight::Medium);
+        list.text(
+            chip.x + (chip.w - text_w) / 2.0,
+            font::baseline_centered(mid, size, Weight::Medium),
+            key,
+            size,
+            Weight::Medium,
+            theme.text_dim,
+        );
+    }
+    Some(rect.inset(-menu::SHADOW_REACH))
 }
 
 /// The picture viewport: canvas colour, a soft shadow around the picture and the picture
@@ -125,15 +235,30 @@ pub fn title_bar(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List 
     let base = font::baseline_centered(mid, size, Weight::Regular);
 
     // Menu titles: always visible, subdued; the pull-downs open while the right button is
-    // held, as in DeluxePaint.
-    for (rect, menu) in layout.menu_titles.iter().zip(dpx_ui::menu::MENUS.iter()) {
+    // held, as in DeluxePaint. Then the titles are readable and the open one is marked.
+    let menu_ctx = ui.menu_context();
+    for (i, (rect, entry)) in layout
+        .menu_titles
+        .iter()
+        .zip(dpx_ui::menu::MENUS.iter())
+        .enumerate()
+    {
+        let ink = match menu::title_look(&menu_ctx, &ui.menu, i) {
+            TitleLook::Idle => theme.text_dim,
+            TitleLook::Ready => theme.text,
+            TitleLook::Ghosted => theme.disabled,
+            TitleLook::Open => {
+                list.round_rect(*rect, RADIUS_SMALL, theme.accent);
+                theme.on_accent
+            }
+        };
         list.text(
             rect.x + crate::layout::TITLE_PAD,
             base,
-            menu.title,
+            entry.title,
             size,
             Weight::Regular,
-            theme.text_dim,
+            ink,
         );
     }
     let mut x = layout.status_x();
@@ -739,5 +864,119 @@ mod tests {
             })
             .collect();
         assert_eq!(images, [(l.picture, PICTURE_IMAGE)]);
+    }
+
+    #[test]
+    fn the_held_menu_marks_its_title_and_makes_the_others_readable() {
+        let (l, theme, palette) = (layout(), Theme::dark(), Palette::dpaint_default_32());
+        let mut ui = UiState::default();
+        let (x, y) = l.menu_titles[2].center();
+        menu::open(&l, &mut ui.menu, x, y);
+        let list = title_bar(&l, &theme, &Model::new(&ui, &palette));
+        let texts = texts(&list);
+        assert_eq!(texts[2].0, "Mode");
+        assert_eq!(texts[2].2, theme.on_accent);
+        assert_eq!(fills(&list, theme.accent), [l.menu_titles[2]]);
+        for i in [0, 1, 3, 4, 5, 6] {
+            assert_eq!(texts[i].2, theme.text, "{}", texts[i].0);
+        }
+        // The status keeps its place and its look.
+        assert_eq!(
+            (texts[7].0.as_str(), texts[7].1),
+            ("DeluxePainter", l.status_x())
+        );
+    }
+
+    #[test]
+    fn the_overlay_is_the_held_menu_or_the_tooltip_with_its_bounds() {
+        use dpx_ui::{KeyMode, Tooltip, TooltipTarget};
+        let (l, theme, palette) = (layout(), Theme::light(), Palette::dpaint_default_32());
+        let mut ui = UiState::default();
+        assert!(overlay(&l, &theme, &Model::new(&ui, &palette)).is_none());
+        // The whole window has nothing more than its parts then.
+        let model = Model::new(&ui, &palette);
+        assert_eq!(
+            window(&l, &theme, &model).len(),
+            canvas(&l, &theme).len()
+                + dock(&l, &theme, &model).len()
+                + title_bar(&l, &theme, &model).len()
+        );
+
+        // A tooltip: name and key beside the dock, level with its button.
+        let target = TooltipTarget::Tool {
+            tool: Tool::Curve,
+            filled: false,
+        };
+        ui.tooltip = Some(Tooltip::new(target, KeyMode::Paint));
+        let tip = ui.tooltip.clone().expect("set");
+        let rect = tooltip_rect(&l, &tip).expect("the dock is shown");
+        let dock_rect = l.dock.as_ref().expect("dock").rect;
+        let button = l.tool_button(Tool::Curve).expect("button");
+        assert!(rect.right() <= dock_rect.x - 4.0 && rect.x >= 0.0);
+        assert!((rect.center().1 - button.center().1).abs() <= 1.0);
+        let (bounds, list) = overlay(&l, &theme, &Model::new(&ui, &palette)).expect("overlay");
+        assert!(bounds.encloses(&rect) && l.window.encloses(&bounds));
+        let shown: Vec<String> = texts(&list).into_iter().map(|t| t.0).collect();
+        assert_eq!(shown, ["Curve", "q"]);
+        for (text, x, _) in texts(&list) {
+            assert!(x >= rect.x && x < rect.right(), "{text}");
+        }
+        // While text is typed the key would type: only the name, in a narrower card.
+        ui.tooltip = Some(Tooltip::new(target, KeyMode::Typing));
+        let typing = ui.tooltip.clone().expect("set");
+        assert!(tooltip_rect(&l, &typing).expect("rect").w < rect.w);
+        let (_, list) = overlay(&l, &theme, &Model::new(&ui, &palette)).expect("overlay");
+        assert_eq!(texts(&list).len(), 1);
+        // The last tool row in a low window: the card stays inside the window.
+        let low = MainLayout::new(
+            crate::layout::MIN_WINDOW,
+            1.5,
+            Chrome::ALL,
+            64,
+            (320, 256),
+            PixelSize::default(),
+        );
+        for tool in [Tool::Undo, Tool::Clear, Tool::DottedFreehand] {
+            let tip = Tooltip::new(
+                TooltipTarget::Tool {
+                    tool,
+                    filled: false,
+                },
+                KeyMode::Paint,
+            );
+            let r = tooltip_rect(&low, &tip).expect("rect");
+            assert!(low.window.encloses(&r), "{tool:?}: {r:?}");
+            assert!(r.y >= low.bar.expect("bar").bottom());
+        }
+        // Without the dock (F10) and for a target the Classic look still draws: nothing.
+        let bare = MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome {
+                bar: true,
+                dock: false,
+            },
+            32,
+            (320, 256),
+            PixelSize::default(),
+        );
+        assert!(tooltip_rect(&bare, &tip).is_none());
+        let panel = Tooltip::new(
+            TooltipTarget::Panel(dpx_ui::PanelButton::First),
+            KeyMode::Paint,
+        );
+        assert!(tooltip_rect(&l, &panel).is_none());
+
+        // The held menu takes the overlay; a tooltip is not drawn under it.
+        let (x, y) = l.menu_titles[0].center();
+        menu::open(&l, &mut ui.menu, x, y);
+        let (bounds, list) = overlay(&l, &theme, &Model::new(&ui, &palette)).expect("overlay");
+        let card = menu::menu_card(&l, 0).expect("card");
+        assert!(bounds.encloses(&card.rect));
+        let shown: Vec<String> = texts(&list).into_iter().map(|t| t.0).collect();
+        assert!(shown.contains(&"Load..".to_string()) && !shown.contains(&"Curve".to_string()));
+        // The window's list ends with it.
+        let all = window(&l, &theme, &Model::new(&ui, &palette));
+        assert_eq!(all.ops()[all.len() - list.len()..], *list.ops());
     }
 }

@@ -16,6 +16,7 @@ use crate::bitmap::{self, Bitmap};
 use crate::font::{Font, glyph};
 use crate::pens::Pens;
 use crate::screen::PaintMode;
+use crate::skin::{ThemeChoice, UiStyle};
 
 /// LoRes menu geometry (screen pixels).
 pub mod geom {
@@ -179,6 +180,11 @@ pub enum Action {
     Pref(Pref),
     /// Prefs ▸ Pixel Size: choose the interface pixel size (radio check mark).
     PixelSize(PixelSize),
+    /// Prefs ▸ Modern UI: switch between the Classic and the Modern skin (check mark while
+    /// the Modern skin is shown; ADR-47).
+    UiStyle,
+    /// Prefs ▸ Theme: choose the Modern skin's colour scheme (radio check mark; ADR-47).
+    Theme(ThemeChoice),
 }
 
 /// Shortcut shown at the right of an item.
@@ -263,6 +269,14 @@ const fn pixel_size(label: &'static str, key: Key, p: PixelSize) -> Item {
         label,
         key,
         entry: Entry::Action(Action::PixelSize(p)),
+    }
+}
+
+const fn theme(label: &'static str, t: ThemeChoice) -> Item {
+    Item {
+        label,
+        key: Key::None,
+        entry: Entry::Action(Action::Theme(t)),
     }
 }
 
@@ -562,8 +576,23 @@ pub static MENUS: [Menu; 7] = [
             pref("FastAdjust", Pref::FastAdjust),
             // ADR-44: the layer panel (DeluxePainter addition).
             pref_key("Layers", plain("L"), Pref::LayerPanel),
-            // ADR-43: a DeluxePainter addition; Pixel Size stays the last item.
+            // ADR-43: a DeluxePainter addition.
             cmd("AI & MCP..", "app.ai_mcp"),
+            // ADR-47: the skin and the Modern skin's colour scheme (DeluxePainter additions);
+            // Pixel Size stays the last item.
+            Item {
+                label: "Modern UI",
+                key: plain("F12"),
+                entry: Entry::Action(Action::UiStyle),
+            },
+            sub(
+                "Theme",
+                &[
+                    theme("System", ThemeChoice::System),
+                    theme("Dark", ThemeChoice::Dark),
+                    theme("Light", ThemeChoice::Light),
+                ],
+            ),
             sub(
                 "Pixel Size",
                 &[
@@ -610,6 +639,10 @@ pub struct MenuContext {
     pub spare_brush: bool,
     /// Anim ▸ Method ▸ Expanded is chosen (else Compressed; ADR-38).
     pub anim_expanded: bool,
+    /// The skin shown (Prefs ▸ Modern UI is checked in the Modern one; ADR-47).
+    pub ui_style: UiStyle,
+    /// Prefs ▸ Theme (its items are ghosted in the Classic skin, which has no theme).
+    pub theme: ThemeChoice,
 }
 
 impl Action {
@@ -619,6 +652,8 @@ impl Action {
             Action::Mode(m) => Some(ctx.mode == m),
             Action::Pref(p) => Some(ctx.prefs.get(p)),
             Action::PixelSize(p) => Some(ctx.pixel_size == p),
+            Action::UiStyle => Some(ctx.ui_style == UiStyle::Modern),
+            Action::Theme(t) => Some(ctx.theme == t),
             // Anim ▸ Method: a radio pair (ADR-38).
             Action::Command("anim.method_compressed") => Some(!ctx.anim_expanded),
             Action::Command("anim.method_expanded") => Some(ctx.anim_expanded),
@@ -627,10 +662,11 @@ impl Action {
     }
 
     /// Commands not in [`IMPLEMENTED`] are ghosted; Mode, Prefs and Pixel Size items always
-    /// work (HBrite only on EHB screens).
+    /// work (HBrite only on EHB screens, a theme only in the Modern skin).
     pub fn enabled(self, ctx: &MenuContext) -> bool {
         match self {
             Action::Mode(PaintMode::HBrite) => ctx.ehb,
+            Action::Theme(_) => ctx.ui_style == UiStyle::Modern,
             Action::Command(id) => {
                 IMPLEMENTED.contains(&id)
                     && (id != "color.recompute" || ctx.ham)
@@ -903,7 +939,14 @@ impl BoxLayout {
         let font = Font::builtin();
         let checks = items.iter().any(|it| {
             it.action().is_some_and(|a| {
-                matches!(a, Action::Mode(_) | Action::Pref(_) | Action::PixelSize(_))
+                matches!(
+                    a,
+                    Action::Mode(_)
+                        | Action::Pref(_)
+                        | Action::PixelSize(_)
+                        | Action::UiStyle
+                        | Action::Theme(_)
+                )
             })
         });
         let text_dx = geom::TEXT_DX + if checks { geom::CHECK_W } else { 0 };
@@ -1226,6 +1269,8 @@ mod tests {
             anim_brush: false,
             spare_brush: false,
             anim_expanded: false,
+            ui_style: UiStyle::Classic,
+            theme: ThemeChoice::System,
         }
     }
 
@@ -1248,7 +1293,8 @@ mod tests {
     }
 
     /// Every menu and submenu lies on the screen, also on the smallest UI screen, NTSC's
-    /// 320x200 (wave-8 integration: Prefs holds Layers and AI & MCP.. besides Pixel Size).
+    /// 320x200 (wave-8 integration: Prefs holds Layers and AI & MCP.. besides Pixel Size;
+    /// ADR-47 adds Modern UI and Theme before Pixel Size).
     #[test]
     fn boxes_stay_on_screen() {
         for (sw, sh) in [(320, 256), (320, 200)] {
@@ -1273,15 +1319,15 @@ mod tests {
                 }
             }
         }
-        // The Prefs menu with both additions, and the room it leaves on 320x200.
+        // The Prefs menu with its additions, and the room it leaves on 320x200.
         let prefs = MENUS.len() - 1;
         let labels: Vec<&str> = MENUS[prefs].items.iter().map(|i| i.label).collect();
         assert_eq!(
-            labels[labels.len() - 3..],
-            ["Layers", "AI & MCP..", "Pixel Size"]
+            labels[labels.len() - 5..],
+            ["Layers", "AI & MCP..", "Modern UI", "Theme", "Pixel Size"]
         );
         let b = menu_box(prefs, 320, 200);
-        assert_eq!((b.y, b.h, b.items), (geom::BOX_TOP, 148, 14));
+        assert_eq!((b.y, b.h, b.items), (geom::BOX_TOP, 168, 16));
     }
 
     #[test]
@@ -1317,11 +1363,55 @@ mod tests {
         assert_eq!(st.hovered_action(&ctx()), None);
     }
 
+    /// ADR-47: Prefs ▸ Modern UI is a check item for the Modern skin and Prefs ▸ Theme a radio
+    /// group of the three choices, ghosted in the Classic skin (it has no theme).
     #[test]
-    fn ai_and_mcp_comes_right_before_pixel_size() {
+    fn modern_ui_and_theme_come_before_pixel_size() {
+        let items = MENUS.last().unwrap().items;
+        let modern = &items[items.len() - 3];
+        assert_eq!((modern.label, modern.key), ("Modern UI", Key::Plain("F12")));
+        assert_eq!(modern.action(), Some(Action::UiStyle));
+        let Entry::Submenu(themes) = items[items.len() - 2].entry else {
+            panic!("Theme is a submenu");
+        };
+        assert_eq!(items[items.len() - 2].label, "Theme");
+        let labels: Vec<_> = themes.iter().map(|i| i.label).collect();
+        assert_eq!(labels, ["System", "Dark", "Light"]);
+        for (item, choice) in themes.iter().zip(ThemeChoice::ALL) {
+            assert_eq!(item.action(), Some(Action::Theme(choice)));
+        }
+        let classic = ctx();
+        let modern_ctx = MenuContext {
+            ui_style: UiStyle::Modern,
+            theme: ThemeChoice::Light,
+            ..ctx()
+        };
+        // The switch works in both skins; its mark says which one is shown.
+        assert!(Action::UiStyle.enabled(&classic) && Action::UiStyle.enabled(&modern_ctx));
+        assert_eq!(Action::UiStyle.checked(&classic), Some(false));
+        assert_eq!(Action::UiStyle.checked(&modern_ctx), Some(true));
+        // The theme: ghosted in Classic (and so is its submenu item), a radio mark in Modern.
+        assert!(!Action::Theme(ThemeChoice::Dark).enabled(&classic));
+        assert!(!items[items.len() - 2].enabled(&classic));
+        assert!(items[items.len() - 2].enabled(&modern_ctx));
+        for choice in ThemeChoice::ALL {
+            assert!(Action::Theme(choice).enabled(&modern_ctx));
+            assert_eq!(
+                Action::Theme(choice).checked(&modern_ctx),
+                Some(choice == ThemeChoice::Light)
+            );
+        }
+        // The classic font has every character of the new labels.
+        for label in ["Modern UI", "Theme", "System", "Dark", "Light", "F12"] {
+            assert!(label.chars().all(|c| (' '..='~').contains(&c)));
+        }
+    }
+
+    #[test]
+    fn ai_and_mcp_comes_before_the_skin_items() {
         // ADR-43: Prefs > AI & MCP.. opens the MCP requester; it is implemented.
         let items = MENUS.last().unwrap().items;
-        let item = &items[items.len() - 2];
+        let item = &items[items.len() - 4];
         assert_eq!(item.label, "AI & MCP..");
         assert!(matches!(
             item.entry,

@@ -329,6 +329,47 @@ pub fn tool(tool: Tool) -> Icon {
     }
 }
 
+/// Stroke width of the small marks in menus, in points.
+pub const MARK_STROKE: f32 = 1.6;
+
+/// A check mark around (`cx`, `cy`), about 10 points wide; stroked [`MARK_STROKE`] wide.
+pub fn check_mark(cx: f32, cy: f32) -> Path {
+    Path::new()
+        .move_to(cx - 4.4, cy + 0.2)
+        .line_to(cx - 1.4, cy + 3.3)
+        .line_to(cx + 4.6, cy - 3.4)
+}
+
+/// The dot of the chosen item of a radio group, centred on (`cx`, `cy`); filled.
+pub fn radio_dot(cx: f32, cy: f32) -> Path {
+    Path::new().circle(cx, cy, 3.0)
+}
+
+/// The chevron of an item that opens a submenu, centred on (`cx`, `cy`); stroked.
+pub fn chevron(cx: f32, cy: f32) -> Path {
+    Path::new()
+        .move_to(cx - 2.2, cy - 4.2)
+        .line_to(cx + 2.2, cy)
+        .line_to(cx - 2.2, cy + 4.2)
+}
+
+/// The letter on the key cap that stands for the Amiga key in menu shortcuts: a plain "A"
+/// of three strokes, drawn here (no font glyph, no original key symbol), inside `cap`.
+pub fn key_cap_letter(cap: crate::paint::Rect) -> Path {
+    let (cx, cy) = cap.center();
+    let (half, rise) = (cap.w * 0.2, cap.h * 0.27);
+    Path::new()
+        .move_to(cx - half, cy + rise)
+        .line_to(cx, cy - rise)
+        .line_to(cx + half, cy + rise)
+        .segment(
+            cx - half * 0.55,
+            cy + rise * 0.3,
+            cx + half * 0.55,
+            cy + rise * 0.3,
+        )
+}
+
 /// The filled shape of built-in brush `index` (toolbox order: four round brushes, four
 /// squares, two scatter brushes), centred on (`cx`, `cy`); one brush pixel is `unit` points.
 /// The size comes from the brush's real footprint, so the dock shows the brushes in their

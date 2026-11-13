@@ -57,7 +57,9 @@
 //!     [--theme dark|light]              … its colour scheme (default dark),
 //!     [--size WxH]                      … the window's size in points (default 1280x800),
 //!     [--device-scale 1|2]              … physical pixels per point (default 1) and
-//!     [--pointer X,Y]                   … a pointer resting at window point X,Y
+//!     [--pointer X,Y]                   … a pointer at window point X,Y
+//!     [--tooltip]                       … that has rested there: the tooltip of the dock
+//!                                       button under it (`--menu` draws the Modern cards)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -1019,11 +1021,6 @@ struct PainterApp {
     /// The document; every change goes through its command engine.
     engine: Engine,
     ui: UiState,
-    /// The skin of the main window (ADR-47); Classic until the owner switches. Remembered in
-    /// the settings file.
-    ui_style: dpx_ui::UiStyle,
-    /// The Modern skin's theme (ADR-47); the Classic skin ignores it. Remembered likewise.
-    theme: dpx_ui::ThemeChoice,
     /// The Modern skin's live window: region images, hover, the chrome flags during a pass
     /// (ADR-47, modern.rs).
     modern: modern::State,
@@ -1103,8 +1100,6 @@ impl PainterApp {
         Self {
             engine: Engine::new(doc),
             ui: UiState::default(),
-            ui_style: dpx_ui::UiStyle::default(),
-            theme: dpx_ui::ThemeChoice::default(),
             modern: modern::State::default(),
             texture: None,
             dirty: true,
@@ -1743,6 +1738,10 @@ impl PainterApp {
             Action::Mode(m) => self.ui.mode = m,
             Action::Pref(p) => self.ui.prefs.toggle(p),
             Action::PixelSize(p) => self.set_pixel_size(p),
+            // ADR-47 (modern.rs): the other skin from the next pass on; the Modern skin's
+            // colour scheme.
+            Action::UiStyle => self.toggle_skin(),
+            Action::Theme(theme) => self.ui.theme = theme,
             Action::Command(id) => match id {
                 // ADR-39 (palette_stencil.rs): its own items, and the Stencil items while there
                 // is an area stencil.
@@ -1884,6 +1883,9 @@ impl eframe::App for PainterApp {
         self.modern_begin_pass();
         self.pass(ui);
         self.modern_end_pass();
+        // A switch of the skin asked for in this pass (Prefs ▸ Modern UI, F12) happens
+        // between two passes, so no pass is half Classic and half Modern.
+        self.modern_apply_switch(ui.ctx());
     }
 }
 
@@ -2072,8 +2074,19 @@ impl PainterApp {
             // Menu strip held with the right button: track, multi-select with the left button,
             // select on release.
             if let Some(pos) = hover {
-                let (sx, sy) = view.ui_pos(to_screen(pos));
-                if self.ui.menu.pointer(sw, sh, sx, sy) {
+                let changed = match &modern_layout {
+                    // ADR-47: the Modern cards have their own geometry and write the same
+                    // menu state.
+                    Some(l) => {
+                        let p = pos - area.min;
+                        dpx_ui_modern::menu::pointer(l, &mut self.ui.menu, p.x, p.y)
+                    }
+                    None => {
+                        let (sx, sy) = view.ui_pos(to_screen(pos));
+                        self.ui.menu.pointer(sw, sh, sx, sy)
+                    }
+                };
+                if changed {
                     self.dirty = true;
                 }
             }
@@ -2144,9 +2157,15 @@ impl PainterApp {
             }
             if (press_l || press_r) && self.layer_rename_press(hit) {
                 // ADR-44: the press ended a layer rename (it takes the name, as Return).
-            } else if press_r && hit == Some(Hit::TitleBar) && !modern {
-                // (The Modern bar's pull-downs come with the next slice of ADR-47.)
-                self.ui.menu.open(sw, sh, ux, uy);
+            } else if press_r && hit == Some(Hit::TitleBar) {
+                match &modern_layout {
+                    // ADR-47: the Modern bar's pull-downs, held with the right button too.
+                    Some(l) => {
+                        let p = pos - area.min;
+                        dpx_ui_modern::menu::open(l, &mut self.ui.menu, p.x, p.y);
+                    }
+                    None => self.ui.menu.open(sw, sh, ux, uy),
+                }
                 self.dirty = true;
             } else if press_l || press_r {
                 if let Some(hit) = hit {
@@ -2229,6 +2248,15 @@ impl PainterApp {
             }
         });
         self.window_keys(&ctx);
+        // ADR-47: F12 or Cmd/Ctrl+Shift+U switch between the Classic and the Modern skin
+        // (not while text is typed or a key of this pass opened a requester).
+        let skin_key = ctx.input(|i| {
+            let chord = i.modifiers.command && i.modifiers.shift && !i.modifiers.alt;
+            i.key_pressed(egui::Key::F12) || (chord && i.key_pressed(egui::Key::U))
+        });
+        if skin_key && !was_typing && !self.typing() && !self.modal_open() {
+            self.toggle_skin();
+        }
         if !was_typing {
             self.menu_keys(&ctx);
             self.anim_keys(&ctx);
@@ -2239,7 +2267,14 @@ impl PainterApp {
             self.layer_keys(&ctx);
         }
         // U = undo (as in DeluxePaint), Shift+U = redo (DeluxePainter addition).
-        let (undo_key, shift) = ctx.input(|i| (i.key_pressed(egui::Key::U), i.modifiers.shift));
+        // Cmd/Ctrl+Shift+U is the skin switch above, not a redo.
+        let (undo_key, shift) = ctx.input(|i| {
+            let skin_chord = i.modifiers.command && i.modifiers.shift && !i.modifiers.alt;
+            (
+                i.key_pressed(egui::Key::U) && !skin_chord,
+                i.modifiers.shift,
+            )
+        });
         // A modal opened by a key of this pass (e.g. the "Nothing to play" note) takes the rest.
         if undo_key && !was_typing && !self.typing() && !self.modal_open() {
             if shift {

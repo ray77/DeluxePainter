@@ -12,7 +12,9 @@
 //! - [`icons`]: our own vector icons for the tools and the built-in brushes.
 //! - [`layout`]: the rectangles of the main window.
 //! - [`hit`]: what lies under a point.
-//! - [`build`]: display lists of the bar, the dock and the picture viewport.
+//! - [`menu`]: the pull-down menus: their cards, the pointer tracking, their drawing.
+//! - [`build`]: display lists of the bar, the dock, the picture viewport and the overlay
+//!   (menu cards, tooltip).
 //! - [`raster`]: display list to RGBA8 (`tiny-skia`, `ab_glyph`).
 //! - [`frame`]: a whole window in one call, for headless snapshots. The live window
 //!   rasterises the same lists region by region ([`Renderer::render_region`]).
@@ -25,6 +27,7 @@ pub mod frame;
 pub mod hit;
 pub mod icons;
 pub mod layout;
+pub mod menu;
 pub mod paint;
 pub mod raster;
 pub mod theme;

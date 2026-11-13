@@ -87,6 +87,11 @@ pub struct UiState {
     pub prefs: Prefs,
     /// Prefs ▸ Pixel Size.
     pub pixel_size: PixelSize,
+    /// The skin that draws the main window and the Modern skin's colour scheme (ADR-47;
+    /// Prefs ▸ Modern UI and Prefs ▸ Theme). In this crate they only set the marks and the
+    /// ghosting of those two items: the Classic drawing is the same whatever they say.
+    pub ui_style: crate::skin::UiStyle,
+    pub theme: crate::skin::ThemeChoice,
     pub menu: MenuState,
     /// Picture ▸ Load/Save while it is open (drawn over everything else).
     pub file_requester: Option<FileRequester>,
@@ -166,6 +171,8 @@ impl UiState {
             anim_brush: self.has_anim_brush,
             spare_brush: self.has_spare_brush,
             anim_expanded: self.anim_expanded,
+            ui_style: self.ui_style,
+            theme: self.theme,
         }
     }
 }
@@ -184,6 +191,8 @@ impl Default for UiState {
             coords: None,
             prefs: Prefs::default(),
             pixel_size: PixelSize::default(),
+            ui_style: crate::skin::UiStyle::default(),
+            theme: crate::skin::ThemeChoice::default(),
             menu: MenuState::default(),
             file_requester: None,
             page_size_requester: None,

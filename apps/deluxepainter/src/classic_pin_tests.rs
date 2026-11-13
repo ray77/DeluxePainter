@@ -189,12 +189,12 @@ fn switching_to_modern_and_back_leaves_classic_alone() {
         .into_iter()
         .enumerate()
         {
-            app.ui_style = style;
-            app.theme = theme;
+            app.ui.ui_style = style;
+            app.ui.theme = theme;
             app.dirty = true;
             ui_pass(&mut app, &ctx, 1.0 + i as f64, vec![]);
         }
-        assert_eq!(app.ui_style, UiStyle::Classic);
+        assert_eq!(app.ui.ui_style, UiStyle::Classic);
         app.ui.menu = menu;
         app.ui.page_size_requester = requester;
         app.ui.coords = coords;

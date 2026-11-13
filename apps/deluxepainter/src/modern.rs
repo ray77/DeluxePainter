@@ -6,7 +6,10 @@
 //! screen and the page, every tool, key and requester works unchanged. Around it the bar and
 //! the dock are drawn by `dpx-ui-modern` on the CPU, each into its own image that is redone
 //! only when its display list changes; the dock answers a click with the Classic skin's
-//! [`Hit`] values, so `handle_press` does not know which skin it came from.
+//! [`Hit`] values, so `handle_press` does not know which skin it came from. The pull-down
+//! menus (held with the right button on the bar, as in Classic) and the tooltips of the dock
+//! buttons are one more image over everything; they write and read the same `MenuState`
+//! and `Tooltip` as the Classic skin.
 //!
 //! During a Modern pass the two classic chrome flags (`title_visible`, `toolbox_visible`)
 //! are switched off in the shared state and kept aside here: the classic code then lays
@@ -14,7 +17,7 @@
 //! shown" and "dock shown" (F9, F10) and are back in the shared state after the pass.
 
 use dpx_core::Document;
-use dpx_ui::{Hit, PixelSize, UiState, UiStyle};
+use dpx_ui::{Hit, KeyMode, PixelSize, ThemeChoice, Tooltip, TooltipTarget, UiState, UiStyle};
 use dpx_ui_modern::paint::{List, Rect};
 use dpx_ui_modern::{
     Chrome, Frame, Image, MainLayout, Model, Picture, Renderer, Spot, Theme, ThemeKind, Toggles,
@@ -33,6 +36,7 @@ const DOCK: usize = 1;
 #[cfg(test)]
 const BAR: usize = 2;
 const REGION_NAMES: [&str; REGIONS] = ["modern-viewport", "modern-dock", "modern-bar"];
+const OVERLAY_NAME: &str = "modern-overlay";
 
 /// One region's image as it is on the GPU: one texture, or several tiles when the region is
 /// larger than the GPU's largest texture (a 4K or 5K window at device scale 2).
@@ -74,6 +78,12 @@ pub(crate) struct State {
     hover: Option<Hit>,
     renderer: Renderer,
     regions: [Region; REGIONS],
+    /// What lies over the regions: the open menu's cards or a tooltip. Its image is
+    /// transparent where nothing is drawn.
+    overlay: Region,
+    /// The other skin was asked for in this pass (Prefs ▸ Modern UI, F12); it is shown from
+    /// the next pass on.
+    switch: bool,
     /// The window's minimum size is the Modern one.
     min_size: bool,
     /// The theme of the last painted pass.
@@ -92,6 +102,77 @@ impl State {
     #[cfg(test)]
     pub(crate) fn theme(&self) -> Option<ThemeKind> {
         self.theme
+    }
+
+    /// How often the overlay (menu cards, tooltip) was rasterised so far, and whether one
+    /// is shown now.
+    #[cfg(test)]
+    pub(crate) fn overlay(&self) -> (u64, bool) {
+        (self.overlay.renders, self.overlay.key.is_some())
+    }
+}
+
+impl Region {
+    /// Nothing is shown here: the image goes.
+    fn clear(&mut self) {
+        self.key = None;
+        self.tiles.clear();
+    }
+
+    /// Makes the image show `list` in the pixel rectangle `px` of the window, rasterising
+    /// it only when what it is made from changed. `background`: the opaque colour under
+    /// the list, or `None` for an image that is transparent where the list draws nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        renderer: &mut Renderer,
+        name: &str,
+        list: &List,
+        px: [i32; 4],
+        scale: f32,
+        background: Option<dpx_ui_modern::paint::Color>,
+        side: i32,
+    ) {
+        let clear = dpx_ui_modern::paint::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+        let key = region_key(list, px, scale, background.unwrap_or(clear), side);
+        if self.key == Some(key) {
+            return;
+        }
+        let cut = tiles(px, side);
+        if cut.len() != self.tiles.len() {
+            self.tiles.clear();
+        }
+        for (n, tile) in cut.into_iter().enumerate() {
+            let (origin, w, h) = ((tile[0], tile[1]), tile[2] as u32, tile[3] as u32);
+            // The picture is not among a list's images: the quad is a texture of its own.
+            let rgba = match background {
+                Some(colour) => renderer.render_region(list, &[], origin, w, h, scale, colour),
+                None => renderer.render_overlay(list, origin, w, h, scale),
+            };
+            // Premultiplied alpha; for an opaque image the same bytes as straight alpha.
+            let image = egui::ColorImage::from_rgba_premultiplied(
+                [tile[2] as usize, tile[3] as usize],
+                &rgba,
+            );
+            match self.tiles.get_mut(n) {
+                Some((at, texture)) => {
+                    *at = tile;
+                    texture.set(image, egui::TextureOptions::NEAREST);
+                }
+                None => self.tiles.push((
+                    tile,
+                    ctx.load_texture(name, image, egui::TextureOptions::NEAREST),
+                )),
+            }
+        }
+        self.key = Some(key);
+        self.renders += 1;
     }
 }
 
@@ -131,7 +212,7 @@ fn pixels(rect: &Rect, scale: f32) -> [i32; 4] {
 impl PainterApp {
     /// The Modern skin is the one shown.
     pub(crate) fn is_modern(&self) -> bool {
-        self.ui_style == UiStyle::Modern
+        self.ui.ui_style == UiStyle::Modern
     }
 
     /// Before a pass: in the Modern skin the classic chrome flags move aside (see the module
@@ -195,9 +276,18 @@ impl PainterApp {
             let (w, h) = layout::MIN_WINDOW;
             let min = if modern { [w, h] } else { CLASSIC_MIN_WINDOW };
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min.into()));
-            if !modern {
+            if modern {
+                // A window smaller than the Modern layout is made for grows to its least
+                // size (a minimum size alone does not resize a window on every system).
+                let size = ctx.content_rect().size();
+                if size.x < w || size.y < h {
+                    let grown = egui::vec2(size.x.max(w), size.y.max(h));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(grown));
+                }
+            } else {
                 // Back in Classic: the region images are not needed any more.
                 self.modern.regions = Default::default();
+                self.modern.overlay = Region::default();
                 self.modern.hover = None;
             }
             self.dirty = true;
@@ -243,23 +333,13 @@ impl PainterApp {
     /// The theme to paint in: the fixed choice, or the system's (dark when it says nothing).
     fn modern_theme(&self, ctx: &egui::Context) -> ThemeKind {
         let system_dark = ctx.system_theme().map(|t| t == egui::Theme::Dark);
-        ThemeKind::resolve(self.theme, system_dark)
+        ThemeKind::resolve(self.ui.theme, system_dark)
     }
 
     /// The display lists of the regions with their rectangles, in painting order: viewport
     /// (canvas colour and the picture's shadow), dock, bar. A hidden region has no entry.
     fn modern_lists(&self, l: &MainLayout, theme: &Theme) -> [Option<(Rect, List)>; REGIONS] {
-        let model = Model {
-            ui: &self.ui,
-            palette: self.palette(),
-            custom_brush: self.custom_brush.is_some(),
-            toggles: Toggles {
-                grid: self.tools.grid,
-                symmetry: self.tools.symmetry,
-                magnify: self.tools.magnify.is_some(),
-            },
-            hover: self.modern.hover,
-        };
+        let model = self.modern_model();
         [
             (l.viewport.w > 0.0 && l.viewport.h > 0.0)
                 .then(|| (l.viewport, build::canvas(l, theme))),
@@ -303,51 +383,25 @@ impl PainterApp {
         // The largest texture the GPU takes; a larger region is cut into tiles.
         let side = ctx.input(|i| i.max_texture_side).min(i32::MAX as usize) as i32;
         for (i, entry) in lists.iter().enumerate() {
-            let region = &mut self.modern.regions[i];
+            let state = &mut self.modern;
+            let region = &mut state.regions[i];
             let px = entry.as_ref().map(|(bounds, _)| pixels(bounds, l.scale));
             let (Some((_, list)), Some(px)) = (entry, px.filter(|p| p[2] > 0 && p[3] > 0)) else {
                 // Hidden (F9, F10): its image goes.
-                region.key = None;
-                region.tiles.clear();
+                region.clear();
                 continue;
             };
-            let key = region_key(list, px, l.scale, theme.canvas, side);
-            if region.key != Some(key) {
-                let cut = tiles(px, side);
-                if cut.len() != region.tiles.len() {
-                    region.tiles.clear();
-                }
-                for (n, tile) in cut.into_iter().enumerate() {
-                    // The picture is not among the list's images: the quad is a texture of
-                    // its own, painted below.
-                    let rgba = self.modern.renderer.render_region(
-                        list,
-                        &[],
-                        (tile[0], tile[1]),
-                        tile[2] as u32,
-                        tile[3] as u32,
-                        l.scale,
-                        theme.canvas,
-                    );
-                    // Opaque, so premultiplied and straight alpha are the same bytes.
-                    let image = egui::ColorImage::from_rgba_premultiplied(
-                        [tile[2] as usize, tile[3] as usize],
-                        &rgba,
-                    );
-                    match region.tiles.get_mut(n) {
-                        Some((at, texture)) => {
-                            *at = tile;
-                            texture.set(image, egui::TextureOptions::NEAREST);
-                        }
-                        None => region.tiles.push((
-                            tile,
-                            ctx.load_texture(REGION_NAMES[i], image, egui::TextureOptions::NEAREST),
-                        )),
-                    }
-                }
-                region.key = Some(key);
-                region.renders += 1;
-            }
+            let (renderer, name) = (&mut state.renderer, REGION_NAMES[i]);
+            region.show(
+                ctx,
+                renderer,
+                name,
+                list,
+                px,
+                l.scale,
+                Some(theme.canvas),
+                side,
+            );
             for (at, texture) in &region.tiles {
                 painter.image(texture.id(), to_points(*at), uv, egui::Color32::WHITE);
             }
@@ -363,6 +417,66 @@ impl PainterApp {
                 );
             }
         }
+        // Over everything, the picture included: the open menu or a tooltip.
+        let over = self.overlay_list(&l, &theme);
+        let state = &mut self.modern;
+        let px = over.as_ref().map(|(bounds, _)| pixels(bounds, l.scale));
+        match (&over, px.filter(|p| p[2] > 0 && p[3] > 0)) {
+            (Some((_, list)), Some(px)) => {
+                let renderer = &mut state.renderer;
+                state
+                    .overlay
+                    .show(ctx, renderer, OVERLAY_NAME, list, px, l.scale, None, side);
+                for (at, texture) in &state.overlay.tiles {
+                    painter.image(texture.id(), to_points(*at), uv, egui::Color32::WHITE);
+                }
+            }
+            _ => state.overlay.clear(),
+        }
+    }
+
+    /// What lies over the regions, with its rectangle: the cards of the menu that is held
+    /// open, or the tooltip of the dock button the pointer rests on.
+    fn overlay_list(&self, l: &MainLayout, theme: &Theme) -> Option<(Rect, List)> {
+        build::overlay(l, theme, &self.modern_model())
+    }
+
+    /// What the Modern chrome shows.
+    fn modern_model(&self) -> Model<'_> {
+        Model {
+            ui: &self.ui,
+            palette: self.palette(),
+            custom_brush: self.custom_brush.is_some(),
+            toggles: Toggles {
+                grid: self.tools.grid,
+                symmetry: self.tools.symmetry,
+                magnify: self.tools.magnify.is_some(),
+            },
+            hover: self.modern.hover,
+        }
+    }
+
+    /// Prefs ▸ Modern UI, F12 and Cmd/Ctrl+Shift+U: the other skin. It is shown from the
+    /// next pass on, because the classic chrome flags are held aside until this one ends.
+    pub(crate) fn toggle_skin(&mut self) {
+        self.modern.switch ^= true;
+    }
+
+    /// After a pass: the switch asked for in it. Document, tool, scroll position, Magnify
+    /// and everything else are shared; an open menu and a tooltip belong to the skin that
+    /// drew them and go. Back in Classic the window snaps to the screen again (the snap
+    /// state was forgotten in every Modern pass); in Modern it keeps its size.
+    pub(crate) fn modern_apply_switch(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.modern.switch) {
+            return;
+        }
+        self.ui.ui_style = self.ui.ui_style.toggled();
+        self.ui.menu.close();
+        self.ui.tooltip = None;
+        self.tooltip = crate::tooltip::State::default();
+        self.modern.hover = None;
+        self.dirty = true;
+        ctx.request_repaint();
     }
 
     /// The Modern window as one image, made from the same layout, lists and screen as the
@@ -376,6 +490,9 @@ impl PainterApp {
         let mut list = List::new();
         for (_, part) in self.modern_lists(&l, &theme).into_iter().flatten() {
             list.append(part);
+        }
+        if let Some((_, over)) = self.overlay_list(&l, &theme) {
+            list.append(over);
         }
         let screen = self.compose_screen();
         let rgba = dpx_ui::to_rgba(&screen, self.palette(), 1, 1);
@@ -409,13 +526,26 @@ fn picture_of(view: View, pixel_size: PixelSize) -> Picture {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SnapshotOptions {
     pub theme: ThemeKind,
+    /// What Prefs ▸ Theme marks: the theme when `--theme` names one, else System.
+    pub choice: ThemeChoice,
     /// Window size in points.
     pub size: (f32, f32),
     /// Physical pixels per point.
     pub device_scale: f32,
     /// A resting pointer, in window points.
     pub pointer: Option<(f32, f32)>,
+    /// The pointer has rested long enough: the tooltip of the button under it shows.
+    pub tooltip: bool,
 }
+
+/// The snapshot flags that only the Modern skin knows.
+const MODERN_FLAGS: [&str; 5] = [
+    "--theme",
+    "--size",
+    "--device-scale",
+    "--pointer",
+    "--tooltip",
+];
 
 /// Default window of a Modern snapshot, in points.
 const DEFAULT_SIZE: (f32, f32) = (1280.0, 800.0);
@@ -429,8 +559,9 @@ fn pair(spec: &str, separator: char) -> Option<(f32, f32)> {
 }
 
 /// Reads `--ui modern` and its companions `--theme dark|light` (default dark, never the
-/// machine's setting), `--size WxH` in points (default 1280x800), `--device-scale 1|2` and
-/// `--pointer X,Y` (window points). `None` without `--ui modern`: a Classic snapshot, which
+/// machine's setting), `--size WxH` in points (default 1280x800), `--device-scale 1|2`,
+/// `--pointer X,Y` (window points) and `--tooltip` (the pointer has rested: the tooltip of
+/// the button under it shows). `None` without `--ui modern`: a Classic snapshot, which
 /// these flags do not touch.
 pub(crate) fn snapshot_options(args: &[String]) -> Result<Option<SnapshotOptions>, String> {
     let modern = match arg_value(args, "--ui").as_deref() {
@@ -439,16 +570,21 @@ pub(crate) fn snapshot_options(args: &[String]) -> Result<Option<SnapshotOptions
         Some(other) => return Err(format!("bad --ui '{other}' (expected classic or modern)")),
     };
     if !modern {
-        for flag in ["--theme", "--size", "--device-scale", "--pointer"] {
+        for flag in MODERN_FLAGS {
             if args.iter().any(|a| a == flag) {
                 return Err(format!("{flag} needs --ui modern"));
             }
         }
         return Ok(None);
     }
-    let theme = match arg_value(args, "--theme").as_deref() {
-        None | Some("dark") => ThemeKind::Dark,
-        Some("light") => ThemeKind::Light,
+    if args.iter().any(|a| a == "--hover") {
+        // Classic's flag is in UI pixels of the classic screen, which Modern does not show.
+        return Err("--hover is the Classic skin's; use --pointer X,Y --tooltip".into());
+    }
+    let (theme, choice) = match arg_value(args, "--theme").as_deref() {
+        None => (ThemeKind::Dark, ThemeChoice::System),
+        Some("dark") => (ThemeKind::Dark, ThemeChoice::Dark),
+        Some("light") => (ThemeKind::Light, ThemeChoice::Light),
         Some(other) => return Err(format!("bad --theme '{other}' (expected dark or light)")),
     };
     let size = match arg_value(args, "--size") {
@@ -475,11 +611,17 @@ pub(crate) fn snapshot_options(args: &[String]) -> Result<Option<SnapshotOptions
                 .ok_or_else(|| format!("bad --pointer '{spec}' (expected X,Y in window points)"))?,
         ),
     };
+    let tooltip = args.iter().any(|a| a == "--tooltip");
+    if tooltip && pointer.is_none() {
+        return Err("--tooltip needs --pointer X,Y".into());
+    }
     Ok(Some(SnapshotOptions {
         theme,
+        choice,
         size,
         device_scale,
         pointer,
+        tooltip,
     }))
 }
 
@@ -508,13 +650,49 @@ pub(crate) fn snapshot_image(
     // The classic screen without its chrome, one image pixel per displayed pixel (the pixel
     // shape of the display mode applied), exactly as a Classic snapshot at scale 1 makes it.
     let (pw, ph, picture) = snapshot_rgba(1, doc, view, scroll, &quad_ui(ui), false);
-    let mut frame = Frame {
+    // What the chrome shows: the Modern skin with its theme (the marks of Prefs ▸ Modern UI
+    // and Prefs ▸ Theme) and, for a rested pointer, the tooltip of the button under it.
+    let mut shown = ui.clone();
+    shown.ui_style = UiStyle::Modern;
+    shown.theme = options.choice;
+    // A Classic tooltip (the Control Panel's, inside the quad) is not the chrome's.
+    shown.tooltip = None;
+    let layout = Frame {
+        size: options.size,
+        scale: options.device_scale,
+        theme: Theme::of(options.theme),
+        model: Model::new(&shown, doc.palette()),
+        picture: Image {
+            width: pw,
+            height: ph,
+            rgba: &picture,
+        },
+        per_ui_pixel: (view.fx * view.ux) as u32,
+    }
+    .layout();
+    let hover = match options
+        .pointer
+        .map(|(x, y)| dpx_ui_modern::hit(&layout, x, y))
+    {
+        Some(Spot::Ui(hit)) => Some(hit),
+        _ => None,
+    };
+    if options.tooltip && !shown.menu.active {
+        shown.tooltip = hover
+            .and_then(TooltipTarget::of_hit)
+            .map(|target| Tooltip::new(target, KeyMode::Paint));
+        if shown.tooltip.is_none() {
+            eprintln!("note: --tooltip: no button with a tooltip under --pointer");
+        }
+    }
+    let frame = Frame {
         size: options.size,
         scale: options.device_scale,
         theme: Theme::of(options.theme),
         model: Model {
             custom_brush,
-            ..Model::new(ui, doc.palette())
+            hover,
+            ..Model::new(&shown, doc.palette())
         },
         picture: Image {
             width: pw,
@@ -523,11 +701,6 @@ pub(crate) fn snapshot_image(
         },
         per_ui_pixel: (view.fx * view.ux) as u32,
     };
-    if let Some((x, y)) = options.pointer
-        && let Spot::Ui(hit) = dpx_ui_modern::hit(&frame.layout(), x, y)
-    {
-        frame.model.hover = Some(hit);
-    }
     dpx_ui_modern::render_window(&frame, &mut Renderer::new())
 }
 
@@ -560,7 +733,7 @@ mod tests {
         assert_eq!(snapshot_options(&args(&["--snapshot", "a.png"])), Ok(None));
         assert_eq!(snapshot_options(&args(&["--ui", "classic"])), Ok(None));
         // The Modern flags alone are a mistake, not silently ignored.
-        for flag in ["--theme", "--size", "--device-scale", "--pointer"] {
+        for flag in MODERN_FLAGS {
             let e = snapshot_options(&args(&[flag, "x"])).expect_err(flag);
             assert!(e.contains("--ui modern"), "{e}");
         }
@@ -573,9 +746,11 @@ mod tests {
             snapshot_options(&args(&["--ui", "modern"])),
             Ok(Some(SnapshotOptions {
                 theme: ThemeKind::Dark,
+                choice: ThemeChoice::System,
                 size: (1280.0, 800.0),
                 device_scale: 1.0,
                 pointer: None,
+                tooltip: false,
             }))
         );
         let all = [
@@ -589,14 +764,17 @@ mod tests {
             "2",
             "--pointer",
             "1210,150",
+            "--tooltip",
         ];
         assert_eq!(
             snapshot_options(&args(&all)),
             Ok(Some(SnapshotOptions {
                 theme: ThemeKind::Light,
+                choice: ThemeChoice::Light,
                 size: (1440.0, 900.0),
                 device_scale: 2.0,
                 pointer: Some((1210.0, 150.0)),
+                tooltip: true,
             }))
         );
         for bad in [
@@ -608,6 +786,7 @@ mod tests {
             ["--device-scale", "3"],
             ["--device-scale", "1.5"],
             ["--pointer", "12"],
+            ["--hover", "300,40"],
         ] {
             let mut list = vec!["--ui", "modern"];
             list.extend(bad);
@@ -640,9 +819,11 @@ mod tests {
         };
         let options = SnapshotOptions {
             theme: ThemeKind::Dark,
+            choice: ThemeChoice::Dark,
             size: (1280.0, 800.0),
             device_scale: 1.0,
             pointer: Some((1210.0, 105.0)),
+            tooltip: false,
         };
         let (iw, ih, rgba) = snapshot_image(&options, &doc, view, (0, 0), &ui, false);
         assert_eq!((iw, ih), (1280, 800));
@@ -762,7 +943,7 @@ mod tests {
     impl Rig {
         fn new(style: UiStyle, size: (f32, f32), ppp: f32) -> Rig {
             let mut app = PainterApp::new();
-            app.ui_style = style;
+            app.ui.ui_style = style;
             let ctx = egui::Context::default();
             // As `main()`: Cmd/Ctrl +/− are ours, not egui's zoom.
             ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -884,10 +1065,15 @@ mod tests {
         /// position and what is open.
         fn state(&self) -> String {
             let app = &self.app;
+            // The skin itself is the one thing the two windows may differ in.
+            let ui = UiState {
+                ui_style: UiStyle::Classic,
+                ..app.ui.clone()
+            };
             format!(
                 "{:?}",
                 (
-                    &app.ui,
+                    &ui,
                     &app.tools,
                     app.page().into_owned(),
                     app.engine.document().palette(),
@@ -1172,7 +1358,7 @@ mod tests {
         };
         assert_eq!(minimum(&rig), [(w, h)], "the Modern minimum, sent once");
         // Back in Classic the window returns to the screen at the pixel size.
-        rig.app.ui_style = UiStyle::Classic;
+        rig.app.ui.ui_style = UiStyle::Classic;
         rig.pass(vec![]);
         assert!(
             rig.commands
@@ -1327,10 +1513,10 @@ mod tests {
         rig.pass(vec![]);
         rig.pass(vec![]);
         assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Dark));
-        rig.app.theme = ThemeChoice::Light;
+        rig.app.ui.theme = ThemeChoice::Light;
         rig.pass(vec![]);
         assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Light), "fixed");
-        rig.app.theme = ThemeChoice::Dark;
+        rig.app.ui.theme = ThemeChoice::Dark;
         rig.system = Some(egui::Theme::Light);
         rig.pass(vec![]);
         rig.pass(vec![]);
@@ -1431,5 +1617,509 @@ mod tests {
         shot(&mut rig, ThemeKind::Dark, "live-anim-panel");
         rig.tap(egui::Key::F10);
         shot(&mut rig, ThemeKind::Dark, "live-f10");
+    }
+
+    // ---- Menus, tooltips, the switch and the theme (slice 1c of ADR-47) ----
+
+    use dpx_ui::menu::{self as classic_menu, Entry, MENUS};
+    use dpx_ui::{PaintMode, ThemeChoice as Choice};
+    use dpx_ui_modern::menu as modern_menu;
+
+    /// Where the item that runs `wanted` is: its menu, its item and, when it is in a
+    /// submenu, its place there.
+    fn menu_place(wanted: Action) -> (usize, usize, Option<usize>) {
+        for (m, menu) in MENUS.iter().enumerate() {
+            for (i, item) in menu.items.iter().enumerate() {
+                match item.entry {
+                    Entry::Action(a) if a == wanted => return (m, i, None),
+                    Entry::Submenu(items) => {
+                        if let Some(s) = items.iter().position(|it| it.action() == Some(wanted)) {
+                            return (m, i, Some(s));
+                        }
+                    }
+                    Entry::Action(_) => {}
+                }
+            }
+        }
+        panic!("{wanted:?} is in no menu");
+    }
+
+    impl Rig {
+        /// The window points on the way to the item that runs `wanted`, in this rig's skin:
+        /// over the menu's title, over its item and, for a submenu, over the item there.
+        fn menu_points(&self, wanted: Action) -> Vec<egui::Pos2> {
+            let (m, item, sub) = menu_place(wanted);
+            let sub_items = match MENUS[m].items[item].entry {
+                Entry::Submenu(items) => Some(items),
+                Entry::Action(_) => None,
+            };
+            if self.app.is_modern() {
+                let l = self.app.modern_layout().expect("layout");
+                let middle = |r: Rect| egui::pos2(r.x + r.w / 2.0, r.y + r.h / 2.0);
+                let card = modern_menu::menu_card(&l, m).expect("the bar is shown");
+                let mut points = vec![middle(l.menu_titles[m]), middle(card.row(item))];
+                if let (Some(s), Some(items)) = (sub, sub_items) {
+                    let sub_card = modern_menu::submenu_card(&l, &card, item, items);
+                    points.push(middle(sub_card.row(s)));
+                }
+                points
+            } else {
+                let (w, h) = self.app.view().ui_size();
+                let slot = classic_menu::title_slots()[m];
+                let mbox = classic_menu::menu_box(m, w, h);
+                let mut pixels = vec![
+                    (slot.x + 2, 1),
+                    (mbox.x + mbox.w / 2, mbox.item_top(item) + 1),
+                ];
+                if let (Some(s), Some(items)) = (sub, sub_items) {
+                    let sbox = classic_menu::submenu_box(&mbox, item, items, w, h);
+                    pixels.push((sbox.x + sbox.w / 2, sbox.item_top(s) + 1));
+                }
+                pixels.into_iter().map(|p| ui_point(&self.app, p)).collect()
+            }
+        }
+
+        /// The right button goes down on the title of the menu that holds `wanted` and the
+        /// pointer moves to its item; the button stays down. Returns where the pointer is.
+        fn hold_menu(&mut self, wanted: Action) -> egui::Pos2 {
+            let points = self.menu_points(wanted);
+            self.pass(vec![
+                egui::Event::PointerMoved(points[0]),
+                pointer_button(points[0], Secondary, true),
+            ]);
+            assert!(self.app.ui.menu.active, "the menus are held");
+            for &p in &points[1..] {
+                self.pass(vec![egui::Event::PointerMoved(p)]);
+            }
+            let (m, item, sub) = menu_place(wanted);
+            let menu = self.app.ui.menu;
+            assert_eq!(
+                (menu.menu, menu.item, menu.sub_item),
+                (Some(m), Some(item), sub),
+                "the pointer is over {wanted:?}"
+            );
+            points[points.len() - 1]
+        }
+
+        /// Picks the item that runs `wanted` as on the Amiga: right button down on the
+        /// title, along to the item, up over it. This is `pick` for either skin.
+        fn pick(&mut self, wanted: Action) {
+            let last = self.hold_menu(wanted);
+            self.pass(vec![pointer_button(last, Secondary, false)]);
+            assert!(!self.app.ui.menu.active, "letting go closes the menus");
+        }
+    }
+
+    /// An item of every menu, picked with the right button: a plain command, one in a
+    /// submenu, radio and check items, a ghosted item, an item that opens a requester, and
+    /// the left button while the menu is held (multi-select).
+    fn menu_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
+        // Something on the page that Flip moves and BG -> FG recolours.
+        rig.click(Place::Page(40, 40), Primary);
+        rig.click(Place::Cell(5), Primary);
+        seen(rig, "a dot on the page".into());
+        let rest = Place::Page(200, 200);
+        for action in [
+            Action::Command("picture.flip_horizontal"),
+            Action::Mode(PaintMode::Smear),
+            Action::Command("anim.method_expanded"),
+            Action::Command("color.bg_to_fg"),
+            Action::Command("antialias.high"),
+            Action::Pref(Pref::Coords),
+            Action::Pref(Pref::Coords),
+            Action::PixelSize(PixelSize(4)),
+            Action::PixelSize(PixelSize(6)),
+            // Ghosted: nothing happens.
+            Action::Command("picture.print"),
+            Action::Command("brush.halve"),
+        ] {
+            rig.pick(action);
+            assert!(!rig.app.modal_open(), "{action:?} opens nothing");
+            // The menus are not in the same place in the two skins: the pointer goes to
+            // the same page pixel before the states are compared.
+            rig.move_to(rest);
+            seen(rig, format!("picked {action:?}"));
+        }
+        assert_eq!(rig.app.ui.mode, PaintMode::Smear);
+        assert!(rig.app.ui.anim_expanded);
+        // Items that open a requester: it is the same one, and Esc closes it.
+        for id in ["palette.mixer", "picture.page_size", "anim.set_rate"] {
+            rig.pick(Action::Command(id));
+            assert!(rig.app.modal_open(), "{id} opens its requester");
+            seen(rig, format!("picked {id}"));
+            rig.tap(egui::Key::Escape);
+            assert!(!rig.app.modal_open(), "Esc closes {id}");
+            rig.move_to(rest);
+            seen(rig, format!("Esc after {id}"));
+        }
+        // Multi-select: the left button picks while the right one holds the menu open.
+        let at = rig.hold_menu(Action::Mode(PaintMode::Shade));
+        rig.pass(vec![pointer_button(at, Primary, true)]);
+        rig.pass(vec![pointer_button(at, Primary, false)]);
+        assert_eq!(rig.app.ui.mode, PaintMode::Shade);
+        assert!(rig.app.ui.menu.active, "the menu stays open");
+        seen(rig, "left click on Shade in the held menu".into());
+        let at = rig.menu_points(Action::Mode(PaintMode::Blend))[1];
+        rig.pass(vec![egui::Event::PointerMoved(at)]);
+        rig.pass(vec![pointer_button(at, Primary, true)]);
+        rig.pass(vec![pointer_button(at, Primary, false)]);
+        assert_eq!(rig.app.ui.mode, PaintMode::Blend);
+        seen(rig, "left click on Blend".into());
+        // Let go over Cycle: one more pick; the menu closes.
+        let at = rig.menu_points(Action::Mode(PaintMode::Cycle))[1];
+        rig.pass(vec![egui::Event::PointerMoved(at)]);
+        rig.pass(vec![pointer_button(at, Secondary, false)]);
+        assert_eq!(rig.app.ui.mode, PaintMode::Cycle);
+        assert!(!rig.app.ui.menu.active);
+        rig.move_to(rest);
+        seen(rig, "let go over Cycle".into());
+        // Keys do nothing while the menu is held; letting go away from it picks nothing.
+        rig.hold_menu(Action::Mode(PaintMode::Matte));
+        rig.tap(egui::Key::F3);
+        assert_eq!(rig.app.ui.mode, PaintMode::Cycle, "no hotkey under a menu");
+        let away = rig.point(rest);
+        rig.pass(vec![egui::Event::PointerMoved(away)]);
+        rig.pass(vec![pointer_button(away, Secondary, false)]);
+        assert_eq!(rig.app.ui.mode, PaintMode::Cycle);
+        assert!(!rig.app.ui.menu.active);
+        seen(rig, "let go away from the menu".into());
+    }
+
+    #[test]
+    fn menu_picks_do_the_same_in_both_skins() {
+        in_both_skins(Rig::modern(), menu_script);
+        in_both_skins(Rig::new(UiStyle::Modern, (1001.0, 700.0), 1.5), menu_script);
+    }
+
+    /// Every item of every menu and submenu is reached with the pointer in the live Modern
+    /// window, and the action under it is the menu model's.
+    #[test]
+    fn every_menu_item_is_under_the_pointer_in_the_live_window() {
+        let mut rig = Rig::new(UiStyle::Modern, (900.0, 620.0), 2.0);
+        let mut seen = 0;
+        for menu in MENUS.iter() {
+            for item in menu.items {
+                let actions: Vec<Action> = match item.entry {
+                    Entry::Action(a) => vec![a],
+                    Entry::Submenu(items) => items.iter().filter_map(|i| i.action()).collect(),
+                };
+                for action in actions {
+                    let last = rig.hold_menu(action);
+                    let ctx = rig.app.ui.menu_context();
+                    assert_eq!(
+                        rig.app.ui.menu.hovered_action(&ctx),
+                        Some(action).filter(|a| a.enabled(&ctx)),
+                        "{action:?}"
+                    );
+                    // Back to the bar beside the titles before letting go: no item is
+                    // under the pointer, so nothing is picked.
+                    let _ = last;
+                    let bar = egui::pos2(880.0, 10.0);
+                    rig.pass(vec![egui::Event::PointerMoved(bar)]);
+                    assert_eq!(rig.app.ui.menu.item, None);
+                    rig.pass(vec![pointer_button(bar, Secondary, false)]);
+                    assert!(!rig.app.ui.menu.active && !rig.app.modal_open());
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 100, "{seen} items");
+        assert!(!rig.app.engine.can_undo(), "nothing was picked");
+    }
+
+    #[test]
+    fn f12_and_the_chord_switch_the_skin_from_the_next_pass_on() {
+        use egui::Key;
+        let mut rig = Rig::classic();
+        // Something to undo and redo, to see that the chord is not Shift+U.
+        rig.click(Place::Page(30, 30), Primary);
+        rig.key('u');
+        assert!(rig.app.engine.can_redo());
+        let before = (rig.app.ui.tool, rig.app.scroll, rig.app.page().into_owned());
+        rig.tap(Key::F12);
+        assert!(rig.app.is_modern(), "F12: Modern");
+        // The same pass was still a Classic one; the next one lays the Modern window out.
+        assert!(rig.app.modern_layout().is_some());
+        rig.pass(vec![]);
+        assert!(rig.app.ui.title_visible && rig.app.ui.toolbox_visible);
+        assert_eq!(
+            (rig.app.ui.tool, rig.app.scroll, rig.app.page().into_owned()),
+            before,
+            "the document and the tool are shared"
+        );
+        // Painting works at once in the new skin.
+        rig.click(Place::Page(100, 90), Primary);
+        assert_eq!(rig.app.page().get(100, 90), Some(rig.app.ui.fg));
+        rig.key('u');
+        // Cmd/Ctrl+Shift+U: back, and no redo.
+        let held = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        let chord_u = |rig: &mut Rig| {
+            let mut events = vec![egui::Event::ModifiersChanged(held)];
+            events.extend(chord(Key::U, Key::U, held, ""));
+            rig.pass(events);
+            rig.pass(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        };
+        chord_u(&mut rig);
+        assert!(!rig.app.is_modern(), "the chord: Classic");
+        assert!(rig.app.engine.can_redo(), "the chord is not a redo");
+        assert_eq!(rig.app.page().get(100, 90), Some(0));
+        chord_u(&mut rig);
+        assert!(rig.app.is_modern());
+        // Not while a requester is open, and not while text is typed.
+        rig.key('p');
+        assert!(rig.app.modal_open());
+        rig.tap(Key::F12);
+        assert!(rig.app.is_modern(), "a requester takes the key");
+        rig.tap(Key::Escape);
+        rig.click(Place::Tool(Tool::Text, false), Primary);
+        rig.click(Place::Page(50, 50), Primary);
+        assert!(rig.app.typing());
+        rig.tap(Key::F12);
+        chord_u(&mut rig);
+        assert!(rig.app.is_modern(), "typing takes the keys");
+        rig.tap(Key::Escape);
+        assert!(!rig.app.typing());
+        rig.tap(Key::F12);
+        assert!(!rig.app.is_modern());
+    }
+
+    #[test]
+    fn a_small_classic_window_grows_to_the_modern_minimum() {
+        let mut rig = Rig::new(UiStyle::Classic, (640.0, 512.0), 1.0);
+        rig.commands.clear();
+        rig.tap(egui::Key::F12);
+        rig.pass(vec![]);
+        let (w, h) = layout::MIN_WINDOW;
+        assert!(
+            rig.commands
+                .contains(&egui::ViewportCommand::InnerSize(egui::vec2(w, h))),
+            "{:?}",
+            rig.commands
+        );
+        // A window that is large enough keeps its size.
+        let mut rig = Rig::classic();
+        rig.commands.clear();
+        rig.tap(egui::Key::F12);
+        for _ in 0..30 {
+            rig.pass(vec![]);
+        }
+        assert_eq!(rig.sizes_asked(), 0, "{:?}", rig.commands);
+    }
+
+    #[test]
+    fn prefs_switches_the_skin_and_the_theme_and_both_are_remembered() {
+        let dir = std::env::temp_dir().join(format!("dpx-modern-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp directory");
+        let (store, first) = crate::config::ConfigStore::open(&dir);
+        assert_eq!(first.ui_style, UiStyle::Classic, "a first start is Classic");
+        let mut rig = Rig::classic();
+        rig.app.config = Some(store);
+        // Classic: Prefs ▸ Theme is ghosted, Prefs ▸ Modern UI switches.
+        let ctx = rig.app.ui.menu_context();
+        assert_eq!(Action::UiStyle.checked(&ctx), Some(false));
+        rig.pick(Action::Theme(Choice::Light));
+        assert_eq!(rig.app.ui.theme, Choice::System, "no theme in Classic");
+        rig.pick(Action::UiStyle);
+        assert!(rig.app.is_modern());
+        rig.pass(vec![]);
+        // Modern: the item is checked; the theme items work and are radio marks.
+        let ctx = rig.app.ui.menu_context();
+        assert_eq!(Action::UiStyle.checked(&ctx), Some(true));
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Dark));
+        rig.pick(Action::Theme(Choice::Light));
+        assert_eq!(rig.app.ui.theme, Choice::Light);
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Light));
+        let ctx = rig.app.ui.menu_context();
+        assert_eq!(Action::Theme(Choice::Light).checked(&ctx), Some(true));
+        assert_eq!(Action::Theme(Choice::System).checked(&ctx), Some(false));
+        // A fixed theme does not follow the system; System does.
+        rig.system = Some(egui::Theme::Dark);
+        rig.pass(vec![]);
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Light));
+        rig.pick(Action::Theme(Choice::System));
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Dark));
+        rig.system = Some(egui::Theme::Light);
+        rig.pass(vec![]);
+        rig.pass(vec![]);
+        assert_eq!(rig.app.modern.theme(), Some(ThemeKind::Light));
+        rig.pick(Action::Theme(Choice::Dark));
+        // The settings file gets both once they have stopped changing.
+        for _ in 0..6 {
+            rig.t += 2.0;
+            rig.pass(vec![]);
+        }
+        let (_, saved) = crate::config::ConfigStore::open(&dir);
+        assert_eq!(
+            (saved.ui_style, saved.theme),
+            (UiStyle::Modern, Choice::Dark)
+        );
+        // The next start shows what was chosen.
+        let mut next = PainterApp::new();
+        saved.apply(&mut next);
+        assert!(next.is_modern());
+        assert_eq!(next.ui.theme, Choice::Dark);
+        // And back by menu, in the Modern skin's own menu.
+        rig.pick(Action::UiStyle);
+        assert!(!rig.app.is_modern());
+        for _ in 0..6 {
+            rig.t += 2.0;
+            rig.pass(vec![]);
+        }
+        let (_, saved) = crate::config::ConfigStore::open(&dir);
+        assert_eq!(
+            (saved.ui_style, saved.theme),
+            (UiStyle::Classic, Choice::Dark)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn shot(rig: &mut Rig, kind: ThemeKind, name: &str) -> (u32, Vec<u8>) {
+        let (w, h, rgba) = rig.app.modern_window_image(kind);
+        if let Ok(dir) = std::env::var("DPX_MODERN_SHOTS") {
+            let path = format!("{dir}/{name}.png");
+            write_png(&path, w, h, &rgba).expect("a writable directory");
+        }
+        (w, rgba)
+    }
+
+    fn probe((w, rgba): &(u32, Vec<u8>), l: &MainLayout, x: f32, y: f32) -> [u8; 3] {
+        pixel(rgba, *w, (x * l.scale) as u32, (y * l.scale) as u32)
+    }
+
+    fn rgb(c: dpx_ui_modern::paint::Color) -> [u8; 3] {
+        [c.r, c.g, c.b]
+    }
+
+    /// The held menu is drawn by the Modern skin over the window (nothing of the classic
+    /// strip is in the picture), costs one overlay image and a new bar, and goes with the
+    /// button.
+    #[test]
+    fn the_held_menu_is_an_overlay_over_the_modern_window() {
+        for (kind, ppp) in [(ThemeKind::Dark, 1.0), (ThemeKind::Light, 2.0)] {
+            let theme = Theme::of(kind);
+            let mut rig = Rig::new(UiStyle::Modern, (1280.0, 800.0), ppp);
+            rig.app.ui.theme = match kind {
+                ThemeKind::Dark => Choice::Dark,
+                ThemeKind::Light => Choice::Light,
+            };
+            rig.click(Place::Cell(5), Primary);
+            rig.key('R');
+            rig.drag(&[Place::Page(20, 10), Place::Page(300, 240)], Primary);
+            rig.pass(vec![]);
+            let before = rig.app.modern.renders();
+            assert_eq!(rig.app.modern.overlay(), (0, false));
+            rig.hold_menu(Action::Mode(PaintMode::Smear));
+            let after = rig.app.modern.renders();
+            assert_eq!(
+                (after[VIEWPORT], after[DOCK]),
+                (before[VIEWPORT], before[DOCK]),
+                "viewport and dock are not redone for a menu"
+            );
+            assert!(after[BAR] > before[BAR], "the open title is marked");
+            let (renders, shown) = rig.app.modern.overlay();
+            assert!(shown && renders >= 1);
+            // The pointer moving inside the same row redoes nothing.
+            let at = rig.menu_points(Action::Mode(PaintMode::Smear))[1];
+            rig.pass(vec![egui::Event::PointerMoved(at + egui::vec2(3.0, 2.0))]);
+            assert_eq!(rig.app.modern.overlay(), (renders, true));
+            assert_eq!(rig.app.modern.renders(), after);
+
+            let name = format!("live-menu-{kind:?}-{ppp}x").to_lowercase();
+            let image = shot(&mut rig, kind, &name);
+            let l = rig.app.modern_layout().expect("layout");
+            let (m, item, _) = menu_place(Action::Mode(PaintMode::Smear));
+            let card = modern_menu::menu_card(&l, m).expect("card");
+            let row = card.row(item);
+            // The row under the pointer and the open title are on the accent; another row
+            // is the card; beside the card the picture shows (the rectangle in colour 5).
+            assert_eq!(
+                probe(&image, &l, row.x + 3.0, row.y + 12.0),
+                rgb(theme.accent)
+            );
+            let other = card.row(item + 2);
+            assert_eq!(
+                probe(&image, &l, other.x + 3.0, other.y + 12.0),
+                rgb(theme.raised)
+            );
+            let title = l.menu_titles[m];
+            assert_eq!(
+                probe(&image, &l, title.x + 2.0, title.y + title.h / 2.0),
+                rgb(theme.accent)
+            );
+            let c = rig.app.palette().get(5).expect("colour 5");
+            let beside = modern_point(&rig.app, Place::Page(150, 100));
+            assert!(!card.rect.inset(-20.0).contains(beside.x, beside.y));
+            assert_eq!(probe(&image, &l, beside.x, beside.y), [c.r, c.g, c.b]);
+            // The top of the picture is page, not a classic menu strip.
+            let top = modern_point(&rig.app, Place::Page(310, 0));
+            let page0 = rig.app.palette().get(0).expect("colour 0");
+            assert_eq!(probe(&image, &l, top.x, top.y), [page0.r, page0.g, page0.b]);
+
+            rig.pass(vec![pointer_button(at, Secondary, false)]);
+            assert_eq!(rig.app.ui.mode, PaintMode::Smear);
+            assert!(!rig.app.modern.overlay().1, "the overlay is gone");
+        }
+    }
+
+    /// A pointer resting on a dock button shows the shared tooltip in the Modern look,
+    /// beside the dock; the Classic drawing of it is not in the picture.
+    #[test]
+    fn a_resting_pointer_shows_the_tooltip_beside_the_dock() {
+        let mut rig = Rig::modern();
+        rig.app.ui.theme = Choice::Light;
+        let theme = Theme::light();
+        rig.move_to(Place::Tool(Tool::Line, false));
+        assert_eq!(rig.app.ui.tooltip, None, "not at once");
+        rig.t += crate::tooltip::DELAY + 0.1;
+        rig.pass(vec![]);
+        let tip = rig
+            .app
+            .ui
+            .tooltip
+            .clone()
+            .expect("the tooltip after the delay");
+        assert_eq!(tip.text, "Straight Line  v");
+        let (renders, shown) = rig.app.modern.overlay();
+        assert!(shown);
+        for _ in 0..3 {
+            rig.pass(vec![]);
+        }
+        assert_eq!(rig.app.modern.overlay(), (renders, true), "idle passes");
+        let l = rig.app.modern_layout().expect("layout");
+        let rect = build::tooltip_rect(&l, &tip).expect("a dock button's tooltip");
+        let (dock, button) = (
+            l.dock.as_ref().expect("dock").rect,
+            l.tool_button(Tool::Line).expect("button"),
+        );
+        assert!(rect.right() < dock.x && rect.x > l.picture.x, "{rect:?}");
+        assert!(rect.y < button.center().1 && rect.bottom() > button.center().1);
+        let image = shot(&mut rig, ThemeKind::Light, "live-tooltip-light");
+        assert_eq!(
+            probe(&image, &l, rect.x + 4.0, rect.y + rect.h / 2.0),
+            rgb(theme.raised)
+        );
+        // The other half of a split button at once, with its own text.
+        rig.move_to(Place::Tool(Tool::Rectangle, true));
+        assert_eq!(
+            rig.app.ui.tooltip.as_ref().map(|t| t.text.as_str()),
+            Some("Filled Rectangle  R")
+        );
+        assert!(rig.app.modern.overlay().0 > renders);
+        // A press hides it; so does the held menu.
+        rig.click(Place::Tool(Tool::Rectangle, true), Primary);
+        assert_eq!(rig.app.ui.tooltip, None);
+        assert!(!rig.app.modern.overlay().1);
+        // A tooltip shown in one skin does not survive the switch to the other.
+        rig.move_to(Place::Tool(Tool::Curve, false));
+        rig.t += crate::tooltip::DELAY + 0.1;
+        rig.pass(vec![]);
+        assert!(rig.app.ui.tooltip.is_some());
+        rig.tap(egui::Key::F12);
+        assert_eq!(rig.app.ui.tooltip, None);
+        assert_eq!(rig.app.ui.menu, dpx_ui::MenuState::default());
     }
 }
