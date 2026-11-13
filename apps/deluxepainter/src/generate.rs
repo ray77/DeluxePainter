@@ -13,7 +13,7 @@
 //!   shows the picture.
 //! - **Picture**: the picture replaces the whole picture, every animation frame, its format
 //!   and palette in one undo step (`Command::ReplacePicture`; the Apply line says how many
-//!   frames go); Undo also brings back its colour ranges and transparent colour
+//!   frames and layers go); Undo also brings back its colour ranges and transparent colour
 //!   ([`page_state`]).
 //! - **Brush**: the picture becomes the custom brush, fitted to the picture palette like a
 //!   brush file (Brush ▸ Load: every colour to the nearest picture colour, never onto the
@@ -47,6 +47,7 @@ use dpx_imagegen::{
     ApiKeys, GenError, GenerationRequest, ImageGenerationProvider, JobId, JobManager, JobState,
     KeyCheck, KeySource, OpenAiConfig, OpenAiProvider, ProviderStatus, Quality, Secret, Style,
 };
+use dpx_ui::generate_requester::no_layer_memory;
 use dpx_ui::{
     GenPhase, GenQuality, GenStyle, GenTarget, GenerateOptions, GenerateRequester,
     GenerateResponse, ImageGenSetupRequester, ProviderInfo, ReqEvent, SetupInfo, SetupProvider,
@@ -275,16 +276,21 @@ pub(crate) fn rounded_note(t: GenTarget, n: usize) -> Option<dpx_ui::NoteRequest
     ))
 }
 
-/// The line under the options once there is a result: what Apply does. `frames`: the
-/// picture's frames (Picture replaces them all); `fitted`: the brush colours that had to be
-/// fitted to the picture palette (as Brush ▸ Load says in its note).
-pub(crate) fn apply_text(t: GenTarget, frames: usize, fitted: usize) -> String {
+/// The line under the options once there is a result: what Apply does. `frames` and
+/// `layers`: the picture's (Picture replaces them all and leaves one frame with one layer;
+/// the line names them in the words of MCP's "Replace Picture?",
+/// `dpx_mcp::tools::replaced_extent`: "all 3 frames, 2 layers", "2 layers", "all 20 frames";
+/// with both named "(undoable)" is left out, it would not fit the line on a 320-pixel
+/// screen); `fitted`: the brush colours that had to be fitted to the picture palette (as
+/// Brush ▸ Load says in its note).
+pub(crate) fn apply_text(t: GenTarget, frames: usize, layers: usize, fitted: usize) -> String {
     match t {
         GenTarget::Spare => "Apply: onto the spare page (j shows it)".into(),
-        GenTarget::Picture if frames > 1 => {
-            format!("Apply: replaces all {frames} frames (undoable)")
-        }
-        GenTarget::Picture => "Apply: replaces the picture (undoable)".into(),
+        GenTarget::Picture => match dpx_mcp::tools::replaced_extent(frames, layers) {
+            None => "Apply: replaces the picture (undoable)".into(),
+            Some(extent) if frames > 1 && layers > 1 => format!("Apply: replaces {extent}"),
+            Some(extent) => format!("Apply: replaces {extent} (undoable)"),
+        },
         GenTarget::Brush if fitted > 0 => {
             format!("Apply: as the brush, {fitted} colours fitted")
         }
@@ -293,9 +299,38 @@ pub(crate) fn apply_text(t: GenTarget, frames: usize, fitted: usize) -> String {
     }
 }
 
-/// Why no new layer can be added: the picture has the most layers allowed.
+/// Why no new layer can be added: the picture has the most layers allowed. Apply's refusal
+/// ("Not applied: …."); it leaves the advice out ("delete or merge one first", which the
+/// requester's box gives before generating) so it shows whole on the two lines under the box
+/// on a 320-pixel screen, as the memory refusal does.
 pub(crate) fn layers_full() -> String {
-    format!("the picture has {MAX_LAYERS} layers, the most allowed: delete or merge one first")
+    format!("the picture has {MAX_LAYERS} layers, the most allowed")
+}
+
+/// Why `doc` has no room for a new layer: [`layers_full`], or one more picture in every
+/// frame would pass the memory limit (`dpx_core::layer::room_for_layer`, the rule
+/// `AddPictureLayer` applies; the requester's box says the same with what to do,
+/// `GenerateRequester::layer_problem`, and MCP's `generate_image` and `apply_generated_image`
+/// refuse it as `LAYER_LIMIT`). `None` when there is room.
+pub(crate) fn no_layer_room(doc: &dpx_core::Document) -> Option<String> {
+    if doc.layer_count() >= MAX_LAYERS {
+        return Some(layers_full());
+    }
+    let (w, h) = (doc.page().width(), doc.page().height());
+    dpx_core::layer::room_for_layer(doc.layer_count(), doc.frame_count(), w, h)
+        .err()
+        .map(|_| no_layer_memory(doc.frame_count(), w, h))
+}
+
+/// The line under the box for a result shown for New layer on a picture with no room for
+/// one ([`no_layer_room`]); `None` when there is room.
+pub(crate) fn no_new_layer(doc: &dpx_core::Document) -> Option<String> {
+    no_layer_room(doc)?;
+    Some(if doc.layer_count() >= MAX_LAYERS {
+        format!("No new layer: {MAX_LAYERS} layers is the most")
+    } else {
+        "No new layer: no room in memory".into()
+    })
 }
 
 /// The name of a generated picture's layer: "Generated", or "Generated N" (the smallest N
@@ -502,7 +537,7 @@ impl PainterApp {
         let screen = View::of_target(doc.target()).ui_size();
         let doc_colors = doc.palette().len().min(256) as u16;
         let doc_format = (doc.target(), (doc.page().width(), doc.page().height()));
-        let doc_layers = doc.layer_count();
+        let (doc_layers, doc_frames) = (doc.layer_count(), doc.frame_count());
         let last = self.imagegen.last.clone().unwrap_or_else(|| Remembered {
             options: GenerateOptions {
                 quality: gen_quality(self.imagegen.settings.openai.quality),
@@ -521,6 +556,7 @@ impl PainterApp {
         req.set_more(last.more);
         req.set_document(doc_format.0, doc_format.1);
         req.set_doc_layers(doc_layers);
+        req.set_doc_frames(doc_frames);
         self.imagegen.opened = Some(Remembered {
             options: req.options(),
             prompt: req.prompt(),
@@ -692,12 +728,13 @@ impl PainterApp {
         let palette = req.palette_choice();
         // Nothing is generated (and paid for) that cannot be converted or applied for these
         // options: a current palette larger than the mode shows, a new layer on a picture
-        // with the most layers (the box says so, Generate is off).
+        // with the most layers or with no room for one more picture in every frame (the box
+        // says so, Generate is off).
         let doc = self.engine.document();
         let max = target.mode.max_colors(target.chipset).unwrap_or(16);
         if req.problem().is_some()
             || (palette == PaletteChoice::Current && doc.palette().len() > usize::from(max))
-            || (o.target == GenTarget::NewLayer && doc.layer_count() >= MAX_LAYERS)
+            || (o.target == GenTarget::NewLayer && no_layer_room(doc).is_some())
         {
             return;
         }
@@ -844,12 +881,14 @@ impl PainterApp {
                     }
                     _ => (import::thumbnail(&r.page, &r.palette, w, h), 0),
                 };
+                // A new layer the picture has no room for says so instead.
                 let message = match o.target {
-                    GenTarget::NewLayer if doc.layer_count() >= MAX_LAYERS => {
-                        format!("No new layer: {MAX_LAYERS} layers is the most")
-                    }
-                    to => apply_text(to, doc.frame_count(), fitted),
-                };
+                    GenTarget::NewLayer => no_new_layer(doc),
+                    _ => None,
+                }
+                .unwrap_or_else(|| {
+                    apply_text(o.target, doc.frame_count(), doc.layer_count(), fitted)
+                });
                 req.set_thumbnail(Some(thumb));
                 req.set_error(None);
                 req.set_message(Some(message));
@@ -918,8 +957,8 @@ impl PainterApp {
     fn layer_from_generated(&mut self, r: &Imported) -> Result<(), String> {
         self.finish_stroke();
         let doc = self.engine.document();
-        if doc.layer_count() >= MAX_LAYERS {
-            return Err(layers_full());
+        if let Some(why) = no_layer_room(doc) {
+            return Err(why);
         }
         let command = Command::AddPictureLayer {
             name: Some(layer_name(doc.layers())),
@@ -1351,9 +1390,9 @@ pub(crate) fn parse_spec(spec: &str) -> Result<Spec, String> {
 }
 
 /// `--mcp-gen-question picture|spare` (snapshots): the question before an MCP client's
-/// generated picture replaces the picture (naming `doc`'s frames and layers) or a picture
-/// on the spare page, for a generated picture of `doc`'s page size and palette size, as
-/// Claude Code would ask it.
+/// generated picture replaces the picture or a picture on the spare page (`doc` stands in
+/// for it), for a generated picture of `doc`'s page size and palette size, naming `doc`'s
+/// frames and layers, as Claude Code would ask it.
 fn snapshot_question(
     which: &str,
     doc: &dpx_core::Document,
@@ -1370,9 +1409,15 @@ fn snapshot_question(
             doc.frame_count(),
             doc.layer_count(),
         ),
-        "spare" => {
-            dpx_mcp::tools::replace_spare_question(client, dpx_mcp::Slot::First, w, h, colors)
-        }
+        "spare" => dpx_mcp::tools::replace_spare_question(
+            client,
+            dpx_mcp::Slot::First,
+            w,
+            h,
+            colors,
+            doc.frame_count(),
+            doc.layer_count(),
+        ),
         other => return Err(format!("--mcp-gen-question {other}: picture or spare")),
     };
     Ok(crate::mcp::question_requester(&q))

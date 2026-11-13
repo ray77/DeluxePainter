@@ -595,9 +595,33 @@ mod with_generator {
                 .text
                 .contains("the picture (all 20 frames)")
         );
-        let spare = replace_spare_question(Some("claude-code"), Slot::First, 320, 240, 32);
+        let spare = replace_spare_question(Some("claude-code"), Slot::First, 320, 240, 32, 1, 1);
         assert_eq!(spare.title, "Replace Spare Page?");
-        assert!(spare.text.contains("spare page (page1)"), "{}", spare.text);
+        assert_eq!(
+            spare.text,
+            "Claude wants to put a generated picture (320x240, 32 colours) on the spare page \
+             (page1), replacing the picture there. Undo on that page (j shows it) brings it \
+             back. Replace?"
+        );
+        // Seam review (wave 8): the spare page's frames and layers that go are named too.
+        let anim = replace_spare_question(None, Slot::Second, 8, 8, 2, 3, 2);
+        assert!(
+            anim.text.contains(
+                "spare page (page2), replacing the picture there (all 3 frames, 2 layers)."
+            ),
+            "{}",
+            anim.text
+        );
+        assert!(
+            replace_spare_question(None, Slot::First, 8, 8, 2, 1, 4)
+                .text
+                .contains("the picture there (4 layers).")
+        );
+        assert!(
+            replace_spare_question(None, Slot::First, 8, 8, 2, 20, 1)
+                .text
+                .contains("the picture there (all 20 frames).")
+        );
     }
 
     #[test]
@@ -800,6 +824,9 @@ mod with_generator {
         assert_eq!(code_of(&r), "LAYER_LIMIT");
         let msg = r.structured_content.unwrap()["message"].to_string();
         assert!(msg.contains("820 frames of 2 layers"), "{msg}");
+        // The Generate requester's box and Apply open with the same words
+        // (`dpx_ui::generate_requester::no_layer_memory`).
+        assert!(msg.contains("no room for another layer: "), "{msg}");
         assert_eq!(g.jobs.list().len(), sent, "nothing was sent");
         assert_eq!(
             g.code(

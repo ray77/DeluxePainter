@@ -2427,7 +2427,7 @@ pub async fn read_resource(ctx: &ToolCtx, uri: &str) -> Result<ReadResourceResul
 #[path = "tools_gen.rs"]
 mod generation_tools;
 #[cfg(feature = "imagegen")]
-pub use generation_tools::{replace_question, replace_spare_question};
+pub use generation_tools::{replace_question, replace_spare_question, replaced_extent};
 #[path = "tools_layers.rs"]
 pub mod layers;
 

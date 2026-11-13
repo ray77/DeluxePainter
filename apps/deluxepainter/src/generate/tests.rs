@@ -469,7 +469,7 @@ fn a_generated_picture_goes_to_the_spare_page_and_the_shown_page_stays() {
     );
     assert_eq!(
         req(&app).message(),
-        Some(apply_text(GenTarget::Spare, 1, 0).as_str())
+        Some(apply_text(GenTarget::Spare, 1, 1, 0).as_str())
     );
     assert_eq!(app.engine.document(), &before, "nothing before Apply");
     click(&mut app, &ctx, t + 0.1, GenControl::Apply);
@@ -568,7 +568,7 @@ fn apply_to_the_picture_is_one_undo_step() {
     let want = expected(&app, "A castle");
     assert_eq!(
         req(&app).message(),
-        Some(apply_text(GenTarget::Picture, 1, 0).as_str())
+        Some(apply_text(GenTarget::Picture, 1, 1, 0).as_str())
     );
     // Return applies once there is a result.
     ui_pass(
@@ -868,38 +868,100 @@ fn the_quality_choice_is_remembered_in_the_settings() {
 #[test]
 fn apply_texts_and_the_summary_fit_their_line() {
     let font = dpx_ui::font::Font::builtin();
+    // The line under the box is 300 pixels wide on a 320-pixel screen.
+    let fits = |text: &str| font.text_width(text) <= 300;
     for t in [
         GenTarget::Spare,
         GenTarget::Picture,
         GenTarget::Brush,
         GenTarget::NewLayer,
     ] {
-        for (frames, fitted) in [(1, 0), (dpx_core::anim::MAX_FRAMES, 256)] {
-            let text = apply_text(t, frames, fitted);
-            assert!(font.text_width(&text) <= 300, "{text}");
+        // The most frames and layers too (digits are all as wide).
+        for frames in [1, dpx_core::anim::MAX_FRAMES] {
+            for layers in [1, MAX_LAYERS] {
+                for fitted in [0, 256] {
+                    let text = apply_text(t, frames, layers, fitted);
+                    assert!(fits(&text), "{text}");
+                }
+            }
         }
     }
     assert_eq!(
-        apply_text(GenTarget::Picture, 20, 0),
+        apply_text(GenTarget::Picture, 20, 1, 0),
         "Apply: replaces all 20 frames (undoable)"
     );
+    // Seam review (wave 8): the layers that go are named as in MCP's "Replace Picture?".
     assert_eq!(
-        apply_text(GenTarget::NewLayer, 20, 0),
+        apply_text(GenTarget::Picture, 3, 2, 0),
+        "Apply: replaces all 3 frames, 2 layers"
+    );
+    assert_eq!(
+        apply_text(GenTarget::Picture, 1, 2, 0),
+        "Apply: replaces 2 layers (undoable)"
+    );
+    assert_eq!(
+        apply_text(GenTarget::Picture, 1, 1, 0),
+        "Apply: replaces the picture (undoable)"
+    );
+    assert_eq!(
+        apply_text(GenTarget::NewLayer, 20, 3, 0),
         "Apply: as a new layer (undoable)"
     );
     let full = format!("No new layer: {MAX_LAYERS} layers is the most");
-    assert!(font.text_width(&full) <= 300, "{full}");
+    assert!(fits(&full), "{full}");
+    assert!(fits("No new layer: no room in memory"));
+    // Apply's refusals take the two lines whole on the smallest screen: 32 layers, and
+    // frames with no room for another layer (the most frames, the widest page).
+    let full = format!("Not applied: {}.", layers_full());
+    assert_eq!(
+        full,
+        "Not applied: the picture has 32 layers, the most allowed."
+    );
+    let refused = format!(
+        "Not applied: {}.",
+        dpx_ui::generate_requester::no_layer_memory(
+            dpx_core::anim::MAX_FRAMES,
+            dpx_core::command::MAX_PAGE_SIDE,
+            dpx_core::command::MAX_PAGE_SIDE
+        )
+    );
+    let smallest = GenerateRequester::new(
+        GenerateOptions::default(),
+        "",
+        32,
+        (320, 200),
+        ProviderInfo {
+            ready: true,
+            summary: String::new(),
+            note: String::new(),
+        },
+    );
+    assert!(smallest.fits_lines(&refused), "{refused}");
+    assert!(smallest.fits_lines(&full), "{full}");
+    // A 320x256 screen gives the same 300-pixel line.
+    let pal = GenerateRequester::new(
+        GenerateOptions::default(),
+        "",
+        32,
+        (320, 256),
+        ProviderInfo {
+            ready: true,
+            summary: String::new(),
+            note: String::new(),
+        },
+    );
+    assert!(pal.fits_lines(&full) && pal.fits_lines(&refused));
     assert_eq!(layer_name(&[Layer::background()]), "Generated");
     assert_eq!(
         layer_name(&[Layer::background(), Layer::new("Generated")]),
         "Generated 2"
     );
     assert_eq!(
-        apply_text(GenTarget::Brush, 1, 20),
+        apply_text(GenTarget::Brush, 1, 1, 20),
         "Apply: as the brush, 20 colours fitted"
     );
-    assert!(font.text_width("OpenAI Images: billed per picture") <= 300);
-    assert!(font.text_width(TestPattern.display_name()) <= 300);
+    assert!(fits("OpenAI Images: billed per picture"));
+    assert!(fits(TestPattern.display_name()));
     assert!(OPENAI_NOTE.is_ascii() && NO_GENERATOR.is_ascii());
 }
 
@@ -974,7 +1036,11 @@ fn the_mcp_question_snapshot_shows_either_question_or_refuses() {
             "Replace Picture?",
             "the picture (all 3 frames, 2 layers)",
         ),
-        ("spare", "Replace Spare Page?", "spare page (page1)"),
+        (
+            "spare",
+            "Replace Spare Page?",
+            "spare page (page1), replacing the picture there (all 3 frames, 2 layers).",
+        ),
     ] {
         let mut ui = UiState::default();
         snapshot(&args(&["--mcp-gen-question", which]), &doc, &mut ui).unwrap();
@@ -995,7 +1061,15 @@ fn the_longest_mcp_generation_questions_fit_the_smallest_screen() {
     let client = Some("An MCP client named wwwwwwwwwwwwwwwww");
     for q in [
         dpx_mcp::tools::replace_question(client, 1280, 512, 256, 9999, 32),
-        dpx_mcp::tools::replace_spare_question(client, dpx_mcp::Slot::Second, 1280, 512, 256),
+        dpx_mcp::tools::replace_spare_question(
+            client,
+            dpx_mcp::Slot::Second,
+            1280,
+            512,
+            256,
+            9999,
+            32,
+        ),
     ] {
         let req = crate::mcp::question_requester(&q);
         assert!(!req.truncated(), "{:?}", req.lines());
@@ -2022,8 +2096,10 @@ fn a_picture_with_the_most_layers_gets_no_new_one_and_says_so() {
     assert!(!req(&app).enabled(GenControl::Generate), "no Again for it");
     click(&mut app, &ctx, t + 0.1, GenControl::Apply);
     assert!(app.ui.generate_requester.is_some(), "not applied");
-    let why = format!("Not applied: {}.", layers_full());
-    assert_eq!(req(&app).error(), Some(why.as_str()));
+    // Whole on the two lines (it was cut after "delete or merge one" on a 320-pixel screen).
+    let why = "Not applied: the picture has 32 layers, the most allowed.";
+    assert_eq!(req(&app).error(), Some(why));
+    assert!(req(&app).fits_lines(why));
     assert_eq!(app.engine.document().layers().len(), MAX_LAYERS);
     // The result stays: another target still takes it.
     click(&mut app, &ctx, t + 0.2, GenControl::Prev(GenRow::Target));
@@ -2032,6 +2108,128 @@ fn a_picture_with_the_most_layers_gets_no_new_one_and_says_so() {
     click(&mut app, &ctx, t + 0.1, GenControl::Apply);
     assert!(app.ui.generate_requester.is_none(), "applied as the brush");
     assert!(app.custom_brush.is_some());
+}
+
+/// Seam review (wave 8): a new layer that one more picture in every frame would take past the
+/// memory limit (`dpx_core::layer::room_for_layer`; 820 frames of 320x256 with one layer) is
+/// not generated for, as with 32 layers: the box says why, Generate, Return and
+/// `start_generation` send nothing; a result made for another target is not applied as a
+/// new layer and says why.
+#[test]
+fn frames_with_no_memory_for_another_layer_get_no_new_one_and_say_so() {
+    let counting = Arc::new(Counting::default());
+    let (mut app, ctx) = app_with(Some(counting.clone()));
+    app.engine
+        .execute(Command::SetFrameCount { count: 820 })
+        .unwrap();
+    let doc = app.engine.document();
+    assert_eq!((doc.page().width(), doc.page().height()), (320, 256));
+    assert_eq!(doc.layer_count(), 1);
+    open_by_menu(&mut app, &ctx, 0.0);
+    type_text(&mut app, &ctx, 0.2, "A tree");
+    click(&mut app, &ctx, 0.3, GenControl::More);
+    let mut t = 0.4;
+    while req(&app).options().target != GenTarget::NewLayer {
+        click(&mut app, &ctx, t, GenControl::Next(GenRow::Target));
+        t += 0.1;
+    }
+    let why = req(&app).problem().expect("no room for the new layer");
+    assert_eq!(
+        why,
+        "No room for another layer in 820 frames of 320x256: delete frames or layers, or use \
+         another target."
+    );
+    assert!(!req(&app).enabled(GenControl::Generate));
+    click(&mut app, &ctx, t, GenControl::Generate);
+    ui_pass(
+        &mut app,
+        &ctx,
+        t + 0.1,
+        vec![key_event(egui::Key::Enter, true)],
+    );
+    app.start_generation();
+    assert!(app.imagegen.jobs.list().is_empty(), "nothing was sent");
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(req(&app).phase(), GenPhase::Ask);
+    // start_generation checks the picture itself too, not only the requester's problem.
+    app.ui
+        .generate_requester
+        .as_mut()
+        .unwrap()
+        .set_doc_frames(1);
+    assert!(req(&app).problem().is_none());
+    app.start_generation();
+    assert!(
+        app.imagegen.jobs.list().is_empty(),
+        "still nothing was sent"
+    );
+    app.ui
+        .generate_requester
+        .as_mut()
+        .unwrap()
+        .set_doc_frames(820);
+    // A result made for the brush, then shown for New layer, says so and is not applied.
+    click(&mut app, &ctx, t + 0.2, GenControl::Prev(GenRow::Target));
+    assert_eq!(req(&app).options().target, GenTarget::Brush);
+    click(&mut app, &ctx, t + 0.3, GenControl::Generate);
+    let t = settle(&mut app, &ctx, t + 0.4);
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 1);
+    click(&mut app, &ctx, t + 0.05, GenControl::Next(GenRow::Target));
+    assert_eq!(req(&app).options().target, GenTarget::NewLayer);
+    assert_eq!(req(&app).message(), Some("No new layer: no room in memory"));
+    assert!(!req(&app).enabled(GenControl::Generate), "no Again for it");
+    click(&mut app, &ctx, t + 0.1, GenControl::Apply);
+    assert!(app.ui.generate_requester.is_some(), "not applied");
+    assert_eq!(
+        req(&app).error(),
+        Some("Not applied: no room for another layer in 820 frames of 320x256.")
+    );
+    assert_eq!(app.engine.document().layer_count(), 1);
+    assert_eq!(counting.calls.load(Ordering::SeqCst), 1, "no other request");
+    // One frame less has room: Generate is on again for a new layer.
+    app.close_generate();
+    app.engine
+        .execute(Command::SetFrameCount { count: 819 })
+        .unwrap();
+    open_by_menu(&mut app, &ctx, t + 0.2);
+    assert_eq!(req(&app).options().target, GenTarget::NewLayer);
+    assert!(req(&app).problem().is_none());
+    assert!(req(&app).enabled(GenControl::Generate));
+}
+
+/// Seam review (wave 8): Picture's Apply line names the layers that go as well as the frames.
+#[test]
+fn picture_names_the_layers_it_replaces() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.engine
+        .execute(Command::AddLayer { name: None })
+        .unwrap();
+    generate_for(&mut app, &ctx, "x", GenTarget::Picture);
+    assert_eq!(
+        req(&app).message(),
+        Some("Apply: replaces 2 layers (undoable)")
+    );
+    // In MCP's words for the same picture ("Replace Picture?").
+    let q = dpx_mcp::tools::replace_question(None, 320, 256, 32, 1, 2);
+    assert!(q.text.contains("the picture (2 layers)"), "{}", q.text);
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    app.engine
+        .execute(Command::AddLayer { name: None })
+        .unwrap();
+    app.engine
+        .execute(Command::SetFrameCount { count: 3 })
+        .unwrap();
+    generate_for(&mut app, &ctx, "x", GenTarget::Picture);
+    assert_eq!(
+        req(&app).message(),
+        Some("Apply: replaces all 3 frames, 2 layers")
+    );
+    let q = dpx_mcp::tools::replace_question(None, 320, 256, 32, 3, 2);
+    assert!(
+        q.text.contains("the picture (all 3 frames, 2 layers)"),
+        "{}",
+        q.text
+    );
 }
 
 /// Wave-8 integration review: Delete This Page with a generated spare of its own format that

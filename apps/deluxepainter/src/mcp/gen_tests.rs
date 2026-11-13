@@ -357,7 +357,10 @@ fn the_spare_page_is_asked_about_when_it_holds_the_users_picture() {
     let req = rig.app.ui.choice_requester.as_ref().unwrap();
     assert_eq!(req.title(), "Replace Spare Page?");
     let text = req.lines().join(" ");
-    assert!(text.contains("spare page (page1)"), "{text}");
+    assert!(
+        text.contains("spare page (page1), replacing the picture there. Undo"),
+        "one frame of one layer is not counted: {text}"
+    );
     assert!(!req.truncated() && req.height() <= 200, "{:?}", req.lines());
     assert_eq!(req.labels(), ["Replace", "Keep"]);
     // Return keeps it.
@@ -381,6 +384,41 @@ fn the_spare_page_is_asked_about_when_it_holds_the_users_picture() {
     assert_ne!(rig.app.engine.document().page(), mine.page());
     rig.ok("undo", json!({}));
     assert_eq!(rig.app.engine.document().page(), mine.page());
+}
+
+/// Seam review (wave 8): "Replace Spare Page?" names the frames and layers of the spare
+/// page that go, as "Replace Picture?" does, and still fits a 320x200 screen.
+#[test]
+fn the_spare_page_question_names_the_frames_and_layers_that_go() {
+    let mut rig = rig_with(Some(Arc::new(TestPattern)));
+    rig.app
+        .engine
+        .execute(dpx_core::Command::SetFrameCount { count: 3 })
+        .unwrap();
+    rig.app
+        .engine
+        .execute(dpx_core::Command::AddLayer { name: None })
+        .unwrap();
+    rig.ok("draw_pixel", json!({"x": 1, "y": 1, "color": 2}));
+    rig.ok("select_document", json!({"document_id": "page2"}));
+    let job = generated(&mut rig, json!({"prompt": "a castle"}));
+    let rx = rig.start("apply_generated_image", json!({ "job_id": job }));
+    while rig.app.ui.choice_requester.is_none() {
+        rig.pass();
+        assert!(rx.try_recv().is_err(), "it asks first");
+    }
+    let req = rig.app.ui.choice_requester.as_ref().unwrap();
+    let text = req.lines().join(" ");
+    assert!(
+        text.contains(
+            "on the spare page (page1), replacing the picture there (all 3 frames, 2 layers). \
+             Undo"
+        ),
+        "{text}"
+    );
+    assert!(!req.truncated() && req.height() <= 200, "{:?}", req.lines());
+    rig.pass_with(tap(egui::Key::Enter));
+    assert_eq!(rig.wait(&rx)["code"], "APPLY_DECLINED");
 }
 
 /// apply_generated_image to the picture, answered with Replace.

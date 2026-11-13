@@ -1023,10 +1023,25 @@ mod work {
         notes: Vec<String>,
     }
 
+    /// What a replaced picture loses, when it is more than one frame with one layer: "all 3
+    /// frames, 2 layers", "4 layers", "all 20 frames" (a generated picture is one frame with
+    /// one layer). The words of both questions, and of the Generate requester's Apply line
+    /// for Picture (`generate::apply_text` in the app), so the three say the same.
+    pub fn replaced_extent(frames: usize, layers: usize) -> Option<String> {
+        let mut extent = Vec::new();
+        if frames > 1 {
+            extent.push(format!("all {frames} frames"));
+        }
+        if layers > 1 {
+            extent.push(format!("{layers} layers"));
+        }
+        (!extent.is_empty()).then(|| extent.join(", "))
+    }
+
     /// The question before a generated picture replaces the shown one (spec §7.7): it
     /// names every frame and layer that goes when there is more than one (Picture is one
-    /// frame with one layer afterwards). The Generate requester's Apply line names the
-    /// frames only (`generate::apply_text` in the app; ADR-45, "Seam review").
+    /// frame with one layer afterwards), as the Generate requester's Apply line does
+    /// (`generate::apply_text` in the app; ADR-45, "Seam review").
     pub fn replace_question(
         client: Option<&str>,
         w: u32,
@@ -1035,16 +1050,9 @@ mod work {
         frames: usize,
         layers: usize,
     ) -> Question {
-        let mut extent = Vec::new();
-        if frames > 1 {
-            extent.push(format!("all {frames} frames"));
-        }
-        if layers > 1 {
-            extent.push(format!("{layers} layers"));
-        }
-        let what = match extent.as_slice() {
-            [] => "the picture".to_string(),
-            parts => format!("the picture ({})", parts.join(", ")),
+        let what = match replaced_extent(frames, layers) {
+            None => "the picture".to_string(),
+            Some(extent) => format!("the picture ({extent})"),
         };
         Question {
             title: "Replace Picture?".into(),
@@ -1060,20 +1068,27 @@ mod work {
 
     /// The question before a generated picture replaces a picture on the spare page (spec
     /// §4.1.10 and §7.7: existing work is never replaced unasked; a blank spare page is not
-    /// asked about).
+    /// asked about). It names the spare page's `frames` and `layers` that go as
+    /// [`replace_question`] does.
     pub fn replace_spare_question(
         client: Option<&str>,
         page: Slot,
         w: u32,
         h: u32,
         colors: usize,
+        frames: usize,
+        layers: usize,
     ) -> Question {
+        let what = match replaced_extent(frames, layers) {
+            None => "the picture there".to_string(),
+            Some(extent) => format!("the picture there ({extent})"),
+        };
         Question {
             title: "Replace Spare Page?".into(),
             text: format!(
                 "{} wants to put a generated picture ({w}x{h}, {colors} colours) on the \
-                 spare page ({}), replacing the picture there. Undo on that page (j shows \
-                 it) brings it back. Replace?",
+                 spare page ({}), replacing {what}. Undo on that page (j shows it) brings \
+                 it back. Replace?",
                 asker(client),
                 page.id()
             ),
@@ -1086,11 +1101,14 @@ mod work {
     /// it is not one colour all over. The blank page DeluxePainter makes (or none yet) is
     /// not; nor is a page cleared to one colour.
     fn spare_holds_picture(ws: &dyn Workspace) -> bool {
-        ws.spare().is_some_and(|doc| {
-            doc.cels().any(|cel| {
-                let pixels = cel.pixels();
-                pixels.iter().any(|&p| p != pixels[0])
-            })
+        ws.spare().is_some_and(|doc| holds_picture(&doc))
+    }
+
+    /// Some frame or layer of `doc` is not one colour all over ([`spare_holds_picture`]).
+    fn holds_picture(doc: &Document) -> bool {
+        doc.cels().any(|cel| {
+            let pixels = cel.pixels();
+            pixels.iter().any(|&p| p != pixels[0])
         })
     }
 
@@ -1140,22 +1158,28 @@ mod work {
                 l.dc.layers,
             )),
             ApplyTo::Spare => {
+                // The spare page's frames and layers, when it holds a picture.
                 let holds = ctx
                     .exec
-                    .run(move |ws| -> Result<bool, ToolError> {
+                    .run(move |ws| -> Result<Option<(usize, usize)>, ToolError> {
                         if ws.shown() != slot {
                             return Err(pages_swapped());
                         }
-                        Ok(spare_holds_picture(ws))
+                        Ok(ws
+                            .spare()
+                            .filter(holds_picture)
+                            .map(|d| (d.frame_count(), d.layer_count())))
                     })
                     .await??;
-                holds.then(|| {
+                holds.map(|(frames, layers)| {
                     replace_spare_question(
                         ctx.state.activity().snapshot().client.as_deref(),
                         slot.other(),
                         w,
                         h,
                         used,
+                        frames,
+                        layers,
                     )
                 })
             }
@@ -1301,7 +1325,7 @@ mod work {
 }
 
 #[cfg(feature = "imagegen")]
-pub use work::{replace_question, replace_spare_question};
+pub use work::{replace_question, replace_spare_question, replaced_extent};
 
 #[cfg(test)]
 #[path = "tools_gen_tests.rs"]

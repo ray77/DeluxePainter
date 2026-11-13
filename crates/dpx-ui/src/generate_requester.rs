@@ -58,6 +58,19 @@ mod geom {
     pub const ROWS_Y: i32 = 50;
 }
 
+/// Why frames have no room for one more layer (one more picture each would pass the memory
+/// limit of a picture's frames, `dpx_core::anim::MAX_FRAME_BYTES`; `dpx_core::layer::
+/// room_for_layer`), as a clause for the requester's box and the app's Apply: "no room for
+/// another layer in 820 frames of 320x256" (MCP's `LAYER_LIMIT` opens with the same words).
+/// Short, so the box says it whole on 320x200.
+pub fn no_layer_memory(frames: usize, width: u32, height: u32) -> String {
+    let frames = match frames {
+        1 => "1 frame".to_string(),
+        n => format!("{n} frames"),
+    };
+    format!("no room for another layer in {frames} of {width}x{height}")
+}
+
 /// A screen the picture is made for: a screen preset of `dpx_core::mode::PRESETS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolutionPreset {
@@ -362,6 +375,8 @@ pub struct GenerateRequester {
     document: Option<(Target, (u32, u32))>,
     /// The current document's layer count (a new layer needs room for one more).
     doc_layers: usize,
+    /// The current document's frame count (a new layer is a picture in every frame).
+    doc_frames: usize,
     phase: GenPhase,
     provider: ProviderInfo,
     /// The second line under the options, e.g. what Apply will do.
@@ -391,6 +406,7 @@ impl GenerateRequester {
             doc_colors,
             document: None,
             doc_layers: 1,
+            doc_frames: 1,
             phase: GenPhase::Ask,
             provider,
             message: None,
@@ -479,6 +495,13 @@ impl GenerateRequester {
         self.doc_layers = n;
     }
 
+    /// The current document's number of frames: a new layer is one more picture in each, so
+    /// with too many for the memory limit the New layer target cannot be generated for
+    /// either ([`Self::layer_problem`]).
+    pub fn set_doc_frames(&mut self, n: usize) {
+        self.doc_frames = n;
+    }
+
     /// The target and page size the picture is made for: the document's for a new layer,
     /// else the chosen resolution on the chosen chipset.
     pub fn format(&self) -> (Target, (u32, u32)) {
@@ -547,15 +570,36 @@ impl GenerateRequester {
         self.layer_problem().or_else(|| self.palette_problem())
     }
 
-    /// New layer on a picture that already has the most layers allowed.
+    /// New layer on a picture that already has the most layers allowed, or whose frames
+    /// have no room for one more picture each in the memory limit
+    /// (`dpx_core::layer::room_for_layer`, the rule Apply's `AddPictureLayer` applies; MCP's
+    /// `generate_image` refuses the same with "no room for another layer").
     pub fn layer_problem(&self) -> Option<String> {
-        (self.options.target == GenTarget::NewLayer && self.doc_layers >= MAX_LAYERS).then(|| {
-            format!(
+        if self.options.target != GenTarget::NewLayer {
+            return None;
+        }
+        if self.doc_layers >= MAX_LAYERS {
+            return Some(format!(
                 "The picture has {} layers, the most allowed. Choose another target, or \
                  delete or merge a layer first.",
                 self.doc_layers
-            )
-        })
+            ));
+        }
+        let (_, (w, h)) = self.format();
+        dpx_core::layer::room_for_layer(self.doc_layers, self.doc_frames, w, h)
+            .err()
+            .map(|_| {
+                // MCP's words for it ("no room for another layer: …; delete frames or
+                // layers, or use another target").
+                let why = no_layer_memory(self.doc_frames, w, h);
+                let mut chars = why.chars();
+                let first = chars.next().map(|c| c.to_ascii_uppercase());
+                format!(
+                    "{}{}: delete frames or layers, or use another target.",
+                    first.unwrap_or_default(),
+                    chars.as_str()
+                )
+            })
     }
 
     /// Palette Current with a document palette larger than the chosen mode shows (the
@@ -628,6 +672,13 @@ impl GenerateRequester {
     /// The right edge of the option column (requester coordinates).
     fn column_right() -> i32 {
         LEFT + Self::label_w() + ARROW + Self::value_w(GenRow::Chipset) + ARROW
+    }
+
+    /// Whether `text` shows whole on the two lines under the options, where an error beside
+    /// a result shown in the box goes ([`Self::render`] cuts it to two lines).
+    pub fn fits_lines(&self, text: &str) -> bool {
+        let (w, _) = self.size();
+        wrap(text, w - 2 * LEFT).len() <= 2
     }
 
     /// The top of the two lines under the options.
@@ -1673,5 +1724,76 @@ mod tests {
         // Any other target generates.
         click(&mut r, GenControl::Prev(GenRow::Target));
         assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
+    }
+
+    /// Seam review (wave 8): frames with no room for one more picture each in the memory
+    /// limit (`dpx_core::layer::room_for_layer`) block a new layer like 32 layers do: the
+    /// reason in the box, Generate, Again and Return off; the longest reason fits the box on
+    /// 320x200 with and without More...
+    #[test]
+    fn frames_without_room_for_another_layer_block_generate_for_a_new_layer_only() {
+        let pens = pens();
+        let mut r = requester((320, 200));
+        r.set_document(Target::default(), (320, 256));
+        typed(&mut r, "A tree");
+        click(&mut r, GenControl::More);
+        while r.options().target != GenTarget::NewLayer {
+            click(&mut r, GenControl::Next(GenRow::Target));
+        }
+        // 320x256: 819 frames have room for a second layer, 820 do not.
+        r.set_doc_frames(819);
+        assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
+        let note = r.render(&pens);
+        r.set_doc_frames(820);
+        let why = r.layer_problem().expect("no room for a new layer");
+        assert_eq!(
+            why,
+            "No room for another layer in 820 frames of 320x256: delete frames or layers, or \
+             use another target."
+        );
+        assert_eq!(r.problem(), Some(why.clone()));
+        assert!(!r.enabled(GenControl::Generate));
+        assert_eq!(
+            r.handle(ReqEvent::Key(ReqKey::Enter)),
+            GenerateResponse::Continue,
+            "Return does not generate either"
+        );
+        assert_ne!(r.render(&pens).pixels(), note.pixels(), "the box says why");
+        // A result made for another target, then shown for New layer: no Again.
+        r.set_phase(GenPhase::Result);
+        assert!(!r.enabled(GenControl::Generate));
+        r.set_phase(GenPhase::Ask);
+        // Any other target generates.
+        click(&mut r, GenControl::Prev(GenRow::Target));
+        assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
+        click(&mut r, GenControl::Next(GenRow::Target));
+        // One frame is named as one: 8 layers of 4096x4096 hold 128 MiB, a ninth passes it.
+        r.set_document(Target::default(), (4096, 4096));
+        r.set_doc_frames(1);
+        r.set_doc_layers(8);
+        assert!(
+            r.layer_problem()
+                .unwrap()
+                .contains("another layer in 1 frame of 4096x4096:"),
+            "{:?}",
+            r.layer_problem()
+        );
+        // The longest reason (digits are all as wide) fits the box whole on the smallest
+        // screen, with the other rows shown and without.
+        r.set_doc_layers(MAX_LAYERS - 1);
+        r.set_doc_frames(dpx_core::anim::MAX_FRAMES);
+        let longest = r.layer_problem().expect("no room");
+        assert!(longest.contains("in 999 frames of 4096x4096:"), "{longest}");
+        for more in [true, false] {
+            r.set_more(more);
+            let b = r.box_rect().inset(2);
+            let lines = wrap(&longest, b.w - 2);
+            let n = lines.len() as i32;
+            assert!(
+                n * LINE_STEP <= b.h,
+                "more={more}: {n} lines in {}: {lines:?}",
+                b.h
+            );
+        }
     }
 }
