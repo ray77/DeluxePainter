@@ -253,9 +253,8 @@ pub const GENERATED: &str = "Picture generated";
 /// an OCS picture (ADR-46, wave-8 integration: an older project's colours, or an AGA
 /// picture's, that are not 12-bit; `Imported::rounded_colors`), so no colour changes
 /// silently. Only the targets that take the result's palette (the spare page, the picture);
-/// none without rounded entries.
-// TODO(wave8-integration): MCP's generation tools (ADR-45 strand) apply a result too; their
-// answer should carry `Imported::rounded_colors` as `set_format`'s does.
+/// none without rounded entries. MCP's get_generation_status and apply_generated_image say
+/// the same in their notes and `rounded_colors` (`tools_gen.rs`).
 pub(crate) fn rounded_note(t: GenTarget, n: usize) -> Option<dpx_ui::NoteRequester> {
     if n == 0 {
         return None;

@@ -802,8 +802,28 @@ mod work {
         if format.chipset == Chipset::Ocs {
             notes.push("OCS: every palette entry is a 12-bit colour".to_string());
         }
+        let rounded = rounded_colors(r, to);
+        if rounded > 0 {
+            notes.push(format!(
+                "{} of the current palette for OCS",
+                dpx_core::hardware::rounded_note(rounded)
+            ));
+        }
         notes.extend(dpx_core::hardware::format_notes(&format));
         notes
+    }
+
+    /// Entries of the current palette the conversion rounded to 12 bits for an OCS target
+    /// (ADR-46, `Imported::rounded_colors`), as the Generate requester's Apply note counts
+    /// them: only for the targets that take the result's palette (the spare page and the
+    /// picture); a new layer and the brush keep the picture's palette as it is.
+    fn rounded_colors(r: &Imported, to: GenTargetArg) -> usize {
+        match to {
+            GenTargetArg::Spare | GenTargetArg::NewDocument | GenTargetArg::Picture => {
+                r.rounded_colors
+            }
+            GenTargetArg::Brush | GenTargetArg::NewLayer => 0,
+        }
     }
 
     #[derive(Serialize)]
@@ -838,8 +858,15 @@ mod work {
         palette_bits: Option<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
         preview_scale: Option<u32>,
+        /// Current-palette entries rounded to 12-bit OCS values (left out when none).
+        #[serde(skip_serializing_if = "is_zero")]
+        rounded_colors: usize,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         notes: Vec<String>,
+    }
+
+    fn is_zero(n: &usize) -> bool {
+        *n == 0
     }
 
     pub(super) async fn status(ctx: &ToolCtx, a: JobIdArgs) -> Result<CallToolResult, ToolError> {
@@ -860,6 +887,7 @@ mod work {
             palette_size: None,
             palette_bits: None,
             preview_scale: None,
+            rounded_colors: 0,
             notes: Vec::new(),
         };
         match state {
@@ -909,6 +937,7 @@ mod work {
                     Chipset::Ocs => 4,
                     Chipset::Aga => 8,
                 });
+                out.rounded_colors = rounded_colors(&r, to);
                 out.notes = notes_for(&r, to, &landed);
                 out.notes.push(
                     "apply_generated_image applies it (one undo step); the preview shows it \
@@ -935,6 +964,9 @@ mod work {
         colors_used: usize,
         undoable: bool,
         document: Option<DocumentInfo>,
+        /// Current-palette entries rounded to 12-bit OCS values (left out when none).
+        #[serde(skip_serializing_if = "is_zero")]
+        rounded_colors: usize,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         notes: Vec<String>,
     }
@@ -1103,6 +1135,7 @@ mod work {
         let dc = l.dc.clone();
         let format = conversion(&l.plan, &l.dc, to).0;
         let mut notes = notes_for(&r, to, &landed);
+        let rounded = rounded_colors(&r, to);
         let (slot, revision, document) = ctx
             .exec
             .run(move |ws| -> Result<_, ToolError> {
@@ -1165,6 +1198,7 @@ mod work {
             colors_used: used,
             undoable: apply_to != ApplyTo::Brush,
             document,
+            rounded_colors: rounded,
             notes,
         }))
     }

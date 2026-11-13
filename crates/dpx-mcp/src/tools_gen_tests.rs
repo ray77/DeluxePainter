@@ -457,6 +457,40 @@ mod with_generator {
         assert_eq!(s["palette"], "current");
     }
 
+    /// ADR-46: with the current palette on an OCS target, entries that are not 12-bit are
+    /// rounded; status and apply say how many, as the Generate requester's Apply note does.
+    #[test]
+    fn the_current_palettes_colours_rounded_for_ocs_are_counted() {
+        let g = G::new(test_pattern());
+        // The headless picture is AGA: two entries that OCS cannot show.
+        g.ok("set_palette_color", json!({"index": 1, "color": "#080808"}));
+        g.ok("set_palette_color", json!({"index": 3, "color": "#102031"}));
+        let started = g.ok(
+            "generate_image",
+            json!({"prompt": "x", "chipset": "ocs", "palette": "current", "target": "spare"}),
+        );
+        let job = started["job_id"].as_str().unwrap().to_string();
+        let s = g.done(&job).structured_content.unwrap();
+        assert_eq!(s["status"], "done", "{s}");
+        assert_eq!(s["rounded_colors"], 2, "{s}");
+        let notes = s["notes"].to_string();
+        assert!(
+            notes.contains("2 colours rounded to 12-bit OCS values"),
+            "{notes}"
+        );
+        let applied = g.ok("apply_generated_image", json!({ "job_id": job }));
+        assert_eq!(applied["rounded_colors"], 2, "{applied}");
+        // A new palette is made in 12-bit colours: nothing is rounded, nothing is said.
+        let started = g.ok(
+            "generate_image",
+            json!({"prompt": "x", "chipset": "ocs", "palette": "new", "target": "spare"}),
+        );
+        let job = started["job_id"].as_str().unwrap().to_string();
+        let s = g.done(&job).structured_content.unwrap();
+        assert!(s.get("rounded_colors").is_none(), "{s}");
+        assert!(!s["notes"].to_string().contains("rounded"), "{s}");
+    }
+
     #[test]
     fn new_layer_and_brush_apply_and_the_picture_is_asked_first() {
         let g = G::new(test_pattern());
