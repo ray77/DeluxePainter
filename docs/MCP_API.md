@@ -14,7 +14,7 @@ Scripts, tests ──stdio──► deluxepainter mcp            (headless engin
                ──HTTP───► deluxepainter mcp --http     (headless engine, no window)
 ```
 
-- The **running app** serves MCP Streamable HTTP on `127.0.0.1` while MCP control is on (Prefs > AI & MCP.., off by default, or `--mcp` for one session). The tools act on the document in the window, through the same `dpx-core` commands as the mouse and keyboard; every change is an undo step the user can take back with `U`.
+- The **running app** serves MCP Streamable HTTP on `127.0.0.1` while MCP control is on (Prefs > AI & MCP.., off by default, or `--mcp` for one session). The tools act on the document in the window, through the same `dpx-core` commands as the mouse and keyboard; a change is an undo step the user can take back with `U` unless its result says `undoable: false` (section 3).
 - MCP clients launch stdio servers themselves, so they start the **bridge** (`dpx-mcp-bridge`, also `deluxepainter mcp-bridge`). It forwards every call to the app. It needs no arguments and no token in the client's configuration: it reads the app's endpoint file.
 - The **headless** servers (`deluxepainter mcp`, `deluxepainter mcp --http`) run their own engine with a picture and a spare page in memory; nothing is shown. They have no image generator.
 - ADR-43 supersedes ADR-5's plan of a local socket / named pipe: one protocol end to end (rmcp's server and client), no `interprocess` crate.
@@ -30,7 +30,7 @@ Scripts, tests ──stdio──► deluxepainter mcp            (headless engin
 | Mode | stateless (no `Mcp-Session-Id`), JSON responses (no SSE stream); rmcp 3.9 |
 | Lifetime | starts when MCP control is turned on (or with `--mcp`), stops when it is turned off and when the app quits; queued calls then fail with `APP_UNAVAILABLE` |
 | Requests | `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (else 403); any `Origin` header is refused (403); `Authorization: Bearer <token>` compared in constant time (else 401 with `WWW-Authenticate: Bearer`); bodies over 16 MiB are refused (413) |
-| One per user | one GUI per config directory answers MCP clients (`mcp-app.lock`); a second server for the same config directory does not start |
+| One per user | one server per config directory answers MCP clients: it holds `mcp-endpoint.lock`, and a second one for the same config directory does not start ("another DeluxePainter is already serving MCP clients"). `mcp-app.lock` does something else: it ends a second `--mcp` start and tells the bridge that a GUI runs (section 2.4) |
 
 Calls are served in arrival order, one at a time: `tools/call` and `resources/read` take a ticket when they arrive and keep their turn for the whole call (pipelined calls too). `initialize`, `tools/list` and `resources/list` take no ticket.
 
@@ -49,7 +49,7 @@ Calls are served in arrival order, one at a time: `tools/call` and `resources/re
 - A read-only call (and every resource read) is retried once after a lost connection; a changing call is not (it may have run) and gives `APP_CONNECTION_LOST`.
 - The bridge's own failures reach a client as tool results (`isError`, with the codes above); for a resource read they are JSON-RPC errors (internal error, message `CODE: text`).
 - The app sees the client as "<client name> via deluxepainter-bridge".
-- The bridge is built without the image generation code (no HTTP client for OpenAI, no TLS or keychain code); it lists the generation tools and forwards their calls to the window.
+- `dpx-mcp-bridge` built alone (`cargo build --release -p dpx-mcp-bridge`, as `cargo run -p xtask -- mcpb` does for the `.mcpb`) has no image generation code (no HTTP client for OpenAI, no TLS or keychain code). `deluxepainter mcp-bridge`, which Claude Code's `claude mcp add` entry runs, is the full app binary with that code; and a `dpx-mcp-bridge` built in one cargo run with the app (`cargo build --workspace`, `cargo test --workspace`, or `-p deluxepainter -p dpx-mcp-bridge` as in section 9) has it too, because cargo unifies `dpx-mcp`'s `imagegen` feature. Either way the bridge lists the generation tools and forwards their calls to the window; it generates nothing itself.
 
 ### 2.3 Headless servers
 
@@ -138,7 +138,7 @@ Permission: **none** = always answers; **read** = needs "Read document info"; **
 | `select_layer`, `set_layer_visibility`, `rename_layer` | edit | idempotent |
 | `delete_layer` | edit | destructive |
 
-`save_project` and `export_image` need only the Read permission (they change no picture), but replacing an existing file always needs `overwrite: true` and the user's click (section 7).
+`save_project` and `export_image` need only the Read permission (they change no picture), but replacing an existing file always needs `overwrite: true`, and the user's click unless "Overwrite files without asking" is on or the server is headless (section 7).
 
 ### 4.1 Status and documents
 
@@ -244,11 +244,11 @@ Paths must lie in an approved directory; relative paths start at the first one. 
 
 **`export_image`** `{path, format?, overwrite?}`. IFF ILBM (`.iff`, `.ilbm`, `.lbm`), IFF ANIM (`.anim`, every frame) or indexed PNG (`.png`), by the extension or `format` (`iff_ilbm`, `iff_anim`, `png`; a mismatch with the extension is `INVALID_ARGUMENT`). The document (every frame and layer) is checked against the chipset's limits before any encoder runs (`HARDWARE_LIMIT`; nothing is reduced silently; over MCP this check also covers PNG); the file holds the picture as it shows (visible layers flattened). The notes name a custom or overscan screen (e.g. "320x240 is a custom screen size on PAL:Low Res (standard 320x256); exact hardware compatibility is not guaranteed"), that an IFF file stores no chipset (an OCS picture reopens as AGA), and how many layers were flattened.
 
-Both return `{document_id, revision, path, format, bytes, notes}`. An existing file is `FILE_EXISTS` unless `overwrite: true`; then the user is asked (section 7).
+Both return `{document_id, revision, path, format, bytes, notes}`. An existing file is `FILE_EXISTS` unless `overwrite: true`; then the user is asked, unless "Overwrite files without asking" is on or the server is headless (section 7).
 
 ### 4.8 Image generation
 
-Only in the running window, with a generator set up by the user (Prefs > AI & MCP.. > Set up.., or Picture > Generate.. > Set up..). They share the Generate requester's generator, key store, job manager and conversion. Jobs that MCP clients start are visible to MCP only (the requester's own jobs are `JOB_NOT_FOUND` for MCP); the 16 newest are kept.
+Only in the running window, with a generator set up by the user (Prefs > AI & MCP.. > Set up.., or Picture > Generate.. > Set up..). They share the Generate requester's generator, key store, job manager and conversion. Jobs that MCP clients start are visible to MCP only (the requester's own jobs are `JOB_NOT_FOUND` for MCP). The plans of the 16 newest MCP jobs are kept, but the shared job manager keeps only its 8 newest finished jobs (the requester's and MCP's together). A job's picture stays with its plan once `get_generation_status` or `apply_generated_image` has fetched it; a finished job whose picture was never fetched is lost when the job manager drops it, and then gives `JOB_NOT_FOUND` "gen-N is no longer kept: generate it again" although its plan is among the 16.
 
 **`generate_image`** — starts a job and answers at once. **The request is sent immediately**: the description goes over the internet to the provider and is billed to the user's own account (section 8).
 
@@ -264,7 +264,7 @@ Only in the running window, with a generator set up by the user (Prefs > AI & MC
 | `background` | `opaque` | or `transparent` (transparent pixels become colour 0) |
 | `target` | `spare` | `spare`, `picture`, `brush`, `new_layer`, `new_document` (the spare page with a format of its own) |
 
-Options left out take the Generate requester's choices of this session when the user has made any, else the defaults in the table. Framing and scaler have no arguments: they are the requester's (default Crop and the Pixel art scaler). `new_layer` takes the picture's page, chipset and palette: any `preset`, a `width`, `height`, `chipset` or `colors` other than the picture's, or `palette: new` is `INVALID_ARGUMENT`, a picture with 32 layers `LAYER_LIMIT`, a palette its mode cannot show `PALETTE_RANGE_INVALID` — all before anything is sent. Result: `{job_id ("gen-N"), status: "running", target, width, height, chipset, display_mode, colors, palette, dithering, style, background, provider: {id, name, network, model}, cost, notes}`.
+Options left out take the Generate requester's choices of this session when the user has made any, else the defaults in the table; this holds for the resolution (preset or size), chipset, colours, dithering, palette, style and background, not for `target`, which is always `spare` when left out (the requester's Target does not change it). Framing and scaler have no arguments: they are the requester's (default Crop and the Pixel art scaler). `new_layer` takes the picture's page, chipset and palette: any `preset`, a `width`, `height`, `chipset` or `colors` other than the picture's, or `palette: new` is `INVALID_ARGUMENT`, a picture with 32 layers `LAYER_LIMIT`, a palette its mode cannot show `PALETTE_RANGE_INVALID` — all before anything is sent. Result: `{job_id ("gen-N"), status: "running", target, width, height, chipset, display_mode, colors, palette, dithering, style, background, provider: {id, name, network, model}, cost, notes}`.
 
 **`get_generation_status`** `{job_id}`. `{job_id, status: "running" | "done" | "failed" | "cancelled", target, elapsed_seconds, provider}`; failed: `error: {code, message, retryable}`; cancelled: a billing note; done: a PNG image block of the converted picture (palette colours, integer-scaled) and `width`, `height`, `chipset`, `colors_used`, `palette_size`, `palette_bits` (4 OCS, 8 AGA), `preview_scale`, `notes`. For the brush target it shows the brush as Apply makes it (fitted to the shown picture's palette).
 
@@ -336,8 +336,8 @@ Reading a resource needs the Read permission and takes its turn in arrival order
 ## 8. Image generation: cost and consent
 
 - Nothing is generated until the user has chosen a generator and given it a key (OpenAI Images is the only provider; default `none`). Without one, the tools answer `IMAGE_GENERATOR_NOT_CONFIGURED` and nothing is made up; the test pattern used by tests and snapshots is never offered to users.
-- OpenAI bills every picture to the user's own API account, also a cancelled one (UNVERIFIED whether a cancelled request is billed; the texts assume it is). There is no free tier and DeluxePainter quotes no price (OpenAI does not publish a per-picture price for the current models).
-- In the window's Generate requester the cost note is shown before Generate. **Over MCP the request is sent at once, without a question in the app**: the cost and the network use are stated beforehand in `generate_image`'s description and its `openWorldHint` (which clients use when they ask the user to approve a tool call), the provider's cost note is in the result's `cost`, and the activity log names every request. Whether the app should also ask (once per session or per request) is an open owner decision (ADR-45, "Integration (wave 8)").
+- OpenAI bills every picture to the user's own API account; a request already sent may still be billed when it is cancelled (UNVERIFIED whether it is; some texts assume it is). There is no free tier and DeluxePainter quotes no price (OpenAI does not publish a per-picture price for the current models).
+- In the window's Generate requester the cost note is shown before Generate. **Over MCP the request is sent at once, without a question in the app**: the cost and the network use are stated beforehand in `generate_image`'s description and its `openWorldHint` (a hint clients may use when they ask the user to approve a tool call; how real clients show it was never checked, section 10), the provider's cost note is in the result's `cost`, and the activity log names every request. Whether the app should also ask (once per session or per request) is an open owner decision (ADR-45, "Integration (wave 8)").
 - The API key is never part of a result, a log line or an error; provider messages are cleaned (anything like an `sk-` key fragment is replaced by `[key]`).
 
 ## 9. Testing
