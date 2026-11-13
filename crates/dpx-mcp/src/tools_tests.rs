@@ -1268,8 +1268,9 @@ fn presets_are_the_shared_table() {
 }
 
 /// Wave-8 integration of ADR-46: an older project with OCS colours that are not 12-bit
-/// opens with them as stored, the result says which and how to fix them, and IFF export
-/// refuses it until they are fixed.
+/// opens with them as stored, the result says which and how to fix them, and
+/// `export_image` refuses it in every format, PNG too (as the note says), until they are
+/// fixed.
 #[test]
 fn an_old_ocs_project_opens_with_a_note() {
     let dir = crate::access::tests::scratch("tools-old-ocs");
@@ -1288,15 +1289,21 @@ fn an_old_ocs_project_opens_with_a_note() {
         .collect();
     assert_eq!(
         notes[0],
-        "palette entries 9-27, 29, 30 are not 12-bit OCS colours (kept as stored); IFF export \
-         refuses the picture until they are 12-bit"
+        "palette entries 9-27, 29, 30 are not 12-bit OCS colours (kept as stored); \
+         export_image (every format, PNG too) refuses the picture until they are 12-bit"
     );
     assert!(notes[1].contains("set_palette_color"), "{}", notes[1]);
     let p = t.ok("get_palette", json!({}));
     assert_eq!(p["colors"][9], "#0B0B0B", "not rounded");
-    let (code, msg) = t.err("export_image", json!({"path": "old.iff"}));
+    // Every format is refused, as the note says, and nothing is written.
+    for path in ["old.iff", "old.png", "old.anim"] {
+        let (code, msg) = t.err("export_image", json!({"path": path}));
+        assert_eq!(code, "HARDWARE_LIMIT", "{path}");
+        assert!(msg.contains("palette entry 9"), "{path}: {msg}");
+        assert!(!dir.join(path).exists(), "{path}");
+    }
+    let (code, _) = t.err("export_image", json!({"path": "old.pic", "format": "png"}));
     assert_eq!(code, "HARDWARE_LIMIT");
-    assert!(msg.contains("palette entry 9"), "{msg}");
     // One entry can be fixed on its own; the others stay as stored.
     t.ok("set_palette_color", json!({"index": 9, "color": "#111"}));
     let p = t.ok("get_palette", json!({}));

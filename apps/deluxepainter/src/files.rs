@@ -273,6 +273,9 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     }
 }
 
+/// What refuses a picture with such colours in the GUI and the CLI (`.png` writes them).
+pub const OLD_PALETTE_REFUSED_BY: &str = "IFF export";
+
 /// How to fix the colours [`old_palette_notes`] names, in the GUI's words.
 pub const OLD_PALETTE_FIX: &str = "to fix them, use Picture > Screen Format.. with the OCS \
 chipset (it rounds them to 12-bit colours and says how many), or choose AGA there";
@@ -281,7 +284,11 @@ chipset (it rounds them to 12-bit colours and says how many), or choose AGA ther
 /// not 12-bit. It opens with its palette as stored; the notes name the entries, that IFF
 /// export refuses the picture until they are fixed, and how to fix them.
 pub fn old_palette_notes(doc: &Document) -> Vec<String> {
-    match dpx_core::hardware::stored_palette_note(doc.target(), doc.palette()) {
+    match dpx_core::hardware::stored_palette_note(
+        doc.target(),
+        doc.palette(),
+        OLD_PALETTE_REFUSED_BY,
+    ) {
         Some(note) => vec![note, OLD_PALETTE_FIX.into()],
         None => Vec::new(),
     }

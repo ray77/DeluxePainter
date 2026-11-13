@@ -911,7 +911,8 @@ mod tests {
         want.extend([29, 30]);
         assert_eq!(bad, want);
         assert_eq!(
-            dpx_core::hardware::stored_palette_note(doc.target(), doc.palette()).unwrap(),
+            dpx_core::hardware::stored_palette_note(doc.target(), doc.palette(), "IFF export")
+                .unwrap(),
             "palette entries 9-27, 29, 30 are not 12-bit OCS colours (kept as stored); IFF \
              export refuses the picture until they are 12-bit"
         );

@@ -2087,6 +2087,7 @@ mod tests {
             width: w,
             height: h,
             pixels: (0..w * h).map(|i| (i % colors as u32) as u8).collect(),
+            stored: false,
         }
     }
 
@@ -2199,5 +2200,56 @@ mod tests {
         // Nothing of it changed the document.
         assert_eq!(e.document().target(), crate::Target::default());
         assert!(!e.can_undo());
+    }
+
+    /// Wave-8 integration (ADR-46): a page's own palette is copied as it is stored, also the
+    /// colours of an older OCS project that are not 12-bit (Copy to Spare, Delete This Page);
+    /// a ReplacePicture from JSON (MCP, scripts) cannot ask for that.
+    #[test]
+    fn a_pages_stored_palette_is_copied_as_it_is() {
+        use crate::{Chipset, DisplayMode, Palette, Rgb8, Target};
+        let ocs = Target::new(Chipset::Ocs, DisplayMode::PAL_LORES);
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[9] = Rgb8::new(11, 11, 11);
+        let old = Document::from_picture(
+            IndexedImage::new(320, 256, 9),
+            Palette::new(colors.clone()).unwrap(),
+            ocs,
+        );
+        let copy = Command::replace_with_page(&old);
+        let mut e = engine();
+        let before = e.document().clone();
+        e.execute(copy.clone()).unwrap();
+        assert_eq!(e.document().target(), ocs);
+        assert_eq!(e.document().palette().colors(), &colors[..], "as stored");
+        assert_eq!(e.document().page(), old.page());
+        e.undo().unwrap();
+        assert_eq!(e.document().palette(), before.palette());
+        e.redo().unwrap();
+        assert_eq!(e.document().palette().get(9), Some(Rgb8::new(11, 11, 11)));
+        e.undo().unwrap();
+        // The same colours as new ones are refused, as before.
+        assert!(matches!(copy, Command::ReplacePicture { stored: true, .. }));
+        let mut fresh = copy.clone();
+        if let Command::ReplacePicture { stored, .. } = &mut fresh {
+            *stored = false;
+        }
+        let err = e.execute(fresh).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PaletteRangeInvalid);
+        assert_eq!(
+            err.message,
+            "palette entry 9 (#0B0B0B) is not a 12-bit OCS colour"
+        );
+        // The JSON form has no `stored`; asking for it is ignored, so it is refused too.
+        let mut json = serde_json::to_value(&copy).unwrap();
+        assert!(json.get("stored").is_none());
+        json["stored"] = serde_json::Value::Bool(true);
+        let parsed: Command = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            e.execute(parsed).unwrap_err().code,
+            ErrorCode::PaletteRangeInvalid
+        );
+        assert_eq!(e.document().target(), before.target());
+        assert_eq!(e.document().palette(), before.palette());
     }
 }

@@ -184,9 +184,12 @@ pub fn index_list(indices: &[usize]) -> String {
 
 /// The note for a picture whose OCS palette holds colours that are not 12-bit, as a
 /// `.dpxproj` project saved before ADR-46 can (wave-8 integration): they are kept exactly as
-/// stored, and every IFF export refuses the picture (rule 4) until they are 12-bit. `None`
-/// when the chipset shows every entry. Front-ends add how to fix them in their own words.
-pub fn stored_palette_note(target: Target, palette: &Palette) -> Option<String> {
+/// stored, and the exports that check rule 4 refuse the picture until they are 12-bit.
+/// `refused_by` names those in the front-end's words: every IFF export in the GUI and the
+/// CLI (whose PNG export does not check the colours), every format of MCP's `export_image`
+/// (which checks the hardware rules before any format). `None` when the chipset shows every
+/// entry. Front-ends add how to fix them in their own words.
+pub fn stored_palette_note(target: Target, palette: &Palette, refused_by: &str) -> Option<String> {
     let bad = unshowable_entries(target.chipset, palette.colors());
     let (what, are) = match bad.len() {
         0 => return None,
@@ -194,7 +197,7 @@ pub fn stored_palette_note(target: Target, palette: &Palette) -> Option<String> 
         _ => ("palette entries", "are not 12-bit OCS colours"),
     };
     Some(format!(
-        "{what} {} {are} (kept as stored); IFF export refuses the picture until {} 12-bit",
+        "{what} {} {are} (kept as stored); {refused_by} refuses the picture until {} 12-bit",
         index_list(&bad),
         if bad.len() == 1 { "it is" } else { "they are" }
     ))
@@ -420,22 +423,34 @@ mod tests {
         assert_eq!(index_list(&[1, 2, 4, 6, 7, 8]), "1, 2, 4, 6-8");
         assert_eq!(index_list(&[]), "");
         assert_eq!(
-            stored_palette_note(ocs, &grey).unwrap(),
+            stored_palette_note(ocs, &grey, "IFF export").unwrap(),
             "palette entries 1-16, 18-31 are not 12-bit OCS colours (kept as stored); IFF export \
              refuses the picture until they are 12-bit"
+        );
+        // Each front-end names what refuses it (MCP's export_image checks every format).
+        assert!(
+            stored_palette_note(ocs, &grey, "export_image (every format, PNG too)")
+                .unwrap()
+                .ends_with(
+                    "(kept as stored); export_image (every format, PNG too) refuses the \
+                     picture until they are 12-bit"
+                )
         );
         let mut one = Palette::dpaint_default_32().colors().to_vec();
         one[3] = Rgb8::new(1, 2, 3);
         assert_eq!(
-            stored_palette_note(ocs, &Palette::new(one).unwrap()).unwrap(),
+            stored_palette_note(ocs, &Palette::new(one).unwrap(), "IFF export").unwrap(),
             "palette entry 3 is not a 12-bit OCS colour (kept as stored); IFF export refuses the \
              picture until it is 12-bit"
         );
         assert_eq!(
-            stored_palette_note(ocs, &Palette::dpaint_default_32()),
+            stored_palette_note(ocs, &Palette::dpaint_default_32(), "IFF export"),
             None
         );
-        assert_eq!(stored_palette_note(Target::default(), &grey), None);
+        assert_eq!(
+            stored_palette_note(Target::default(), &grey, "IFF export"),
+            None
+        );
         let big = Palette::new(vec![Rgb8::BLACK; 64]).unwrap();
         assert!(check_palette_size(ocs, &big).is_err());
         let big = Palette::new(vec![Rgb8::BLACK; 64]).unwrap();

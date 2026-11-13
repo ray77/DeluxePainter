@@ -858,6 +858,12 @@ fn panel_rows(rig: &Rig) -> Vec<String> {
     panel.rows.iter().map(|r| r.name.clone()).collect()
 }
 
+/// The layer panel's eye column (visible or hidden), bottom first, and its active layer.
+fn panel_eyes(rig: &Rig) -> (Vec<bool>, usize) {
+    let panel = rig.app.ui.layer_panel.as_ref().expect("the panel shows");
+    (panel.rows.iter().map(|r| r.visible).collect(), panel.active)
+}
+
 fn shown_pixel(rig: &Rig, x: i32, y: i32) -> u8 {
     rig.app.engine.document().composite().get(x, y).unwrap()
 }
@@ -921,6 +927,30 @@ fn layer_tools_reach_the_panel_and_undo() {
         json!({"layer": 1, "visible": false}),
     );
     assert!(!rig.app.engine.document().layers()[1].visible);
+    // With the panel on again its rows show what the calls did, and rename, select and
+    // visibility over MCP reach its rows on the pass that ran each call.
+    rig.app.ui.prefs.set(dpx_ui::Pref::LayerPanel, true);
+    rig.app.dirty = true;
+    rig.pass();
+    assert_eq!(panel_rows(&rig), ["Ground", "Moon"]);
+    assert_eq!(panel_eyes(&rig), (vec![true, false], 0));
+    rig.ok("set_layer_visibility", json!({"layer": 1, "visible": true}));
+    assert!(!rig.app.dirty);
+    assert_eq!(panel_eyes(&rig), (vec![true, true], 0));
+    rig.ok("rename_layer", json!({"layer": 1, "name": "Stars"}));
+    assert!(!rig.app.dirty);
+    assert_eq!(panel_rows(&rig), ["Ground", "Stars"]);
+    rig.ok("select_layer", json!({"layer": 1}));
+    assert!(!rig.app.dirty);
+    assert_eq!(panel_eyes(&rig), (vec![true, true], 1));
+    rig.ok(
+        "set_layer_visibility",
+        json!({"layer": 0, "visible": false}),
+    );
+    assert_eq!(panel_eyes(&rig), (vec![false, true], 1));
+    // The GUI's `U` takes the last one back, and the panel follows.
+    rig.pass_with(vec![crate::tests::key_event(egui::Key::U, true)]);
+    assert_eq!(panel_eyes(&rig), (vec![true, true], 1));
     // A requester open: layer changes are busy, reading works.
     rig.app.ui.note_requester = crate::note_requester("Note", &["x".to_string()]);
     let (code, _) = rig.code("create_layer", json!({}));
@@ -958,6 +988,22 @@ fn a_layer_name_being_edited_is_taken_before_an_mcp_change() {
     assert_eq!(panel_rows(&rig), ["Sky!", "Background"]);
     rig.ok("undo", json!({}));
     assert_eq!(names(&rig), ["Background", "Sky!"]);
+    rig.ok("undo", json!({}));
+    assert_eq!(names(&rig), ["Background", "Sky"]);
+    // Before an MCP create_layer that puts the new layer under the one being renamed (above
+    // the active bottom layer): the rename still goes to Sky, now layer 2.
+    rig.ok("select_layer", json!({"layer": 0}));
+    let panel = rig.app.ui.layer_panel.as_mut().unwrap();
+    panel.begin_rename(1);
+    panel.rename_key(dpx_ui::ReqKey::Char('2'));
+    assert_eq!(rig.app.renaming_layer(), Some(1));
+    let c = rig.ok("create_layer", json!({"name": "Hills"}));
+    assert_eq!(c["layer"], 1);
+    assert_eq!(rig.app.renaming_layer(), None);
+    assert_eq!(names(&rig), ["Background", "Hills", "Sky2"]);
+    assert_eq!(panel_rows(&rig), ["Background", "Hills", "Sky2"]);
+    rig.ok("undo", json!({}));
+    assert_eq!(names(&rig), ["Background", "Sky2"]);
     rig.ok("undo", json!({}));
     assert_eq!(names(&rig), ["Background", "Sky"]);
 }

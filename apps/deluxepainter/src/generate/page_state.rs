@@ -117,6 +117,7 @@ pub(crate) fn step_key(command: &Command) -> Option<u64> {
         width,
         height,
         pixels,
+        ..
     } = command
     else {
         return None;
@@ -274,6 +275,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![p],
+            stored: false,
         };
         assert_eq!(step_key(&command(0)), step_key(&command(0)));
         assert_ne!(step_key(&command(0)), step_key(&command(1)));

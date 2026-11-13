@@ -1921,6 +1921,7 @@ mod tests {
             width: 320,
             height: 256,
             pixels: vec![5; 320 * 256],
+            stored: false,
         };
         for cmd in [&set_picture, &replace] {
             assert!(paints_page(cmd), "{cmd:?}");

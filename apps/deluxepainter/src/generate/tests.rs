@@ -1457,6 +1457,170 @@ fn delete_this_page_with_an_own_spare_brings_back_the_details_on_undo() {
     assert_eq!(app.extras, own);
 }
 
+/// A project saved before ADR-46: OCS PAL LoRes 320x256 whose palette entries 9-27, 29 and
+/// 30 are not 12-bit (`crates/dpx-formats/tests/data/README.md`).
+const OLD_OCS: &[u8] =
+    include_bytes!("../../../../crates/dpx-formats/tests/data/v1-ocs-not-12-bit.dpxproj");
+
+/// Opens the older OCS project as Picture ▸ Load.. does (its notes taken); returns its
+/// drawer, to be removed by the test.
+fn open_old_ocs(app: &mut PainterApp, name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("dpx-gen-old-ocs-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Old.dpxproj");
+    std::fs::write(&path, OLD_OCS).unwrap();
+    app.load_picture(path, true);
+    assert!(
+        app.ui.note_requester.take().is_some(),
+        "the notes on its colours"
+    );
+    let doc = app.engine.document();
+    assert_eq!(doc.target().chipset, Chipset::Ocs);
+    let bad = dpx_core::hardware::unshowable_entries(Chipset::Ocs, doc.palette().colors());
+    assert_eq!(bad.len(), 21);
+    dir
+}
+
+/// Wave-8 integration (ADR-46): Copy to Spare onto a generated spare of its own format
+/// copies an older OCS picture with its colours as stored, in one undo step on the spare
+/// page: j and Undo there bring the generated picture and its format back.
+#[test]
+fn copy_to_spare_keeps_an_old_ocs_pictures_colours_and_the_spares_undo() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let dir = open_old_ocs(&mut app, "copy");
+    let old = app.engine.document().clone();
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    assert!(app.spare_differs());
+    let generated = app
+        .menu_data
+        .spare
+        .as_ref()
+        .unwrap()
+        .engine
+        .document()
+        .clone();
+    assert_eq!(generated.target(), ocs_320x240());
+    app.copy_to_spare();
+    assert!(app.ui.note_requester.is_none(), "copied: nothing to say");
+    assert!(app.menu_data.spare_own.is_none(), "an ordinary spare again");
+    let spare = app.menu_data.spare.as_ref().unwrap().engine.document();
+    assert_eq!(spare.target(), old.target());
+    assert_eq!(spare.palette(), old.palette(), "the colours as stored");
+    assert_eq!(spare.page(), old.page());
+    // j shows the copy; Undo there brings back the generated picture, format and palette.
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    assert_eq!(app.engine.document().palette(), old.palette());
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::U));
+    let doc = app.engine.document();
+    assert_eq!(doc.target(), generated.target());
+    assert_eq!(doc.palette(), generated.palette());
+    assert_eq!(doc.page(), generated.page());
+    assert!(app.spare_differs(), "of its own format again");
+    // j: the old picture, as it was.
+    ui_pass(&mut app, &ctx, t + 0.2, tap(egui::Key::J));
+    assert_eq!(app.engine.document().palette(), old.palette());
+    assert_eq!(app.engine.document().page(), old.page());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wave-8 integration (ADR-46): Delete This Page with the older OCS picture on the spare
+/// page shows it with its colours as stored, in one undo step.
+#[test]
+fn delete_this_page_shows_an_old_ocs_spare_with_its_colours() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let dir = open_old_ocs(&mut app, "delete");
+    let old = app.engine.document().clone();
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |_| {});
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::J));
+    let generated = app.engine.document().clone();
+    assert_eq!(generated.target(), ocs_320x240());
+    app.delete_page();
+    assert!(app.menu_data.spare.is_none(), "the spare became the page");
+    let doc = app.engine.document();
+    assert_eq!(doc.target(), old.target());
+    assert_eq!(doc.palette(), old.palette(), "the colours as stored");
+    assert_eq!(doc.page(), old.page());
+    ui_pass(&mut app, &ctx, t + 0.1, tap(egui::Key::U));
+    assert_eq!(app.engine.document().palette(), generated.palette());
+    assert_eq!(app.engine.document().target(), generated.target());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wave-8 integration (ADR-46): Generate with the current palette onto an OCS picture
+/// rounds an older project's colours that are not 12-bit, and the note after Apply says
+/// how many (never silent); Undo brings them back. A new palette, or a current palette that
+/// is 12-bit already, rounds nothing and shows no note.
+#[test]
+fn generate_with_the_current_palette_says_which_colours_it_rounded() {
+    let (mut app, ctx) = app_with(Some(Arc::new(TestPattern)));
+    let dir = open_old_ocs(&mut app, "round");
+    let old = app.engine.document().clone();
+    let t = generate_and_apply(&mut app, &ctx, 0.0, "x", |o| {
+        o.palette = PaletteChoice::Current;
+        o.target = GenTarget::Picture;
+    });
+    let note = app.ui.note_requester.take().expect("the rounding is said");
+    assert_eq!(note.title(), GENERATED);
+    assert_eq!(
+        note.notes(),
+        [
+            "21 colours rounded to 12-bit OCS values",
+            "Undo brings the old colours back"
+        ]
+    );
+    let doc = app.engine.document();
+    assert_eq!(doc.target().chipset, Chipset::Ocs);
+    assert!(
+        doc.palette()
+            .colors()
+            .iter()
+            .all(|&c| dpx_core::hardware::is_12_bit(c))
+    );
+    assert_eq!(
+        doc.palette().get(0),
+        old.palette().get(0),
+        "12-bit ones stay"
+    );
+    ui_pass(&mut app, &ctx, t, tap(egui::Key::U));
+    assert_eq!(app.engine.document().palette(), old.palette());
+    // Onto the spare page: the spare has them rounded, the shown page keeps them.
+    let t = generate_and_apply(&mut app, &ctx, t + 0.1, "x", |o| {
+        o.palette = PaletteChoice::Current;
+        o.target = GenTarget::Spare;
+    });
+    let note = app.ui.note_requester.take().expect("the rounding is said");
+    assert_eq!(
+        note.notes(),
+        [
+            "21 colours rounded to 12-bit OCS values",
+            "On the spare page; the shown page keeps its colours"
+        ]
+    );
+    assert_eq!(app.engine.document().palette(), old.palette());
+    // A new palette rounds nothing of the current one: no note.
+    let t = generate_and_apply(&mut app, &ctx, t + 0.1, "x", |o| {
+        o.palette = PaletteChoice::New;
+        o.target = GenTarget::Picture;
+    });
+    assert!(app.ui.note_requester.is_none());
+    // Now the current palette is 12-bit: nothing to round, no note.
+    generate_and_apply(&mut app, &ctx, t + 0.1, "x", |o| {
+        o.palette = PaletteChoice::Current;
+        o.target = GenTarget::Picture;
+    });
+    assert!(app.ui.note_requester.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_rounding_note_is_only_for_targets_that_take_the_palette() {
+    assert!(rounded_note(GenTarget::Picture, 0).is_none());
+    assert!(rounded_note(GenTarget::Brush, 3).is_none());
+    let note = rounded_note(GenTarget::Spare, 1).unwrap();
+    assert_eq!(note.notes()[0], "1 colour rounded to a 12-bit OCS value");
+}
+
 /// Serves one model list on 127.0.0.1 once the test lets it answer.
 fn serve_models_when(go: std::sync::mpsc::Receiver<()>) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

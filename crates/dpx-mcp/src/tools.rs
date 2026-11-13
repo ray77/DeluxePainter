@@ -2031,10 +2031,20 @@ async fn export_image(ctx: &ToolCtx, a: ExportArgs) -> Result<CallToolResult, To
     }))
 }
 
+/// What refuses a picture with OCS colours that are not 12-bit over MCP: `export_image`
+/// checks the hardware rules before every format (ADR-43), so PNG too (the GUI and the CLI
+/// refuse IFF only).
+pub const OLD_PALETTE_REFUSED_BY: &str = "export_image (every format, PNG too)";
+
 /// ADR-46, wave-8 integration: a project saved before ADR-46 may hold OCS colours that are
-/// not 12-bit; it opens with them as stored, and the result names them and how to fix them.
+/// not 12-bit; it opens with them as stored, and the result names them, that `export_image`
+/// refuses the picture in every format until they are 12-bit, and how to fix them.
 fn old_palette_notes(doc: &Document) -> Vec<String> {
-    match dpx_core::hardware::stored_palette_note(doc.target(), doc.palette()) {
+    match dpx_core::hardware::stored_palette_note(
+        doc.target(),
+        doc.palette(),
+        OLD_PALETTE_REFUSED_BY,
+    ) {
         Some(note) => vec![
             note,
             "to fix them, set them with set_palette_color (12-bit colours), or run set_format \

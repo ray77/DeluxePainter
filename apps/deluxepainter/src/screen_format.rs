@@ -4,12 +4,14 @@
 //!   its chipset with a note ([`PainterApp::refuse_unshowable`]); the rules are
 //!   `dpx_core::hardware`'s, the check is `files::check_hardware`.
 //! - Palette colours that come from elsewhere (Palette ▸ Load.., Restore Palette) are rounded
-//!   to 12 bits on an OCS picture, with a note ([`PainterApp::chipset_colors`]); the Screen
-//!   Format requester names the colours a change to OCS rounds ([`rounded_note`], counted
-//!   by the engine in `Outcome::rounded_colors`).
+//!   to 12 bits on an OCS picture, with a note ([`PainterApp::chipset_colors`]; Palette ▸
+//!   Load.. rounds only the entries the file gives); the Screen Format requester names the
+//!   colours a change to OCS rounds ([`rounded_note`], counted by the engine in
+//!   `Outcome::rounded_colors`).
 //! - `--chipset` and `--preset` set up the picture of a `--snapshot` ([`snapshot_format`]);
-//!   `--requester-keys` drives the Screen Format requester ([`snapshot_requester`]) and
-//!   `--export-note` shows what Picture ▸ Export.. would say ([`snapshot_export_note`]).
+//!   `--requester-keys` drives the Screen Format requester ([`snapshot_requester`]),
+//!   `--export-note` shows what Picture ▸ Export.. would say ([`snapshot_export_note`]) and
+//!   `--load-palette` what Palette ▸ Load.. does ([`snapshot_palette_load`]).
 
 use std::path::Path;
 
@@ -152,6 +154,30 @@ pub(crate) fn snapshot_export_note(
         crate::EXPORTED
     };
     Ok(crate::note_requester(title, &notes))
+}
+
+/// `--load-palette FILE` of a `--snapshot`: Palette ▸ Load.. of FILE on `doc` (as the file
+/// requester's answer), with the note it shows. Returns the document after it; a file that
+/// is no palette is an error.
+pub(crate) fn snapshot_palette_load(
+    args: &[String],
+    doc: &Document,
+    ui: &mut dpx_ui::UiState,
+) -> Result<Document, String> {
+    let Some(file) = arg_value(args, "--load-palette") else {
+        return Ok(doc.clone());
+    };
+    let path = Path::new(&file);
+    std::fs::read(path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| crate::menu_actions::decode_palette(&b).map(drop))
+        .map_err(|e| format!("--load-palette {file}: {e}"))?;
+    let mut app = PainterApp::new();
+    app.engine = Engine::new(doc.clone());
+    app.ui = ui.clone();
+    app.menu_file_accept(dpx_ui::FileKind::LoadPalette, path, false);
+    *ui = app.ui.clone();
+    Ok(app.engine.document().clone())
 }
 
 impl PainterApp {
@@ -502,6 +528,66 @@ mod tests {
         let note = rounded_note(1).unwrap();
         assert_eq!(note.title(), FORMAT_CHANGED);
         assert_eq!(note.notes(), ["1 colour rounded to a 12-bit OCS value"]);
+    }
+
+    /// Wave-8 integration: Palette ▸ Load.. of a file with fewer colours on an older OCS
+    /// project rounds only the colours it loads; the entries the file does not reach stay as
+    /// stored, as its note says (one undo step).
+    #[test]
+    fn palette_load_on_an_old_ocs_project_keeps_the_entries_it_does_not_reach() {
+        let ctx = egui::Context::default();
+        let dir = temp_dir("old-ocs-palette");
+        std::fs::write(
+            dir.join("Old.dpxproj"),
+            include_bytes!("../../../crates/dpx-formats/tests/data/v1-ocs-not-12-bit.dpxproj"),
+        )
+        .unwrap();
+        // An 8-colour palette file whose entry 1 is not 12-bit.
+        let mut colors = Palette::dpaint_default_32().colors()[..8].to_vec();
+        colors[1] = Rgb8::new(0x10, 0x20, 0x31);
+        let file = dpx_iff::Ilbm::from_indexed(
+            IndexedImage::new(1, 1, 0),
+            Palette::new(colors.clone()).unwrap(),
+        );
+        std::fs::write(
+            dir.join("Eight.pal"),
+            dpx_iff::ilbm::write(&file, dpx_iff::Compression::ByteRun1).unwrap(),
+        )
+        .unwrap();
+        let mut app = PainterApp::new();
+        app.last_drawer = Some(dir.to_string_lossy().into_owned());
+        ui_pass(&mut app, &ctx, 0.0, vec![]);
+        pick(&mut app, &ctx, 0.1, "picture.load");
+        typed(&mut app, &ctx, 0.2, "Old.dpxproj");
+        enter(&mut app, &ctx, 0.3);
+        assert!(
+            app.ui.note_requester.take().is_some(),
+            "the notes on its colours"
+        );
+        let stored = app.engine.document().palette().clone();
+        assert_eq!(stored.get(9), Some(Rgb8::new(11, 11, 11)));
+        // Palette ▸ Load.. (in Color ▸ Palette) and the file's name typed.
+        app.run_action(dpx_ui::Action::Command("palette.load"), &ctx);
+        assert!(app.ui.file_requester.is_some());
+        typed(&mut app, &ctx, 0.5, "Eight.pal");
+        enter(&mut app, &ctx, 0.6);
+        assert!(app.ui.file_requester.is_none(), "loaded");
+        let p = app.engine.document().palette().clone();
+        assert_eq!(p.get(1), Some(hardware::snap(Chipset::Ocs, colors[1])));
+        assert_eq!(&p.colors()[2..8], &colors[2..8]);
+        assert_eq!(&p.colors()[8..], &stored.colors()[8..], "as stored");
+        let note = app.ui.note_requester.take().expect("the load note");
+        assert_eq!(note.title(), "Palette loaded");
+        assert_eq!(
+            note.notes(),
+            [
+                "The file has 8 colours; colours 8-31 are unchanged",
+                "1 colour rounded to a 12-bit OCS value"
+            ]
+        );
+        app.undo();
+        assert_eq!(app.engine.document().palette(), &stored);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Wave-8 integration: a project saved before ADR-46 whose OCS palette holds colours that
