@@ -113,6 +113,11 @@ pub struct Imported {
     /// The picture's top-left corner on the page and its size there.
     pub at: (u32, u32),
     pub size: (u32, u32),
+    /// [`convert`] with the current palette for an OCS target: how many of its entries are
+    /// not 12-bit and were rounded for the result (whose palette holds them rounded; ADR-46:
+    /// a project saved before it can hold such colours, and so can an AGA picture). A
+    /// front-end that applies the result says so (never silent). 0 otherwise.
+    pub rounded_colors: usize,
 }
 
 /// Size of a `w`×`h` picture (square pixels) fitted into `page` with the screen's
@@ -230,6 +235,7 @@ impl Mapped {
             reduction: self.reduction,
             at,
             size,
+            rounded_colors: 0,
         }
     }
 }
@@ -489,7 +495,7 @@ pub struct ConvertTarget<'a> {
 /// that (`PALETTE_RANGE_INVALID`), a page outside the target's page limits and an empty
 /// picture (`INVALID_ARGUMENT`). With the current palette on OCS its entries are rounded to
 /// 12-bit values first (a 12-bit palette stays identical), so the result always fits the
-/// chipset.
+/// chipset; [`Imported::rounded_colors`] counts the entries that changed.
 pub fn convert(
     img: &RgbaImage,
     opts: &ConvertOptions,
@@ -575,17 +581,9 @@ fn convert_with(
         Chipset::Ocs => PaletteDepth::Rgb4,
         Chipset::Aga => PaletteDepth::Rgb8,
     };
-    let current = match depth {
-        PaletteDepth::Rgb4 => Palette::new(
-            t.palette
-                .colors()
-                .iter()
-                .map(|&c| Rgb8::from_rgb4(c.to_rgb4()))
-                .collect(),
-        )
-        .expect("same number of entries"),
-        PaletteDepth::Rgb8 => t.palette.clone(),
-    };
+    let mut colors = t.palette.colors().to_vec();
+    let rounded = crate::hardware::snap_colors(target.chipset, &mut colors);
+    let current = Palette::new(colors).expect("same number of entries");
     let bg = t.bg.min((current.len() - 1) as u8);
     let bg_rgb = current.get(bg).unwrap_or(Rgb8::BLACK);
     let source = if opts.transparent_background {
@@ -613,7 +611,7 @@ fn convert_with(
         bg,
         transparent: t.transparent,
     };
-    let result = match opts.framing {
+    let mut result = match opts.framing {
         Framing::Crop => {
             let aspect = resample::display_aspect(t.page, pixel_shape);
             let (x, y, w, h) = resample::crop_to_aspect(source.width(), source.height(), aspect);
@@ -645,6 +643,9 @@ fn convert_with(
         }
     };
     debug_assert_eq!((result.page.width(), result.page.height()), t.page);
+    if opts.palette == PaletteChoice::Current {
+        result.rounded_colors = rounded;
+    }
     Ok(result)
 }
 
@@ -675,6 +676,7 @@ impl Imported {
             width: self.page.width(),
             height: self.page.height(),
             pixels: self.page.pixels().to_vec(),
+            stored: false,
         }
     }
 
@@ -1369,6 +1371,42 @@ mod tests {
                 .code,
             ErrorCode::InvalidArgument
         );
+    }
+
+    /// ADR-46, wave-8 integration: the current palette's entries an OCS result cannot show
+    /// (an older project's, or an AGA picture's) are rounded for it and counted, so a
+    /// front-end can say so; nothing else counts.
+    #[test]
+    fn the_current_palettes_entries_rounded_for_ocs_are_counted() {
+        use crate::hardware::snap;
+        let mut colors = Palette::dpaint_default_32().colors().to_vec();
+        colors[9] = Rgb8::new(11, 11, 11);
+        colors[20] = Rgb8::new(0x10, 0x20, 0x31);
+        let pal = Palette::new(colors.clone()).unwrap();
+        let img = photo(64, 48);
+        let current = ConvertOptions {
+            palette: PaletteChoice::Current,
+            ..copts(Scaler::Smooth, 32, Dither::None)
+        };
+        let ocs = ctarget(ocs_320x240(), (320, 240), &pal);
+        let r = convert(&img, &current, &ocs).unwrap();
+        assert_eq!(r.rounded_colors, 2);
+        assert_eq!(r.palette.get(9), Some(snap(Chipset::Ocs, colors[9])));
+        assert_eq!(r.palette.get(20), Some(snap(Chipset::Ocs, colors[20])));
+        assert_ne!(r.palette.get(9), Some(colors[9]));
+        assert!(r.palette.colors().iter().all(|&c| is_12_bit(c)));
+        // AGA keeps them; a new palette is made for OCS; a 12-bit palette has none to round.
+        let aga = Target::new(Chipset::Aga, DisplayMode::PAL_LORES);
+        let r = convert(&img, &current, &ctarget(aga, (320, 256), &pal)).unwrap();
+        assert_eq!((r.rounded_colors, r.palette.get(9)), (0, Some(colors[9])));
+        let new = ConvertOptions {
+            palette: PaletteChoice::New,
+            ..current
+        };
+        assert_eq!(convert(&img, &new, &ocs).unwrap().rounded_colors, 0);
+        let plain = Palette::dpaint_default_32();
+        let r = convert(&img, &current, &ctarget(ocs_320x240(), (320, 240), &plain)).unwrap();
+        assert_eq!(r.rounded_colors, 0);
     }
 
     const GREEN: Rgba8 = Rgba8::opaque(0, 255, 0);

@@ -125,8 +125,9 @@ pub enum ProjectError {
     Invalid(String),
     /// The project cannot be written as described.
     Write(String),
-    /// The palette breaks the target's colour limits (ADR-46), e.g. an OCS colour that is
-    /// not 12-bit, as builds before ADR-46 could save.
+    /// The palette breaks the target's colour limits (ADR-46): more colours than the mode
+    /// shows on the chipset, or a mode the chipset cannot show. (OCS colours that are not
+    /// 12-bit are read as stored.)
     Hardware(String),
 }
 
@@ -656,8 +657,10 @@ pub fn read_project_with(bytes: &[u8], limits: Limits) -> Result<Project, Projec
         )));
     }
     // The colour limits of the target are document rules too (ADR-46): the chipset shows the
-    // mode, the palette fits its colour count and OCS entries are 12-bit.
-    dpx_core::hardware::check_palette(m.target, &palette)
+    // mode and the palette fits its colour count. OCS entries that are not 12-bit (builds
+    // before ADR-46 could save them) are kept as stored: the front-ends name them
+    // (`hardware::stored_palette_note`) and IFF exports refuse them (wave-8 integration).
+    dpx_core::hardware::check_palette_size(m.target, &palette)
         .map_err(|e| ProjectError::Hardware(format!("{}.", e.message)))?;
     let document = Document::from_layers(frames, stack, current, active, fps, palette, m.target)
         .map_err(|e| invalid(e.message))?;
@@ -858,14 +861,16 @@ mod tests {
         // A 12-bit OCS palette on the 320x240 custom screen reads back.
         let back = read_project(&write(Palette::dpaint_default_32(), ocs)).unwrap();
         assert_eq!(back.document.target(), ocs);
-        // A colour that is not 12-bit (builds before ADR-46 could save one).
-        let e = read_project(&write(sample_palette(32), ocs)).unwrap_err();
-        assert!(matches!(e, ProjectError::Hardware(_)), "{e}");
-        assert_eq!(e.summary(), "Project breaks hardware rules");
-        assert_eq!(e.details(), "palette entry 1 is not a 12-bit OCS colour.");
+        // Colours that are not 12-bit (builds before ADR-46 could save them) are read as
+        // stored (wave-8 integration): nothing is rounded on reading.
+        let back = read_project(&write(sample_palette(32), ocs)).unwrap();
+        assert_eq!(back.document.palette(), &sample_palette(32));
+        assert_eq!(back.document.target(), ocs);
         // More colours than the mode shows on the chipset.
         let e =
             read_project(&write(Palette::new(vec![Rgb8::BLACK; 64]).unwrap(), ocs)).unwrap_err();
+        assert!(matches!(e, ProjectError::Hardware(_)), "{e}");
+        assert_eq!(e.summary(), "Project breaks hardware rules");
         assert_eq!(
             e.details(),
             "64 colours exceed the 32 of PAL:Low Res on Ocs."
@@ -881,6 +886,47 @@ mod tests {
         assert_eq!(e.details(), "Ocs cannot show PAL:Super-High Res.");
         // AGA takes any colours.
         read_project(&write(sample_palette(32), Target::default())).unwrap();
+    }
+
+    /// A version-1 OCS project as a build before ADR-46 saved it (written by an independent
+    /// script, see tests/data/README.md): 32 colours, entries 9-27, 29 and 30 from the old
+    /// grey ramp, not 12-bit.
+    const OLD_OCS: &[u8] = include_bytes!("../tests/data/v1-ocs-not-12-bit.dpxproj");
+
+    /// Wave-8 integration: such a project opens with its palette exactly as stored, keeps the
+    /// project format version, and saves back unchanged; the hardware note names the entries.
+    #[test]
+    fn an_old_ocs_project_with_24_bit_colours_opens_as_stored() {
+        let p = read_project(OLD_OCS).unwrap();
+        let doc = &p.document;
+        assert_eq!(doc.target().chipset, Chipset::Ocs);
+        assert_eq!(doc.palette().len(), 32);
+        assert_eq!(
+            doc.palette().colors()[9],
+            Rgb8::new(11, 11, 11),
+            "not rounded"
+        );
+        let bad = dpx_core::hardware::unshowable_entries(Chipset::Ocs, doc.palette().colors());
+        let mut want: Vec<usize> = (9..=27).collect();
+        want.extend([29, 30]);
+        assert_eq!(bad, want);
+        assert_eq!(
+            dpx_core::hardware::stored_palette_note(doc.target(), doc.palette(), "IFF export")
+                .unwrap(),
+            "palette entries 9-27, 29, 30 are not 12-bit OCS colours (kept as stored); IFF \
+             export refuses the picture until they are 12-bit"
+        );
+        // The picture's pixels are read as written.
+        assert_eq!(doc.page().get(0, 0), Some(8));
+        assert_eq!(doc.page().get(160, 250), Some(1));
+        assert_eq!(doc.page().get(240, 50), Some(3));
+        // Saving again keeps version 1 and every colour.
+        let again = write_project(&p).unwrap();
+        assert_eq!(manifest_of(&again)["format_version"], 1);
+        assert_eq!(read_project(&again).unwrap().document, p.document);
+        // The IFF rule still refuses it.
+        let e = dpx_core::hardware::validate_picture(doc).unwrap_err();
+        assert_eq!(e.message, "palette entry 9 is not a 12-bit OCS colour");
     }
 
     #[test]

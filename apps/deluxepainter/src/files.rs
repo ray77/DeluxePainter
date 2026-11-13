@@ -263,12 +263,34 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         }
         Some(Kind::Project) => {
             let project = project::read_project(&bytes).map_err(|e| with_path(path, e))?;
+            let notes = old_palette_notes(&project.document);
             Ok(Loaded {
                 picture: Picture::Project(Box::new(project)),
-                notes: Vec::new(),
+                notes,
             })
         }
         None => Err(with_path(path, unknown_type(&bytes))),
+    }
+}
+
+/// What refuses a picture with such colours in the GUI and the CLI (`.png` writes them).
+pub const OLD_PALETTE_REFUSED_BY: &str = "IFF export";
+
+/// How to fix the colours [`old_palette_notes`] names, in the GUI's words.
+pub const OLD_PALETTE_FIX: &str = "to fix them, use Picture > Screen Format.. with the OCS \
+chipset (it rounds them to 12-bit colours and says how many), or choose AGA there";
+
+/// ADR-46, wave-8 integration: a project saved before ADR-46 may hold OCS colours that are
+/// not 12-bit. It opens with its palette as stored; the notes name the entries, that IFF
+/// export refuses the picture until they are fixed, and how to fix them.
+pub fn old_palette_notes(doc: &Document) -> Vec<String> {
+    match dpx_core::hardware::stored_palette_note(
+        doc.target(),
+        doc.palette(),
+        OLD_PALETTE_REFUSED_BY,
+    ) {
+        Some(note) => vec![note, OLD_PALETTE_FIX.into()],
+        None => Vec::new(),
     }
 }
 

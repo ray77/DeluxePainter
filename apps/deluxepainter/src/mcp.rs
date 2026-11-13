@@ -710,6 +710,8 @@ impl PainterApp {
     fn mcp_prepare(&mut self) {
         self.menu_item_ends_stencil_paint(Action::Command("mcp.call"));
         self.finish_stroke();
+        // ADR-44: a layer name being edited is taken first, as a click elsewhere takes it.
+        self.finish_layer_rename();
     }
 
     /// The bookkeeping after a change, as after a requester's command.
@@ -789,9 +791,9 @@ impl PainterApp {
     }
 }
 
-/// The GUI's editor state for the tools, borrowed for one job.
-// TODO(wave8-integration): layers (ADR-44): changes go to the active layer, and
-// list_layers / create_layer / select_layer map onto the layer panel's state here.
+/// The GUI's editor state for the tools, borrowed for one job. Changes paint the active
+/// layer; the layer tools (ADR-44) run the engine's layer commands through `execute`, as the
+/// layer panel does, and the panel follows the document on the next redraw.
 struct GuiWorkspace<'a>(&'a mut PainterApp);
 
 impl Workspace for GuiWorkspace<'_> {

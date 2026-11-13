@@ -139,11 +139,68 @@ fn check_depth(t: Target, palette: &Palette) -> Result<(), HardwareError> {
 }
 
 /// Rules 1, 2 and 4: what `target` can show of `palette`. Used where the page is not the
-/// question, e.g. when a `.dpxproj` project is read.
+/// question.
 pub fn check_palette(target: Target, palette: &Palette) -> Result<(), HardwareError> {
-    let max = check_mode(target)?;
-    check_count(target, max, palette.len())?;
+    check_palette_size(target, palette)?;
     check_depth(target, palette)
+}
+
+/// Rules 1 and 2: the chipset shows the mode and the palette has at most its colours. A
+/// `.dpxproj` project is read with these (wave-8 integration): its colours themselves are
+/// kept as stored, see [`stored_palette_note`].
+pub fn check_palette_size(target: Target, palette: &Palette) -> Result<(), HardwareError> {
+    let max = check_mode(target)?;
+    check_count(target, max, palette.len())
+}
+
+/// Every palette entry `chipset` cannot show (OCS: not 12-bit), by index.
+pub fn unshowable_entries(chipset: Chipset, colors: &[Rgb8]) -> Vec<usize> {
+    match chipset {
+        Chipset::Ocs => (0..colors.len())
+            .filter(|&i| !is_12_bit(colors[i]))
+            .collect(),
+        Chipset::Aga => Vec::new(),
+    }
+}
+
+/// `indices` (ascending) as a short list: runs of three or more as "a-b", e.g. "1, 3, 17-31".
+pub fn index_list(indices: &[usize]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < indices.len() {
+        let mut j = i;
+        while j + 1 < indices.len() && indices[j + 1] == indices[j] + 1 {
+            j += 1;
+        }
+        match j - i {
+            0 => parts.push(indices[i].to_string()),
+            1 => parts.extend([indices[i].to_string(), indices[j].to_string()]),
+            _ => parts.push(format!("{}-{}", indices[i], indices[j])),
+        }
+        i = j + 1;
+    }
+    parts.join(", ")
+}
+
+/// The note for a picture whose OCS palette holds colours that are not 12-bit, as a
+/// `.dpxproj` project saved before ADR-46 can (wave-8 integration): they are kept exactly as
+/// stored, and the exports that check rule 4 refuse the picture until they are 12-bit.
+/// `refused_by` names those in the front-end's words: every IFF export in the GUI and the
+/// CLI (whose PNG export does not check the colours), every format of MCP's `export_image`
+/// (which checks the hardware rules before any format). `None` when the chipset shows every
+/// entry. Front-ends add how to fix them in their own words.
+pub fn stored_palette_note(target: Target, palette: &Palette, refused_by: &str) -> Option<String> {
+    let bad = unshowable_entries(target.chipset, palette.colors());
+    let (what, are) = match bad.len() {
+        0 => return None,
+        1 => ("palette entry", "is not a 12-bit OCS colour"),
+        _ => ("palette entries", "are not 12-bit OCS colours"),
+    };
+    Some(format!(
+        "{what} {} {are} (kept as stored); {refused_by} refuses the picture until {} 12-bit",
+        index_list(&bad),
+        if bad.len() == 1 { "it is" } else { "they are" }
+    ))
 }
 
 /// Every hardware rule (module docs) for `doc`, in that order. The rules of MCP's
@@ -355,6 +412,47 @@ mod tests {
         let grey = Palette::new((0..32).map(|i| Rgb8::new(i, i, i)).collect()).unwrap();
         assert!(check_palette(ocs, &grey).is_err());
         assert_eq!(check_palette(Target::default(), &grey), Ok(()));
+        // The size rules alone (a project's palette, wave-8 integration) take the colours.
+        assert_eq!(check_palette_size(ocs, &grey), Ok(()));
+        // Every entry but 0 and 17 (#111111) is not 12-bit.
+        let mut bad: Vec<usize> = (1..32).collect();
+        bad.retain(|&i| i != 17);
+        assert_eq!(unshowable_entries(Chipset::Ocs, grey.colors()), bad);
+        assert!(unshowable_entries(Chipset::Aga, grey.colors()).is_empty());
+        assert_eq!(index_list(&bad), "1-16, 18-31");
+        assert_eq!(index_list(&[1, 2, 4, 6, 7, 8]), "1, 2, 4, 6-8");
+        assert_eq!(index_list(&[]), "");
+        assert_eq!(
+            stored_palette_note(ocs, &grey, "IFF export").unwrap(),
+            "palette entries 1-16, 18-31 are not 12-bit OCS colours (kept as stored); IFF export \
+             refuses the picture until they are 12-bit"
+        );
+        // Each front-end names what refuses it (MCP's export_image checks every format).
+        assert!(
+            stored_palette_note(ocs, &grey, "export_image (every format, PNG too)")
+                .unwrap()
+                .ends_with(
+                    "(kept as stored); export_image (every format, PNG too) refuses the \
+                     picture until they are 12-bit"
+                )
+        );
+        let mut one = Palette::dpaint_default_32().colors().to_vec();
+        one[3] = Rgb8::new(1, 2, 3);
+        assert_eq!(
+            stored_palette_note(ocs, &Palette::new(one).unwrap(), "IFF export").unwrap(),
+            "palette entry 3 is not a 12-bit OCS colour (kept as stored); IFF export refuses the \
+             picture until it is 12-bit"
+        );
+        assert_eq!(
+            stored_palette_note(ocs, &Palette::dpaint_default_32(), "IFF export"),
+            None
+        );
+        assert_eq!(
+            stored_palette_note(Target::default(), &grey, "IFF export"),
+            None
+        );
+        let big = Palette::new(vec![Rgb8::BLACK; 64]).unwrap();
+        assert!(check_palette_size(ocs, &big).is_err());
         let big = Palette::new(vec![Rgb8::BLACK; 64]).unwrap();
         assert!(
             check_palette(ocs, &big)

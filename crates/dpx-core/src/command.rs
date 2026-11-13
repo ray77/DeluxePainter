@@ -129,7 +129,9 @@ pub enum Command {
     ReplaceColor { from: u8, to: u8 },
     /// Exchanges two colours in every pixel (Color ▸ BG <-> FG).
     SwapColors { a: u8, b: u8 },
-    /// Replaces all palette entries; the number of colours must stay the same.
+    /// Replaces all palette entries; the number of colours must stay the same. On OCS every
+    /// entry it changes must be a 12-bit colour (ADR-46); an entry it keeps may stay as it is
+    /// (a project saved before ADR-46 can hold colours that are not 12-bit).
     SetPalette { colors: Vec<Rgb8> },
     /// Picture ▸ Screen Format: display mode, palette size and page size. With `retain` the
     /// picture is kept (top-left aligned, cut off if the page shrinks), otherwise the page is
@@ -327,13 +329,21 @@ pub enum Command {
     /// row). Every other frame goes; the frame rate stays. One undo step brings the old
     /// document back. The target's limits are checked: the mode must exist on the chipset,
     /// the palette has a power of two of 2 up to the mode's maximum entries (12-bit values on
-    /// OCS), the screen fits the mode and the page the target's page limits.
+    /// OCS, unless `stored`), the screen fits the mode and the page the target's page limits.
     ReplacePicture {
         target: Target,
         palette: Vec<Rgb8>,
         width: u32,
         height: u32,
         pixels: Vec<u8>,
+        /// The palette is a page's own, copied as it is stored ([`Command::replace_with_page`]:
+        /// Copy to Spare and Delete This Page between pages of different formats). On OCS it
+        /// may then keep colours that are not 12-bit, as a project saved before ADR-46 holds
+        /// them (wave-8 integration; every IFF export still refuses them), so a copy never
+        /// changes colours. Not part of the JSON form: a command from MCP or a script always
+        /// gives 12-bit colours on OCS.
+        #[serde(skip)]
+        stored: bool,
     },
 }
 
@@ -659,8 +669,16 @@ impl Command {
                         new.len()
                     )));
                 }
-                // OCS colours are 12-bit, a document rule (ADR-46).
-                match crate::hardware::first_unshowable(doc.target.chipset, new) {
+                // OCS colours are 12-bit, a document rule (ADR-46). Only the entries this
+                // changes must be: an older project's colours that are not 12-bit stay
+                // editable entry by entry (wave-8 integration).
+                let old = doc.palette.colors();
+                let changed: Vec<Rgb8> = new
+                    .iter()
+                    .zip(old)
+                    .map(|(&c, &o)| if c == o { Rgb8::BLACK } else { c })
+                    .collect();
+                match crate::hardware::first_unshowable(doc.target.chipset, &changed) {
                     Some((i, c)) => Err(CommandError::new(
                         ErrorCode::PaletteRangeInvalid,
                         format!(
@@ -717,7 +735,8 @@ impl Command {
                 width,
                 height,
                 pixels,
-            } => validate_replace_picture(*target, palette, *width, *height, pixels),
+                stored,
+            } => validate_replace_picture(*target, palette, *width, *height, pixels, *stored),
             Command::RemapColors { from } => {
                 if (1..=256).contains(&from.len()) {
                     Ok(())
@@ -984,6 +1003,7 @@ impl Command {
                 width,
                 height,
                 pixels,
+                ..
             } => {
                 // One frame with one layer, "Background" (ADR-44): the generated picture.
                 let page = IndexedImage::from_pixels(*width, *height, pixels.clone())
@@ -1185,13 +1205,35 @@ fn upper_layers_use(doc: &Document, c: u8) -> bool {
     })
 }
 
+impl Command {
+    /// The [`Command::ReplacePicture`] that makes a document `doc`'s page ([`Document::page`],
+    /// the active layer of the current frame; a layered picture follows with
+    /// [`Command::set_picture`]) with `doc`'s target and its palette as stored (`stored`: on OCS
+    /// also colours that are not 12-bit, as an older project's are; ADR-46, wave-8
+    /// integration). Copy to Spare and Delete This Page between pages of different formats.
+    pub fn replace_with_page(doc: &Document) -> Command {
+        let page = doc.page();
+        Command::ReplacePicture {
+            target: doc.target(),
+            palette: doc.palette().colors().to_vec(),
+            width: page.width(),
+            height: page.height(),
+            pixels: page.pixels().to_vec(),
+            stored: true,
+        }
+    }
+}
+
 /// Checks [`Command::ReplacePicture`] against its own target (the document's is replaced).
+/// A `stored` palette (a page's own, copied) skips the 12-bit rule of OCS; the size rules
+/// still apply.
 fn validate_replace_picture(
     target: Target,
     palette: &[Rgb8],
     width: u32,
     height: u32,
     pixels: &[u8],
+    stored: bool,
 ) -> Result<(), CommandError> {
     let mode = target.mode;
     let max = mode.max_colors(target.chipset).ok_or_else(|| {
@@ -1212,6 +1254,7 @@ fn validate_replace_picture(
         ));
     }
     if target.chipset == Chipset::Ocs
+        && !stored
         && let Some(i) = palette
             .iter()
             .position(|&c| Rgb8::from_rgb4(c.to_rgb4()) != c)

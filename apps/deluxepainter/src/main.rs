@@ -39,6 +39,7 @@
 //!     [--requester-keys K,K..]          keys for `--requester` first: up, down, tab, enter,
 //!                                       or a letter (h Chipset, p Preset) (ADR-46)
 //!     [--export-note NAME]              the note Picture > Export.. shows for NAME (ADR-46)
+//!     [--load-palette FILE]             Palette > Load.. of FILE and the note it shows (ADR-46)
 //!     [--layers-panel [docked]]         show the layer panel (ADR-44) over the screen's right
 //!                                       edge, or docked in the work area right of the screen
 //!     [--mcp-calls FILE.json]           run a JSON array of {"tool", "arguments"} MCP tool
@@ -613,6 +614,11 @@ fn main() -> eframe::Result {
             }
             return Ok(());
         }
+        // ADR-46: Palette ▸ Load.. of a file on the picture, with the note it shows.
+        let doc = screen_format::snapshot_palette_load(&args, &doc, &mut ui).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
         // ADR-46: the note Picture ▸ Export.. would show under a name (nothing is written).
         if let Some(name) = arg_value(&args, "--export-note") {
             let extras = opened.as_ref().map(|o| o.2.clone()).unwrap_or_default();
@@ -2667,6 +2673,8 @@ impl PainterApp {
         // The shown cycling palette follows palette and range changes made earlier in this
         // pass (the clock at the top of `ui()` ran before them).
         self.cycle_tick(ctx.input(|i| i.time));
+        // ADR-44: a document changed elsewhere (MCP, generation) redraws the layer panel.
+        self.follow_document();
         // Upload the screen at native resolution; the GPU scales it with nearest filtering.
         if self.dirty || self.texture.is_none() {
             self.prepare_perspective_view();

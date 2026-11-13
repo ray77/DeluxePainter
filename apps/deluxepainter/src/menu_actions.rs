@@ -20,6 +20,8 @@ use crate::{PainterApp, files, note_requester};
 const PALETTE_LOADED: &str = "Palette loaded";
 /// Title of the note after Palette ▸ Restore Palette rounded colours (ADR-46).
 const RESTORE_PALETTE: &str = "Palette restored";
+/// Title of the note when Copy to Spare could not copy onto a spare of its own format.
+const NOT_COPIED: &str = "Not copied";
 
 /// The page that is not shown (Picture ▸ Spare) with what belongs to it. Both pages share one
 /// palette and screen format; each keeps its own undo history, scroll position, file name,
@@ -392,35 +394,40 @@ impl PainterApp {
             // ADR-45: the spare takes the shown page's format and palette (one undo step on
             // the spare page, which also brings back its own details) and is an ordinary
             // spare again. ADR-44: a layered page then follows as a second step, the whole
-            // picture with every layer (`SetPicture`).
+            // picture with every layer (`SetPicture`). The palette goes as the shown page
+            // stores it (wave-8 integration: an older OCS project's colours that are not
+            // 12-bit too, `Command::replace_with_page`), so the copy changes no colour.
             let before = self.spare_files(&other);
             let doc = self.engine.document();
-            let page = doc.page();
-            let command = Command::ReplacePicture {
-                target: doc.target(),
-                palette: doc.palette().colors().to_vec(),
-                width: page.width(),
-                height: page.height(),
-                pixels: page.pixels().to_vec(),
-            };
+            let command = Command::replace_with_page(doc);
             let key = crate::generate::page_state::step_key(&command);
-            match (other.engine.execute(command), key) {
-                (Ok(_), Some(key)) => {
-                    self.menu_data.page_history.spare.record(key, before);
-                    if !single_picture(doc)
-                        && let Err(e) = other.engine.execute(Command::set_picture(doc))
-                    {
-                        eprintln!("copy to spare: {e}");
-                        other.engine = Engine::new(doc.clone());
-                        self.menu_data.page_history.spare = Default::default();
-                    }
+            let kept = other.engine.clone();
+            let copied = other.engine.execute(command).and_then(|_| {
+                if single_picture(doc) {
+                    Ok(())
+                } else {
+                    other.engine.execute(Command::set_picture(doc)).map(drop)
                 }
-                _ => {
-                    other.engine = Engine::new(doc.clone());
-                    self.menu_data.page_history.spare = Default::default();
+            });
+            match copied {
+                Ok(()) => {
+                    if let Some(key) = key {
+                        self.menu_data.page_history.spare.record(key, before);
+                    }
+                    self.menu_data.spare_own = None;
+                }
+                Err(e) => {
+                    // Never half a copy, never a spare that lost its undo: it stays as it
+                    // was, with its own format, details and history, and the note says why.
+                    eprintln!("copy to spare: {e}");
+                    other.engine = kept;
+                    self.ui.note_requester = crate::note_requester(
+                        NOT_COPIED,
+                        &[format!("The spare page stays as it was: {}", e.message)],
+                    );
+                    self.dirty = true;
                 }
             }
-            self.menu_data.spare_own = None;
             self.menu_data.spare = Some(other);
             return;
         }
@@ -541,15 +548,8 @@ impl PainterApp {
             return;
         };
         let before = self.shown_files();
-        let doc = other.engine.document();
-        let page = doc.page();
-        let command = Command::ReplacePicture {
-            target: doc.target(),
-            palette: doc.palette().colors().to_vec(),
-            width: page.width(),
-            height: page.height(),
-            pixels: page.pixels().to_vec(),
-        };
+        // The spare's palette as it stores it (also an older OCS project's, wave-8).
+        let command = Command::replace_with_page(other.engine.document());
         let key = crate::generate::page_state::step_key(&command);
         match self.engine.execute(command) {
             Ok(_) => {
@@ -729,8 +729,10 @@ impl PainterApp {
             ));
         }
         let mut new = fit_colors(&colors, current);
-        // ADR-46: an OCS picture takes the file's colours as 12-bit values.
-        notes.extend(self.chipset_colors(&mut new));
+        // ADR-46: an OCS picture takes the file's colours as 12-bit values. The entries the
+        // file does not reach stay exactly as they are (wave-8 integration: an older
+        // project's colours that are not 12-bit too; SetPalette keeps unchanged entries).
+        notes.extend(self.chipset_colors(&mut new[..have.min(want)]));
         if new != self.engine.document().palette().colors() {
             self.run(Command::SetPalette { colors: new });
         }

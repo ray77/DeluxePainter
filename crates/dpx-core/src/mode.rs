@@ -376,9 +376,10 @@ const fn preset(
     }
 }
 
-/// The presets, in the order the requester cycles through them; Custom is last.
-// TODO(wave8-integration): the image-generation branch (ADR-45) keeps a private copy of this
-// table for its Generate requester; switch it to this one.
+/// The presets, in the order the requester cycles through them; Custom is last. The one
+/// table of screen presets: the Screen Format requester's Preset gadget, the Generate
+/// requester's Resolution row (every entry but Custom) and MCP's `preset` argument
+/// (`create_document`) all take theirs from here (wave-8 integration).
 pub const PRESETS: [Preset; 8] = [
     preset(
         "ntsc_lores",

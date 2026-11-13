@@ -41,6 +41,16 @@ pub struct State {
     texture: Option<egui::TextureHandle>,
     /// The docked strip's width (physical pixels) this pass's screen was laid out with.
     laid_out: i32,
+    /// The document the panel and the title-bar label were last brought up to date with
+    /// ([`document_key`]).
+    synced: Option<(u64, u64)>,
+}
+
+/// Which document is shown and how far it has changed: its engine (`Engine::id`, another
+/// one after Load or a swap of the pages) and its revision (every change, Undo and selecting
+/// a layer count).
+fn document_key(engine: &Engine) -> (u64, u64) {
+    (engine.id(), engine.document().revision())
 }
 
 /// The command a panel button runs on a document whose active layer is `active`, if there is
@@ -201,10 +211,18 @@ impl PainterApp {
         }
     }
 
+    /// Before the screen is drawn (wave-8 integration): a document that changed since the
+    /// panel and the title-bar label were last brought up to date asks for a redraw in this
+    /// pass, whoever changed it: a layer tool or command of an MCP client (ADR-43), a
+    /// generated picture placed as a layer (ADR-45), Undo, a new picture or the other page
+    /// swapped in (another engine). Paths that set `dirty` themselves need nothing more.
+    pub(crate) fn follow_document(&mut self) {
+        if self.layers.synced != Some(document_key(&self.engine)) {
+            self.dirty = true;
+        }
+    }
+
     /// Before the screen is composed: the panel and the title-bar label follow the document.
-    // TODO(wave8-integration): layer commands that arrive from the live MCP bridge (ADR-43)
-    // or a generated picture placed as a new layer (ADR-45) must set `self.dirty`, so the
-    // panel and the label are brought up to date on the next redraw.
     pub(crate) fn sync_layer_panel(&mut self) {
         let (view, scale) = self.layout();
         let docked = self.layer_strip_px(view, scale) > 0;
@@ -216,6 +234,21 @@ impl PainterApp {
             hidden,
             view.ui_size(),
         );
+        self.layers.synced = Some(document_key(&self.engine));
+    }
+
+    /// Takes the name being edited, as a click elsewhere does: an MCP change runs after it,
+    /// so the rename goes to the layer it was opened on (the change may renumber layers).
+    pub(crate) fn finish_layer_rename(&mut self) {
+        if let Some((layer, name)) = self
+            .ui
+            .layer_panel
+            .as_mut()
+            .and_then(LayerPanel::finish_rename)
+        {
+            self.rename_layer(layer, name);
+            self.dirty = true;
+        }
     }
 
     /// The pointer is over `hit` (the hover branch of `ui()`).
@@ -1418,5 +1451,65 @@ mod tests {
         snapshot_ui(&[], &mut app.engine, &mut ui, view);
         assert!(ui.layer_panel.is_none());
         assert_eq!(ui.layer_label.as_deref(), Some("Hill"));
+    }
+
+    /// Wave-8 integration: a change that reaches the document without setting the redraw
+    /// flag (as an MCP job or a generated picture placed as a layer may) still brings the
+    /// panel and the title-bar label up to date in the next pass, before it is drawn.
+    #[test]
+    fn the_panel_and_the_label_follow_changes_made_elsewhere() {
+        let ctx = egui::Context::default();
+        let mut app = with_panel(&ctx);
+        assert_eq!(panel(&app).rows.len(), 3);
+        // Around every path that sets `dirty`: straight into the engine.
+        app.engine
+            .execute(Command::AddLayer {
+                name: Some("Moon".into()),
+            })
+            .unwrap();
+        app.dirty = false;
+        ui_pass(&mut app, &ctx, 0.2, vec![]);
+        let p = panel(&app);
+        assert_eq!(p.rows.len(), 4);
+        assert_eq!((p.active, p.rows[2].name.as_str()), (2, "Moon"));
+        assert!(!app.dirty, "drawn in that pass");
+        // A pass without a change redraws nothing.
+        ui_pass(&mut app, &ctx, 0.3, vec![]);
+        assert!(!app.dirty);
+        // Undo outside the panel, too.
+        app.engine.undo().unwrap();
+        ui_pass(&mut app, &ctx, 0.4, vec![]);
+        assert_eq!(panel(&app).rows.len(), 3);
+        // With the panel off, the title-bar label follows a selection made elsewhere.
+        ui_pass(&mut app, &ctx, 0.5, shift_l());
+        assert_eq!(app.ui.layer_label.as_deref(), Some("Hill"));
+        app.engine
+            .execute(Command::SelectLayer { layer: 2 })
+            .unwrap();
+        ui_pass(&mut app, &ctx, 0.6, vec![]);
+        assert_eq!(app.ui.layer_label.as_deref(), Some("Sky"));
+        // Another document at the same revision (a picture loaded, the spare page swapped
+        // in): another engine counts too.
+        let mut other = Engine::new(app.engine.document().clone());
+        other
+            .execute(Command::RenameLayer {
+                layer: 2,
+                name: "Stars".into(),
+            })
+            .unwrap();
+        app.engine
+            .execute(Command::SetLayerVisible {
+                layer: 0,
+                visible: true,
+            })
+            .unwrap();
+        ui_pass(&mut app, &ctx, 0.7, vec![]);
+        assert_eq!(
+            other.document().revision(),
+            app.engine.document().revision()
+        );
+        app.engine = other;
+        ui_pass(&mut app, &ctx, 0.8, vec![]);
+        assert_eq!(app.ui.layer_label.as_deref(), Some("Stars"));
     }
 }

@@ -246,6 +246,31 @@ pub(crate) fn convert_options(o: &GenerateOptions) -> ConvertOptions {
     }
 }
 
+/// The note's title after Apply rounded colours of the current palette (ADR-46).
+pub const GENERATED: &str = "Picture generated";
+
+/// The note after Apply when the conversion rounded `n` entries of the current palette for
+/// an OCS picture (ADR-46, wave-8 integration: an older project's colours, or an AGA
+/// picture's, that are not 12-bit; `Imported::rounded_colors`), so no colour changes
+/// silently. Only the targets that take the result's palette (the spare page, the picture);
+/// none without rounded entries.
+// TODO(wave8-integration): MCP's generation tools (ADR-45 strand) apply a result too; their
+// answer should carry `Imported::rounded_colors` as `set_format`'s does.
+pub(crate) fn rounded_note(t: GenTarget, n: usize) -> Option<dpx_ui::NoteRequester> {
+    if n == 0 {
+        return None;
+    }
+    let after = match t {
+        GenTarget::Picture => "Undo brings the old colours back",
+        GenTarget::Spare => "on the spare page; the shown page keeps its colours",
+        _ => return None,
+    };
+    Some(dpx_ui::NoteRequester::new(
+        GENERATED,
+        &[dpx_core::hardware::rounded_note(n), after.to_string()],
+    ))
+}
+
 /// The line under the options once there is a result: what Apply does. `frames`: the
 /// picture's frames (Picture replaces them all); `fitted`: the brush colours that had to be
 /// fitted to the picture palette (as Brush ▸ Load says in its note).
@@ -828,7 +853,10 @@ impl PainterApp {
         };
         let applied = self.apply_generated(&r, o.target, o.target(), o.palette);
         match applied {
-            Ok(()) => self.close_generate(),
+            Ok(()) => {
+                self.close_generate();
+                self.ui.note_requester = rounded_note(o.target, r.rounded_colors);
+            }
             Err(e) => {
                 if let Some(req) = &mut self.ui.generate_requester {
                     req.set_error(Some(format!("Not applied: {e}.")));

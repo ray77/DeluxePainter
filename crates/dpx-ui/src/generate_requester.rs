@@ -24,8 +24,9 @@
 
 use dpx_core::import::{COLOR_COUNTS, Framing, PaletteChoice, Scaler};
 use dpx_core::layer::MAX_LAYERS;
+use dpx_core::mode::PRESETS;
 use dpx_core::quantize::Dither;
-use dpx_core::{Chipset, DisplayMode, IndexedImage, Rect, Resolution, RgbaImage, Target, Video};
+use dpx_core::{Chipset, DisplayMode, IndexedImage, Rect, RgbaImage, Target};
 
 use crate::font::Font;
 use crate::note_requester::wrap;
@@ -57,9 +58,11 @@ mod geom {
     pub const ROWS_Y: i32 = 50;
 }
 
-/// A screen the picture is made for.
+/// A screen the picture is made for: a screen preset of `dpx_core::mode::PRESETS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolutionPreset {
+    /// The preset's id in `dpx_core::mode::PRESETS` (ADR-46).
+    pub id: &'static str,
     pub label: &'static str,
     pub mode: DisplayMode,
     pub screen: (u32, u32),
@@ -72,47 +75,35 @@ impl ResolutionPreset {
     }
 }
 
-// TODO(wave8-integration): use the dpx_core::mode presets of the modes branch (ADR-46)
-// instead of this private copy.
-/// The Resolution choices: the standard screens and 320×240, a custom PAL LoRes screen (no
-/// standard NTSC or PAL size).
-pub const RESOLUTIONS: [ResolutionPreset; 7] = [
-    ResolutionPreset {
-        label: "NTSC LoRes 320x200",
-        mode: DisplayMode::new(Video::Ntsc, Resolution::Lo, false),
-        screen: (320, 200),
-    },
-    ResolutionPreset {
-        label: "PAL LoRes 320x256",
-        mode: DisplayMode::new(Video::Pal, Resolution::Lo, false),
-        screen: (320, 256),
-    },
-    ResolutionPreset {
-        label: "Pixel art 320x240 (custom)",
-        mode: DisplayMode::new(Video::Pal, Resolution::Lo, false),
-        screen: (320, 240),
-    },
-    ResolutionPreset {
-        label: "NTSC HiRes 640x200",
-        mode: DisplayMode::new(Video::Ntsc, Resolution::Hi, false),
-        screen: (640, 200),
-    },
-    ResolutionPreset {
-        label: "PAL HiRes 640x256",
-        mode: DisplayMode::new(Video::Pal, Resolution::Hi, false),
-        screen: (640, 256),
-    },
-    ResolutionPreset {
-        label: "NTSC HiRes Laced 640x400",
-        mode: DisplayMode::new(Video::Ntsc, Resolution::Hi, true),
-        screen: (640, 400),
-    },
-    ResolutionPreset {
-        label: "PAL HiRes Laced 640x512",
-        mode: DisplayMode::new(Video::Pal, Resolution::Hi, true),
-        screen: (640, 512),
-    },
-];
+/// The Resolution choices: every screen preset of the shared table `dpx_core::mode::PRESETS`
+/// (ADR-46: the standard screens and 320×240, a custom PAL LoRes screen with no standard NTSC
+/// or PAL size), in its order; its Custom entry is left out (a picture needs a screen).
+pub const RESOLUTIONS: [ResolutionPreset; PRESETS.len() - 1] = resolutions();
+
+/// [`RESOLUTIONS`], made from `dpx_core::mode::PRESETS` when compiling.
+const fn resolutions() -> [ResolutionPreset; PRESETS.len() - 1] {
+    let mut out = [ResolutionPreset {
+        id: "",
+        label: "",
+        mode: DisplayMode::PAL_LORES,
+        screen: (0, 0),
+    }; PRESETS.len() - 1];
+    let mut i = 0;
+    while i < out.len() {
+        let p = PRESETS[i];
+        let Some((mode, screen)) = p.format else {
+            panic!("only Custom, the last preset, has no screen");
+        };
+        out[i] = ResolutionPreset {
+            id: p.id,
+            label: p.label,
+            mode,
+            screen,
+        };
+        i += 1;
+    }
+    out
+}
 
 /// The default Resolution: 320×240 (the spec's easy-to-find pixel-art size).
 pub const DEFAULT_RESOLUTION: usize = 2;
@@ -1087,7 +1078,7 @@ impl GenerateRequester {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dpx_core::{Palette, Rgba8};
+    use dpx_core::{Palette, Resolution, Rgba8, Video};
 
     fn ready() -> ProviderInfo {
         ProviderInfo {
@@ -1191,6 +1182,44 @@ mod tests {
                 assert!(t.page_fits(t.screen.0, t.screen.1), "{}", p.label);
             }
         }
+    }
+
+    /// Wave-8 integration: the Resolution choices are the shared presets of ADR-46 (the
+    /// Screen Format requester's Preset gadget and MCP's `preset` use the same table), with
+    /// the labels shown before, and 320x240 stays the default.
+    #[test]
+    fn resolutions_are_the_shared_presets() {
+        let shared: Vec<_> = PRESETS.iter().filter(|p| p.format.is_some()).collect();
+        assert_eq!(RESOLUTIONS.len(), shared.len());
+        for (r, p) in RESOLUTIONS.iter().zip(&shared) {
+            assert_eq!((r.id, r.label), (p.id, p.label));
+            assert_eq!(Some((r.mode, r.screen)), p.format);
+            for chipset in CHIPSETS {
+                if let Some(t) = p.target(chipset) {
+                    assert_eq!(r.target(chipset), t, "{}", r.id);
+                }
+            }
+        }
+        let labels: Vec<&str> = RESOLUTIONS.iter().map(|r| r.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "NTSC LoRes 320x200",
+                "PAL LoRes 320x256",
+                "Pixel art 320x240 (custom)",
+                "NTSC HiRes 640x200",
+                "PAL HiRes 640x256",
+                "NTSC HiRes Laced 640x400",
+                "PAL HiRes Laced 640x512",
+            ],
+            "the visible labels did not change"
+        );
+        assert_eq!(RESOLUTIONS[DEFAULT_RESOLUTION].id, "pixel_art_320x240");
+        assert_eq!(
+            GenRow::Resolution.choices(),
+            labels,
+            "the row offers them in this order"
+        );
     }
 
     #[test]

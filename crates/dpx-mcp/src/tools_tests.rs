@@ -104,6 +104,15 @@ fn definitions_are_complete_and_annotated() {
         "open_picture",
         "execute_command",
         "get_pixels",
+        // ADR-44, wave-8 integration.
+        "list_layers",
+        "create_layer",
+        "select_layer",
+        "delete_layer",
+        "set_layer_visibility",
+        "rename_layer",
+        "move_layer",
+        "merge_layer_down",
     ] {
         assert!(names.contains(&want), "{want} missing");
     }
@@ -914,4 +923,395 @@ fn activity_counts_calls_and_the_log_records_changes() {
         }))
         .unwrap();
     assert_eq!(log, ["headless"]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Layers (ADR-44, wave-8 integration)
+
+fn layer_names(v: &Value) -> Vec<String> {
+    v["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn layer_tools_go_through_the_engine_and_undo() {
+    let t = T::new();
+    let l = t.ok("list_layers", json!({}));
+    assert_eq!(l["document_id"], "page1");
+    assert_eq!(l["layer_count"], 1);
+    assert_eq!(l["active_layer"], 0);
+    assert_eq!(
+        l["layers"],
+        json!([{"index": 0, "name": "Background", "visible": true, "active": true}])
+    );
+    assert!(l["transparency"].as_str().unwrap().contains("colour 0"));
+    // create_layer: above the active one, active, one undo step.
+    let rev = l["revision"].as_u64().unwrap();
+    let c = t.ok("create_layer", json!({"name": "Sky"}));
+    assert_eq!(c["revision"], rev + 1);
+    assert_eq!(
+        (
+            c["changed"].clone(),
+            c["undoable"].clone(),
+            c["can_undo"].clone()
+        ),
+        (json!(true), json!(true), json!(true))
+    );
+    assert_eq!(
+        (c["layer"].clone(), c["active_layer"].clone()),
+        (json!(1), json!(1))
+    );
+    assert_eq!(layer_names(&c), ["Background", "Sky"]);
+    // The drawing tools paint the active layer; colour 0 above the bottom is transparent.
+    t.ok("fill_area", json!({"x": 0, "y": 0, "color": 2}));
+    assert_eq!(t.pixel(0, 0), 2);
+    t.ok(
+        "draw_rectangle",
+        json!({"x": 10, "y": 10, "width": 4, "height": 4, "color": 0, "filled": true}),
+    );
+    assert_eq!(t.pixel(11, 11), 0, "erased down to the bottom layer");
+    // An unnamed layer is "Layer N".
+    let c = t.ok("create_layer", json!({}));
+    assert_eq!(layer_names(&c), ["Background", "Sky", "Layer 1"]);
+    assert_eq!(c["layer"], 2);
+    // select_layer is a setting: no undo step; selecting the active layer changes nothing.
+    let s = t.ok("select_layer", json!({"layer": 0}));
+    assert_eq!(
+        (
+            s["changed"].clone(),
+            s["undoable"].clone(),
+            s["active_layer"].clone()
+        ),
+        (json!(true), json!(false), json!(0))
+    );
+    let again = t.ok("select_layer", json!({"layer": 0}));
+    assert_eq!(again["changed"], false);
+    assert_eq!(again["revision"], s["revision"]);
+    t.ok("draw_pixel", json!({"x": 100, "y": 100, "color": 7}));
+    assert_eq!(
+        t.pixel(100, 100),
+        2,
+        "the Sky layer covers the bottom layer"
+    );
+    // Visibility: hiding Sky shows the bottom layer's pixel.
+    let v = t.ok(
+        "set_layer_visibility",
+        json!({"layer": 1, "visible": false}),
+    );
+    assert_eq!(v["layers"][1]["visible"], false);
+    assert_eq!(t.pixel(100, 100), 7);
+    let same = t.ok(
+        "set_layer_visibility",
+        json!({"layer": 1, "visible": false}),
+    );
+    assert_eq!(same["changed"], false);
+    t.ok("set_layer_visibility", json!({"layer": 1, "visible": true}));
+    // Rename, move, merge, delete.
+    let r = t.ok("rename_layer", json!({"layer": 2, "name": "Clouds"}));
+    assert_eq!(layer_names(&r), ["Background", "Sky", "Clouds"]);
+    let m = t.ok("move_layer", json!({"from": 2, "to": 0}));
+    assert_eq!(layer_names(&m), ["Clouds", "Background", "Sky"]);
+    assert_eq!(m["layer"], 0);
+    assert_eq!(
+        m["active_layer"], 1,
+        "the active layer stays the same layer"
+    );
+    let same = t.ok("move_layer", json!({"from": 1, "to": 1}));
+    assert_eq!(same["changed"], false);
+    let g = t.ok("merge_layer_down", json!({"layer": 2}));
+    assert_eq!(layer_names(&g), ["Clouds", "Background"]);
+    assert_eq!(g["layer"], 1);
+    let d = t.ok("delete_layer", json!({"layer": 0}));
+    assert_eq!(layer_names(&d), ["Background"]);
+    assert_eq!(t.pixel(0, 0), 2, "Sky was merged into Background");
+    // Undo walks back: the delete, the merge, the move.
+    t.ok("undo", json!({}));
+    assert_eq!(
+        layer_names(&t.ok("list_layers", json!({}))),
+        ["Clouds", "Background"]
+    );
+    t.ok("undo", json!({}));
+    t.ok("undo", json!({}));
+    let l = t.ok("list_layers", json!({}));
+    assert_eq!(layer_names(&l), ["Background", "Sky", "Clouds"]);
+    // get_document_info and the info resource report the stack.
+    let i = t.ok("get_document_info", json!({}));
+    assert_eq!(i["layer_count"], 3);
+    assert_eq!(i["layers"], l["layers"]);
+    assert_eq!(i["active_layer"], l["active_layer"]);
+    let r = t.rt.block_on(read_resource(&t.ctx, RESOURCE_INFO)).unwrap();
+    let ResourceContents::TextResourceContents { text, .. } = &r.contents[0] else {
+        panic!("a text resource");
+    };
+    let v: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(v["layers"], l["layers"]);
+    assert_eq!(v["layer_count"], 3);
+}
+
+#[test]
+fn layer_tools_refuse_clearly() {
+    let t = T::new();
+    let (code, msg) = t.err("select_layer", json!({"layer": 3}));
+    assert_eq!(code, "LAYER_NOT_FOUND");
+    assert_eq!(
+        msg,
+        "select_layer: there is no layer 3; the picture has 1 layer, layer 0 (see list_layers)"
+    );
+    let (code, msg) = t.err("delete_layer", json!({"layer": 0}));
+    assert_eq!(code, "INVALID_ARGUMENT");
+    assert!(msg.contains("only layer"), "{msg}");
+    let (code, msg) = t.err("merge_layer_down", json!({"layer": 0}));
+    assert_eq!(code, "INVALID_ARGUMENT");
+    assert!(msg.contains("no layer below"), "{msg}");
+    t.ok("create_layer", json!({}));
+    let (code, msg) = t.err("move_layer", json!({"from": 0, "to": 2}));
+    assert_eq!(code, "LAYER_NOT_FOUND");
+    assert_eq!(
+        msg,
+        "move_layer to: there is no layer 2; the picture has 2 layers, 0 (bottom) to 1 (top) \
+         (see list_layers)"
+    );
+    for name in ["", "   ", "a\nb"] {
+        let (code, _) = t.err("rename_layer", json!({"layer": 1, "name": name}));
+        assert_eq!(code, "INVALID_ARGUMENT", "{name:?}");
+    }
+    let (code, _) = t.err("create_layer", json!({"name": "x".repeat(256)}));
+    assert_eq!(code, "INVALID_ARGUMENT");
+    let (code, _) = t.err("select_layer", json!({"layer": 0, "frame": 1}));
+    assert_eq!(code, "INVALID_ARGUMENT", "unknown fields are refused");
+    // 32 layers at most (the engine's rule).
+    for _ in 2..32 {
+        t.ok("create_layer", json!({}));
+    }
+    let (code, msg) = t.err("create_layer", json!({}));
+    assert_eq!(code, "INVALID_ARGUMENT");
+    assert!(msg.contains("at most 32"), "{msg}");
+    // The refusals changed nothing: 32 layers, the last one active.
+    let l = t.ok("list_layers", json!({}));
+    assert_eq!(
+        (l["layer_count"].clone(), l["active_layer"].clone()),
+        (json!(32), json!(31))
+    );
+}
+
+#[test]
+fn layer_tools_need_their_permissions() {
+    let mut settings = Settings::headless(FileAccess::off());
+    settings.edit = false;
+    let t = T::with(settings);
+    t.ok("list_layers", json!({}));
+    for (tool, args) in [
+        ("create_layer", json!({})),
+        ("select_layer", json!({"layer": 0})),
+        ("rename_layer", json!({"layer": 0, "name": "X"})),
+    ] {
+        let (code, _) = t.err(tool, args);
+        assert_eq!(code, "PERMISSION_DENIED", "{tool}");
+    }
+    let mut settings = Settings::headless(FileAccess::off());
+    settings.read = false;
+    let t = T::with(settings);
+    let (code, _) = t.err("list_layers", json!({}));
+    assert_eq!(code, "PERMISSION_DENIED");
+    assert!(is_read_only("list_layers"));
+    assert!(!is_read_only("create_layer"));
+}
+
+#[test]
+fn preview_shows_one_layer_alone() {
+    let t = T::new();
+    t.ok("fill_area", json!({"x": 0, "y": 0, "color": 4}));
+    t.ok("create_layer", json!({"name": "Top"}));
+    t.ok(
+        "draw_rectangle",
+        json!({"x": 0, "y": 0, "width": 2, "height": 1, "color": 5, "filled": true}),
+    );
+    t.ok(
+        "set_layer_visibility",
+        json!({"layer": 1, "visible": false}),
+    );
+    let colors = t.ok("get_palette", json!({}))["colors"].clone();
+    let hex = |i: usize| colors[i].as_str().unwrap().to_string();
+    let rect = json!({"x": 0, "y": 0, "w": 4, "h": 1});
+    let image = |r: &CallToolResult| {
+        decode_png(&view::from_base64(&r.content[0].as_image().unwrap().data).unwrap())
+    };
+    // The hidden upper layer alone: an RGBA PNG, colour 0 transparent.
+    let r = t.call("get_preview", json!({"rect": rect, "scale": 1, "layer": 1}));
+    assert_eq!(r.is_error, Some(false));
+    let (w, h, rgba) = image(&r);
+    assert_eq!((w, h, rgba.len()), (4, 1, 16), "RGBA");
+    let px = |i: usize| {
+        (
+            format!(
+                "#{:02X}{:02X}{:02X}",
+                rgba[i * 4],
+                rgba[i * 4 + 1],
+                rgba[i * 4 + 2]
+            ),
+            rgba[i * 4 + 3],
+        )
+    };
+    assert_eq!(px(0), (hex(5), 255));
+    assert_eq!(px(1), (hex(5), 255));
+    assert_eq!(px(2).1, 0, "colour 0 is left transparent");
+    let s = r.structured_content.unwrap();
+    assert_eq!(s["layer"], 1);
+    let note = s["layer_note"].as_str().unwrap();
+    assert!(
+        note.contains("hidden in the picture") && note.contains("alpha 0"),
+        "{note}"
+    );
+    // The bottom layer alone: opaque, colour 0 as palette colour 0.
+    let r = t.call("get_preview", json!({"rect": rect, "scale": 1, "layer": 0}));
+    let (_, _, rgb) = image(&r);
+    assert_eq!(rgb.len(), 12, "RGB");
+    let first = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+    assert_eq!(first, hex(4));
+    let s = r.structured_content.unwrap();
+    assert!(s["layer_note"].as_str().unwrap().contains("opaque"));
+    // Without `layer`: the picture as it shows (the hidden layer left out), no layer fields.
+    let r = t.call("get_preview", json!({"rect": rect, "scale": 1}));
+    let s = r.structured_content.clone().unwrap();
+    assert!(s.get("layer").is_none() && s.get("layer_note").is_none());
+    let (_, _, rgb) = image(&r);
+    let first = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+    assert_eq!(first, hex(4));
+    let (code, _) = t.err("get_preview", json!({"layer": 2}));
+    assert_eq!(code, "LAYER_NOT_FOUND");
+}
+
+#[test]
+fn execute_command_names_the_layer_ops_and_remap() {
+    let defs = definitions();
+    let exec = defs.iter().find(|d| d.name == "execute_command").unwrap();
+    let text = format!(
+        "{} {}",
+        exec.description.as_deref().unwrap(),
+        exec.input_schema["properties"]["command"]["description"]
+    );
+    for op in [
+        "add_layer",
+        "duplicate_layer",
+        "delete_layer",
+        "move_layer",
+        "select_layer",
+        "set_layer_visible",
+        "rename_layer",
+        "merge_layer_down",
+        "flatten_layers",
+        "remap_colors",
+        "arrange_palette",
+    ] {
+        assert!(text.contains(op), "{op} missing");
+    }
+    // And they run: a layer through execute_command, undone by undo.
+    let t = T::new();
+    t.ok(
+        "execute_command",
+        json!({"command": {"op": "add_layer", "name": "Raw"}}),
+    );
+    assert_eq!(t.ok("list_layers", json!({}))["layer_count"], 2);
+    t.ok("undo", json!({}));
+    assert_eq!(t.ok("list_layers", json!({}))["layer_count"], 1);
+}
+
+/// Wave-8 integration: MCP's presets are the shared table of ADR-46 (the Screen Format and
+/// Generate requesters use it too); the ADR-43 names stay, the table's ids work as well.
+#[test]
+fn presets_are_the_shared_table() {
+    let screens: Vec<_> = dpx_core::mode::PRESETS
+        .iter()
+        .filter(|p| p.format.is_some())
+        .collect();
+    assert_eq!(PresetArg::ALL.len(), screens.len());
+    for (arg, p) in PresetArg::ALL.iter().zip(&screens) {
+        assert_eq!(arg.preset_id(), p.id);
+        assert_eq!(Some(arg.format()), p.format);
+    }
+    let names: Vec<Value> = PresetArg::ALL
+        .iter()
+        .map(|p| serde_json::to_value(p).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ntsc_lores",
+            "pal_lores",
+            "pixelart_320x240",
+            "ntsc_hires",
+            "pal_hires",
+            "ntsc_interlace",
+            "pal_interlace"
+        ]
+        .map(|s| json!(s))
+    );
+    let t = T::new();
+    for (name, size) in [
+        ("pal_hires_laced", (640, 512)),
+        ("ntsc_hires_laced", (640, 400)),
+        ("pixel_art_320x240", (320, 240)),
+        ("pal_interlace", (640, 512)),
+    ] {
+        let c = t.ok("create_document", json!({"preset": name, "colors": 16}));
+        let d = &c["document"];
+        assert_eq!(
+            (d["screen_width"].clone(), d["screen_height"].clone()),
+            (json!(size.0), json!(size.1)),
+            "{name}"
+        );
+    }
+}
+
+/// Wave-8 integration of ADR-46: an older project with OCS colours that are not 12-bit
+/// opens with them as stored, the result says which and how to fix them, and
+/// `export_image` refuses it in every format, PNG too (as the note says), until they are
+/// fixed.
+#[test]
+fn an_old_ocs_project_opens_with_a_note() {
+    let dir = crate::access::tests::scratch("tools-old-ocs");
+    std::fs::write(
+        dir.join("old.dpxproj"),
+        include_bytes!("../../dpx-formats/tests/data/v1-ocs-not-12-bit.dpxproj"),
+    )
+    .unwrap();
+    let t = T::in_dir(&dir);
+    let o = t.ok("open_picture", json!({"path": "old.dpxproj"}));
+    let notes: Vec<&str> = o["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        notes[0],
+        "palette entries 9-27, 29, 30 are not 12-bit OCS colours (kept as stored); \
+         export_image (every format, PNG too) refuses the picture until they are 12-bit"
+    );
+    assert!(notes[1].contains("set_palette_color"), "{}", notes[1]);
+    let p = t.ok("get_palette", json!({}));
+    assert_eq!(p["colors"][9], "#0B0B0B", "not rounded");
+    // Every format is refused, as the note says, and nothing is written.
+    for path in ["old.iff", "old.png", "old.anim"] {
+        let (code, msg) = t.err("export_image", json!({"path": path}));
+        assert_eq!(code, "HARDWARE_LIMIT", "{path}");
+        assert!(msg.contains("palette entry 9"), "{path}: {msg}");
+        assert!(!dir.join(path).exists(), "{path}");
+    }
+    let (code, _) = t.err("export_image", json!({"path": "old.pic", "format": "png"}));
+    assert_eq!(code, "HARDWARE_LIMIT");
+    // One entry can be fixed on its own; the others stay as stored.
+    t.ok("set_palette_color", json!({"index": 9, "color": "#111"}));
+    let p = t.ok("get_palette", json!({}));
+    assert_eq!(
+        (p["colors"][9].clone(), p["colors"][10].clone()),
+        (json!("#111111"), json!("#161616"))
+    );
+    // Export still refuses the next one (MCP's export_image checks every format, ADR-43).
+    let (_, msg) = t.err("export_image", json!({"path": "old.iff"}));
+    assert!(msg.contains("palette entry 10"), "{msg}");
 }
