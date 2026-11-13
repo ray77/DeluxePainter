@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use dpx_core::{BrushImage, Command, Document, Engine, IndexedImage, Outcome, Request};
 use dpx_formats::project::ProjectExtras;
 use dpx_mcp::endpoint;
+use dpx_mcp::generation::{ApplyTo, GenApply, GenHost};
 use dpx_mcp::http::{self, HttpOptions, HttpServer};
 use dpx_mcp::jobs::{self, JobKind, JobQueue};
 use dpx_mcp::pictures::Format;
@@ -723,6 +724,10 @@ impl PainterApp {
         let s = self.menu_data.spare.as_ref()?;
         let doc = self.engine.document();
         let spare = s.engine.document();
+        // ADR-45: a generated spare page keeps its own format and palette.
+        if self.menu_data.spare_own.is_some() {
+            return Some(spare.clone());
+        }
         let blank = || {
             Document::from_picture(
                 IndexedImage::new(doc.page().width(), doc.page().height(), 0),
@@ -785,9 +790,6 @@ impl PainterApp {
 /// The GUI's editor state for the tools, borrowed for one job.
 // TODO(wave8-integration): layers (ADR-44): changes go to the active layer, and
 // list_layers / create_layer / select_layer map onto the layer panel's state here.
-// TODO(wave8-integration): generation (ADR-45): generated pictures reach the editor through
-// `replace_picture` (Picture), `set_spare_page` (Spare page) and `set_brush` (Brush), as
-// `import_image` does; "New layer" comes with ADR-44.
 struct GuiWorkspace<'a>(&'a mut PainterApp);
 
 impl Workspace for GuiWorkspace<'_> {
@@ -928,6 +930,27 @@ impl Workspace for GuiWorkspace<'_> {
 
     fn bg_color(&self) -> u8 {
         self.0.ui.bg
+    }
+
+    /// ADR-45: Picture > Generate..'s generator, jobs and choices.
+    fn image_generation(&mut self) -> Result<GenHost, ToolError> {
+        Ok(self.0.mcp_gen_host())
+    }
+
+    /// ADR-45: the Generate requester's Apply, as a menu command (Stencil > Paint ends, a
+    /// gesture in progress is committed first).
+    fn apply_generated(&mut self, apply: GenApply) -> Result<(), ToolError> {
+        let app = &mut *self.0;
+        app.mcp_prepare();
+        let to = match apply.to {
+            ApplyTo::Spare => dpx_ui::GenTarget::Spare,
+            ApplyTo::Picture => dpx_ui::GenTarget::Picture,
+            ApplyTo::Brush => dpx_ui::GenTarget::Brush,
+            ApplyTo::NewLayer => dpx_ui::GenTarget::NewLayer,
+        };
+        let applied = app.apply_generated(&apply.result, to, apply.format, apply.palette);
+        app.mcp_changed();
+        applied.map_err(|e| ToolError::new("APPLY_FAILED", e))
     }
 
     fn ask(&mut self, question: Question, answer: Answer) {

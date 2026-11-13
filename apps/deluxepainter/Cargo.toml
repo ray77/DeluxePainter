@@ -13,7 +13,7 @@ dpx-core.workspace = true
 dpx-formats.workspace = true
 dpx-iff.workspace = true
 dpx-imagegen.workspace = true
-dpx-mcp.workspace = true
+dpx-mcp = { workspace = true, features = ["imagegen"] }
 dpx-ui.workspace = true
 eframe.workspace = true
 png.workspace = true

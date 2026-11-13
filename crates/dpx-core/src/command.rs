@@ -274,6 +274,15 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// ADR-45: a generated picture's "New layer" target. Like [`Command::AddLayer`] (above
+    /// the active layer, which it becomes; "Layer N" without a name), but the new layer
+    /// holds `pixels` (the page's size, row by row, in the palette) in the current frame and
+    /// is transparent (colour 0) in every other frame. One undo step.
+    AddPictureLayer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        pixels: Vec<u8>,
+    },
     /// A copy of layer `layer` (every frame, name + " copy", same visibility) above it; the
     /// copy becomes active.
     DuplicateLayer { layer: u32 },
@@ -672,6 +681,7 @@ impl Command {
             | Command::SetFrameRate { .. }
             | Command::MoveBrush { .. } => unreachable!("frame commands are checked above"),
             Command::AddLayer { .. }
+            | Command::AddPictureLayer { .. }
             | Command::DuplicateLayer { .. }
             | Command::DeleteLayer { .. }
             | Command::MoveLayer { .. }
@@ -777,6 +787,7 @@ impl Command {
             | Command::SetFrameRate { .. }
             | Command::SelectLayer { .. } => Footprint::Setting,
             Command::AddLayer { .. }
+            | Command::AddPictureLayer { .. }
             | Command::DuplicateLayer { .. }
             | Command::DeleteLayer { .. }
             | Command::MoveLayer { .. }
@@ -950,6 +961,7 @@ impl Command {
             | Command::SetFrameRate { .. }
             | Command::MoveBrush { .. } => unreachable!("frame commands are applied above"),
             Command::AddLayer { .. }
+            | Command::AddPictureLayer { .. }
             | Command::DuplicateLayer { .. }
             | Command::DeleteLayer { .. }
             | Command::MoveLayer { .. }

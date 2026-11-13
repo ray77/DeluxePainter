@@ -1,0 +1,7 @@
+[
+{"op":"clear","color":10},
+{"op":"shape","shape":{"kind":"rect","from":[0,0],"to":[319,40]},"color":6,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[250,70],"radius":[30,12]},"color":1,"filled":true},
+{"op":"shape","shape":{"kind":"ellipse","center":[60,90],"radius":[24,9]},"color":1,"filled":true},
+{"op":"rename_layer","layer":0,"name":"Sky"}
+]

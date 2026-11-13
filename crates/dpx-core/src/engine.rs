@@ -122,6 +122,9 @@ fn command_bytes(command: &Command) -> u64 {
         Command::AddLayer { name: Some(name) } | Command::RenameLayer { name, .. } => {
             name.len() as u64
         }
+        Command::AddPictureLayer { name, pixels } => {
+            pixels.len() as u64 + name.as_ref().map_or(0, |n| n.len() as u64)
+        }
         Command::ReplacePicture {
             palette, pixels, ..
         } => pixels.len() as u64 + 3 * palette.len() as u64,

@@ -302,6 +302,11 @@ impl PainterApp {
     /// Prefs > AI & MCP..: opens the requester.
     pub(crate) fn open_mcp_prefs(&mut self) {
         self.finish_stroke();
+        // The generator line says whether OpenAI has a key: the keychain is opened here only
+        // when OpenAI was set up (ADR-45: never at start, never without a generator).
+        if self.imagegen.settings.provider == crate::generate::GenProvider::OpenAi {
+            self.imagegen.ensure_keys();
+        }
         let view = self.mcp_view();
         self.ui.mcp_requester = Some(McpRequester::new(view, self.view().ui_size()));
     }
@@ -338,6 +343,7 @@ impl PainterApp {
                 Some(t) => Some(t.step.doing().into()),
                 None => p.message.clone(),
             },
+            generation: self.generator_line(),
             busy: p.task.is_some(),
         }
     }
@@ -407,8 +413,12 @@ impl PainterApp {
             McpControl::ConnectCode => self.connect_claude_code(ctx),
             McpControl::ConnectDesktop => self.connect_claude_desktop(),
             McpControl::Disconnect => self.disconnect_claude(),
-            // TODO(wave8-integration): the image generator's "Set up.." button (ADR-45) is
-            // handled here; the requester only shows "Image generation: Picture > Generate..".
+            // ADR-45: the Image Generator setup opens over this requester; Ok and Cancel
+            // close it and this requester shows the generator as it is then.
+            McpControl::SetUpGenerator => {
+                self.open_imagegen_setup();
+                return;
+            }
             McpControl::Close => {
                 self.ui.mcp_requester = None;
                 return;
@@ -618,8 +628,9 @@ pub const SNAPSHOT_EXE: &str = "/Applications/DeluxePainter.app/Contents/MacOS/d
 /// Claude client), `fallback` (port 8766 instead of 8765), `error` (a start that really
 /// failed: the token directory is under `/dev/null`), `code-confirm`, `code-replace`,
 /// `code-missing`, `desktop-missing` or `disconnect` (the question over a ready
-/// requester). Without the flag only `--mcp-calls` runs, as before. Returns the document
-/// to show.
+/// requester), `generator` (ADR-45: OpenAI set up, with a placeholder key in memory) or
+/// `imagegen-setup` (Set up..'s Image Generator setup over a ready requester). Without the
+/// flag only `--mcp-calls` runs, as before. Returns the document to show.
 pub fn snapshot(
     args: &[String],
     doc: &Document,
@@ -640,8 +651,19 @@ pub fn snapshot(
     let status = match state.as_str() {
         "off" => Status::Off,
         "ready" | "code-confirm" | "code-replace" | "code-missing" | "desktop-missing"
-        | "disconnect" => {
+        | "disconnect" | "imagegen-setup" => {
             app.mcp.settings.enabled = true;
+            ready(8765)
+        }
+        "generator" => {
+            // ADR-45: OpenAI with a placeholder key in this run's memory (never the
+            // keychain); the line says a key is set, never which.
+            app.mcp.settings.enabled = true;
+            app.imagegen.settings.provider = crate::generate::GenProvider::OpenAi;
+            let key = dpx_imagegen::Secret::new("sk-snapshot-placeholder").expect("a key");
+            app.imagegen
+                .keys
+                .set(dpx_imagegen::openai::KEY_ACCOUNT, &key);
             ready(8765)
         }
         "connected" => {
@@ -669,7 +691,8 @@ pub fn snapshot(
         _ => {
             return Err(format!(
                 "--mcp-prefs expects off, ready, connected, fallback, error, code-confirm, \
-                 code-replace, code-missing, desktop-missing or disconnect, not '{state}'"
+                 code-replace, code-missing, desktop-missing, disconnect, generator or \
+                 imagegen-setup, not '{state}'"
             ));
         }
     };
@@ -690,6 +713,10 @@ pub fn snapshot(
     }
     let view = app.mcp_view_with(&status);
     app.ui.mcp_requester = Some(McpRequester::new(view, app.view().ui_size()));
+    // ADR-45: Set up.. opens the Image Generator setup over the requester.
+    if state == "imagegen-setup" {
+        app.open_imagegen_setup();
+    }
     let doc = app.engine.document().clone();
     *ui = app.ui.clone();
     app.mcp_stop();

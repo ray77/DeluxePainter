@@ -1,6 +1,7 @@
 //! Prefs ▸ AI & MCP.. (ADR-43, part 3): the requester that turns the MCP server on and off,
 //! shows its status, connects Claude Desktop and Claude Code, sets the AI clients'
-//! permissions and lists their last calls.
+//! permissions, shows the image generator's state with a "Set up.." button for it (ADR-45)
+//! and lists their last calls.
 //!
 //! It only draws what the app gives it ([`McpView`], refreshed every pass) and reports which
 //! control was used ([`McpResponse::Pick`]); the app changes its settings and runs the
@@ -40,24 +41,25 @@ mod geom {
     pub const STATUS_Y: i32 = 25;
     pub const CONNECT_Y: i32 = 45;
     pub const MANAGE_Y: i32 = 59;
-    pub const MESSAGE_Y: i32 = 73;
-    pub const RULE_1: i32 = 84;
-    pub const PERMISSION_Y: i32 = 87;
-    pub const FOLDER_Y: i32 = 115;
-    pub const GENERATION_Y: i32 = 124;
-    pub const RULE_2: i32 = 134;
-    pub const ACTIVITY_Y: i32 = 137;
+    pub const MESSAGE_Y: i32 = 72;
+    pub const RULE_1: i32 = 82;
+    pub const PERMISSION_Y: i32 = 84;
+    pub const FOLDER_Y: i32 = 112;
+    /// The image generator's two lines (ADR-45): "Image generation:", then its state; the
+    /// "Set up.." button right of them is centred on both.
+    pub const GENERATION_Y: i32 = 121;
+    pub const GENERATION_STATE_Y: i32 = 130;
+    pub const SET_UP_Y: i32 = 124;
+    pub const RULE_2: i32 = 140;
+    pub const ACTIVITY_Y: i32 = 143;
     /// Above the activity lines, below the Close button.
-    pub const FIXED_H: i32 = 165;
+    pub const FIXED_H: i32 = 171;
 }
 
 const CONTROL_LABEL: &str = "MCP control:";
 const CONNECT_LABEL: &str = "Connect:";
 const ACTIVITY_LABEL: &str = "Last calls:";
-/// Where the generated pictures come from (the integration step adds a set-up button).
-// TODO(wave8-integration): ADR-45 adds a "Set up.." button for the image generator on this
-// line (a new `McpControl`, handled in the app's `mcp_prefs.rs`) and may name the provider.
-pub const GENERATION_LINE: &str = "Image generation: Picture > Generate..";
+const GENERATION_LABEL: &str = "Image generation:";
 
 /// What the requester shows: the app's MCP state, made again every pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -76,6 +78,9 @@ pub struct McpView {
     pub activity: Vec<String>,
     /// What the last connect action did, or what it is doing.
     pub message: Option<String>,
+    /// The image generator's state (ADR-45), e.g. "OpenAI, key set", shown under
+    /// "Image generation:" with the "Set up.." button right of both. Never the key.
+    pub generation: String,
     /// A connect action runs: the connect buttons are ghosted until it ends.
     pub busy: bool,
 }
@@ -92,6 +97,9 @@ pub enum McpControl {
     Read,
     Edit,
     Overwrite,
+    /// The image generator's "Set up.." (ADR-45): the app opens the Image Generator setup
+    /// over this requester.
+    SetUpGenerator,
     Close,
 }
 
@@ -120,6 +128,7 @@ fn label(c: McpControl) -> &'static str {
         McpControl::Read => PERMISSIONS[0].1,
         McpControl::Edit => PERMISSIONS[1].1,
         McpControl::Overwrite => PERMISSIONS[2].1,
+        McpControl::SetUpGenerator => "Set up..",
         McpControl::Close => "Close",
     }
 }
@@ -165,9 +174,10 @@ impl McpRequester {
         self.screen = screen;
     }
 
-    /// Activity lines that fit on this screen.
+    /// Activity lines that fit on this screen, with a line free above and below (ADR-45: the
+    /// image generator's two lines leave three activity lines on a 200-line screen).
     pub fn activity_rows(&self) -> usize {
-        let room = (self.screen.1 - 8 - geom::FIXED_H).max(0) / ROW_H;
+        let room = (self.screen.1 - 2 - geom::FIXED_H).max(0) / ROW_H;
         (room as usize).clamp(MIN_ACTIVITY, MAX_ACTIVITY)
     }
 
@@ -227,6 +237,11 @@ impl McpRequester {
             out.push((*c, Self::radio_rect(at, label)));
         }
         let (w, h) = self.size();
+        let sw = Self::button_w(McpControl::SetUpGenerator);
+        out.push((
+            McpControl::SetUpGenerator,
+            Rect::new(w - sw - 6, geom::SET_UP_Y, sw, BUTTON_H),
+        ));
         let cw = Self::button_w(McpControl::Close).max(56);
         out.push((
             McpControl::Close,
@@ -365,12 +380,21 @@ impl McpRequester {
             room,
             pens.dark,
         );
-        draw_clipped(
+        // The generator's lines end before its Set up.. button.
+        let set_up = Self::button_w(McpControl::SetUpGenerator) + 6 + GAP;
+        font.draw(
             &mut img,
             LEFT,
             geom::GENERATION_Y,
-            GENERATION_LINE.chars(),
-            room,
+            GENERATION_LABEL,
+            pens.dark,
+        );
+        draw_clipped(
+            &mut img,
+            LEFT,
+            geom::GENERATION_STATE_Y,
+            self.view.generation.chars(),
+            w - LEFT - set_up,
             pens.dark,
         );
         img.hline(1, w - 2, geom::RULE_2, pens.dark);
@@ -447,6 +471,7 @@ mod tests {
                 .map(|i| format!("{i}s draw_pixel {i},{i}"))
                 .collect(),
             message: None,
+            generation: "OpenAI, key set".into(),
             busy: false,
         }
     }
@@ -463,7 +488,7 @@ mod tests {
         if a == McpResponse::Continue { b } else { a }
     }
 
-    const ALL: [McpControl; 10] = [
+    const ALL: [McpControl; 11] = [
         McpControl::On,
         McpControl::Off,
         McpControl::ConnectDesktop,
@@ -473,6 +498,7 @@ mod tests {
         McpControl::Read,
         McpControl::Edit,
         McpControl::Overwrite,
+        McpControl::SetUpGenerator,
         McpControl::Close,
     ];
 
@@ -633,5 +659,68 @@ mod tests {
         assert_ne!(centre(&on, McpControl::Off), Some(p.dark));
         assert_eq!(centre(&off, McpControl::Off), Some(p.dark));
         assert_ne!(centre(&off, McpControl::On), Some(p.dark));
+    }
+
+    #[test]
+    fn the_generator_line_shows_its_state_beside_set_up() {
+        let p = pens();
+        for screen in [(320, 200), (320, 256), (288, 200)] {
+            let mut v = view();
+            v.generation = "OpenAI, no API key, and a very long tail to clip".into();
+            v.busy = true;
+            let mut r = McpRequester::new(v, screen);
+            let set_up = rect_of(&r, McpControl::SetUpGenerator);
+            let (w, h) = r.size();
+            assert!(h <= screen.1 - 2, "{screen:?}: fits the screen");
+            assert_eq!(set_up.x + set_up.w, w - 6, "right-aligned like Close");
+            // Between the folder line and the rule above the activity, centred on the
+            // label and the state.
+            assert!(set_up.y >= geom::FOLDER_Y + 9 && set_up.y + set_up.h <= geom::RULE_2);
+            let lines = (geom::GENERATION_Y, geom::GENERATION_STATE_Y + 8);
+            let (above, below) = (set_up.y - lines.0, lines.1 - (set_up.y + set_up.h));
+            assert!((above - below).abs() <= 1, "{above} above, {below} below");
+            // A connect step running does not ghost it.
+            assert!(r.enabled(McpControl::SetUpGenerator));
+            assert_eq!(
+                click(&mut r, McpControl::SetUpGenerator),
+                McpResponse::Pick(McpControl::SetUpGenerator)
+            );
+            // Both lines show; the state stops before the button.
+            let img = r.render(&p);
+            let inked = |y0: i32, x0: i32, x1: i32| {
+                (y0..y0 + 8)
+                    .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                    .filter(|&(x, y)| img.get(x, y) == Some(p.dark))
+                    .count()
+            };
+            assert!(
+                inked(geom::GENERATION_Y, LEFT, LEFT + 60) > 20,
+                "{screen:?}"
+            );
+            let state = geom::GENERATION_STATE_Y;
+            assert!(inked(state, LEFT, LEFT + 60) > 20, "{screen:?}");
+            assert_eq!(
+                inked(state, set_up.x - GAP, set_up.x),
+                0,
+                "{screen:?}: a gap before Set up.."
+            );
+        }
+    }
+
+    #[test]
+    fn every_generator_state_fits_beside_set_up_on_the_narrowest_screens() {
+        // The states Prefs > AI & MCP.. shows (the app's `generator_line`).
+        let r = McpRequester::new(view(), (320, 200));
+        let room = r.size().0 - LEFT - (McpRequester::button_w(McpControl::SetUpGenerator) + 6);
+        for state in [
+            "Not set up",
+            "OpenAI, key set",
+            "OpenAI, no API key",
+            "OpenAI, key from OPENAI_API_KEY",
+            "OpenAI, key not checked yet",
+        ] {
+            assert!(text_w(state) + GAP <= room, "{state}");
+        }
+        assert!(text_w(GENERATION_LABEL) + GAP <= room);
     }
 }

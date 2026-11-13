@@ -1109,3 +1109,75 @@ fn activity_and_folder_lines() {
         "none (file tools are off)"
     );
 }
+
+/// Clicks a control of the Image Generator setup (over the AI & MCP requester).
+fn click_setup(rig: &mut Rig, c: dpx_ui::SetupControl) {
+    let r = rig
+        .app
+        .ui
+        .imagegen_setup
+        .as_ref()
+        .expect("the setup is open");
+    let (ox, oy) = r.origin();
+    let rect = r.controls().into_iter().find(|&(k, _)| k == c).unwrap().1;
+    rig.click_at((ox + rect.x + rect.w / 2, oy + rect.y + rect.h / 2));
+}
+
+#[test]
+fn set_up_opens_the_image_generator_setup_over_the_requester_and_returns_to_it() {
+    use dpx_ui::{SetupControl, SetupProvider};
+    let mut rig = Rig::new(Fake::default());
+    // A keychain stand-in in memory (the real one is never touched), so Ok closes at once.
+    rig.app.imagegen.keys = Arc::new(dpx_imagegen::ApiKeys::new(
+        Some(Box::new(dpx_imagegen::secret::MemoryStore::new())),
+        None,
+        Arc::new(|_: &str| None::<String>),
+    ));
+    assert_eq!(rig.view().generation, "Not set up");
+    // Set up.. opens the setup over the requester; Cancel returns to it.
+    rig.click(McpControl::SetUpGenerator);
+    assert!(rig.app.ui.imagegen_setup.is_some(), "the setup opened");
+    assert!(
+        rig.app.ui.mcp_requester.is_some(),
+        "AI & MCP stays under it"
+    );
+    click_setup(&mut rig, SetupControl::Cancel);
+    assert!(rig.app.ui.imagegen_setup.is_none());
+    assert!(rig.app.ui.mcp_requester.is_some(), "back to AI & MCP");
+    assert_eq!(rig.view().generation, "Not set up");
+    // Esc in the setup closes only the setup.
+    rig.click(McpControl::SetUpGenerator);
+    assert!(rig.app.ui.imagegen_setup.is_some());
+    rig.pass(vec![key_event(egui::Key::Escape, true)]);
+    assert!(rig.app.ui.imagegen_setup.is_none());
+    assert!(rig.app.ui.mcp_requester.is_some(), "Esc left AI & MCP open");
+    // OpenAI with a pasted key and Ok: the line says a key is there, never the key.
+    rig.click(McpControl::SetUpGenerator);
+    click_setup(&mut rig, SetupControl::Provider(SetupProvider::OpenAi));
+    rig.pass(vec![egui::Event::Paste("sk-test-SECRET-4711".into())]);
+    click_setup(&mut rig, SetupControl::Ok);
+    assert!(rig.app.ui.imagegen_setup.is_none(), "Ok closed the setup");
+    assert!(rig.app.ui.mcp_requester.is_some());
+    rig.pass(vec![]);
+    assert_eq!(rig.view().generation, "OpenAI, key set");
+    assert!(!format!("{:?}", rig.view()).contains("SECRET"));
+    // The requester under it still works: Close closes it.
+    rig.click(McpControl::Close);
+    assert!(rig.app.ui.mcp_requester.is_none());
+}
+
+#[test]
+fn the_generator_line_names_a_missing_key_or_the_environment() {
+    let mut rig = Rig::new(Fake::default());
+    rig.app.imagegen.settings.provider = crate::generate::GenProvider::OpenAi;
+    rig.pass(vec![]);
+    assert_eq!(rig.view().generation, "OpenAI, no API key");
+    rig.app.imagegen.keys = Arc::new(dpx_imagegen::ApiKeys::new(
+        None,
+        Some("test store".into()),
+        Arc::new(|v: &str| (v == "OPENAI_API_KEY").then(|| "sk-env-SECRET".to_string())),
+    ));
+    rig.pass(vec![]);
+    assert_eq!(rig.view().generation, "OpenAI, key from OPENAI_API_KEY");
+    assert!(!format!("{:?}", rig.view()).contains("SECRET"));
+}

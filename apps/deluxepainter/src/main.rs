@@ -47,7 +47,8 @@
 //!     [--mcp-prefs STATE]               Prefs ▸ AI & MCP: off, ready, connected (with the
 //!                                       --mcp-calls in its activity), fallback, error,
 //!                                       code-confirm, code-replace, code-missing,
-//!                                       desktop-missing or disconnect (ADR-43)
+//!                                       desktop-missing or disconnect (ADR-43), generator
+//!                                       (OpenAI set up) or imagegen-setup (Set up..; ADR-45)
 //! `deluxepainter --font-preview out.png` render sample lines of the UI font (3×)
 //! `deluxepainter --open pic.iff`        start the GUI (or a snapshot) with a picture
 //! `deluxepainter --no-settings`         start the GUI without reading or writing the settings file
@@ -577,7 +578,11 @@ fn main() -> eframe::Result {
                 recovery::format_utc(recovery::unix_now()),
             ));
         }
-        // ADR-44: the layer panel (`--layers-panel`) or the title bar's layer name.
+        // ADR-44: the layer panel (`--layers-panel`) or the title bar's layer name, of the
+        // document shown (ADR-45: Generate's Apply or MCP calls may have made another one).
+        if engine.document() != &doc {
+            engine = Engine::new(doc.clone());
+        }
         layers::snapshot_ui(&args, &mut engine, &mut ui, view);
         // ADR-41: the tooltip of a resting pointer.
         if let Err(e) =
