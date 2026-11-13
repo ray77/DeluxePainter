@@ -107,13 +107,17 @@ pub struct ApplyGeneratedArgs {
     pub target: Option<GenTargetArg>,
 }
 
-pub(super) const GENERATE_IMAGE: Spec = edit(
-    "generate_image",
-    "Generate image",
-    "Ask the image generator the user set up in DeluxePainter (Prefs > AI & MCP > Set up..; e.g. OpenAI Images, billed to the user's own account) for a picture from a description. It is converted to exactly the chosen size, chipset and colours, as Picture > Generate.. does. Returns a job_id at once: poll get_generation_status, then apply_generated_image. Without a set-up generator nothing is generated (IMAGE_GENERATOR_NOT_CONFIGURED); no picture is ever made up.",
-    schema::<GenerateImageArgs>,
-    false,
-);
+pub(super) const GENERATE_IMAGE: Spec = Spec {
+    // ADR-45: the description leaves DeluxePainter for the generator's service.
+    open_world: true,
+    ..edit(
+        "generate_image",
+        "Generate image",
+        "Ask the image generator the user set up in DeluxePainter (Prefs > AI & MCP > Set up..; e.g. OpenAI Images) for a picture from a description. The request is sent at once: the description goes over the internet to that service, and every request is billed to the user's own account there (a cancelled one too); the result's `cost` repeats the provider's note. The picture is converted to exactly the chosen size, chipset and colours, as Picture > Generate.. does. Returns a job_id at once: poll get_generation_status, then apply_generated_image. Without a set-up generator nothing is generated (IMAGE_GENERATOR_NOT_CONFIGURED); no picture is ever made up.",
+        schema::<GenerateImageArgs>,
+        false,
+    )
+};
 
 pub(super) const GET_GENERATION_STATUS: Spec = read(
     "get_generation_status",
@@ -125,7 +129,7 @@ pub(super) const GET_GENERATION_STATUS: Spec = read(
 pub(super) const APPLY_GENERATED_IMAGE: Spec = edit(
     "apply_generated_image",
     "Apply generated image",
-    "Apply a finished generation as one undo step: to the spare page (default), the picture (replaces it; DeluxePainter asks the user first), the brush, a new layer (the picture's page and palette) or new_document (the spare page with a format of its own). Returns the document it went to.",
+    "Apply a finished generation as one undo step: to the spare page (default; DeluxePainter asks the user first when the spare page holds a picture), the picture (replaces every frame and layer; DeluxePainter asks the user first), the brush (fitted to the picture's palette), a new layer (the picture's page and palette) or new_document (the spare page with a format of its own). Returns the document it went to.",
     schema::<ApplyGeneratedArgs>,
     true,
 );
@@ -186,8 +190,8 @@ mod work {
     use dpx_core::import::{ConvertOptions, ConvertTarget, Imported, Margins};
     use dpx_core::layer::MAX_LAYERS;
     use dpx_imagegen::{
-        GenError, GenerationRequest, ImageGenerationProvider, JobId, JobState, ProviderStatus,
-        Style,
+        GenError, GenerationRequest, ImageGenerationProvider, JobId, JobState, JobStatus,
+        ProviderStatus, Style,
     };
 
     use super::*;
@@ -211,6 +215,27 @@ mod work {
             .and_then(|n| n.parse().ok())
             .map(JobId)
             .ok_or_else(|| not_found(text))
+    }
+
+    /// A job of an AI client that the job manager no longer has and whose picture was never
+    /// fetched.
+    fn no_longer_kept(id: JobId) -> ToolError {
+        ToolError::new(
+            "JOB_NOT_FOUND",
+            format!("{id} is no longer kept: generate it again"),
+        )
+    }
+
+    /// A job's state as the tools report it: done once its picture is kept with its plan
+    /// (the job manager may have dropped the job since: it keeps only its newest finished
+    /// jobs), else the job manager's state; neither: no longer kept. One rule for
+    /// get_generation_status and cancel_generation.
+    fn state_of(plan: &Plan, status: Option<&JobStatus>) -> Result<JobState, ToolError> {
+        match (status, &plan.picture) {
+            (_, Some(_)) => Ok(JobState::Done),
+            (Some(s), None) => Ok(s.state),
+            (None, None) => Err(no_longer_kept(plan.job)),
+        }
     }
 
     /// A provider error as a tool error: its stable code (ADR-45) and its cleaned text.
@@ -258,6 +283,7 @@ mod work {
         palette: Palette,
         bg: u8,
         layers: usize,
+        frames: usize,
     }
 
     impl DocContext {
@@ -272,6 +298,7 @@ mod work {
                 palette: doc.palette().clone(),
                 bg: ws.bg_color(),
                 layers: doc.layer_count(),
+                frames: doc.frame_count(),
             }
         }
 
@@ -645,12 +672,7 @@ mod work {
                     ),
                 ));
             }
-            None => {
-                return Err(ToolError::new(
-                    "JOB_NOT_FOUND",
-                    format!("{id} is no longer kept: generate it again"),
-                ));
-            }
+            None => return Err(no_longer_kept(id)),
         }
         let first = l
             .host
@@ -712,15 +734,54 @@ mod work {
         .map_err(ToolError::from)
     }
 
-    fn colors_used(r: &Imported) -> usize {
+    fn colors_used(page: &IndexedImage) -> usize {
         let mut seen = [false; 256];
-        for &p in r.page.pixels() {
+        for &p in page.pixels() {
             seen[usize::from(p)] = true;
         }
         seen.iter().filter(|&&s| s).count()
     }
 
-    fn notes_for(r: &Imported, to: GenTargetArg, format: Target) -> Vec<String> {
+    /// A converted picture as it lands on its target, which the status preview and the
+    /// numbers of get_generation_status and apply_generated_image describe: the brush as
+    /// Apply makes it (fitted to the shown picture's palette, `Imported::fitted_brush`, as
+    /// the Generate requester's thumbnail shows it), any other target the converted page.
+    struct Landed {
+        page: IndexedImage,
+        palette: Palette,
+        /// The format whose palette that is: the planned one; the shown picture's for the
+        /// brush and a new layer.
+        format: Target,
+        colors_used: usize,
+        /// Brush: colours that had to change to fit the picture's palette.
+        fitted: usize,
+    }
+
+    fn landed(r: &Imported, plan: &Plan, dc: &DocContext, to: GenTargetArg) -> Landed {
+        match to {
+            GenTargetArg::Brush => {
+                let b = r.fitted_brush(&dc.palette);
+                let (page, palette) = b.preview(&r.palette, &dc.palette);
+                Landed {
+                    page,
+                    palette,
+                    format: dc.target,
+                    colors_used: b.colors_used(),
+                    fitted: b.changed,
+                }
+            }
+            _ => Landed {
+                page: r.page.clone(),
+                palette: r.palette.clone(),
+                format: conversion(plan, dc, to).0,
+                colors_used: colors_used(&r.page),
+                fitted: 0,
+            },
+        }
+    }
+
+    fn notes_for(r: &Imported, to: GenTargetArg, landed: &Landed) -> Vec<String> {
+        let format = landed.format;
         let mut notes = Vec::new();
         if r.transparent_color.is_some() {
             notes.push("transparent pixels are colour 0".to_string());
@@ -729,6 +790,14 @@ mod work {
             notes.push(
                 "colour 0 is transparent on the new layer; no opaque pixel uses it".to_string(),
             );
+        }
+        if to == GenTargetArg::Brush {
+            notes.push(format!(
+                "the brush is in the picture's palette ({} colours), as Brush > Load fits \
+                 one: {} of its colours had to change",
+                landed.palette.len(),
+                landed.fitted
+            ));
         }
         if format.chipset == Chipset::Ocs {
             notes.push("OCS: every palette entry is a 12-bit colour".to_string());
@@ -776,16 +845,7 @@ mod work {
     pub(super) async fn status(ctx: &ToolCtx, a: JobIdArgs) -> Result<CallToolResult, ToolError> {
         let l = look(ctx, &a.job_id).await?;
         let id = l.plan.job;
-        let state = match (&l.state, &l.plan.picture) {
-            (_, Some(_)) => JobState::Done,
-            (Some(s), None) => s.state,
-            (None, None) => {
-                return Err(ToolError::new(
-                    "JOB_NOT_FOUND",
-                    format!("{id} is no longer kept: generate it again"),
-                ));
-            }
-        };
+        let state = state_of(&l.plan, l.state.as_ref())?;
         let mut out = StatusOut {
             job_id: id.to_string(),
             status: state.as_str(),
@@ -835,27 +895,28 @@ mod work {
             }
             JobState::Done => {
                 let pic = picture(&l)?;
-                let r = convert(pic, &l.plan, &l.dc, l.plan.target).await?;
-                let (format, _, _) = conversion(&l.plan, &l.dc, l.plan.target);
-                let (w, h) = (r.page.width(), r.page.height());
+                let to = l.plan.target;
+                let r = convert(pic, &l.plan, &l.dc, to).await?;
+                let landed = landed(&r, &l.plan, &l.dc, to);
+                let (w, h) = (landed.page.width(), landed.page.height());
                 let scale = view::preview_scale(w, h, None)?;
                 out.width = Some(w);
                 out.height = Some(h);
-                out.chipset = Some(ChipsetArg::of(format.chipset));
-                out.colors_used = Some(colors_used(&r));
-                out.palette_size = Some(r.palette.len());
-                out.palette_bits = Some(match format.chipset {
+                out.chipset = Some(ChipsetArg::of(landed.format.chipset));
+                out.colors_used = Some(landed.colors_used);
+                out.palette_size = Some(landed.palette.len());
+                out.palette_bits = Some(match landed.format.chipset {
                     Chipset::Ocs => 4,
                     Chipset::Aga => 8,
                 });
-                out.notes = notes_for(&r, l.plan.target, format);
+                out.notes = notes_for(&r, to, &landed);
                 out.notes.push(
-                    "apply_generated_image applies it (one undo step); the preview shows the \
-                     palette colours, square pixels"
+                    "apply_generated_image applies it (one undo step); the preview shows it \
+                     as it lands, in the palette colours, square pixels"
                         .into(),
                 );
-                let rendered =
-                    blocking(move || view::render_png(&r.page, &r.palette, scale)).await??;
+                let Landed { page, palette, .. } = landed;
+                let rendered = blocking(move || view::render_png(&page, &palette, scale)).await??;
                 out.preview_scale = Some(rendered.scale);
                 Ok(image_result(view::to_base64(&rendered.png), &out))
             }
@@ -878,18 +939,82 @@ mod work {
         notes: Vec<String>,
     }
 
-    /// The question before a generated picture replaces the shown one (spec §7.7).
-    pub fn replace_question(client: Option<&str>, w: u32, h: u32, colors: usize) -> Question {
+    /// The question before a generated picture replaces the shown one (spec §7.7): it
+    /// names every frame and layer that goes when there is more than one (Picture is one
+    /// frame with one layer afterwards), as the Generate requester's Apply line does.
+    pub fn replace_question(
+        client: Option<&str>,
+        w: u32,
+        h: u32,
+        colors: usize,
+        frames: usize,
+        layers: usize,
+    ) -> Question {
+        let mut extent = Vec::new();
+        if frames > 1 {
+            extent.push(format!("all {frames} frames"));
+        }
+        if layers > 1 {
+            extent.push(format!("{layers} layers"));
+        }
+        let what = match extent.as_slice() {
+            [] => "the picture".to_string(),
+            parts => format!("the picture ({})", parts.join(", ")),
+        };
         Question {
             title: "Replace Picture?".into(),
             text: format!(
-                "{} wants to replace the picture with a generated one ({w}x{h}, {colors} \
+                "{} wants to replace {what} with a generated one ({w}x{h}, {colors} \
                  colours). Undo brings the old one back. Replace?",
                 asker(client)
             ),
             yes: "Replace".into(),
             no: "Keep".into(),
         }
+    }
+
+    /// The question before a generated picture replaces a picture on the spare page (spec
+    /// §4.1.10 and §7.7: existing work is never replaced unasked; a blank spare page is not
+    /// asked about).
+    pub fn replace_spare_question(
+        client: Option<&str>,
+        page: Slot,
+        w: u32,
+        h: u32,
+        colors: usize,
+    ) -> Question {
+        Question {
+            title: "Replace Spare Page?".into(),
+            text: format!(
+                "{} wants to put a generated picture ({w}x{h}, {colors} colours) on the \
+                 spare page ({}), replacing the picture there. Undo on that page (j shows \
+                 it) brings it back. Replace?",
+                asker(client),
+                page.id()
+            ),
+            yes: "Replace".into(),
+            no: "Keep".into(),
+        }
+    }
+
+    /// The spare page holds a picture a generated one would replace: some frame or layer of
+    /// it is not one colour all over. The blank page DeluxePainter makes (or none yet) is
+    /// not; nor is a page cleared to one colour.
+    fn spare_holds_picture(ws: &dyn Workspace) -> bool {
+        ws.spare().is_some_and(|doc| {
+            doc.cels().any(|cel| {
+                let pixels = cel.pixels();
+                pixels.iter().any(|&p| p != pixels[0])
+            })
+        })
+    }
+
+    fn pages_swapped() -> ToolError {
+        ToolError::new(
+            "REVISION_CONFLICT",
+            "the pages were swapped (select_document or j) while the generated picture was \
+             applied to the spare page; call apply_generated_image again",
+        )
     }
 
     pub(super) async fn apply(
@@ -901,42 +1026,83 @@ mod work {
         if to == GenTargetArg::NewLayer {
             layer_fits(&l.dc)?;
         }
-        let pic = picture(&l)?;
-        let r = convert(pic, &l.plan, &l.dc, to).await?;
-        let (format, _, opts) = conversion(&l.plan, &l.dc, to);
-        let (w, h, used) = (r.page.width(), r.page.height(), colors_used(&r));
-        let id = l.plan.job;
-        if to == GenTargetArg::Picture {
-            let client = ctx.state.activity().snapshot().client;
-            let declined = |why: String| Err(ToolError::new("APPLY_DECLINED", why));
-            match ctx
-                .exec
-                .ask(replace_question(client.as_deref(), w, h, used))
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return declined(format!(
-                        "the user kept the picture; {id} was not applied (the spare page, \
-                         brush and new_layer targets need no question)"
-                    ));
-                }
-                Err(e) if e.code == crate::jobs::NO_ANSWER => {
-                    return declined(format!("{}; the picture was kept", e.message));
-                }
-                Err(e) => return Err(e),
-            }
-        }
         let apply_to = match to {
             GenTargetArg::Spare | GenTargetArg::NewDocument => ApplyTo::Spare,
             GenTargetArg::Picture => ApplyTo::Picture,
             GenTargetArg::Brush => ApplyTo::Brush,
             GenTargetArg::NewLayer => ApplyTo::NewLayer,
         };
+        let pic = picture(&l)?;
+        let r = convert(pic, &l.plan, &l.dc, to).await?;
+        let (_, _, opts) = conversion(&l.plan, &l.dc, to);
+        let landed = landed(&r, &l.plan, &l.dc, to);
+        let (w, h, used) = (
+            landed.page.width(),
+            landed.page.height(),
+            landed.colors_used,
+        );
+        let id = l.plan.job;
+        let slot = l.dc.slot;
+        // Replacing a picture is asked first: the shown one always, the spare page's when
+        // it holds one.
+        let question = match apply_to {
+            ApplyTo::Picture => Some(replace_question(
+                ctx.state.activity().snapshot().client.as_deref(),
+                w,
+                h,
+                used,
+                l.dc.frames,
+                l.dc.layers,
+            )),
+            ApplyTo::Spare => {
+                let holds = ctx
+                    .exec
+                    .run(move |ws| -> Result<bool, ToolError> {
+                        if ws.shown() != slot {
+                            return Err(pages_swapped());
+                        }
+                        Ok(spare_holds_picture(ws))
+                    })
+                    .await??;
+                holds.then(|| {
+                    replace_spare_question(
+                        ctx.state.activity().snapshot().client.as_deref(),
+                        slot.other(),
+                        w,
+                        h,
+                        used,
+                    )
+                })
+            }
+            ApplyTo::Brush | ApplyTo::NewLayer => None,
+        };
+        let asked = question.is_some();
+        if let Some(q) = question {
+            let kept = if apply_to == ApplyTo::Picture {
+                "the picture"
+            } else {
+                "the spare page"
+            };
+            let declined = |why: String| Err(ToolError::new("APPLY_DECLINED", why));
+            match ctx.exec.ask(q).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return declined(format!(
+                        "the user kept {kept}; {id} was not applied (the brush and new_layer \
+                         targets need no question, nor does a blank spare page)"
+                    ));
+                }
+                Err(e) if e.code == crate::jobs::NO_ANSWER => {
+                    return declined(format!("{}; {kept} was kept", e.message));
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // A new layer and the current palette were converted for the shown picture.
         let depends = apply_to == ApplyTo::NewLayer || opts.palette == PaletteChoice::Current;
         let dc = l.dc.clone();
-        let mut notes = notes_for(&r, to, format);
+        let format = conversion(&l.plan, &l.dc, to).0;
+        let mut notes = notes_for(&r, to, &landed);
         let (slot, revision, document) = ctx
             .exec
             .run(move |ws| -> Result<_, ToolError> {
@@ -951,6 +1117,19 @@ mod work {
                          generated picture was converted for it; call apply_generated_image \
                          again",
                     ));
+                }
+                if apply_to == ApplyTo::Spare {
+                    // The spare page asked about (or found blank) is the one it goes to.
+                    if ws.shown() != dc.slot {
+                        return Err(pages_swapped());
+                    }
+                    if !asked && spare_holds_picture(ws) {
+                        return Err(ToolError::new(
+                            "REVISION_CONFLICT",
+                            "the spare page got a picture while the generated one was \
+                             applied; call apply_generated_image again",
+                        ));
+                    }
                 }
                 ws.apply_generated(GenApply {
                     to: apply_to,
@@ -1009,10 +1188,9 @@ mod work {
                 let host = ws.image_generation()?;
                 let plan = host.plans.get(id).ok_or_else(|| not_found(&shown))?;
                 let cancelled = host.jobs.cancel(id);
-                let state = host
-                    .jobs
-                    .status(id)
-                    .map_or(JobState::Cancelled, |s| s.state);
+                // As get_generation_status sees it: a picture kept with the plan is done
+                // (and still appliable) after the job manager dropped the job.
+                let state = state_of(&plan, host.jobs.status(id).as_ref())?;
                 ws.log(&format!("cancel_generation {id}"));
                 let mut notes = Vec::new();
                 if cancelled {
@@ -1036,7 +1214,7 @@ mod work {
 }
 
 #[cfg(feature = "imagegen")]
-pub use work::replace_question;
+pub use work::{replace_question, replace_spare_question};
 
 #[cfg(test)]
 #[path = "tools_gen_tests.rs"]

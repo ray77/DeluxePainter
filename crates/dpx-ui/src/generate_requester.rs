@@ -23,6 +23,7 @@
 //! generating: stop waiting).
 
 use dpx_core::import::{COLOR_COUNTS, Framing, PaletteChoice, Scaler};
+use dpx_core::layer::MAX_LAYERS;
 use dpx_core::quantize::Dither;
 use dpx_core::{Chipset, DisplayMode, IndexedImage, Rect, Resolution, RgbaImage, Target, Video};
 
@@ -368,6 +369,8 @@ pub struct GenerateRequester {
     doc_colors: u16,
     /// The current document's target and page size (a new layer is made for them).
     document: Option<(Target, (u32, u32))>,
+    /// The current document's layer count (a new layer needs room for one more).
+    doc_layers: usize,
     phase: GenPhase,
     provider: ProviderInfo,
     /// The second line under the options, e.g. what Apply will do.
@@ -396,6 +399,7 @@ impl GenerateRequester {
             screen,
             doc_colors,
             document: None,
+            doc_layers: 1,
             phase: GenPhase::Ask,
             provider,
             message: None,
@@ -478,6 +482,12 @@ impl GenerateRequester {
         self.document = Some((target, page));
     }
 
+    /// The current document's number of layers: with [`MAX_LAYERS`] the New layer target
+    /// cannot be generated for ([`Self::layer_problem`]).
+    pub fn set_doc_layers(&mut self, n: usize) {
+        self.doc_layers = n;
+    }
+
     /// The target and page size the picture is made for: the document's for a new layer,
     /// else the chosen resolution on the chosen chipset.
     pub fn format(&self) -> (Target, (u32, u32)) {
@@ -539,9 +549,26 @@ impl GenerateRequester {
         }
     }
 
-    /// Why nothing can be generated with these options: Palette Current with a document
-    /// palette larger than the chosen mode shows (generating would be paid for and then not
-    /// convertible). Shown in the box instead of the note; Generate is disabled meanwhile.
+    /// Why nothing can be generated with these options ([`Self::layer_problem`], else
+    /// [`Self::palette_problem`]): generating would be paid for and then not applicable.
+    /// Shown in the box instead of the note; Generate is disabled meanwhile.
+    pub fn problem(&self) -> Option<String> {
+        self.layer_problem().or_else(|| self.palette_problem())
+    }
+
+    /// New layer on a picture that already has the most layers allowed.
+    pub fn layer_problem(&self) -> Option<String> {
+        (self.options.target == GenTarget::NewLayer && self.doc_layers >= MAX_LAYERS).then(|| {
+            format!(
+                "The picture has {} layers, the most allowed. Choose another target, or \
+                 delete or merge a layer first.",
+                self.doc_layers
+            )
+        })
+    }
+
+    /// Palette Current with a document palette larger than the chosen mode shows (the
+    /// result could not be converted).
     pub fn palette_problem(&self) -> Option<String> {
         let (target, _) = self.format();
         let max = target.mode.max_colors(target.chipset).unwrap_or(16);
@@ -838,7 +865,7 @@ impl GenerateRequester {
                 self.provider.ready
                     && !matches!(self.phase, GenPhase::Working { .. })
                     && !self.prompt.text().trim().is_empty()
-                    && self.palette_problem().is_none()
+                    && self.problem().is_none()
             }
             GenControl::SetUp => !matches!(self.phase, GenPhase::Working { .. }),
             GenControl::Apply => self.phase == GenPhase::Result && self.thumb.is_some(),
@@ -996,9 +1023,9 @@ impl GenerateRequester {
         let inner = b.inset(2);
         let showing_thumb = self.phase == GenPhase::Result && self.thumb.is_some();
         let text_lines: Vec<String> = match self.phase {
-            // A palette the mode cannot show comes first: nothing can be generated until the
-            // options change.
-            GenPhase::Ask => match (self.palette_problem(), &self.error) {
+            // A palette the mode cannot show (or a full picture for a new layer) comes first:
+            // nothing can be generated until the options change.
+            GenPhase::Ask => match (self.problem(), &self.error) {
                 (Some(p), _) => wrap(&p, inner.w - 2),
                 (None, Some(e)) => wrap(e, inner.w - 2),
                 (None, None) => wrap(&self.provider.note, inner.w - 2),
@@ -1584,5 +1611,38 @@ mod tests {
         assert_eq!(r.format().0, chosen.target());
         assert!(r.enabled(GenControl::Next(GenRow::Chipset)));
         assert!(r.enabled(GenControl::Generate));
+    }
+
+    #[test]
+    fn a_full_picture_blocks_generate_for_a_new_layer_only() {
+        let pens = pens();
+        let mut r = requester((320, 200));
+        typed(&mut r, "A tree");
+        click(&mut r, GenControl::More);
+        while r.options().target != GenTarget::NewLayer {
+            click(&mut r, GenControl::Next(GenRow::Target));
+        }
+        r.set_doc_layers(MAX_LAYERS - 1);
+        assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
+        let note = r.render(&pens);
+        r.set_doc_layers(MAX_LAYERS);
+        let why = r.layer_problem().expect("no room for a new layer");
+        assert!(why.starts_with("The picture has 32 layers"), "{why}");
+        assert_eq!(r.problem(), Some(why.clone()));
+        assert!(!r.enabled(GenControl::Generate));
+        assert_eq!(
+            r.handle(ReqEvent::Key(ReqKey::Enter)),
+            GenerateResponse::Continue,
+            "Return does not generate either"
+        );
+        // The reason shows in the box, whole, on the smallest screen.
+        assert_ne!(r.render(&pens).pixels(), note.pixels());
+        let b = r.box_rect().inset(2);
+        let lines = wrap(&why, b.w - 2);
+        let n = lines.len() as i32;
+        assert!(n * LINE_STEP <= b.h, "{n} lines in {}: {lines:?}", b.h);
+        // Any other target generates.
+        click(&mut r, GenControl::Prev(GenRow::Target));
+        assert!(r.problem().is_none() && r.enabled(GenControl::Generate));
     }
 }

@@ -44,6 +44,8 @@
 //!     [--mcp-calls FILE.json]           run a JSON array of {"tool", "arguments"} MCP tool
 //!                                       calls on the GUI workspace first (ADR-43)
 //!     [--mcp-question NAME]             the question before an MCP client replaces file NAME
+//!     [--mcp-gen-question picture|spare] the question before an MCP client's generated
+//!                                       picture replaces the picture or the spare page's (ADR-45)
 //!     [--mcp-prefs STATE]               Prefs ▸ AI & MCP: off, ready, connected (with the
 //!                                       --mcp-calls in its activity), fallback, error,
 //!                                       code-confirm, code-replace, code-missing,
@@ -1580,12 +1582,9 @@ impl PainterApp {
         if self.stencil_paint_undo(false) {
             return;
         }
-        // ADR-39: the engine's undo; the area stencil follows its picture.
-        let stepped = self.history_step(false);
-        // ADR-45: a ReplacePicture step brings back the page's details outside the document.
-        if stepped.is_ok() {
-            self.page_files_undone();
-        }
+        // ADR-39: the engine's undo; the area stencil follows its picture. ADR-45: a
+        // ReplacePicture step brings back the page's details outside the document.
+        let stepped = self.page_history_step(false);
         Self::report(stepped, ErrorCode::NothingToUndo);
         self.clamp_colors();
         self.clamp_scroll();
@@ -1597,12 +1596,8 @@ impl PainterApp {
         if self.stencil_paint_undo(true) {
             return;
         }
-        let key = self.redo_key();
-        let stepped = self.history_step(true);
         // ADR-45: and Redo sets them again.
-        if stepped.is_ok() {
-            self.page_files_redone(key);
-        }
+        let stepped = self.page_history_step(true);
         Self::report(stepped, ErrorCode::NothingToRedo);
         self.clamp_colors();
         self.clamp_scroll();

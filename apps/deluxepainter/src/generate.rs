@@ -41,7 +41,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use dpx_core::import::{self, ConvertOptions, ConvertTarget, Imported, Margins, PaletteChoice};
 use dpx_core::layer::{Layer, MAX_LAYERS};
-use dpx_core::{BrushImage, Command, IndexedImage, Palette, Target};
+use dpx_core::{BrushImage, Command, Palette, Target};
 use dpx_imagegen::openai::{self, DEFAULT_MODEL, ENV_KEY, KEY_ACCOUNT, MODELS_CHECKED};
 use dpx_imagegen::{
     ApiKeys, GenError, GenerationRequest, ImageGenerationProvider, JobId, JobManager, JobState,
@@ -298,29 +298,11 @@ pub(crate) fn convert_for(
 }
 
 /// The Brush target's brush: the result as a brush in its own palette, and fitted to the
-/// picture palette `page` like Brush ▸ Load (`brush_menu::fit_brush`), with the number of
-/// colours that had to change.
+/// picture palette `page` like Brush ▸ Load (`Imported::fitted_brush`, which MCP's brush
+/// target uses too), with the number of colours that had to change.
 fn fitted_brush(r: &Imported, page: &Palette) -> (BrushImage, BrushImage, usize) {
-    let own = BrushImage::from_image(&r.page, r.transparent_color);
-    let (fitted, changed) = crate::brush_menu::fit_brush(&own, &r.palette, page);
-    (own, fitted, changed)
-}
-
-/// The fitted brush as the thumbnail shows it: in the picture palette, its transparent pixels
-/// in the result's transparent colour (no opaque pixel uses that number).
-fn brush_preview(r: &Imported, page: &Palette, fitted: &BrushImage) -> (IndexedImage, Palette) {
-    let mut colors = page.colors().to_vec();
-    if let Some(t) = fitted.transparent
-        && let (Some(slot), Some(c)) = (colors.get_mut(usize::from(t)), r.palette.get(t))
-    {
-        *slot = c;
-    }
-    let image = IndexedImage::from_pixels(fitted.width, fitted.height, fitted.pixels.clone())
-        .expect("a brush has width x height pixels");
-    (
-        image,
-        Palette::new(colors).expect("as many entries as the picture palette"),
-    )
+    let b = r.fitted_brush(page);
+    (b.own, b.fitted, b.changed)
 }
 
 /// At most `max` characters of `why`, cut at a word (for the setup's test line).
@@ -488,6 +470,7 @@ impl PainterApp {
         let screen = View::of_target(doc.target()).ui_size();
         let doc_colors = doc.palette().len().min(256) as u16;
         let doc_format = (doc.target(), (doc.page().width(), doc.page().height()));
+        let doc_layers = doc.layer_count();
         let last = self.imagegen.last.clone().unwrap_or_else(|| Remembered {
             options: GenerateOptions {
                 quality: gen_quality(self.imagegen.settings.openai.quality),
@@ -505,6 +488,7 @@ impl PainterApp {
         );
         req.set_more(last.more);
         req.set_document(doc_format.0, doc_format.1);
+        req.set_doc_layers(doc_layers);
         self.ui.generate_requester = Some(req);
         self.imagegen.picture = None;
         self.imagegen.result = None;
@@ -662,12 +646,14 @@ impl PainterApp {
         let description = req.prompt();
         let (target, page) = req.format();
         let palette = req.palette_choice();
-        // Nothing is generated (and paid for) that cannot be converted for these options:
-        // a current palette larger than the mode shows (the box says so, Generate is off).
-        let doc_colors = self.engine.document().palette().len();
+        // Nothing is generated (and paid for) that cannot be converted or applied for these
+        // options: a current palette larger than the mode shows, a new layer on a picture
+        // with the most layers (the box says so, Generate is off).
+        let doc = self.engine.document();
         let max = target.mode.max_colors(target.chipset).unwrap_or(16);
-        if req.palette_problem().is_some()
-            || (palette == PaletteChoice::Current && doc_colors > usize::from(max))
+        if req.problem().is_some()
+            || (palette == PaletteChoice::Current && doc.palette().len() > usize::from(max))
+            || (o.target == GenTarget::NewLayer && doc.layer_count() >= MAX_LAYERS)
         {
             return;
         }
@@ -802,14 +788,14 @@ impl PainterApp {
                 let (thumb, fitted) = match o.target {
                     // The brush as Apply makes it: fitted to the picture palette.
                     GenTarget::Brush => {
-                        let (_, brush, fitted) = fitted_brush(&r, doc.palette());
-                        let (page, palette) = brush_preview(&r, doc.palette(), &brush);
-                        (import::thumbnail(&page, &palette, w, h), fitted)
+                        let b = r.fitted_brush(doc.palette());
+                        let (page, palette) = b.preview(&r.palette, doc.palette());
+                        (import::thumbnail(&page, &palette, w, h), b.changed)
                     }
-                    // The frame as it will show: the new layer over the visible ones.
+                    // The frame as it will show: the new layer right above the active one,
+                    // under the visible layers above that.
                     GenTarget::NewLayer => {
-                        let mut shown = doc.composite().into_owned();
-                        dpx_core::layer::overlay(&mut shown, &r.page);
+                        let shown = dpx_core::layer::composite_with_new_layer(doc, &r.page);
                         (import::thumbnail(&shown, doc.palette(), w, h), 0)
                     }
                     _ => (import::thumbnail(&r.page, &r.palette, w, h), 0),
@@ -1317,17 +1303,49 @@ pub(crate) fn parse_spec(spec: &str) -> Result<Spec, String> {
     Ok(s)
 }
 
+/// `--mcp-gen-question picture|spare` (snapshots): the question before an MCP client's
+/// generated picture replaces the picture (naming `doc`'s frames and layers) or a picture
+/// on the spare page, for a generated picture of `doc`'s page size and palette size, as
+/// Claude Code would ask it.
+fn snapshot_question(
+    which: &str,
+    doc: &dpx_core::Document,
+) -> Result<dpx_ui::ChoiceRequester, String> {
+    let (w, h) = (doc.page().width(), doc.page().height());
+    let colors = doc.palette().len();
+    let client = Some("claude-code");
+    let q = match which {
+        "picture" => dpx_mcp::tools::replace_question(
+            client,
+            w,
+            h,
+            colors,
+            doc.frame_count(),
+            doc.layer_count(),
+        ),
+        "spare" => {
+            dpx_mcp::tools::replace_spare_question(client, dpx_mcp::Slot::First, w, h, colors)
+        }
+        other => return Err(format!("--mcp-gen-question {other}: picture or spare")),
+    };
+    Ok(crate::mcp::question_requester(&q))
+}
+
 /// Snapshot options (ADR-45): `--generate-requester` shows Picture ▸ Generate.. over the
 /// current screen, `--generate SPEC` sets it up ([`parse_spec`]), `--generate-run` generates
 /// with the **test pattern (not AI, debug only)** and shows the result, `--generate-apply`
-/// shows the picture after Apply instead, and `--imagegen-setup` shows the Image Generator
-/// setup. No key store, network or settings file is touched. Returns the document to show
-/// (the spare page after Apply onto it). Errors carry the exit code 2.
+/// shows the picture after Apply instead, `--imagegen-setup` shows the Image Generator
+/// setup and `--mcp-gen-question picture|spare` an MCP client's question before Apply
+/// ([`snapshot_question`]). No key store, network or settings file is touched. Returns the
+/// document to show (the spare page after Apply onto it). Errors carry the exit code 2.
 pub(crate) fn snapshot(
     args: &[String],
     doc: &dpx_core::Document,
     ui: &mut UiState,
 ) -> Result<dpx_core::Document, (i32, String)> {
+    if let Some(which) = crate::arg_value(args, "--mcp-gen-question") {
+        ui.choice_requester = Some(snapshot_question(&which, doc).map_err(|e| (2, e))?);
+    }
     let has = |f: &str| args.iter().any(|a| a == f);
     let spec = crate::arg_value(args, "--generate");
     let (requester, run, apply, setup) = (

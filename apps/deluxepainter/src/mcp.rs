@@ -779,9 +779,11 @@ impl PainterApp {
         }
     }
 
+    /// MCP's undo and redo: the GUI's own step (ADR-45: with the page's details of a
+    /// recorded ReplacePicture step, e.g. a generated picture applied over MCP).
     fn mcp_history(&mut self, redo: bool) -> Result<Outcome, ToolError> {
         self.mcp_prepare();
-        let out = self.history_step(redo);
+        let out = self.page_history_step(redo);
         self.mcp_changed();
         Ok(out?)
     }

@@ -13,15 +13,20 @@
 //! colour ranges) or each page has its own (`MenuData::spare_own`: a spare of its own format
 //! and palette). An entry says which it was, so Undo and Redo also split or join them again.
 //!
+//! Every Undo and Redo of the shown page goes through [`PainterApp::page_history_step`]: the
+//! GUI's keys and menu as well as MCP's `undo` and `redo` tools (a generated picture applied
+//! over MCP records its entry like the requester's Apply, so MCP's Undo must put the details
+//! back too, and must take the entry off the list, or a later Undo would miss its own).
+//!
 //! An entry is matched to its step by a fingerprint of the command: a `ReplacePicture` this
-//! module did not record (one sent over MCP, say) is undone without touching the files, and an
-//! entry whose step is gone (the engine was replaced, or dropped its oldest steps) is never
-//! taken for another one.
+//! module did not record (one sent as a raw command over MCP's `execute_command`, say) is
+//! undone without touching the files, and an entry whose step is gone (the engine was
+//! replaced, or dropped its oldest steps) is never taken for another one.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
-use dpx_core::Command;
+use dpx_core::{Command, CommandError, Outcome};
 
 use crate::PainterApp;
 use crate::files::PictureExtras;
@@ -189,9 +194,23 @@ impl PainterApp {
         self.dirty = true;
     }
 
+    /// Undo (`redo`: Redo) on the shown page: the engine's step ([`Self::history_step`]),
+    /// and for a recorded `ReplacePicture` step the page's files with it. The one way the
+    /// GUI (U, Shift+U) and MCP (`undo`, `redo`) step the shown page's history.
+    pub(crate) fn page_history_step(&mut self, redo: bool) -> Result<Outcome, CommandError> {
+        let key = if redo { self.redo_key() } else { None };
+        let out = self.history_step(redo)?;
+        if redo {
+            self.page_files_redone(key);
+        } else {
+            self.page_files_undone();
+        }
+        Ok(out)
+    }
+
     /// After an Undo on the shown page: a recorded `ReplacePicture` step brings back the
     /// page's files too.
-    pub(crate) fn page_files_undone(&mut self) {
+    fn page_files_undone(&mut self) {
         let Some(key) = self.engine.next_redo().and_then(|(c, _)| step_key(c)) else {
             return;
         };
@@ -202,13 +221,13 @@ impl PainterApp {
     }
 
     /// The key of the step the next Redo replays (taken before it runs).
-    pub(crate) fn redo_key(&self) -> Option<u64> {
+    fn redo_key(&self) -> Option<u64> {
         self.engine.next_redo().and_then(|(c, _)| step_key(c))
     }
 
     /// After a Redo of the step `key` ([`Self::redo_key`]) on the shown page: a recorded
     /// `ReplacePicture` step sets the files it gave again.
-    pub(crate) fn page_files_redone(&mut self, key: Option<u64>) {
+    fn page_files_redone(&mut self, key: Option<u64>) {
         let Some(key) = key else {
             return;
         };

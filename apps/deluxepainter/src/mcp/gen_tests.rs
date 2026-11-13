@@ -231,12 +231,34 @@ fn a_new_layer_holds_the_picture_in_the_current_frame_and_is_one_undo_step() {
 #[test]
 fn the_brush_target_makes_the_brush_and_the_picture_target_asks_first() {
     let mut rig = rig_with(Some(Arc::new(TestPattern)));
-    let job = generated(&mut rig, json!({"prompt": "a castle", "target": "brush"}));
+    // A 4-colour picture and a brush converted with 256 colours of its own: the numbers
+    // describe the brush as it lands, fitted to the picture's 4 colours.
+    rig.ok(
+        "create_document",
+        json!({"width": 320, "height": 256, "chipset": "ocs", "colors": 4}),
+    );
+    let job = job_of(&rig.ok(
+        "generate_image",
+        json!({"prompt": "a castle", "target": "brush", "chipset": "aga", "colors": 256}),
+    ));
+    let s = done(&mut rig, &job).structured_content.unwrap();
+    assert_eq!(s["status"], "done", "{s}");
+    assert_eq!(s["palette_size"], 4, "{s}");
+    assert!(s["colors_used"].as_u64().unwrap() <= 4, "{s}");
     let before = rig.app.engine.document().clone();
     let a = rig.ok("apply_generated_image", json!({ "job_id": job }));
     assert_eq!(a["undoable"], false);
+    assert!(a["colors_used"].as_u64().unwrap() <= 4, "{a}");
     let brush = rig.app.custom_brush.as_ref().expect("a custom brush");
     assert_eq!((brush.width, brush.height), (320, 256));
+    assert!(
+        brush.pixels.iter().all(|&p| p < 4),
+        "in the picture palette"
+    );
+    let mut used: Vec<u8> = brush.pixels.clone();
+    used.sort_unstable();
+    used.dedup();
+    assert_eq!(a["colors_used"], used.len(), "what the brush uses");
     assert_eq!(
         rig.app.engine.document(),
         &before,
@@ -282,6 +304,153 @@ fn the_brush_target_makes_the_brush_and_the_picture_target_asks_first() {
     rig.pass_with(vec![key_event(egui::Key::U, true)]);
     assert_eq!(rig.app.engine.document().page(), before.page());
     assert_eq!(rig.app.engine.document().palette(), before.palette());
+}
+
+#[test]
+fn the_picture_question_names_every_frame_and_layer_that_goes() {
+    let mut rig = rig_with(Some(Arc::new(TestPattern)));
+    rig.ok(
+        "execute_command",
+        json!({"command": {"op": "add_frames", "count": 2}}),
+    );
+    rig.ok(
+        "execute_command",
+        json!({"command": {"op": "add_layer", "name": "Sky"}}),
+    );
+    let job = generated(&mut rig, json!({"prompt": "a castle", "target": "picture"}));
+    let rx = rig.start("apply_generated_image", json!({ "job_id": job }));
+    while rig.app.ui.choice_requester.is_none() {
+        rig.pass();
+    }
+    let req = rig.app.ui.choice_requester.as_ref().unwrap();
+    let text = req.lines().join(" ");
+    assert!(
+        text.starts_with("Claude wants to replace the picture (all 3 frames, 2 layers) with"),
+        "{text}"
+    );
+    assert!(
+        !req.truncated(),
+        "the whole question shows: {:?}",
+        req.lines()
+    );
+    // It fits the smallest UI screen.
+    assert!(req.height() <= 200, "{}", req.height());
+    click_choice(&mut rig, 0);
+    assert_eq!(rig.wait(&rx)["success"], true);
+    let doc = rig.app.engine.document();
+    assert_eq!((doc.frame_count(), doc.layer_count()), (1, 1));
+}
+
+#[test]
+fn the_spare_page_is_asked_about_when_it_holds_the_users_picture() {
+    let mut rig = rig_with(Some(Arc::new(TestPattern)));
+    // The user's picture, then shown page2: page1 is the spare page now.
+    rig.ok("draw_pixel", json!({"x": 1, "y": 1, "color": 2}));
+    let mine = rig.app.engine.document().clone();
+    rig.ok("select_document", json!({"document_id": "page2"}));
+    let job = generated(&mut rig, json!({"prompt": "a castle"}));
+    let rx = rig.start("apply_generated_image", json!({ "job_id": job }));
+    while rig.app.ui.choice_requester.is_none() {
+        rig.pass();
+        assert!(rx.try_recv().is_err(), "it asks first");
+    }
+    let req = rig.app.ui.choice_requester.as_ref().unwrap();
+    assert_eq!(req.title(), "Replace Spare Page?");
+    let text = req.lines().join(" ");
+    assert!(text.contains("spare page (page1)"), "{text}");
+    assert!(!req.truncated() && req.height() <= 200, "{:?}", req.lines());
+    assert_eq!(req.labels(), ["Replace", "Keep"]);
+    // Return keeps it.
+    rig.pass_with(tap(egui::Key::Enter));
+    let r = rig.wait(&rx);
+    assert_eq!(r["code"], "APPLY_DECLINED", "{r}");
+    let spare = rig.app.menu_data.spare.as_ref().unwrap();
+    assert_eq!(spare.engine.document().page(), mine.page(), "kept");
+    // Replace puts it there; Undo on that page brings the user's picture back.
+    let rx = rig.start("apply_generated_image", json!({ "job_id": job }));
+    while rig.app.ui.choice_requester.is_none() {
+        rig.pass();
+    }
+    click_choice(&mut rig, 0);
+    let r = rig.wait(&rx);
+    assert_eq!(
+        (r["success"].clone(), r["document_id"].clone()),
+        (json!(true), json!("page1"))
+    );
+    rig.ok("select_document", json!({"document_id": "page1"}));
+    assert_ne!(rig.app.engine.document().page(), mine.page());
+    rig.ok("undo", json!({}));
+    assert_eq!(rig.app.engine.document().page(), mine.page());
+}
+
+/// apply_generated_image to the picture, answered with Replace.
+fn replace_picture(rig: &mut Rig, job: &str) -> Value {
+    let rx = rig.start(
+        "apply_generated_image",
+        json!({"job_id": job, "target": "picture"}),
+    );
+    while rig.app.ui.choice_requester.is_none() {
+        rig.pass();
+    }
+    click_choice(rig, 0);
+    let r = rig.wait(&rx);
+    assert_eq!(r["success"], true, "{r}");
+    r
+}
+
+#[test]
+fn mcp_undo_and_redo_of_a_generated_picture_take_its_details_back_and_forth() {
+    let mut rig = rig_with(Some(Arc::new(TestPattern)));
+    let range = |low, high| dpx_iff::ilbm::ColorRange {
+        rate: 8192,
+        flags: 1,
+        low,
+        high,
+    };
+    let mine = crate::files::PictureExtras {
+        ranges: vec![range(20, 27), range(8, 15)],
+        grab: Some((3, 4)),
+        transparent_color: Some(7),
+    };
+    rig.app.extras = mine.clone();
+    let before = rig.app.engine.document().clone();
+    let a = generated(
+        &mut rig,
+        json!({"prompt": "a castle", "target": "picture", "palette": "new",
+               "background": "transparent"}),
+    );
+    let b = generated(
+        &mut rig,
+        json!({"prompt": "a tower", "target": "picture", "palette": "new",
+               "background": "opaque"}),
+    );
+    // Two generated pictures in turn, each with the details Palette New gives.
+    replace_picture(&mut rig, &a);
+    let first = rig.app.extras.clone();
+    assert_eq!(
+        (first.grab, first.ranges.len(), first.transparent_color),
+        (None, 0, Some(0))
+    );
+    let after_a = rig.app.engine.document().clone();
+    replace_picture(&mut rig, &b);
+    let second = rig.app.extras.clone();
+    assert_eq!(second.transparent_color, None);
+    // MCP's undo takes the second back with its details; redo sets them again.
+    rig.ok("undo", json!({}));
+    assert_eq!(rig.app.engine.document().page(), after_a.page());
+    assert_eq!(rig.app.extras, first, "undo brings the details back");
+    rig.ok("redo", json!({}));
+    assert_ne!(rig.app.engine.document().page(), after_a.page());
+    assert_eq!(rig.app.extras, second, "redo sets them again");
+    rig.ok("undo", json!({}));
+    assert_eq!(rig.app.extras, first);
+    // The entry left the list with its step: the GUI's U then finds the first one's.
+    rig.pass_with(vec![key_event(egui::Key::U, true)]);
+    assert_eq!(rig.app.engine.document().page(), before.page());
+    assert_eq!(rig.app.engine.document().palette(), before.palette());
+    assert_eq!(rig.app.extras, mine, "the user's own details are back");
+    rig.ok("redo", json!({}));
+    assert_eq!(rig.app.extras, first);
 }
 
 #[test]

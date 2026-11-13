@@ -205,6 +205,45 @@ pub fn fit_brush_into(
     out
 }
 
+/// Brush ▸ Load's fitting: `brush` (colour numbers of `file_palette`) with its colours
+/// fitted to `page_palette`. Numbers whose colour differs from the page palette's go to the
+/// nearest page colour, the transparent colour keeps its number, and no opaque colour goes
+/// to the transparent number (a black outline must not turn into holes where page colour 0
+/// is black too). The second value is how many colours had to change. (ADR-45: in
+/// `dpx-core` so the Generate requester and MCP's brush target fit one way.)
+pub fn fit_loaded_brush(
+    brush: &BrushImage,
+    file_palette: &Palette,
+    page_palette: &Palette,
+) -> (BrushImage, usize) {
+    let transparent = brush.transparent;
+    let mut map: [Option<u8>; 256] = [None; 256];
+    let mut changed = 0;
+    let mut out = brush.clone();
+    for &p in &brush.pixels {
+        let slot = &mut map[usize::from(p)];
+        if slot.is_some() {
+            continue;
+        }
+        let want = file_palette.get(p);
+        let to = match want {
+            Some(c) if page_palette.get(p) != Some(c) => {
+                changed += usize::from(Some(p) != transparent);
+                match transparent {
+                    Some(t) => page_palette.nearest_excluding(c, &[t]),
+                    None => page_palette.nearest(c),
+                }
+            }
+            _ => p,
+        };
+        *slot = Some(if Some(p) == transparent { p } else { to });
+    }
+    for p in &mut out.pixels {
+        *p = map[usize::from(*p)].unwrap_or(*p);
+    }
+    (out, changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

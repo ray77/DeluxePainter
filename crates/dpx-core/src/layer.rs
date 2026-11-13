@@ -160,6 +160,26 @@ pub fn with_changes(
     out
 }
 
+/// The current frame of `doc` as it shows once `picture` (the page's size) is a new
+/// visible layer where [`Command::AddPictureLayer`] puts it: right above the active layer,
+/// under the visible layers above that one (ADR-45: the Generate requester's New layer
+/// thumbnail). The same picture as the composite after that command.
+pub fn composite_with_new_layer(doc: &Document, picture: &IndexedImage) -> IndexedImage {
+    let frame = doc.current_frame();
+    let mut visible: Vec<&IndexedImage> = Vec::with_capacity(doc.layer_count() + 1);
+    for (l, layer) in doc.layers().iter().enumerate() {
+        if layer.visible
+            && let Some(cel) = doc.cel(frame, l)
+        {
+            visible.push(cel);
+        }
+        if l == doc.active_layer() {
+            visible.push(picture);
+        }
+    }
+    flatten(&visible, doc.page().width(), doc.page().height())
+}
+
 // ---- Layer commands.
 
 impl Command {
@@ -1343,5 +1363,45 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("at most 32"), "{}", err.message);
         assert_eq!(e.document().layer_count(), MAX_LAYERS);
+    }
+
+    #[test]
+    fn the_new_layer_preview_is_the_composite_after_add_picture_layer() {
+        // [Background, Top] with Top's pixel 0 opaque, in every choice of active and
+        // hidden layer: the new layer goes right above the active one, under Top.
+        let picture = pic(4, &[0, 7, 7, 7, 0, 0, 7, 7]);
+        for (active, top_visible, bottom_visible) in [
+            (0, true, true),
+            (1, true, true),
+            (0, false, true),
+            (0, true, false),
+            (1, true, false),
+        ] {
+            let mut e = engine();
+            e.execute(Command::Clear { color: 4 }).unwrap();
+            e.execute(Command::AddLayer { name: None }).unwrap();
+            e.execute(Command::SetPage {
+                width: 4,
+                height: 2,
+                pixels: vec![9, 9, 0, 0, 0, 0, 0, 0],
+            })
+            .unwrap();
+            e.execute(Command::SelectLayer { layer: active }).unwrap();
+            for (layer, visible) in [(0, bottom_visible), (1, top_visible)] {
+                e.execute(Command::SetLayerVisible { layer, visible })
+                    .unwrap();
+            }
+            let shown = composite_with_new_layer(e.document(), &picture);
+            e.execute(Command::AddPictureLayer {
+                name: None,
+                pixels: picture.pixels().to_vec(),
+            })
+            .unwrap();
+            let case = (active, top_visible, bottom_visible);
+            assert_eq!(&shown, e.document().composite().as_ref(), "{case:?}");
+            if active == 0 && top_visible {
+                assert_eq!(shown.pixels()[..2], [9, 9], "Top stays on top: {case:?}");
+            }
+        }
     }
 }

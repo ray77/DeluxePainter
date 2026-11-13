@@ -46,6 +46,20 @@ fn the_tools_are_listed_and_annotated() {
         assert_eq!(a.destructive_hint, Some(destructive), "{name}");
         assert!(super::super::is_read_only(name) == read_only);
     }
+    // Only generate_image reaches beyond DeluxePainter (the generator's service).
+    for t in &defs {
+        let a = t.annotations.as_ref().unwrap();
+        let open = t.name == "generate_image";
+        assert_eq!(a.open_world_hint, Some(open), "{}", t.name);
+    }
+    let text = get("generate_image")
+        .description
+        .as_deref()
+        .unwrap_or_default();
+    assert!(
+        text.contains("over the internet") && text.contains("billed"),
+        "{text}"
+    );
     let schema = &get("generate_image").input_schema;
     assert_eq!(schema["required"], json!(["prompt"]));
     for key in [
@@ -512,6 +526,161 @@ mod with_generator {
             ),
             "JOB_NOT_FOUND"
         );
+    }
+
+    #[test]
+    fn the_picture_question_names_every_frame_and_layer_it_replaces() {
+        let one = replace_question(Some("claude-code"), 320, 256, 32, 1, 1);
+        assert_eq!(
+            one.text,
+            "Claude wants to replace the picture with a generated one (320x256, 32 colours). \
+             Undo brings the old one back. Replace?"
+        );
+        let anim = replace_question(Some("claude-code"), 320, 256, 32, 3, 2);
+        assert!(
+            anim.text
+                .starts_with("Claude wants to replace the picture (all 3 frames, 2 layers) "),
+            "{}",
+            anim.text
+        );
+        assert!(
+            replace_question(None, 8, 8, 2, 1, 4)
+                .text
+                .contains("the picture (4 layers)")
+        );
+        assert!(
+            replace_question(None, 8, 8, 2, 20, 1)
+                .text
+                .contains("the picture (all 20 frames)")
+        );
+        let spare = replace_spare_question(Some("claude-code"), Slot::First, 320, 240, 32);
+        assert_eq!(spare.title, "Replace Spare Page?");
+        assert!(spare.text.contains("spare page (page1)"), "{}", spare.text);
+    }
+
+    #[test]
+    fn the_brush_target_reports_the_brush_fitted_to_the_picture_palette() {
+        let g = G::new(test_pattern());
+        g.ok(
+            "create_document",
+            json!({"width": 320, "height": 256, "chipset": "ocs", "colors": 4}),
+        );
+        let picture = g.ok("get_palette", json!({}));
+        let colors: Vec<Rgb8> = picture["colors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| parse_color(c.as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(colors.len(), 4);
+        let s = g.ok(
+            "generate_image",
+            json!({"prompt": "a castle", "target": "brush", "chipset": "aga", "colors": 256}),
+        );
+        assert_eq!(s["colors"], 256, "the conversion has its own palette");
+        let job = s["job_id"].as_str().unwrap().to_string();
+        let r = g.done(&job);
+        let image = r.content[0].as_image().expect("a preview").data.clone();
+        let st = r.structured_content.unwrap();
+        assert_eq!(st["status"], "done");
+        assert!(st["colors_used"].as_u64().unwrap() <= 4, "{st}");
+        assert_eq!(st["palette_size"], 4, "{st}");
+        assert_eq!(st["palette_bits"], 4, "the picture is OCS: {st}");
+        assert_eq!(st["chipset"], "ocs", "{st}");
+        assert!(
+            st["notes"].to_string().contains("picture's palette"),
+            "{st}"
+        );
+        // The preview shows the brush as it lands: only the picture's colours.
+        let bytes = view::from_base64(&image).unwrap();
+        let (png, _, _) = crate::pictures::decode_rgba("preview", &bytes).unwrap();
+        assert!(
+            png.pixels()
+                .iter()
+                .all(|p| colors.contains(&Rgb8::new(p.r, p.g, p.b))),
+            "every preview pixel is a picture colour"
+        );
+        let a = g.ok(
+            "apply_generated_image",
+            json!({"job_id": job, "target": "brush"}),
+        );
+        assert!(a["colors_used"].as_u64().unwrap() <= 4, "{a}");
+    }
+
+    #[test]
+    fn a_spare_page_with_a_picture_is_asked_about_and_a_blank_one_is_not() {
+        let g = G::new(test_pattern());
+        let job = g.ok("generate_image", json!({"prompt": "a castle"}))["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        g.done(&job);
+        // No spare page yet: no question (acceptance test 5's way).
+        g.ok("apply_generated_image", json!({ "job_id": job }));
+        assert_eq!(g.applied.lock().unwrap().len(), 1);
+        // The user's picture is the spare page after a swap: asked first (nobody answers
+        // here, so it is kept).
+        g.ok("draw_pixel", json!({"x": 1, "y": 1, "color": 2}));
+        g.ok("select_document", json!({"document_id": "page2"}));
+        let r = g.call("apply_generated_image", json!({ "job_id": job }));
+        assert_eq!(code_of(&r), "APPLY_DECLINED");
+        let msg = r.structured_content.unwrap()["message"].to_string();
+        assert!(msg.contains("kept the spare page"), "{msg}");
+        assert_eq!(g.applied.lock().unwrap().len(), 1, "not applied");
+        // The brush needs no question.
+        g.ok(
+            "apply_generated_image",
+            json!({"job_id": job, "target": "brush"}),
+        );
+        assert_eq!(g.applied.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cancel_reports_a_kept_picture_as_done_after_the_job_manager_dropped_it() {
+        let g = G::new(test_pattern());
+        let start = |prompt: &str| {
+            g.ok("generate_image", json!({ "prompt": prompt }))["job_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let fetched = start("one");
+        let st = g.done(&fetched).structured_content.unwrap();
+        assert_eq!(
+            st["status"], "done",
+            "its picture is kept with the plan now"
+        );
+        let never_fetched = start("two");
+        g.jobs.wait(job_of(&never_fetched), Duration::from_secs(10));
+        for n in 0..JobManager::KEEP_FINISHED {
+            let id = start(&format!("more {n}"));
+            g.jobs.wait(job_of(&id), Duration::from_secs(10));
+        }
+        assert!(g.jobs.status(job_of(&fetched)).is_none(), "dropped");
+        assert!(g.jobs.status(job_of(&never_fetched)).is_none(), "dropped");
+        let c = g.ok("cancel_generation", json!({ "job_id": fetched }));
+        assert_eq!(
+            (c["status"].clone(), c["cancelled"].clone()),
+            (json!("done"), json!(false))
+        );
+        assert!(c["notes"].to_string().contains("not running (done)"), "{c}");
+        assert_eq!(
+            g.ok("get_generation_status", json!({ "job_id": fetched }))["status"],
+            "done"
+        );
+        g.ok("apply_generated_image", json!({ "job_id": fetched }));
+        // Never fetched and dropped: no longer kept, for both tools alike.
+        for tool in ["cancel_generation", "get_generation_status"] {
+            assert_eq!(
+                g.code(tool, json!({ "job_id": never_fetched })),
+                "JOB_NOT_FOUND",
+                "{tool}"
+            );
+        }
+    }
+
+    fn job_of(text: &str) -> dpx_imagegen::JobId {
+        dpx_imagegen::JobId(text.strip_prefix("gen-").unwrap().parse().unwrap())
     }
 
     #[test]

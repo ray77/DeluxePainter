@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::command::{Command, CommandError, ErrorCode};
 use crate::image::IndexedImage;
 use crate::mode::{Chipset, Target};
+use crate::paint::BrushImage;
 use crate::palette::{Palette, Rgb8};
 use crate::quantize::{self, Dither, PaletteDepth, ReduceOptions, Reduction};
 use crate::resample;
@@ -675,6 +676,57 @@ impl Imported {
             height: self.page.height(),
             pixels: self.page.pixels().to_vec(),
         }
+    }
+
+    /// The page as a brush the way Brush ▸ Load makes one (ADR-45, the Brush target): in
+    /// its own palette (for Use Brush Palette), and fitted to the picture palette `page`
+    /// ([`crate::brush_palette::fit_loaded_brush`]); transparent pixels are its transparent
+    /// colour.
+    pub fn fitted_brush(&self, page: &Palette) -> FittedBrush {
+        let own = BrushImage::from_image(&self.page, self.transparent_color);
+        let (fitted, changed) = crate::brush_palette::fit_loaded_brush(&own, &self.palette, page);
+        FittedBrush {
+            own,
+            fitted,
+            changed,
+        }
+    }
+}
+
+/// [`Imported::fitted_brush`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FittedBrush {
+    /// The brush in the result's own palette.
+    pub own: BrushImage,
+    /// The brush in the picture palette's colour numbers.
+    pub fitted: BrushImage,
+    /// Colours that had to change to fit.
+    pub changed: usize,
+}
+
+impl FittedBrush {
+    /// The fitted brush as it shows: in the picture palette `page`, its transparent pixels
+    /// in `own`'s (the result's palette) transparent colour, a number no opaque pixel uses.
+    pub fn preview(&self, own: &Palette, page: &Palette) -> (IndexedImage, Palette) {
+        let mut colors = page.colors().to_vec();
+        if let Some(t) = self.fitted.transparent
+            && let (Some(slot), Some(c)) = (colors.get_mut(usize::from(t)), own.get(t))
+        {
+            *slot = c;
+        }
+        (
+            self.fitted.to_image(),
+            Palette::new(colors).expect("as many entries as the picture palette"),
+        )
+    }
+
+    /// Different colour numbers the fitted brush uses (its transparent one included).
+    pub fn colors_used(&self) -> usize {
+        let mut seen = [false; 256];
+        for &p in &self.fitted.pixels {
+            seen[usize::from(p)] = true;
+        }
+        seen.iter().filter(|&&s| s).count()
     }
 }
 

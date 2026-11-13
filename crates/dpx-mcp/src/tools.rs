@@ -450,6 +450,9 @@ struct Spec {
     read_only: bool,
     destructive: bool,
     idempotent: bool,
+    /// The tool reaches beyond DeluxePainter (ADR-45: `generate_image` sends the
+    /// description to the image generator's service); `openWorldHint`.
+    open_world: bool,
 }
 
 fn schema<T: JsonSchema + 'static>() -> Arc<JsonObject> {
@@ -471,6 +474,7 @@ const fn read(
         read_only: true,
         destructive: false,
         idempotent: true,
+        open_world: false,
     }
 }
 
@@ -490,6 +494,7 @@ const fn edit(
         read_only: false,
         destructive,
         idempotent: false,
+        open_world: false,
     }
 }
 
@@ -670,7 +675,7 @@ pub fn definitions() -> Vec<Tool> {
                     Some(s.read_only),
                     Some(s.destructive),
                     Some(s.idempotent),
-                    Some(false),
+                    Some(s.open_world),
                 ))
         })
         .collect()
@@ -2313,7 +2318,7 @@ pub async fn read_resource(ctx: &ToolCtx, uri: &str) -> Result<ReadResourceResul
 #[path = "tools_gen.rs"]
 mod generation_tools;
 #[cfg(feature = "imagegen")]
-pub use generation_tools::replace_question;
+pub use generation_tools::{replace_question, replace_spare_question};
 
 #[cfg(test)]
 #[path = "tools_tests.rs"]
