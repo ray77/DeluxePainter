@@ -922,6 +922,7 @@ fn launch_marker(config: &Path, marker: &Path, enabled: bool) {
 }
 
 /// What a bridge call does first, with short waits.
+#[cfg(unix)]
 fn bridge_reach(config: &Path) -> Result<(), dpx_mcp::ToolError> {
     dpx_mcp::bridge::Bridge::with_launch_wait(
         Some(config.to_path_buf()),
