@@ -333,13 +333,13 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 | Page Size | `page_size_requester.rs` | **modern** | |
 | Screen Format | `requester.rs` | **modern** (a card, lead decision 27) | |
 | Grid, Symmetry, Spacing, Fill, Translucency | `tool_requesters.rs` on `form.rs` | **modern** (slice 4b) | |
-| Stencil, Arrange | `stencil_requester.rs`, `arrange_requester.rs` (own code, no form) | classic look | a swatch grid part; Stencil toggles by click and drag-paint, Arrange drags a swatch to another place |
+| Make Stencil, Arrange Palette | `stencil_requester.rs`, `arrange_requester.rs` (own code, no form) | **modern** (slice 4b) | |
 | AnimBrush (Pick up, Make, Settings), Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | **modern** (slice 4b) | |
 | Anim requesters: Set Frame Count, Add, Copy and Delete Frames, Go to Frame, Set Rate | `anim_requester.rs` (forms) | **modern** (slice 4b) | |
 | Set Range | `anim_control.rs` (`PlayRangeRequester`, a form) | **modern** (slice 4b) | |
 | File requester (Load, Save, Export, brushes, anims) | `file_requester.rs` | classic look | the list part with scroll bar and the fields exist; needs Drawer / Pattern / File fields in one view, Disks / Assigns / Parent, "# of Frames", long names |
 | Color Mixer | `palette_requester.rs` | classic look | swatch grid, sample box, RGB/HSV sliders, SPREAD / COPY / EX / UNDO; it changes the palette of the whole screen live, so where the card stands over the picture is a visible decision |
-| Range | `range_requester.rs` | classic look | a palette strip that marks the range's span, range, speed, direction and active controls |
+| Range | `range_requester.rs` | **modern** (slice 4b) | |
 | Import | `import_requester.rs` | classic look | a true-colour thumbnail part (the app paints it over the frame today), option rows with a Tab focus |
 | Generate, Image Generator setup | `generate_requester.rs`, `imagegen_setup.rs` | classic look | a text field with paste, option rows, "More..", a status/thumbnail box |
 | AI & MCP | `mcp_requester.rs` | classic look | status lines, permissions, connect buttons, the list of last calls |

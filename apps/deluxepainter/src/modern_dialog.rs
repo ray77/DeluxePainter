@@ -34,8 +34,11 @@ pub(crate) enum Card {
     Note,
     /// Picture ▸ Page Size.
     PageSize,
-    /// A toolbox settings requester (Gridding, Symmetry, Spacing, Fill Type, Translucency ..).
+    /// A toolbox settings requester: Gridding, Symmetry, Spacing, Fill Type, Translucency,
+    /// Make Stencil, Arrange Palette, the AnimBrush requesters, Perspective.
     Tool,
+    /// Color ▸ Ranges..
+    Range,
     /// An Anim menu requester (Set Frame Count, Add, Copy, Delete Frames, Go to Frame, Rate).
     Anim,
     /// Anim ▸ Control ▸ Set Range..
@@ -47,13 +50,6 @@ fn anim_control_is_card(ui: &UiState) -> bool {
     ui.anim_control
         .as_ref()
         .is_some_and(AnimControlRequester::has_view)
-}
-
-/// The toolbox settings requester that is open is one the Modern skin draws itself.
-fn tool_is_card(ui: &UiState) -> bool {
-    ui.tool_requester
-        .as_ref()
-        .is_some_and(ToolRequester::has_view)
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -86,7 +82,7 @@ pub(crate) fn card(
         return Some(Card::ScreenFormat);
     }
     if ui.tool_requester.is_some() {
-        return tool_is_card(ui).then_some(Card::Tool);
+        return Some(Card::Tool);
     }
     if playing {
         return None;
@@ -94,8 +90,11 @@ pub(crate) fn card(
     if ui.anim_requester.is_some() {
         return Some(Card::Anim);
     }
-    if ui.palette_requester.is_some() || ui.range_requester.is_some() {
+    if ui.palette_requester.is_some() {
         return None;
+    }
+    if ui.range_requester.is_some() {
+        return Some(Card::Range);
     }
     if ui.note_requester.is_some() {
         return Some(Card::Note);
@@ -114,7 +113,8 @@ pub(crate) fn view(
     palette: &Palette,
 ) -> Option<Dialog> {
     match card {
-        Card::Tool => ui.tool_requester.as_ref().and_then(|r| r.view(palette)),
+        Card::Tool => ui.tool_requester.as_ref().map(|r| r.view(palette)),
+        Card::Range => ui.range_requester.as_ref().map(|r| r.view(palette)),
         Card::Anim => ui.anim_requester.as_ref().map(AnimRequester::view),
         Card::AnimControl => ui.anim_control.as_ref().and_then(|r| r.view()),
         Card::Choice => ui.choice_requester.as_ref().map(|r| r.view()),
@@ -127,9 +127,7 @@ pub(crate) fn view(
 /// A requester of the shared interface state that is still shown in the Classic look is
 /// open (the picture quad hosts it).
 pub(crate) fn classic_look_open(ui: &UiState) -> bool {
-    (ui.tool_requester.is_some() && !tool_is_card(ui))
-        || ui.palette_requester.is_some()
-        || ui.range_requester.is_some()
+    ui.palette_requester.is_some()
         || ui.file_requester.is_some()
         || ui.import_requester.is_some()
         || ui.generate_requester.is_some()
@@ -158,15 +156,14 @@ pub(crate) struct Cards {
 impl Cards {
     /// Takes every requester the Modern skin draws itself out of `ui`.
     pub(crate) fn take(ui: &mut UiState) -> Self {
-        let tool = tool_is_card(ui);
         let anim_control = anim_control_is_card(ui);
         Self {
             note: ui.note_requester.take(),
             choice: ui.choice_requester.take(),
             page_size: ui.page_size_requester.take(),
-            tool: if tool { ui.tool_requester.take() } else { None },
+            tool: ui.tool_requester.take(),
             anim: ui.anim_requester.take(),
-            range: None,
+            range: ui.range_requester.take(),
             anim_control: if anim_control {
                 ui.anim_control.take()
             } else {
@@ -180,15 +177,9 @@ impl Cards {
         ui.note_requester = self.note;
         ui.choice_requester = self.choice;
         ui.page_size_requester = self.page_size;
-        if self.tool.is_some() {
-            ui.tool_requester = self.tool;
-        }
-        if self.anim.is_some() {
-            ui.anim_requester = self.anim;
-        }
-        if self.range.is_some() {
-            ui.range_requester = self.range;
-        }
+        ui.tool_requester = self.tool;
+        ui.anim_requester = self.anim;
+        ui.range_requester = self.range;
         if self.anim_control.is_some() {
             ui.anim_control = self.anim_control;
         }

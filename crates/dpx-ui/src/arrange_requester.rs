@@ -63,6 +63,20 @@ impl Button {
     }
 }
 
+/// Ids of the controls in [`ArrangeRequester::view`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// The swatch grid (one control).
+    pub const GRID: ControlId = 0;
+    pub const MOVE: ControlId = 1;
+    pub const EXCHANGE: ControlId = 2;
+    pub const UNDO: ControlId = 3;
+    pub const REVERT: ControlId = 4;
+    pub const CANCEL: ControlId = 5;
+    pub const OK: ControlId = 6;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrangeRequester {
     colors: usize,
@@ -97,6 +111,94 @@ impl ArrangeRequester {
 
     fn rows(&self) -> i32 {
         self.colors.div_ceil(COLS) as i32
+    }
+
+    /// The whole swatch grid: every cell with the gap that belongs to it.
+    fn grid_rect(&self) -> Rect {
+        Rect::new(
+            Self::grid_x(),
+            GRID_Y,
+            COLS as i32 * PITCH,
+            self.rows() * PITCH,
+        )
+    }
+
+    fn held_on(&self, b: Button) -> bool {
+        self.held == Some(b) && self.button_rect(b).contains(self.pointer.0, self.pointer.1)
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47); the swatches' colours come from
+    /// `palette`. Move and Ex stand in a line under the grid (they are the mode of a drag),
+    /// Undo, Revert, Cancel and Ok at the bottom.
+    pub fn view(&self, palette: &Palette) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, Dialog, Item, Kind, Mark, Part, Push, Role, Size,
+            Swatch, Swatches, Tone,
+        };
+        let cells = self
+            .order
+            .iter()
+            .enumerate()
+            .take(self.colors)
+            .map(|(slot, &entry)| Swatch {
+                rgb: crate::stencil_requester::swatch_rgb(palette, entry),
+                mark: if self.drag == Some(slot) {
+                    Mark::Picked
+                } else if self.drag.is_some() && self.over == Some(slot) {
+                    Mark::Target
+                } else {
+                    Mark::None
+                },
+            })
+            .collect();
+        let mode = |b: Button, id, on: bool| {
+            Part::Button(Push {
+                control: Control::new(id, self.button_rect(b)),
+                label: b.label().into(),
+                on,
+                pressed: self.held_on(b),
+                enabled: true,
+            })
+        };
+        let button = |b: Button, id, role| {
+            ViewButton::new(
+                Control::new(id, self.button_rect(b)),
+                b.label(),
+                role,
+                self.held_on(b),
+            )
+        };
+        Dialog {
+            title: "Arrange Palette".into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![vec![
+                Item::Swatches(Swatches {
+                    control: Control::new(ctl::GRID, self.grid_rect()),
+                    cols: COLS,
+                    cells,
+                    strip: false,
+                }),
+                Item::Line {
+                    label: "Drag".into(),
+                    key: None,
+                    parts: vec![
+                        mode(Button::Move, ctl::MOVE, !self.exchange),
+                        mode(Button::Exchange, ctl::EXCHANGE, self.exchange),
+                        Part::Text(
+                            format!("{} of {} colours moved", self.moved(), self.colors),
+                            Tone::Dim,
+                        ),
+                    ],
+                },
+            ]],
+            buttons: vec![
+                button(Button::Undo, ctl::UNDO, Role::Plain),
+                button(Button::Revert, ctl::REVERT, Role::Plain),
+                button(Button::Cancel, ctl::CANCEL, Role::Cancel),
+                button(Button::Ok, ctl::OK, Role::Default),
+            ],
+        }
     }
 
     pub fn size(&self) -> (i32, i32) {
@@ -290,6 +392,92 @@ impl ArrangeRequester {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The view (ADR-47): the grid is one control over all cells; the swatch a drag started
+    /// on and the one it would land on are marked; Move and Ex show the mode.
+    #[test]
+    fn the_view_marks_the_drag_and_shows_the_mode() {
+        use crate::dialog::{Item, Mark, Part};
+        let pal = Palette::dpaint_default_32();
+        let mut r = ArrangeRequester::new(32);
+        let v = r.view(&pal);
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [
+                ctl::GRID,
+                ctl::MOVE,
+                ctl::EXCHANGE,
+                ctl::UNDO,
+                ctl::REVERT,
+                ctl::CANCEL,
+                ctl::OK
+            ]
+        );
+        let grid = v.control(ctl::GRID).unwrap().area;
+        for c in 0..32usize {
+            let (col, row) = ((c % 16) as i32, (c / 16) as i32);
+            let (x, y) = (
+                grid.x + (2 * col + 1) * grid.w / 32,
+                grid.y + (2 * row + 1) * grid.h / 4,
+            );
+            assert_eq!(r.cell_at(x, y), Some(c));
+        }
+        for (id, button) in [
+            (ctl::MOVE, Button::Move),
+            (ctl::EXCHANGE, Button::Exchange),
+            (ctl::UNDO, Button::Undo),
+            (ctl::REVERT, Button::Revert),
+            (ctl::CANCEL, Button::Cancel),
+            (ctl::OK, Button::Ok),
+        ] {
+            let a = v.control(id).unwrap().area;
+            assert_eq!(r.button_at(a.x + a.w / 2, a.y + a.h / 2), Some(button));
+        }
+        let marks = |v: &crate::dialog::Dialog| -> Vec<(usize, Mark)> {
+            match &v.columns[0][0] {
+                Item::Swatches(g) => g
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.mark != Mark::None)
+                    .map(|(i, c)| (i, c.mark))
+                    .collect(),
+                i => panic!("the grid: {i:?}"),
+            }
+        };
+        let modes = |v: &crate::dialog::Dialog| -> (bool, bool, String) {
+            match &v.columns[0][1] {
+                Item::Line { parts, .. } => match &parts[..] {
+                    [Part::Button(a), Part::Button(b), Part::Text(t, _)] => (a.on, b.on, t.clone()),
+                    p => panic!("{p:?}"),
+                },
+                i => panic!("{i:?}"),
+            }
+        };
+        assert!(marks(&v).is_empty());
+        assert_eq!(modes(&v), (true, false, "0 of 32 colours moved".into()));
+        let (from, to) = (r.cell_rect(9), r.cell_rect(2));
+        r.handle(ReqEvent::Press(from.x + 3, from.y + 3));
+        assert_eq!(marks(&r.view(&pal)), [(9, Mark::Picked)]);
+        r.handle(ReqEvent::Drag(to.x + 3, to.y + 3));
+        assert_eq!(marks(&r.view(&pal)), [(2, Mark::Target), (9, Mark::Picked)]);
+        r.handle(ReqEvent::Release);
+        let v = r.view(&pal);
+        assert!(marks(&v).is_empty());
+        assert_eq!(modes(&v).2, "8 of 32 colours moved");
+        // Slot 2 now shows the colour that was entry 9.
+        let Item::Swatches(g) = &v.columns[0][0] else {
+            panic!()
+        };
+        let c = pal.get(9).unwrap();
+        assert_eq!(g.cells[2].rgb, [c.r, c.g, c.b]);
+        let ex = r.button_rect(Button::Exchange);
+        r.handle(ReqEvent::Press(ex.x + 1, ex.y + 1));
+        r.handle(ReqEvent::Release);
+        let m = modes(&r.view(&pal));
+        assert_eq!((m.0, m.1), (false, true));
+    }
 
     fn pens() -> Pens {
         Pens::from_palette(&Palette::dpaint_default_32())

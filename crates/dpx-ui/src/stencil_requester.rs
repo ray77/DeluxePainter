@@ -40,6 +40,23 @@ impl Button {
     }
 }
 
+/// Ids of the controls in [`StencilRequester::view`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// The swatch grid (one control).
+    pub const GRID: ControlId = 0;
+    pub const MAKE: ControlId = 1;
+    pub const CLEAR: ControlId = 2;
+    pub const INVERT: ControlId = 3;
+    pub const CANCEL: ControlId = 4;
+}
+
+/// The colour of palette entry `entry` for a swatch (black for an entry the palette lacks).
+pub(crate) fn swatch_rgb(palette: &Palette, entry: u8) -> [u8; 3] {
+    palette.get(entry).map_or([0, 0, 0], |c| [c.r, c.g, c.b])
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StencilRequester {
     colors: usize,
@@ -71,6 +88,69 @@ impl StencilRequester {
 
     fn rows(&self) -> i32 {
         self.colors.div_ceil(COLS) as i32
+    }
+
+    /// The whole swatch grid: every cell with the gap that belongs to it.
+    fn grid_rect(&self) -> Rect {
+        Rect::new(
+            Self::grid_x(),
+            GRID_Y,
+            COLS as i32 * PITCH,
+            self.rows() * PITCH,
+        )
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47); the swatches' colours come from
+    /// `palette`.
+    pub fn view(&self, palette: &Palette) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, Dialog, Item, Kind, Mark, Role, Size, Swatch, Swatches,
+            Tone,
+        };
+        let cells = (0..self.colors)
+            .map(|c| Swatch {
+                rgb: swatch_rgb(palette, c as u8),
+                mark: if self.protected[c] {
+                    Mark::Chosen
+                } else {
+                    Mark::None
+                },
+            })
+            .collect();
+        let button = |b: Button, id, role| {
+            let pressed = self.held == Some(b)
+                && self.button_rect(b).contains(self.pointer.0, self.pointer.1);
+            ViewButton::new(
+                Control::new(id, self.button_rect(b)),
+                b.label(),
+                role,
+                pressed,
+            )
+        };
+        Dialog {
+            title: "Make Stencil".into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![vec![
+                Item::Swatches(Swatches {
+                    control: Control::new(ctl::GRID, self.grid_rect()),
+                    cols: COLS,
+                    cells,
+                    strip: false,
+                }),
+                Item::Text {
+                    text: format!("{} of {} colours protected", self.count(), self.colors),
+                    tone: Tone::Dim,
+                    bullet: false,
+                },
+            ]],
+            buttons: vec![
+                button(Button::Make, ctl::MAKE, Role::Default),
+                button(Button::Clear, ctl::CLEAR, Role::Plain),
+                button(Button::Invert, ctl::INVERT, Role::Plain),
+                button(Button::Cancel, ctl::CANCEL, Role::Cancel),
+            ],
+        }
     }
 
     pub fn size(&self) -> (i32, i32) {
@@ -224,6 +304,69 @@ impl StencilRequester {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The view (ADR-47): the grid is one control over all cells, so the proportional place
+    /// of a swatch in it is that swatch; the centre of every button is its press.
+    #[test]
+    fn the_view_has_the_grid_as_one_control_and_four_buttons() {
+        use crate::dialog::{Item, Mark};
+        let pal = Palette::dpaint_default_32();
+        let mut r = StencilRequester::new(32, None);
+        let v = r.view(&pal);
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [ctl::GRID, ctl::MAKE, ctl::CLEAR, ctl::INVERT, ctl::CANCEL]
+        );
+        let grid = v.control(ctl::GRID).unwrap().area;
+        assert_eq!((grid.w, grid.h), (16 * PITCH, 2 * PITCH));
+        for c in 0..32usize {
+            // The middle of cell `c` of a grid of 16 columns and 2 rows of equal cells.
+            let (col, row) = ((c % 16) as i32, (c / 16) as i32);
+            let (x, y) = (
+                grid.x + (2 * col + 1) * grid.w / 32,
+                grid.y + (2 * row + 1) * grid.h / 4,
+            );
+            assert_eq!(r.cell_at(x, y), Some(c));
+            assert!(r.cell_rect(c).contains(x, y));
+        }
+        for (id, button) in [
+            (ctl::MAKE, Button::Make),
+            (ctl::CLEAR, Button::Clear),
+            (ctl::INVERT, Button::Invert),
+            (ctl::CANCEL, Button::Cancel),
+        ] {
+            let a = v.control(id).unwrap().area;
+            assert_eq!(r.button_at(a.x + a.w / 2, a.y + a.h / 2), Some(button));
+        }
+        let marks = |v: &crate::dialog::Dialog| -> Vec<bool> {
+            match &v.columns[0][0] {
+                Item::Swatches(g) => g.cells.iter().map(|c| c.mark == Mark::Chosen).collect(),
+                i => panic!("the grid: {i:?}"),
+            }
+        };
+        assert!(marks(&v).iter().all(|m| !m));
+        let cell = r.cell_rect(5);
+        r.handle(ReqEvent::Press(cell.x + 3, cell.y + 3));
+        let to = r.cell_rect(7);
+        r.handle(ReqEvent::Drag(to.x + 3, to.y + 3));
+        r.handle(ReqEvent::Release);
+        let m = marks(&r.view(&pal));
+        assert_eq!(m.iter().filter(|m| **m).count(), 3);
+        assert!(m[5] && m[6] && m[7]);
+        assert!(matches!(
+            &r.view(&pal).columns[0][1],
+            Item::Text { text, .. } if text == "3 of 32 colours protected"
+        ));
+        let Item::Swatches(g) = &v.columns[0][0] else {
+            panic!()
+        };
+        let c = pal.get(5).unwrap();
+        assert_eq!(g.cells[5].rgb, [c.r, c.g, c.b]);
+        let a = v.control(ctl::CLEAR).unwrap().area;
+        r.handle(ReqEvent::Press(a.x + 1, a.y + 1));
+        assert!(r.view(&pal).buttons[1].pressed);
+    }
 
     fn pens() -> Pens {
         Pens::from_palette(&Palette::dpaint_default_32())

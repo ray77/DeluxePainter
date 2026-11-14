@@ -838,7 +838,9 @@ impl Draw<'_> {
             let ch = (self.m.swatch * 2.0 / rows as f32).clamp(9.0, self.m.swatch + 4.0);
             (w / cols as f32, self.snap(ch), x)
         } else {
-            let side = self.snap((w / cols as f32).min(self.m.swatch));
+            // A few rows use the column's width; many rows keep the card low.
+            let most = if rows <= 4 { 32.0 } else { self.m.swatch };
+            let side = ((w / cols as f32).min(most) * self.scale).floor() / self.scale;
             (side, side, self.snap(x + (w - side * cols as f32) / 2.0))
         };
         let frame = Rect::new(x0, y, cw * cols as f32, ch * rows as f32);
@@ -1538,11 +1540,12 @@ mod tests {
     use dpx_ui::dialog::{ListRow, ScrollBar};
     use dpx_ui::form_ctl;
     use dpx_ui::{
-        AnimBrushRequester, AnimRequester, ChoiceRequester, FillRequester, FillSettings,
-        GridRequester, GridSettings, NoteRequester, PageSizeRequester, PerspectiveRequester,
-        PerspectiveSettings, PlayRangeRequester, Preset, ReqEvent, ReqKey, ScreenFormatRequester,
-        SpacingMode, SpacingRequester, SpacingSettings, SymmetryRequester, SymmetrySettings,
-        ToolRequester, TranslucencyRequester,
+        AnimBrushRequester, AnimRequester, ArrangeRequester, ChoiceRequester, FillRequester,
+        FillSettings, GridRequester, GridSettings, NoteRequester, PageSizeRequester,
+        PerspectiveRequester, PerspectiveSettings, PlayRangeRequester, Preset, RangeRequester,
+        ReqEvent, ReqKey, ScreenFormatRequester, SpacingMode, SpacingRequester, SpacingSettings,
+        StencilRequester, SymmetryRequester, SymmetrySettings, ToolRequester,
+        TranslucencyRequester,
     };
 
     const WINDOWS: [(f32, f32); 3] = [(720.0, 520.0), (1280.0, 800.0), (1001.0, 640.0)];
@@ -1579,7 +1582,7 @@ mod tests {
     }
 
     fn tool(r: &ToolRequester) -> Dialog {
-        r.view(&palette()).expect("a converted requester")
+        r.view(&palette())
     }
 
     fn spacing(mode: SpacingMode) -> ToolRequester {
@@ -1654,6 +1657,44 @@ mod tests {
         };
         out.push(("perspective", perspective(Some((320, 200)))));
         out.push(("perspective, no brush", perspective(None)));
+        // The palette requesters: Make Stencil, Arrange Palette and Range with 2, 32 and
+        // 256 colours.
+        let grey = |n: usize| {
+            let colors = (0..n)
+                .map(|i| dpx_core::Rgb8 {
+                    r: (i * 255 / (n - 1)) as u8,
+                    g: (i * 97 % 256) as u8,
+                    b: 255 - (i * 255 / (n - 1)) as u8,
+                })
+                .collect();
+            dpx_core::Palette::new(colors).expect("a palette")
+        };
+        let protected: Vec<bool> = (0..256).map(|i| i % 3 == 0).collect();
+        for (name, n) in [("stencil", 32), ("stencil, 256", 256), ("stencil, 2", 2)] {
+            let r = StencilRequester::new(n, Some(&protected));
+            out.push((name, r.view(&grey(n))));
+        }
+        for (name, n) in [("arrange", 32), ("arrange, 256", 256), ("arrange, 2", 2)] {
+            let mut r = ArrangeRequester::new(n);
+            let (from, to) = (r.cell_rect(n - 1), r.cell_rect(0));
+            r.handle(ReqEvent::Press(from.x + 1, from.y + 1));
+            r.handle(ReqEvent::Drag(to.x + 1, to.y + 1));
+            out.push((name, r.view(&grey(n))));
+        }
+        for (name, n) in [("range", 32), ("range, 256", 256), ("range, 2", 2)] {
+            let pal = grey(n);
+            let mut r = RangeRequester::new(&pal, &[], 0);
+            if n == 2 {
+                out.push(("range, empty", r.view(&pal)));
+            }
+            for cell in [0, (n - 1).min(40) as u8] {
+                let c = r.cell_rect(cell);
+                r.handle(ReqEvent::Press(c.x + 1, c.y + 1));
+                r.handle(ReqEvent::Release);
+            }
+            assert!(r.current().defined(), "{name}");
+            out.push((name, r.view(&pal)));
+        }
         let mut range = PlayRangeRequester::new(999, Some((500, 999)));
         out.push(("play range", range.view()));
         for key in [ReqKey::Backspace, ReqKey::Backspace, ReqKey::Enter] {

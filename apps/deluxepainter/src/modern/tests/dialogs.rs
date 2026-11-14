@@ -28,10 +28,8 @@ fn dialog_state(rig: &mut Rig) -> String {
     let page = app.ui.page_size_requester.take();
     let format = app.requester.take();
     let palette = app.palette().clone();
-    let tool = app
-        .ui
-        .tool_requester
-        .take_if(|r| r.view(&palette).is_some());
+    let tool = app.ui.tool_requester.take();
+    let range = app.ui.range_requester.take();
     let anim = app.ui.anim_requester.take();
     let control = app.ui.anim_control.take_if(|r| r.has_view());
     let percent = (
@@ -43,6 +41,8 @@ fn dialog_state(rig: &mut Rig) -> String {
             .as_ref()
             .map(|b| (b.len(), b.duration, b.current(), b.direction)),
         app.perspective.settings,
+        app.stencil.clone(),
+        app.extras.ranges.clone(),
     );
     let shown = format!(
         "{:?}",
@@ -52,6 +52,7 @@ fn dialog_state(rig: &mut Rig) -> String {
             page.as_ref().map(|r| r.view()),
             format.as_ref().map(|r| (r.view(), r.command())),
             tool.as_ref().map(|r| r.view(&palette)),
+            range.as_ref().map(|r| (r.view(&palette), r.ranges())),
             anim.as_ref().map(|r| r.view()),
             control.as_ref().map(|r| r.view()),
             percent,
@@ -71,9 +72,8 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.choice_requester = choice;
     app.ui.page_size_requester = page;
     app.requester = format;
-    if tool.is_some() {
-        app.ui.tool_requester = tool;
-    }
+    app.ui.tool_requester = tool;
+    app.ui.range_requester = range;
     app.ui.anim_requester = anim;
     if control.is_some() {
         app.ui.anim_control = control;
@@ -1240,6 +1240,384 @@ fn the_animbrush_and_perspective_requesters_do_the_same_in_both_skins() {
     both_at_every_scale(animbrush_perspective_script);
 }
 
+/// Where swatch `cell` of a grid of 16 columns and `rows` rows lies in the grid's control,
+/// as a fraction (`at` inside the cell).
+fn swatch(cell: u16, rows: u16, at: (f32, f32)) -> (f32, f32) {
+    (
+        (f32::from(cell % 16) + at.0) / 16.0,
+        (f32::from(cell / 16) + at.1) / f32::from(rows),
+    )
+}
+
+impl Rig {
+    /// Press on the first point of control `id` (fractions of it, also beyond its edges),
+    /// move over the others, let go on the last; `seen` after every move.
+    fn drag_in_control(&mut self, id: ControlId, path: &[(f32, f32)], seen: Seen, what: &str) {
+        let first = self.control_point(id, path[0]);
+        self.pass(vec![
+            egui::Event::PointerMoved(first),
+            pointer_button(first, Primary, true),
+        ]);
+        seen(self, format!("{what}: pressed"));
+        let mut last = first;
+        for (i, frac) in path.iter().enumerate().skip(1) {
+            // (The control's place is asked while the button is held: it does not move.)
+            last = self.control_point(id, *frac);
+            self.pass(vec![egui::Event::PointerMoved(last)]);
+            seen(self, format!("{what}: moved to point {i}"));
+        }
+        self.pass(vec![pointer_button(last, Primary, false)]);
+        seen(self, format!("{what}: let go"));
+    }
+}
+
+/// Effect ▸ Stencil ▸ Make.. (slice 4b): swatches toggled by a click and painted by a drag
+/// over the grid and beyond its edge, Clear, Invert, Make, Cancel, Return and Esc.
+fn stencil_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::ToolRequester;
+    use dpx_ui::stencil_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("stencil.make"));
+        assert!(matches!(
+            rig.app.ui.tool_requester,
+            Some(ToolRequester::Stencil(_))
+        ));
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Tool));
+        }
+        seen(rig, "Make Stencil..".into());
+    };
+    let protected = |rig: &Rig| -> Vec<usize> {
+        match &rig.app.ui.tool_requester {
+            Some(ToolRequester::Stencil(r)) => (0..32).filter(|c| r.is_protected(*c)).collect(),
+            _ => panic!("the stencil requester"),
+        }
+    };
+    open(rig, seen);
+    for cell in [5, 5, 3, 20, 31, 0] {
+        rig.click_control(ctl::GRID, swatch(cell, 2, MID));
+        seen(rig, format!("swatch {cell}"));
+    }
+    assert_eq!(protected(rig), [0, 3, 20, 31]);
+    // The corners of a swatch are that swatch.
+    rig.click_control(ctl::GRID, swatch(17, 2, (0.06, 0.06)));
+    rig.click_control(ctl::GRID, swatch(18, 2, (0.8, 0.8)));
+    assert_eq!(protected(rig), [0, 3, 17, 18, 20, 31]);
+    seen(rig, "two swatches by their corners".into());
+    // A drag paints the state of the first swatch over the others.
+    let path: Vec<(f32, f32)> = [8, 9, 10, 11].map(|c| swatch(c, 2, MID)).to_vec();
+    rig.drag_in_control(ctl::GRID, &path, seen, "a drag over four swatches");
+    assert_eq!(protected(rig), [0, 3, 8, 9, 10, 11, 17, 18, 20, 31]);
+    // From a protected swatch on: the drag clears; it leaves the grid at its right edge.
+    let path = [swatch(17, 2, MID), swatch(19, 2, MID), (1.2, 0.75)];
+    rig.drag_in_control(ctl::GRID, &path, seen, "a drag out of the grid");
+    assert_eq!(protected(rig)[..6], [0, 3, 8, 9, 10, 11]);
+    assert!(protected(rig).iter().all(|c| *c < 17), "the row is cleared");
+    rig.click_control(ctl::INVERT, MID);
+    assert_eq!(protected(rig).len(), 26);
+    seen(rig, "Invert".into());
+    rig.press_and_leave(ctl::CLEAR);
+    rig.press_and_leave(ctl::MAKE);
+    rig.click_beside();
+    rig.type_text("x");
+    rig.tap(egui::Key::Tab);
+    assert_eq!(protected(rig).len(), 26);
+    seen(
+        rig,
+        "Clear and Make pressed and left, keys that mean nothing".into(),
+    );
+    rig.click_control(ctl::CLEAR, (0.97, 0.9));
+    assert!(protected(rig).is_empty());
+    seen(rig, "Clear".into());
+    rig.click_control(ctl::GRID, swatch(6, 2, MID));
+    rig.click_control(ctl::CANCEL, MID);
+    assert!(rig.app.ui.tool_requester.is_none() && rig.app.stencil.is_none());
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.click_control(ctl::GRID, swatch(6, 2, MID));
+    rig.tap(egui::Key::Escape);
+    assert!(rig.app.ui.tool_requester.is_none() && rig.app.stencil.is_none());
+    seen(rig, "Esc".into());
+    open(rig, seen);
+    rig.click_control(ctl::GRID, swatch(6, 2, MID));
+    rig.click_control(ctl::MAKE, (0.04, 0.1));
+    assert!(rig.app.ui.tool_requester.is_none());
+    assert!(rig.app.stencil.as_ref().is_some_and(|s| s[6] && !s[7]));
+    seen(rig, "Make".into());
+    // It opens on the stencil there is; Return makes it.
+    open(rig, seen);
+    assert_eq!(protected(rig), [6]);
+    rig.click_control(ctl::GRID, swatch(7, 2, MID));
+    rig.tap(egui::Key::Enter);
+    assert!(rig.app.stencil.as_ref().is_some_and(|s| s[6] && s[7]));
+    seen(rig, "Return".into());
+}
+
+#[test]
+fn the_stencil_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(stencil_script);
+}
+
+/// Color ▸ Palette ▸ Arrange (slice 4b): a swatch dragged to another place moves there or,
+/// with Ex, changes places; Undo, Revert, Cancel, Ok, Return and Esc.
+fn arrange_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::ToolRequester;
+    use dpx_ui::arrange_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("palette.arrange"));
+        assert!(matches!(
+            rig.app.ui.tool_requester,
+            Some(ToolRequester::Arrange(_))
+        ));
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Tool));
+        }
+        seen(rig, "Arrange..".into());
+    };
+    let order = |rig: &Rig| -> Vec<u8> {
+        match &rig.app.ui.tool_requester {
+            Some(ToolRequester::Arrange(r)) => r.order().to_vec(),
+            _ => panic!("the arrange requester"),
+        }
+    };
+    // Something painted, so that the renumbered picture can be compared.
+    rig.click(Place::Cell(9), Primary);
+    rig.click(Place::Page(40, 40), Primary);
+    seen(rig, "a dot in colour 9".into());
+    let colours = rig.app.engine.document().palette().clone();
+    open(rig, seen);
+    let cell = |c: u16| swatch(c, 2, MID);
+    // Move: 9 goes to place 2, what lies between shifts by one.
+    rig.drag_in_control(ctl::GRID, &[cell(9), cell(5), cell(2)], seen, "9 to 2");
+    assert_eq!(order(rig)[..4], [0, 1, 9, 2]);
+    // A click on a swatch and a drag that ends beside the grid move nothing.
+    rig.click_control(ctl::GRID, swatch(20, 2, (0.1, 0.9)));
+    rig.drag_in_control(ctl::GRID, &[cell(4), cell(6), (0.4, -0.9)], seen, "out");
+    assert_eq!(order(rig)[..4], [0, 1, 9, 2]);
+    // Ex: the two change places.
+    rig.click_control(ctl::EXCHANGE, MID);
+    seen(rig, "Ex".into());
+    rig.drag_in_control(ctl::GRID, &[cell(0), cell(17), cell(31)], seen, "0 with 31");
+    assert_eq!((order(rig)[0], order(rig)[31]), (31, 0));
+    rig.click_control(ctl::MOVE, (0.05, 0.1));
+    seen(rig, "Move".into());
+    rig.press_and_leave(ctl::EXCHANGE);
+    rig.press_and_leave(ctl::UNDO);
+    rig.press_and_leave(ctl::REVERT);
+    rig.press_and_leave(ctl::OK);
+    rig.click_beside();
+    rig.type_text("x");
+    assert_eq!((order(rig)[0], order(rig)[31]), (31, 0));
+    seen(rig, "buttons pressed and left".into());
+    rig.click_control(ctl::UNDO, MID);
+    assert_eq!((order(rig)[0], order(rig)[2]), (0, 9));
+    seen(rig, "Undo".into());
+    rig.click_control(ctl::REVERT, MID);
+    assert_eq!(order(rig)[..4], [0, 1, 2, 3]);
+    seen(rig, "Revert".into());
+    rig.click_control(ctl::UNDO, (0.96, 0.9));
+    assert_eq!(order(rig)[..4], [0, 1, 9, 2]);
+    seen(rig, "Undo of Revert".into());
+    rig.click_control(ctl::CANCEL, MID);
+    assert!(rig.app.ui.tool_requester.is_none());
+    assert_eq!(rig.app.engine.document().palette(), &colours, "Cancel");
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.drag_in_control(ctl::GRID, &[cell(9), cell(3), cell(2)], seen, "9 to 2");
+    rig.tap(egui::Key::Escape);
+    assert_eq!(rig.app.engine.document().palette(), &colours, "Esc");
+    seen(rig, "Esc".into());
+    open(rig, seen);
+    rig.drag_in_control(ctl::GRID, &[cell(9), cell(3), cell(2)], seen, "9 to 2");
+    rig.click_control(ctl::OK, (0.95, 0.9));
+    assert!(rig.app.ui.tool_requester.is_none());
+    let now = rig.app.engine.document().palette().clone();
+    assert_eq!(now.get(2), colours.get(9), "Ok arranges the palette");
+    seen(rig, "Ok".into());
+    open(rig, seen);
+    rig.click_control(ctl::EXCHANGE, MID);
+    rig.drag_in_control(ctl::GRID, &[cell(1), cell(16), cell(30)], seen, "1 with 30");
+    rig.tap(egui::Key::Enter);
+    let then = rig.app.engine.document().palette().clone();
+    assert_eq!((then.get(1), then.get(30)), (now.get(30), now.get(1)));
+    seen(rig, "Return".into());
+    rig.key('u');
+    seen(rig, "undo".into());
+}
+
+#[test]
+fn the_arrange_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(arrange_script);
+}
+
+/// Color ▸ Ranges.. (slice 4b): the range numbers by button and key, a span by two clicks
+/// and by a drag over the strip, the rate slider, direction, Active, Clear, Cancel, Ok,
+/// Return and Esc.
+fn range_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::range_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("color.ranges"));
+        assert!(rig.app.ui.range_requester.is_some());
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Range));
+        }
+        seen(rig, "Ranges..".into());
+    };
+    let req = |rig: &Rig| rig.app.ui.range_requester.clone().expect("open");
+    let span = |rig: &Rig| {
+        let r = req(rig).current();
+        (r.low, r.high)
+    };
+    let step = |rig: &Rig| dpx_ui::range_requester::rate_to_step(req(rig).current().rate);
+    let cell = |c: u16| swatch(c, 2, MID);
+    let kept = rig.app.extras.ranges.clone();
+    open(rig, seen);
+    // The range numbers.
+    for n in [4u16, 7, 0, 2] {
+        rig.click_control(ctl::SELECT + n, MID);
+        assert_eq!(req(rig).selected(), usize::from(n));
+        seen(rig, format!("range {}", n + 1));
+    }
+    rig.click_control(ctl::SELECT + 5, (0.08, 0.1));
+    rig.press_and_leave(ctl::SELECT + 1);
+    assert_eq!(req(rig).selected(), 5);
+    seen(
+        rig,
+        "range 6 by its first pixel, range 2 pressed and left".into(),
+    );
+    for key in ['1', '8', '3'] {
+        rig.key(key);
+        seen(rig, format!("the {key} key"));
+    }
+    assert_eq!(req(rig).selected(), 2);
+    assert!(!req(rig).current().defined(), "range 3 is empty");
+    // A span: the first colour, Esc takes it back; then first and last.
+    rig.click_control(ctl::GRID, cell(3));
+    assert!(req(rig).awaiting_high());
+    seen(rig, "the first colour".into());
+    rig.tap(egui::Key::Escape);
+    assert!(rig.app.ui.range_requester.is_some() && !req(rig).awaiting_high());
+    seen(rig, "Esc takes it back".into());
+    rig.click_control(ctl::GRID, cell(3));
+    rig.click_control(ctl::GRID, swatch(9, 2, (0.9, 0.9)));
+    assert_eq!(span(rig), (3, 9));
+    seen(rig, "colours 3 to 9".into());
+    // A drag over the strip sets the span, backwards too, and across the rows.
+    rig.drag_in_control(ctl::GRID, &[cell(12), cell(13), cell(15)], seen, "12 to 15");
+    assert_eq!(span(rig), (12, 15));
+    rig.drag_in_control(ctl::GRID, &[cell(22), cell(21), cell(18)], seen, "22 to 18");
+    assert_eq!(span(rig), (18, 22));
+    // The rate: a click beside the knob is one step; the knob dragged beyond the ends.
+    assert_eq!(step(rig), 16);
+    rig.click_control(ctl::RATE, (0.9, 0.5));
+    assert_eq!(step(rig), 17);
+    seen(rig, "one step up".into());
+    rig.click_control(ctl::RATE, (0.04, 0.5));
+    rig.click_control(ctl::RATE, (0.04, 0.5));
+    assert_eq!(step(rig), 15);
+    seen(rig, "two steps down".into());
+    for (to, most) in [(1.6, 63), (-0.7, 0), (1.3, 63)] {
+        let knob = |rig: &Rig| {
+            let dialog = rig.dialog();
+            let slider = dialog.columns[0]
+                .iter()
+                .find_map(|item| match item {
+                    dpx_ui::dialog::Item::Line { parts, .. } => {
+                        parts.iter().find_map(|p| match p {
+                            dpx_ui::dialog::Part::Slider(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("the slider");
+            let (area, knob) = (slider.control.area, slider.knob);
+            ((knob.x - area.x) as f32 + knob.w as f32 / 2.0) / area.w as f32
+        };
+        let from = rig.control_point(ctl::RATE, (knob(rig), 0.5));
+        let before = step(rig);
+        rig.pass(vec![
+            egui::Event::PointerMoved(from),
+            pointer_button(from, Primary, true),
+        ]);
+        assert_eq!(step(rig), before, "a press on the knob changes nothing");
+        seen(rig, "the knob held".into());
+        let end = rig.control_point(ctl::RATE, (to, 2.5));
+        rig.pass(vec![egui::Event::PointerMoved(end)]);
+        assert_eq!(step(rig), most, "dragged beyond the end");
+        seen(rig, format!("the knob dragged to {most}"));
+        rig.pass(vec![pointer_button(end, Primary, false)]);
+        seen(rig, "let go".into());
+    }
+    // Direction, Active, Clear.
+    for way in ["Reverse", "Forward"] {
+        rig.click_control(ctl::DIRECTION, MID);
+        seen(rig, way.to_string());
+    }
+    rig.key('r');
+    assert!(req(rig).current().reverse());
+    seen(rig, "the r key".into());
+    rig.click_control(ctl::ACTIVE, MID);
+    assert!(!req(rig).current().active());
+    seen(rig, "Active off".into());
+    rig.click_control(ctl::ACTIVE, (0.95, 0.9));
+    rig.press_and_leave(ctl::CLEAR);
+    assert!(req(rig).current().active() && req(rig).current().defined());
+    seen(rig, "Active on, Clear pressed and left".into());
+    rig.click_control(ctl::CLEAR, MID);
+    assert!(!req(rig).current().defined());
+    seen(rig, "Clear".into());
+    rig.key('r');
+    rig.type_text("x9");
+    rig.tap(egui::Key::Tab);
+    rig.wheel(2.0);
+    seen(rig, "keys that mean nothing for an empty range".into());
+    rig.press_and_leave(ctl::OK);
+    rig.press_and_leave(ctl::CANCEL);
+    rig.click_beside();
+    assert!(rig.app.ui.range_requester.is_some());
+    seen(rig, "Ok and Cancel pressed and left".into());
+    rig.click_control(ctl::CANCEL, (0.04, 0.1));
+    assert!(rig.app.ui.range_requester.is_none());
+    assert_eq!(rig.app.extras.ranges, kept, "Cancel keeps the ranges");
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.key('4');
+    rig.drag_in_control(ctl::GRID, &[cell(1), cell(2), cell(6)], seen, "1 to 6");
+    rig.tap(egui::Key::Escape);
+    assert!(rig.app.ui.range_requester.is_none());
+    assert_eq!(rig.app.extras.ranges, kept, "Esc keeps the ranges");
+    seen(rig, "Esc".into());
+    open(rig, seen);
+    rig.key('4');
+    rig.drag_in_control(ctl::GRID, &[cell(1), cell(2), cell(6)], seen, "1 to 6");
+    rig.click_control(ctl::OK, (0.95, 0.9));
+    assert!(rig.app.ui.range_requester.is_none());
+    assert_eq!(rig.app.extras.ranges.len(), 4);
+    assert_eq!(
+        (rig.app.extras.ranges[3].low, rig.app.extras.ranges[3].high),
+        (1, 6)
+    );
+    seen(rig, "Ok".into());
+    open(rig, seen);
+    rig.key('4');
+    rig.click_control(ctl::CLEAR, MID);
+    rig.tap(egui::Key::Enter);
+    assert_eq!(
+        rig.app.extras.ranges, kept,
+        "Return: range 4 is cleared again"
+    );
+    seen(rig, "Return".into());
+}
+
+#[test]
+fn the_range_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(range_script);
+}
+
 /// Several requesters open at once: the pointer and the keys belong to the one `pass()`
 /// asks first, and that is the one the Modern skin shows as its card.
 fn stack_script(rig: &mut Rig, seen: Seen) {
@@ -1508,7 +1886,16 @@ fn the_card_veils_the_window_and_follows_the_pointer() {
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 20] = [
+    let open: [(&str, Card, Open); 23] = [
+        ("stencil", Card::Tool, |rig| {
+            rig.pick(Action::Command("stencil.make"))
+        }),
+        ("arrange", Card::Tool, |rig| {
+            rig.pick(Action::Command("palette.arrange"))
+        }),
+        ("range", Card::Range, |rig| {
+            rig.pick(Action::Command("color.ranges"))
+        }),
         ("perspective", Card::Tool, |rig| {
             rig.app.open_perspective_requester();
             rig.pass(vec![]);
@@ -1684,8 +2071,7 @@ fn only_the_converted_requesters_are_cards() {
             .is_none()
     );
     type Open = fn(&mut Rig);
-    let others: [(&str, Open); 5] = [
-        ("Stencil", |rig| rig.pick(Action::Command("stencil.make"))),
+    let others: [(&str, Open); 4] = [
         ("Color Mixer", |rig| rig.key('p')),
         ("file", |rig| rig.pick(Action::Command("picture.load"))),
         ("Generate", |rig| {

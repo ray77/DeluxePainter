@@ -343,28 +343,19 @@ impl ToolRequester {
         }
     }
 
-    /// Whether the Modern skin shows this requester itself ([`ToolRequester::view`]).
-    pub fn has_view(&self) -> bool {
-        matches!(
-            self,
-            ToolRequester::Grid(_)
-                | ToolRequester::Symmetry(_)
-                | ToolRequester::Spacing(_)
-                | ToolRequester::Fill(_)
-                | ToolRequester::Translucency(_)
-                | ToolRequester::AnimBrush(_)
-                | ToolRequester::Perspective(_)
-        )
-    }
-
-    /// The requester as the Modern skin shows it (ADR-47); `None` for one that is still
-    /// shown in the Classic look. `palette` supplies the swatches.
-    pub fn view(&self, _palette: &Palette) -> Option<crate::dialog::Dialog> {
+    /// The requester as the Modern skin shows it (ADR-47). `palette` supplies the swatches
+    /// of the stencil and the arrange requester.
+    pub fn view(&self, palette: &Palette) -> crate::dialog::Dialog {
         match self {
-            _ if !self.has_view() => None,
-            ToolRequester::AnimBrush(r) => Some(r.view()),
-            ToolRequester::Perspective(r) => Some(r.view()),
-            _ => self.form().map(Form::view),
+            ToolRequester::Stencil(r) => r.view(palette),
+            ToolRequester::Arrange(r) => r.view(palette),
+            ToolRequester::AnimBrush(r) => r.view(),
+            ToolRequester::Perspective(r) => r.view(),
+            ToolRequester::Grid(r) => r.form.view(),
+            ToolRequester::Symmetry(r) => r.form.view(),
+            ToolRequester::Spacing(r) => r.form.view(),
+            ToolRequester::Fill(r) => r.form.view(),
+            ToolRequester::Translucency(r) => r.form.view(),
         }
     }
 

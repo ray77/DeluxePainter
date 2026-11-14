@@ -155,6 +155,22 @@ enum Held {
     },
 }
 
+/// Ids of the controls in [`RangeRequester::view`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// The palette strip (one control).
+    pub const GRID: ControlId = 0;
+    /// The range numbers 1 to 8: `SELECT + 0..8`.
+    pub const SELECT: ControlId = 1;
+    pub const RATE: ControlId = 9;
+    pub const DIRECTION: ControlId = 10;
+    pub const ACTIVE: ControlId = 11;
+    pub const CLEAR: ControlId = 12;
+    pub const CANCEL: ControlId = 13;
+    pub const OK: ControlId = 14;
+}
+
 /// State of the Range requester.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeRequester {
@@ -309,6 +325,142 @@ impl RangeRequester {
 
     fn enabled(&self, b: Button) -> bool {
         !b.needs_span() || self.current().defined()
+    }
+
+    /// What the line at the bottom says about the selected range.
+    fn info(&self) -> String {
+        let cur = self.current();
+        if self.awaiting_high.is_some() {
+            "Click the last color of the range".to_string()
+        } else if cur.defined() {
+            let sps = f64::from(cur.rate) * 60.0 / 16384.0;
+            format!(
+                "{} colors, {sps:.0}/s{}",
+                usize::from(cur.high - cur.low) + 1,
+                if cur.active() { "" } else { ", off" }
+            )
+        } else {
+            "Click the first, then the last color".to_string()
+        }
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): the palette as a strip with the
+    /// span marked, the range numbers, the rate slider, direction, Active and Clear. The
+    /// colours come from `palette` (the one the screen is shown in).
+    pub fn view(&self, palette: &Palette) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, Cycle, Dialog, Item, Kind, Mark, Part, Push, Role, Size,
+            Slider, Swatch, Swatches, Tone,
+        };
+        let cur = self.current();
+        let on = cur.defined();
+        let (cols, rows, cw, ch) = self.grid();
+        let cells = (0..self.colors)
+            .map(|i| {
+                let n = i as u8;
+                let marked = match self.awaiting_high {
+                    Some(low) => n == low,
+                    None => on && n >= cur.low && n <= cur.high,
+                };
+                Swatch {
+                    rgb: palette.get(n).map_or([0, 0, 0], |c| [c.r, c.g, c.b]),
+                    mark: if marked { Mark::Chosen } else { Mark::None },
+                }
+            })
+            .collect();
+        let held = |b: Button| {
+            self.held == Some(Held::Button(b)) && b.rect().contains(self.pointer.0, self.pointer.1)
+        };
+        let push = |b: Button, id, label: String, latched: bool| {
+            Part::Button(Push {
+                control: Control::new(id, b.rect()),
+                label,
+                on: latched,
+                pressed: held(b),
+                enabled: self.enabled(b),
+            })
+        };
+        let select = (0..MAX_RANGES)
+            .map(|i| {
+                push(
+                    Button::Select(i),
+                    ctl::SELECT + i as crate::dialog::ControlId,
+                    (i + 1).to_string(),
+                    i == self.selected,
+                )
+            })
+            .collect();
+        let t = Self::slider_rect();
+        let slider = Part::Slider(Slider {
+            // The knob runs inside the track's bevel.
+            control: Control::new(ctl::RATE, Rect::new(t.x + 1, t.y, t.w - 2, t.h)),
+            knob: Rect::new(self.knob_x(), t.y + 1, geom::KNOB_W, t.h - 2),
+            value: rate_to_step(cur.rate).to_string(),
+            enabled: on,
+        });
+        let direction = Part::Cycle(Cycle {
+            control: Control::new(ctl::DIRECTION, Button::Direction.rect()),
+            options: vec!["Forward".into(), "Reverse".into()],
+            selected: usize::from(cur.reverse()),
+            enabled: on,
+        });
+        let span = if self.awaiting_high.is_some() || !on {
+            self.info()
+        } else {
+            format!("Colors {}-{}: {}", cur.low, cur.high, self.info())
+        };
+        let button = |b: Button, id, label, role| {
+            ViewButton::new(Control::new(id, b.rect()), label, role, held(b))
+        };
+        Dialog {
+            title: "Range".into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![vec![
+                Item::Swatches(Swatches {
+                    control: Control::new(
+                        ctl::GRID,
+                        Rect::new(geom::GRID_X, geom::GRID_Y, cols * cw, rows * ch),
+                    ),
+                    cols: cols as usize,
+                    cells,
+                    strip: true,
+                }),
+                Item::Line {
+                    label: "Range".into(),
+                    key: None,
+                    parts: select,
+                },
+                Item::Line {
+                    label: "Rate".into(),
+                    key: None,
+                    parts: vec![slider],
+                },
+                Item::Line {
+                    label: "Direction".into(),
+                    key: Some('r'),
+                    parts: vec![
+                        direction,
+                        push(
+                            Button::Active,
+                            ctl::ACTIVE,
+                            "Active".into(),
+                            cur.active() && on,
+                        ),
+                        push(Button::Clear, ctl::CLEAR, "Clear".into(), false),
+                    ],
+                },
+                Item::Text {
+                    text: span,
+                    tone: Tone::Dim,
+                    bullet: false,
+                },
+            ]],
+            buttons: vec![
+                button(Button::Cancel, ctl::CANCEL, "Cancel", Role::Cancel),
+                button(Button::Ok, ctl::OK, "Ok", Role::Default),
+            ],
+        }
     }
 
     /// Sets the span of the selected range to `a..=b` (any order, at most [`MAX_SPAN`]
@@ -531,19 +683,7 @@ impl RangeRequester {
             ink,
         );
 
-        let info = if self.awaiting_high.is_some() {
-            "Click the last color of the range".to_string()
-        } else if on {
-            let sps = f64::from(cur.rate) * 60.0 / 16384.0;
-            format!(
-                "{} colors, {sps:.0}/s{}",
-                usize::from(cur.high - cur.low) + 1,
-                if cur.active() { "" } else { ", off" }
-            )
-        } else {
-            "Click the first, then the last color".to_string()
-        };
-        font.draw(&mut img, 8, geom::INFO_Y, &info, pens.dark);
+        font.draw(&mut img, 8, geom::INFO_Y, &self.info(), pens.dark);
 
         for b in Button::all() {
             let label = match b {
@@ -619,6 +759,113 @@ mod tests {
             },
         ];
         assert_eq!(RangeRequester::new(&pal(), &data, 99).selected(), 1);
+    }
+
+    /// The view (ADR-47): the strip is one control over all cells, the slider's knob runs
+    /// through its control's rectangle, and the centre of every button is its press.
+    #[test]
+    fn the_view_follows_the_selected_range() {
+        use crate::dialog::{Item, Mark, Part};
+        let mut r = empty();
+        let v = r.view(&pal());
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        let mut wanted = vec![ctl::GRID];
+        wanted.extend(ctl::SELECT..ctl::SELECT + 8);
+        wanted.extend([
+            ctl::RATE,
+            ctl::DIRECTION,
+            ctl::ACTIVE,
+            ctl::CLEAR,
+            ctl::CANCEL,
+            ctl::OK,
+        ]);
+        assert_eq!(ids, wanted);
+        let grid = v.control(ctl::GRID).unwrap().area;
+        let (cols, rows, _, _) = r.grid();
+        for c in 0..32i32 {
+            let (col, row) = (c % cols, c / cols);
+            let (x, y) = (
+                grid.x + (2 * col + 1) * grid.w / (2 * cols),
+                grid.y + (2 * row + 1) * grid.h / (2 * rows),
+            );
+            assert_eq!(r.cell_at(x, y), Some(c as u8));
+        }
+        for (id, button) in (0..8)
+            .map(|i| (ctl::SELECT + i, Button::Select(usize::from(i))))
+            .chain([
+                (ctl::DIRECTION, Button::Direction),
+                (ctl::ACTIVE, Button::Active),
+                (ctl::CLEAR, Button::Clear),
+                (ctl::CANCEL, Button::Cancel),
+                (ctl::OK, Button::Ok),
+            ])
+        {
+            let a = v.control(id).unwrap().area;
+            let at = (a.x + a.w / 2, a.y + a.h / 2);
+            assert_eq!(
+                Button::all().find(|b| b.rect().contains(at.0, at.1)),
+                Some(button)
+            );
+        }
+        let parts = |v: &crate::dialog::Dialog, line: usize| -> Vec<Part> {
+            match &v.columns[0][line] {
+                Item::Line { parts, .. } => parts.clone(),
+                i => panic!("{i:?}"),
+            }
+        };
+        let text = |v: &crate::dialog::Dialog| match v.columns[0].last() {
+            Some(Item::Text { text, .. }) => text.clone(),
+            i => panic!("{i:?}"),
+        };
+        // Empty: the first range number latched, slider, direction, Active, Clear ghosted.
+        assert!(matches!(&parts(&v, 1)[0], Part::Button(b) if b.on && b.label == "1"));
+        assert!(matches!(&parts(&v, 1)[7], Part::Button(b) if !b.on && b.label == "8"));
+        assert!(matches!(&parts(&v, 2)[0], Part::Slider(s) if !s.enabled && s.value == "0"));
+        assert!(matches!(&parts(&v, 3)[0], Part::Cycle(c) if !c.enabled && c.selected == 0));
+        assert!(matches!(&parts(&v, 3)[1], Part::Button(b) if !b.enabled && !b.on));
+        assert_eq!(text(&v), "Click the first, then the last color");
+        // A first colour: it alone is marked; then the span.
+        cell(&mut r, 4);
+        let v = r.view(&pal());
+        let marks = |v: &crate::dialog::Dialog| -> Vec<usize> {
+            match &v.columns[0][0] {
+                Item::Swatches(g) => {
+                    assert!(g.strip && g.cols == 16);
+                    g.cells
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.mark == Mark::Chosen)
+                        .map(|(i, _)| i)
+                        .collect()
+                }
+                i => panic!("{i:?}"),
+            }
+        };
+        assert_eq!(marks(&v), [4]);
+        assert_eq!(text(&v), "Click the last color of the range");
+        cell(&mut r, 7);
+        let v = r.view(&pal());
+        assert_eq!(marks(&v), [4, 5, 6, 7]);
+        assert_eq!(text(&v), "Colors 4-7: 4 colors, 15/s");
+        assert!(matches!(&parts(&v, 3)[1], Part::Button(b) if b.enabled && b.on));
+        // The slider: a press in the middle of the knob holds it, a drag to the end of the
+        // control's rectangle sets the highest rate, to its start the lowest.
+        let Part::Slider(s) = parts(&v, 2)[0].clone() else {
+            panic!("the slider");
+        };
+        assert!(s.enabled && s.value == "16");
+        let a = s.control.area;
+        r.handle(ReqEvent::Press(s.knob.x + s.knob.w / 2, a.y + a.h / 2));
+        r.handle(ReqEvent::Drag(a.x + a.w - 1 - s.knob.w / 2, a.y + 2));
+        assert_eq!(rate_to_step(r.current().rate), RATE_MAX);
+        r.handle(ReqEvent::Drag(a.x + s.knob.w / 2, a.y + 2));
+        assert_eq!(rate_to_step(r.current().rate), 0);
+        r.handle(ReqEvent::Release);
+        click(&mut r, RangeRequester::direction_rect());
+        assert!(matches!(&parts(&r.view(&pal()), 3)[0], Part::Cycle(c) if c.selected == 1));
+        let cancel = v.control(ctl::CANCEL).unwrap().area;
+        r.handle(ReqEvent::Press(cancel.x + 1, cancel.y + 1));
+        assert!(r.view(&pal()).buttons[0].pressed);
     }
 
     #[test]
