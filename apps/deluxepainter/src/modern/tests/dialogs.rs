@@ -33,6 +33,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     let anim = app.ui.anim_requester.take();
     let control = app.ui.anim_control.take();
     let file = app.ui.file_requester.take();
+    let import = app.ui.import_requester.take();
     let percent = (
         app.menu_data.effects.percent,
         app.engine.document().fps(),
@@ -58,7 +59,10 @@ fn dialog_state(rig: &mut Rig) -> String {
             anim.as_ref().map(|r| r.view()),
             control.as_ref().map(|r| r.view()),
             // Slice 4c (a tuple holds at most twelve values).
-            (file.as_ref().map(|r| (r.view(), r.drawer().to_string())),),
+            (
+                file.as_ref().map(|r| (r.view(), r.drawer().to_string())),
+                import.as_ref().map(|r| (r.view(), r.options(), r.focus())),
+            ),
             percent,
             (open, pending, confirmed),
         )
@@ -79,6 +83,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.anim_requester = anim;
     app.ui.anim_control = control;
     app.ui.file_requester = file;
+    app.ui.import_requester = import;
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -2367,12 +2372,173 @@ fn the_file_requester_does_the_same_in_both_skins() {
     both_at_every_scale(file_script);
 }
 
+/// A true-colour picture for the Import requester: two gradients.
+fn import_picture() -> dpx_core::RgbaImage {
+    let mut image = dpx_core::RgbaImage::new(64, 48, dpx_core::Rgba8::new(0, 0, 0, 255));
+    for y in 0..48 {
+        for x in 0..64 {
+            let c = dpx_core::Rgba8::new(x as u8 * 4, y as u8 * 5, 255 - x as u8 * 3, 255);
+            image.set(x, y, c);
+        }
+    }
+    image
+}
+
+/// Import Picture (slice 4c): every radio button, the colour count to both ends, Tab and
+/// the arrow keys on every option, the ghosted count with the current palette, the
+/// thumbnail after every change, Cancel, Esc, Ok and Return.
+fn import_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::ImportControl;
+    use dpx_ui::import_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.app
+            .open_import_image("probe.png".into(), import_picture(), None, Vec::new());
+        rig.pass(vec![]);
+        assert!(rig.app.ui.import_requester.is_some());
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Import));
+        }
+        let thumb = rig.dialog().columns[1].iter().any(|i| {
+            matches!(
+                i,
+                dpx_ui::dialog::Item::Picture {
+                    picture: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(thumb, "the thumbnail is part of what is shown");
+        seen(rig, "Import".into());
+    };
+    let req = |rig: &Rig| rig.app.ui.import_requester.clone().expect("open");
+    let is_open = |rig: &Rig| rig.app.ui.import_requester.is_some();
+    open(rig, seen);
+    // Every radio button, at its middle and at its corners.
+    for id in [
+        ctl::POSITION + 1,
+        ctl::POSITION,
+        ctl::DITHER + 1,
+        ctl::DITHER + 2,
+        ctl::DITHER,
+        ctl::PALETTE + 1,
+        ctl::PALETTE,
+    ] {
+        for at in [MID, (0.02, 0.1), (0.98, 0.9)] {
+            rig.click_control(id, at);
+            seen(rig, format!("radio {id} at {at:?}"));
+        }
+    }
+    // The colour count down to its least and up to its most; at an end the button is
+    // ghosted and has no place to press.
+    let mut steps = 0;
+    while req(rig).enabled(ImportControl::Fewer) {
+        rig.click_control(
+            ctl::FEWER,
+            if steps % 2 == 0 {
+                (0.05, 0.1)
+            } else {
+                (0.95, 0.9)
+            },
+        );
+        steps += 1;
+        seen(rig, format!("fewer colours ({steps})"));
+    }
+    assert_eq!(req(rig).options().colors, 2);
+    while req(rig).enabled(ImportControl::More) {
+        rig.click_control(ctl::MORE, MID);
+        steps += 1;
+        seen(rig, format!("more colours ({steps})"));
+    }
+    assert!(steps > 6);
+    rig.press_and_leave(ctl::FEWER);
+    rig.press_beside_and_enter(ctl::FEWER);
+    seen(rig, "Fewer pressed and left".into());
+    // Tab from option to option, the arrow keys change the one that has the focus.
+    for round in 0..5 {
+        rig.tap(egui::Key::Tab);
+        seen(rig, format!("Tab {round}"));
+        for key in [
+            egui::Key::ArrowDown,
+            egui::Key::ArrowRight,
+            egui::Key::ArrowDown,
+            egui::Key::ArrowUp,
+            egui::Key::ArrowLeft,
+        ] {
+            rig.tap(key);
+            seen(rig, format!("Tab {round}, {key:?}"));
+        }
+    }
+    // The current palette: the count is ghosted and Tab passes it.
+    rig.click_control(ctl::PALETTE + 1, MID);
+    assert!(!req(rig).colors_enabled());
+    seen(rig, "the current palette".into());
+    for round in 0..4 {
+        rig.tap(egui::Key::Tab);
+        rig.tap(egui::Key::ArrowDown);
+        assert_ne!(req(rig).focus(), Some(dpx_ui::ImportRow::Colors));
+        seen(rig, format!("Tab {round} past the ghosted count"));
+    }
+    rig.click_control(ctl::PALETTE, MID);
+    // Keys and presses that do nothing.
+    rig.type_text("x");
+    rig.wheel(-2.0);
+    rig.click_beside();
+    for id in [ctl::CANCEL, ctl::OK] {
+        rig.press_and_leave(id);
+        rig.press_beside_and_enter(id);
+        assert!(is_open(rig));
+        seen(rig, format!("button {id} pressed and left"));
+    }
+    // Cancel keeps the picture; Esc too.
+    let page = rig.app.page().into_owned();
+    rig.click_control(ctl::CANCEL, (0.02, 0.05));
+    assert!(!is_open(rig), "Cancel closes it");
+    assert_eq!(rig.app.page().into_owned(), page);
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig), "Esc closes it");
+    seen(rig, "Esc".into());
+    // Ok imports; so does Return.
+    open(rig, seen);
+    rig.click_control(ctl::DITHER + 2, MID);
+    rig.click_control(ctl::OK, (0.98, 0.95));
+    assert!(!is_open(rig), "Ok closes it");
+    assert_ne!(rig.app.page().into_owned(), page, "the picture is imported");
+    seen(rig, "Ok".into());
+    while rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+        seen(rig, "the note closed".into());
+    }
+    open(rig, seen);
+    rig.click_control(ctl::POSITION + 1, MID);
+    rig.tap(egui::Key::Enter);
+    assert!(!is_open(rig), "Return is Ok");
+    seen(rig, "Return".into());
+    while rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+        seen(rig, "the note closed".into());
+    }
+    assert!(!rig.app.modal_open());
+}
+
+#[test]
+fn the_import_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(import_script);
+}
+
 /// Every converted requester fits the smallest window and is drawn there, in both themes
 /// and at device scale 1 and 2 (the images go to `DPX_MODERN_SHOTS` for a look).
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 26] = [
+    let open: [(&str, Card, Open); 27] = [
+        ("import", Card::Import, |rig| {
+            rig.app
+                .open_import_image("probe.png".into(), import_picture(), None, Vec::new());
+            rig.pass(vec![]);
+        }),
         ("file-load", Card::File, |rig| {
             rig.pick(Action::Command("picture.load"))
         }),

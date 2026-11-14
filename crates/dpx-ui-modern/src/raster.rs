@@ -278,6 +278,14 @@ impl Renderer {
                         blit_nearest(&mut pixmap, clip.as_ref(), rect, at, image);
                     }
                 }
+                Op::Pixels { rect, pixels } => {
+                    let image = Image {
+                        width: pixels.width,
+                        height: pixels.height,
+                        rgba: &pixels.rgba,
+                    };
+                    blit_nearest(&mut pixmap, clip.as_ref(), rect, at, &image);
+                }
                 Op::Clip(None) => clip = None,
                 Op::Clip(Some(path)) => {
                     clip = Mask::new(width, height).map(|mut mask| {

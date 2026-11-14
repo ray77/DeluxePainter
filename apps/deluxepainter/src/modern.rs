@@ -1550,6 +1550,8 @@ mod tests {
                 r.origin(w, h)
             } else if let Some(r) = &app.ui.choice_requester {
                 r.origin(w, h)
+            } else if let Some(r) = &app.ui.import_requester {
+                r.origin()
             } else if let Some(r) = &app.ui.tool_requester {
                 r.origin(w, h)
             } else if let Some(r) = &app.ui.anim_requester {
@@ -3625,25 +3627,6 @@ mod tests {
         seen(rig, "Esc".into());
     }
 
-    /// The Import requester of a true-colour image: Cancel by its last pixel.
-    fn import_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
-        use dpx_ui::ImportResponse as R;
-        let image = dpx_core::RgbaImage::new(40, 30, dpx_core::Rgba8::new(200, 40, 40, 255));
-        rig.app
-            .open_import_image("probe.png".into(), image, None, Vec::new());
-        rig.pass(vec![]);
-        let req = rig.app.ui.import_requester.clone().expect("Import");
-        seen(rig, "Import".into());
-        let (ox, oy) = req.origin();
-        let (_, last) = pixels_where(|x, y| {
-            let mut r = req.clone();
-            r.handle(ReqEvent::Press(x, y)) == R::Cancel || r.handle(ReqEvent::Release) == R::Cancel
-        });
-        rig.click_at(ui_pixel(rig, (ox + last.0, oy + last.1)), FAR, Primary);
-        assert!(rig.app.ui.import_requester.is_none(), "Cancel closes it");
-        seen(rig, "Cancel".into());
-    }
-
     /// Picture ▸ Generate..: Cancel by its first pixel.
     fn generate_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
         use dpx_ui::GenerateResponse as R;
@@ -3682,11 +3665,10 @@ mod tests {
     /// One requester of each kind, with the layer column shown: each opens in the Modern
     /// window, takes clicks on the first and last pixels of its buttons through the
     /// unchanged mapping, closes, and leaves the same state as in the Classic window.
-    const MODAL_SCRIPTS: [(&str, Script); 6] = [
+    const MODAL_SCRIPTS: [(&str, Script); 5] = [
         ("Screen Format", screen_format_script),
         ("Show Page", show_page_script),
         ("Color Mixer", color_mixer_script),
-        ("Import", import_script),
         ("Generate", generate_script),
         ("AI & MCP", mcp_script),
     ];

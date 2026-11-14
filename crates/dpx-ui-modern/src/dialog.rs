@@ -20,12 +20,12 @@
 
 use dpx_ui::dialog::{
     Button, Check, Choice, Control, ControlId, Cycle, Dialog, Field, IconButton, Item, Kind,
-    ListView, Mark, Part, Push, Radio, Role, Size, Slider, Swatches, Tone,
+    ListView, Mark, Part, Push, Radio, Role, Size, Slider, Swatches, Thumbnail, Tone,
 };
 
 use crate::font;
 use crate::icons;
-use crate::paint::{Color, List, Path, Rect, Weight};
+use crate::paint::{Color, List, Path, Pixels, Rect, Weight};
 use crate::theme::Theme;
 
 /// Free space between the card's edge and its content.
@@ -92,6 +92,8 @@ struct Metrics {
     footer_gap: f32,
     /// Side of a swatch of a swatch grid.
     swatch: f32,
+    /// The most height a picture takes.
+    picture: f32,
 }
 
 const ROOMY: Metrics = Metrics {
@@ -104,6 +106,7 @@ const ROOMY: Metrics = Metrics {
     title: 50.0,
     footer_gap: 18.0,
     swatch: 24.0,
+    picture: 220.0,
 };
 
 const COMPACT: Metrics = Metrics {
@@ -116,6 +119,7 @@ const COMPACT: Metrics = Metrics {
     title: 44.0,
     footer_gap: 12.0,
     swatch: 19.0,
+    picture: 150.0,
 };
 
 /// A control as it lies in the window.
@@ -932,6 +936,56 @@ impl Draw<'_> {
         frame.h
     }
 
+    /// A true-colour picture in a frame, centred in the column; returns the height. One
+    /// picture pixel is a whole number of points where the column and the low-window limit
+    /// allow it, else the picture is fitted into them.
+    fn picture(
+        &mut self,
+        width: u32,
+        height: u32,
+        picture: Option<&Thumbnail>,
+        x: f32,
+        y: f32,
+        w: f32,
+    ) -> f32 {
+        let theme = self.theme;
+        let (pw, ph) = (width.max(1) as f32, height.max(1) as f32);
+        // The frame: a hairline and a gap around the picture.
+        let rim = self.snap(5.0);
+        let room = ((w - 2.0 * rim).max(8.0), self.m.picture);
+        let fit = (room.0 / pw).min(room.1 / ph);
+        let k = if fit >= 1.0 {
+            fit.floor().min(3.0)
+        } else {
+            fit
+        };
+        let (iw, ih) = (self.snap(pw * k).max(1.0), self.snap(ph * k).max(1.0));
+        let frame = Rect::new(
+            self.snap(x + (w - iw) / 2.0 - rim),
+            y,
+            iw + 2.0 * rim,
+            ih + 2.0 * rim,
+        );
+        self.list.round_rect(frame, CONTROL_RADIUS, theme.panel);
+        self.list.ring(frame, CONTROL_RADIUS, theme.hairline, 1.0);
+        let inner = Rect::new(frame.x + rim, frame.y + rim, iw, ih);
+        match picture {
+            Some(p) if p.rgba.len() as u64 >= u64::from(p.width) * u64::from(p.height) * 4 => {
+                self.list.pixels(
+                    inner,
+                    Pixels {
+                        width: p.width,
+                        height: p.height,
+                        rgba: p.rgba.clone(),
+                    },
+                );
+            }
+            // Not made yet: the empty well.
+            _ => self.list.rect(inner, theme.canvas),
+        }
+        frame.h
+    }
+
     /// The width a part asks for; `None` for a stepper or a slider, which take what is left.
     fn natural(p: &Part) -> Option<f32> {
         match p {
@@ -955,6 +1009,18 @@ impl Draw<'_> {
         let (line, ch) = (self.m.line, self.m.control);
         let top = self.snap(y + (line - ch) / 2.0);
         let mid = y + line / 2.0;
+        // Radio buttons give up their common width in a line too narrow for it.
+        let plain: f32 = parts.iter().filter_map(Self::natural).sum::<f32>()
+            + PART_GAP * parts.len().saturating_sub(1) as f32;
+        let padded: f32 = parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Radio(r) => Some(Self::radio_width(r).max(RADIO_MIN_W)),
+                p => Self::natural(p),
+            })
+            .sum::<f32>()
+            + PART_GAP * parts.len().saturating_sub(1) as f32;
+        let pad_radios = pad_radios && (padded <= w || plain > w);
         let natural = |p: &Part| -> Option<f32> {
             match p {
                 Part::Radio(r) if pad_radios => Some(Self::radio_width(r).max(RADIO_MIN_W)),
@@ -1317,7 +1383,7 @@ impl Draw<'_> {
         let label_w = items
             .iter()
             .filter_map(|i| match i {
-                Item::Line { label, .. } if !label.is_empty() => {
+                Item::Line { label, .. } | Item::Setting { label, .. } if !label.is_empty() => {
                     Some(font::measure(label, SIZE, Weight::Regular))
                 }
                 _ => None,
@@ -1393,6 +1459,41 @@ impl Draw<'_> {
                         self.parts(parts, x + control_x, top, w - control_x, true);
                         self.m.line
                     }
+                    Item::Setting {
+                        label,
+                        focused,
+                        enabled,
+                        parts,
+                    } => {
+                        let mid = top + self.m.line / 2.0;
+                        let within = Rect::new(x, top, control_x.max(1.0), self.m.line);
+                        let lw = font::measure(label, SIZE, Weight::Regular);
+                        // The option the arrow keys change: its label on a quiet bar with
+                        // the accent around it, like the field that has the keys.
+                        let (ink, ground) = match (*enabled, *focused) {
+                            (false, _) => (theme.disabled, theme.raised),
+                            (true, true) => {
+                                let bar = Rect::new(
+                                    x - 7.0,
+                                    self.snap(mid - 11.0),
+                                    (lw + 14.0).ceil(),
+                                    22.0,
+                                );
+                                self.list.round_rect(bar, 6.0, theme.hover);
+                                self.list.ring(bar, 6.0, theme.accent, 1.5);
+                                (theme.text, theme.hover)
+                            }
+                            (true, false) => (theme.text_dim, theme.raised),
+                        };
+                        self.text(x, mid, label, SIZE, Weight::Regular, ink, within, ground);
+                        self.parts(parts, x + control_x, top, w - control_x, true);
+                        self.m.line
+                    }
+                    Item::Picture {
+                        width,
+                        height,
+                        picture,
+                    } => self.picture(*width, *height, picture.as_ref(), x, top, w),
                     Item::Row(parts) => {
                         if let Some((first, rest)) = parts.split_first() {
                             self.parts(std::slice::from_ref(first), x, top, w, false);
@@ -1851,7 +1952,69 @@ mod tests {
         assert!(!hires.chipset_switchable(), "Super-High Res is AGA only");
         out.push(("screen format, chipset ghosted", hires.view()));
         files(&mut out);
+        imports(&mut out);
         out
+    }
+
+    fn import_requester(name: &str, screen: (i32, i32)) -> dpx_ui::ImportRequester {
+        dpx_ui::ImportRequester::new(
+            dpx_ui::ImportInfo {
+                name: name.into(),
+                size: (4032, 3024),
+                colors: None,
+                fitted: (320, 240),
+                page: (320, 256),
+            },
+            dpx_core::import::ImportOptions::default(),
+            256,
+            32,
+            screen,
+            (1, 1),
+        )
+    }
+
+    /// A thumbnail of the size the requester asks for: a red and a blue half.
+    fn thumbnail(r: &dpx_ui::ImportRequester) -> dpx_core::RgbaImage {
+        let (w, h) = r.thumb_size();
+        let mut image = dpx_core::RgbaImage::new(w, h, dpx_core::Rgba8::new(200, 30, 30, 255));
+        for y in 0..h {
+            for x in w / 2..w {
+                image.set(x, y, dpx_core::Rgba8::new(30, 30, 200, 255));
+            }
+        }
+        image
+    }
+
+    /// Import Picture (slice 4c) in the states that change what it shows.
+    fn imports(out: &mut Vec<(&'static str, Dialog)>) {
+        let plain = import_requester("photo.jpg", (320, 256));
+        out.push(("import, no thumbnail yet", plain.view()));
+        let mut shown = plain.clone();
+        shown.set_thumbnail(thumbnail(&shown));
+        out.push(("import", shown.view()));
+        // The focus on every option in turn; the current palette ghosts the count.
+        let mut focused = shown.clone();
+        for name in ["import, position", "import, palette", "import, colours"] {
+            focused.handle(ReqEvent::Key(ReqKey::Tab));
+            out.push((name, focused.view()));
+        }
+        focused.handle(ReqEvent::Key(ReqKey::Up));
+        focused.handle(ReqEvent::Key(ReqKey::Tab));
+        focused.handle(ReqEvent::Key(ReqKey::Down));
+        out.push(("import, dither, the least colours", focused.view()));
+        let mut current = shown.clone();
+        current.handle(ReqEvent::Key(ReqKey::Tab));
+        current.handle(ReqEvent::Key(ReqKey::Tab));
+        current.handle(ReqEvent::Key(ReqKey::Down));
+        out.push(("import, the current palette", current.view()));
+        // A long name; a large screen (a larger thumbnail); a tall one.
+        let long = "a-very-long-file-name-of-a-holiday-photograph-from-the-camera.jpeg";
+        let mut wide = import_requester(long, (736, 566));
+        wide.set_thumbnail(thumbnail(&wide));
+        out.push(("import, a long name on a large screen", wide.view()));
+        let mut small = import_requester("x.png", (320, 200));
+        small.set_thumbnail(thumbnail(&small));
+        out.push(("import, the smallest screen", small.view()));
     }
 
     /// A drawer as the file requester lists it: `files` files after two drawers.
@@ -1966,18 +2129,18 @@ mod tests {
                 }
             }
             // Nothing is cut that the dialog did not cut itself; only a list row's long
-            // name (a file name) may end in an ellipsis.
+            // name and a long fact (a file name) may end in an ellipsis.
             let source = format!("{dialog:?}");
             let b = built(&dialog, WINDOWS[0], 1.0, ThemeKind::Dark);
             let rows: Vec<&str> = dialog
                 .columns
                 .iter()
                 .flatten()
-                .filter_map(|i| match i {
-                    Item::List(list) => Some(list.rows.iter().map(|r| r.label.as_str())),
-                    _ => None,
+                .flat_map(|i| match i {
+                    Item::List(list) => list.rows.iter().map(|r| r.label.as_str()).collect(),
+                    Item::Facts { rows, .. } => rows.iter().map(|r| r.1.as_str()).collect(),
+                    _ => Vec::new(),
                 })
-                .flatten()
                 .collect();
             for t in &b.texts {
                 let own = t.text.matches('\u{2026}').count();
@@ -3440,5 +3603,140 @@ mod tests {
             bar.to_classic(bar.rect.x + 1.0, bar.rect.bottom() - 0.01).1,
             area.y + area.h - 1
         );
+    }
+    /// Import Picture (slice 4c): the option rows stand under each other, the focused
+    /// option's label lies on a bar with the accent around it, a ghosted option is faint and
+    /// its buttons take no pointer, and the thumbnail is a picture of the list in a frame:
+    /// whole picture pixels where the column allows, never wider than the column.
+    #[test]
+    fn option_rows_show_the_focus_and_the_thumbnail_is_in_the_list() {
+        use dpx_ui::import_requester::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = import_requester("photo.jpg", (320, 256));
+        req.set_thumbnail(thumbnail(&req));
+        let draw = |r: &dpx_ui::ImportRequester, scale: f32| {
+            build(&r.view(), window, scale, &theme, &Pointer::default())
+        };
+        let b = draw(&req, 1.0);
+        // The first radio button of every option starts at the same x.
+        let xs: Vec<f32> = [ctl::POSITION, ctl::PALETTE, ctl::FEWER, ctl::DITHER]
+            .iter()
+            .map(|&id| b.spot(id).expect("a control").rect.x)
+            .collect();
+        assert!(xs.iter().all(|&x| x == xs[0]), "{xs:?}");
+        // All three dither choices are on the card, left to right, without overlap.
+        let dither: Vec<Rect> = (0..3)
+            .map(|i| b.spot(ctl::DITHER + i).unwrap().rect)
+            .collect();
+        assert!(dither[0].right() <= dither[1].x && dither[1].right() <= dither[2].x);
+        // No focus: no accent ring but the default button's fill; with Tab the label's bar.
+        let rings = |b: &Built| {
+            b.list
+                .ops()
+                .iter()
+                .filter(|op| {
+                    matches!(op, Op::RoundRect { stroke: Some(s), rect, .. }
+                        if s.color == theme.accent && rect.h == 22.0)
+                })
+                .count()
+        };
+        assert_eq!(rings(&b), 0);
+        assert_eq!(text_color(&b, "Position"), theme.text_dim);
+        req.handle(ReqEvent::Key(ReqKey::Tab));
+        let b = draw(&req, 1.0);
+        assert_eq!(rings(&b), 1);
+        assert_eq!(text_color(&b, "Position"), theme.text);
+        assert_eq!(text_color(&b, "Palette"), theme.text_dim);
+        // The current palette: the count's label and number are faint, its buttons gone.
+        req.handle(ReqEvent::Key(ReqKey::Tab));
+        req.handle(ReqEvent::Key(ReqKey::Down));
+        let b = draw(&req, 1.0);
+        assert_eq!(text_color(&b, "Colours"), theme.disabled);
+        assert_eq!(text_color(&b, "32"), theme.text_dim);
+        assert!(b.spot(ctl::FEWER).is_none() && b.spot(ctl::MORE).is_none());
+        // The thumbnail: one op that carries the pixels, in the right column, in a frame.
+        let (tw, th) = req.thumb_size();
+        for scale in [1.0, 1.5, 2.0] {
+            let b = draw(&req, scale);
+            let pictures: Vec<(Rect, u32, u32)> = b
+                .list
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Pixels { rect, pixels } => Some((*rect, pixels.width, pixels.height)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pictures.len(), 1);
+            let (rect, w, h) = pictures[0];
+            assert_eq!((w, h), (tw, th));
+            assert!(b.card.encloses(&rect));
+            assert!(rect.x > dither[2].right(), "right of the options");
+            // A whole number of points per picture pixel, on whole physical pixels.
+            let k = rect.w / tw as f32;
+            assert!(k >= 1.0 && (k - k.round()).abs() < 0.02, "{k}");
+            assert!(((rect.h / th as f32) - k).abs() < 0.02);
+            for v in [rect.x, rect.y, rect.w, rect.h] {
+                assert!(
+                    ((v * scale).round() - v * scale).abs() < 1e-3,
+                    "{v} at {scale}"
+                );
+            }
+        }
+        // Rasterised: the left half red, the right half blue, the frame around it.
+        let b = draw(&req, 1.0);
+        let rect = b
+            .list
+            .ops()
+            .iter()
+            .find_map(|op| match op {
+                Op::Pixels { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        let rgba = Renderer::new().render(&b.list, &[], 1280, 800, 1.0, theme.canvas);
+        let at = |x: f32, y: f32| {
+            let i = ((y as usize) * 1280 + x as usize) * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2]]
+        };
+        let (cx, cy) = rect.center();
+        assert_eq!(at(rect.x + 2.0, cy), [200, 30, 30]);
+        assert_eq!(at(rect.right() - 2.0, cy), [30, 30, 200]);
+        assert_eq!(at(rect.x + 2.0, rect.y + 1.0), [200, 30, 30]);
+        assert_eq!(
+            at(cx, rect.bottom() + 2.0),
+            [theme.panel.r, theme.panel.g, theme.panel.b]
+        );
+        // Without a thumbnail: the frame with an empty well of the same size.
+        let empty = draw(&import_requester("photo.jpg", (320, 256)), 1.0);
+        assert!(
+            !empty
+                .list
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Pixels { .. }))
+        );
+        assert_eq!(empty.card, b.card);
+        // A picture much larger than the column is fitted into it.
+        let big = Dialog {
+            columns: vec![vec![Item::Picture {
+                width: 2000,
+                height: 500,
+                picture: Some(Thumbnail::new(2000, 500, vec![9; 2000 * 500 * 4])),
+            }]],
+            ..req.view()
+        };
+        let b = build(&big, window, 1.0, &theme, &Pointer::default());
+        let rect = b
+            .list
+            .ops()
+            .iter()
+            .find_map(|op| match op {
+                Op::Pixels { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .unwrap();
+        assert!(b.card.encloses(&rect) && rect.w > 400.0);
     }
 }

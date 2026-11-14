@@ -331,6 +331,22 @@ pub enum Weight {
     Medium,
 }
 
+/// A small true-colour picture a list carries itself (a thumbnail): straight RGBA8, row by
+/// row, drawn opaque.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Pixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
+}
+
+impl std::fmt::Debug for Pixels {
+    /// The size only: a list is printed in test failures, its pictures are not.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pixels({}x{})", self.width, self.height)
+    }
+}
+
 /// One drawing step.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
@@ -366,6 +382,8 @@ pub enum Op {
     /// Picture number `image` of the pictures given to the rasteriser, drawn into `rect` with
     /// nearest-neighbour sampling.
     Image { rect: Rect, image: usize },
+    /// A picture of the list's own, drawn into `rect` with nearest-neighbour sampling.
+    Pixels { rect: Rect, pixels: Pixels },
     /// Restricts everything that follows to the inside of the outline; `None` lifts the
     /// restriction. Clips do not nest: a new one replaces the previous one.
     Clip(Option<Path>),
@@ -475,6 +493,10 @@ impl List {
         self.push(Op::Image { rect, image });
     }
 
+    pub fn pixels(&mut self, rect: Rect, pixels: Pixels) {
+        self.push(Op::Pixels { rect, pixels });
+    }
+
     pub fn clip(&mut self, path: Path) {
         self.push(Op::Clip(Some(path)));
     }
@@ -536,6 +558,13 @@ impl List {
                     h.byte(5);
                     h.rect(rect);
                     h.word(*image as u32);
+                }
+                Op::Pixels { rect, pixels } => {
+                    h.byte(8);
+                    h.rect(rect);
+                    h.word(pixels.width);
+                    h.word(pixels.height);
+                    pixels.rgba.iter().for_each(|&b| h.byte(b));
                 }
                 Op::Clip(None) => h.byte(6),
                 Op::Clip(Some(path)) => {

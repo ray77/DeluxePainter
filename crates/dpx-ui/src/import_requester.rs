@@ -65,6 +65,23 @@ const DITHERS: [(Dither, &str); 3] = [
 ];
 const LABELS: [&str; 4] = ["Position:", "Palette:", "Colours:", "Dither:"];
 
+/// The controls of the requester's description for the Modern skin
+/// ([`ImportRequester::view`]): the ids are the places in [`ImportRequester::controls`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// Centre, Top left: `POSITION + 0..2`.
+    pub const POSITION: ControlId = 0;
+    /// New, Current: `PALETTE + 0..2`.
+    pub const PALETTE: ControlId = 2;
+    pub const FEWER: ControlId = 4;
+    pub const MORE: ControlId = 5;
+    /// None, Floyd-Steinberg, Ordered: `DITHER + 0..3`.
+    pub const DITHER: ControlId = 6;
+    pub const CANCEL: ControlId = 9;
+    pub const OK: ControlId = 10;
+}
+
 /// What the requester says about the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportInfo {
@@ -488,6 +505,129 @@ impl ImportRequester {
             }
         };
         self.apply(c)
+    }
+
+    /// What the requester shows, for the Modern skin (ADR-47): the file's facts and the four
+    /// options at the left (the one the arrow keys change is marked, the colour count is
+    /// ghosted with the current palette), the true-colour thumbnail at the right.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, ControlId, Dialog, Item, Kind, Part, Push, Radio, Role,
+            Size, Thumbnail, Tone,
+        };
+        let controls = self.controls();
+        let part = |id: ControlId| {
+            let (c, rect) = controls[id as usize];
+            let control = Control::new(id, rect);
+            let radio = |label: &str, on: bool| {
+                Part::Radio(Radio {
+                    control,
+                    label: label.into(),
+                    on,
+                    enabled: true,
+                })
+            };
+            match c {
+                ImportControl::Position(p) => radio(
+                    POSITIONS[usize::from(id - ctl::POSITION)].1,
+                    self.options.position == p,
+                ),
+                ImportControl::Palette(p) => radio(
+                    PALETTES[usize::from(id - ctl::PALETTE)].1,
+                    self.options.palette == p,
+                ),
+                ImportControl::Dither(d) => radio(
+                    DITHERS[usize::from(id - ctl::DITHER)].1,
+                    self.options.dither == d,
+                ),
+                _ => Part::Button(Push {
+                    control,
+                    label: if c == ImportControl::Fewer { "-" } else { "+" }.into(),
+                    on: false,
+                    pressed: self.pressed(c),
+                    enabled: self.enabled(c),
+                }),
+            }
+        };
+        let setting = |row: ImportRow, label: &str, parts: Vec<Part>| Item::Setting {
+            label: label.trim_end_matches(':').into(),
+            focused: self.focus == Some(row),
+            enabled: row != ImportRow::Colors || self.colors_enabled(),
+            parts,
+        };
+        let colours = if self.colors_enabled() {
+            Tone::Normal
+        } else {
+            Tone::Dim
+        };
+        let (tw, th) = self.thumb_size();
+        let button = |id: ControlId, label, role| {
+            let (c, rect) = controls[id as usize];
+            ViewButton::new(Control::new(id, rect), label, role, self.pressed(c))
+        };
+        Dialog {
+            title: TITLE.into(),
+            kind: Kind::Plain,
+            size: Size::Large,
+            columns: vec![
+                vec![
+                    Item::Facts {
+                        rows: vec![
+                            ("File".into(), self.info.name.clone()),
+                            (
+                                "Picture".into(),
+                                self.info.details().trim().replace("  ", ", "),
+                            ),
+                            (
+                                "On the page".into(),
+                                self.info.result().trim_start_matches("-> ").into(),
+                            ),
+                        ],
+                        message: None,
+                    },
+                    setting(
+                        ImportRow::Position,
+                        LABELS[0],
+                        vec![part(ctl::POSITION), part(ctl::POSITION + 1)],
+                    ),
+                    setting(
+                        ImportRow::Palette,
+                        LABELS[1],
+                        vec![part(ctl::PALETTE), part(ctl::PALETTE + 1)],
+                    ),
+                    setting(
+                        ImportRow::Colors,
+                        LABELS[2],
+                        vec![
+                            part(ctl::FEWER),
+                            part(ctl::MORE),
+                            Part::Text(self.shown_colors().to_string(), colours),
+                        ],
+                    ),
+                    setting(
+                        ImportRow::Dither,
+                        LABELS[3],
+                        vec![
+                            part(ctl::DITHER),
+                            part(ctl::DITHER + 1),
+                            part(ctl::DITHER + 2),
+                        ],
+                    ),
+                ],
+                vec![
+                    Item::Heading("Preview".into()),
+                    Item::Picture {
+                        width: tw,
+                        height: th,
+                        picture: self.thumb.as_ref().map(Thumbnail::of),
+                    },
+                ],
+            ],
+            buttons: vec![
+                button(ctl::CANCEL, "Cancel", Role::Cancel),
+                button(ctl::OK, "Ok", Role::Default),
+            ],
+        }
     }
 
     /// Draws the requester centred on its UI screen.
@@ -1039,5 +1179,125 @@ mod tests {
         assert_eq!(count, (rect.w * 2 * rect.h) as usize);
         let o = ((rect.y as usize) * fw + rect.x as usize * 2) * 4;
         assert_eq!(rgba[o..o + 3], [9, 99, 199]);
+    }
+    #[test]
+    fn the_view_names_every_control_where_the_requester_takes_it() {
+        use crate::dialog::{Item, Part, Role};
+        let mut r = requester((320, 256));
+        let view = r.view();
+        assert_eq!(view.title, "Import Picture");
+        // The ids are the places in `controls()`, with the same rectangles.
+        let controls = r.controls();
+        assert_eq!(view.controls().len(), controls.len());
+        for c in view.controls() {
+            assert_eq!(c.area, controls[usize::from(c.id)].1, "control {}", c.id);
+        }
+        assert_eq!(
+            view.buttons
+                .iter()
+                .map(|b| (b.label.as_str(), b.role, b.control.id))
+                .collect::<Vec<_>>(),
+            [
+                ("Cancel", Role::Cancel, ctl::CANCEL),
+                ("Ok", Role::Default, ctl::OK)
+            ]
+        );
+        // The facts, four options, the thumbnail's frame.
+        let Item::Facts { rows, .. } = &view.columns[0][0] else {
+            panic!("the facts come first");
+        };
+        assert_eq!(
+            rows.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+            ["photo.jpg", "4032x3024, true colour", "320x240 on 320x256"]
+        );
+        let settings = |r: &ImportRequester| -> Vec<(String, bool, bool, Vec<Part>)> {
+            r.view().columns[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Setting {
+                        label,
+                        focused,
+                        enabled,
+                        parts,
+                    } => Some((label.clone(), *focused, *enabled, parts.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let on = |r: &ImportRequester| -> Vec<String> {
+            settings(r)
+                .iter()
+                .flat_map(|s| s.3.clone())
+                .filter_map(|p| match p {
+                    Part::Radio(radio) if radio.on => Some(radio.label),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            settings(&r)
+                .iter()
+                .map(|s| s.0.as_str())
+                .collect::<Vec<_>>(),
+            ["Position", "Palette", "Colours", "Dither"]
+        );
+        let (tw, th) = r.thumb_size();
+        assert!(matches!(&view.columns[1][..],
+            [Item::Heading(_), Item::Picture { width, height, picture: None }]
+                if (*width, *height) == (tw, th)));
+        // A press in the middle of every control's rectangle reaches it.
+        let press = |r: &mut ImportRequester, id| {
+            let a = r.view().control(id).expect("the control").area;
+            click(r, a)
+        };
+        let before = on(&r);
+        assert_eq!(press(&mut r, ctl::POSITION + 1), ImportResponse::Changed);
+        assert_eq!(press(&mut r, ctl::DITHER + 2), ImportResponse::Changed);
+        assert_ne!(on(&r), before);
+        assert!(
+            on(&r).contains(&"Top left".to_string()) && on(&r).contains(&"Ordered".to_string())
+        );
+        let count = |r: &ImportRequester| r.options().colors;
+        let was = count(&r);
+        assert_eq!(press(&mut r, ctl::FEWER), ImportResponse::Changed);
+        assert!(count(&r) < was);
+        assert_eq!(press(&mut r, ctl::MORE), ImportResponse::Changed);
+        assert_eq!(count(&r), was);
+        assert_eq!(press(&mut r, ctl::CANCEL), ImportResponse::Cancel);
+        assert_eq!(press(&mut r, ctl::OK), ImportResponse::Ok);
+        // The focus follows Tab; with the current palette the count is ghosted, shows the
+        // palette's size, and its buttons take no press.
+        key(&mut r, ReqKey::Tab);
+        assert_eq!(
+            settings(&r).iter().map(|s| s.1).collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
+        assert_eq!(press(&mut r, ctl::PALETTE + 1), ImportResponse::Changed);
+        let colours = &settings(&r)[2];
+        assert!(!colours.2, "ghosted");
+        assert!(matches!(&colours.3[..],
+            [Part::Button(a), Part::Button(b), Part::Text(n, crate::dialog::Tone::Dim)]
+                if !a.enabled && !b.enabled && n == "32"));
+        // A held button is shown held while the pointer is on it.
+        let ok = r.view().control(ctl::OK).unwrap().area;
+        r.handle(ReqEvent::Press(ok.x + 2, ok.y + 2));
+        assert!(r.view().buttons[1].pressed);
+        r.handle(ReqEvent::Drag(0, 0));
+        assert!(!r.view().buttons[1].pressed);
+        r.handle(ReqEvent::Release);
+        // The thumbnail is part of the description once it is made.
+        r.set_thumbnail(RgbaImage::new(tw, th, Rgba8::new(200, 40, 40, 7)));
+        let Item::Picture {
+            picture: Some(p), ..
+        } = &r.view().columns[1][1]
+        else {
+            panic!("the thumbnail");
+        };
+        assert_eq!((p.width, p.height), (tw, th));
+        assert_eq!(&p.rgba[..4], [200, 40, 40, 255], "opaque");
+        assert!(
+            format!("{p:?}").len() < 60,
+            "printed by size and fingerprint"
+        );
     }
 }

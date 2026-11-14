@@ -288,6 +288,47 @@ pub struct ListView {
     pub scroll: Option<ScrollBar>,
 }
 
+/// A small true-colour picture (a thumbnail): straight RGBA8, row by row.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
+}
+
+impl Thumbnail {
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            rgba: rgba.into(),
+        }
+    }
+}
+
+impl Thumbnail {
+    /// The picture as it is shown: opaque (its alpha is not used).
+    pub fn of(image: &dpx_core::RgbaImage) -> Self {
+        let rgba = image
+            .pixels()
+            .iter()
+            .flat_map(|p| [p.r, p.g, p.b, 255])
+            .collect();
+        Self::new(image.width(), image.height(), rgba)
+    }
+}
+
+impl std::fmt::Debug for Thumbnail {
+    /// The size and a fingerprint of the pixels (FNV-1a), not the pixels: descriptions are
+    /// printed and compared as text in tests.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hash = self.rgba.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        write!(f, "Thumbnail({}x{}, {hash:016x})", self.width, self.height)
+    }
+}
+
 /// One item of a column, from top to bottom.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
@@ -304,6 +345,21 @@ pub enum Item {
         label: String,
         key: Option<char>,
         parts: Vec<Part>,
+    },
+    /// A form line that is one option of several the keyboard moves between: its label is
+    /// highlighted while it has the focus (Tab) and ghosted while the option cannot be set.
+    Setting {
+        label: String,
+        focused: bool,
+        enabled: bool,
+        parts: Vec<Part>,
+    },
+    /// A true-colour picture in a frame, `width` × `height` picture pixels, shown with
+    /// nearest-neighbour sampling; `None`: the frame alone (the picture is not made yet).
+    Picture {
+        width: u32,
+        height: u32,
+        picture: Option<Thumbnail>,
     },
     /// A form line without a label: its first part (a radio button or a check box) stands
     /// where the labels of the other lines stand, the rest follows as in a `Line`.
@@ -362,7 +418,7 @@ impl Dialog {
         let mut out = Vec::new();
         for item in self.columns.iter().flatten() {
             match item {
-                Item::Line { parts, .. } | Item::Row(parts) => {
+                Item::Line { parts, .. } | Item::Setting { parts, .. } | Item::Row(parts) => {
                     for part in parts {
                         match part {
                             Part::Field(f) => out.push(f.control),
@@ -384,6 +440,7 @@ impl Dialog {
                 Item::Swatches(grid) => out.push(grid.control),
                 Item::Heading(_)
                 | Item::Text { .. }
+                | Item::Picture { .. }
                 | Item::Facts { .. }
                 | Item::Credits(_)
                 | Item::Rule => {}
