@@ -14,11 +14,13 @@
 //! accent, cancel, plain; under the pointer, held, ghosted), text and number fields with a
 //! caret, cycle gadgets (a stepper, or two segments for a gadget with two values), check
 //! boxes, sliders, radio rows, a list with a scroll bar, labels, headings, wrapped text
-//! with bullets, a panel of facts with a message, credits, rules.
+//! with bullets, a panel of facts with a message, credits, rules. Since slice 4b: radio
+//! buttons inside a line, buttons and icon buttons inside a line (plain or latched), and the
+//! palette as a grid of swatches or as a strip, with marks.
 
 use dpx_ui::dialog::{
-    Button, Check, Choice, Control, ControlId, Cycle, Dialog, Field, Item, Kind, ListView, Part,
-    Role, Size, Slider, Tone,
+    Button, Check, Choice, Control, ControlId, Cycle, Dialog, Field, IconButton, Item, Kind,
+    ListView, Mark, Part, Push, Radio, Role, Size, Slider, Swatches, Tone,
 };
 
 use crate::font;
@@ -61,6 +63,17 @@ const CHECK: f32 = 18.0;
 const KNOB_R: f32 = 8.0;
 const SCROLL_W: f32 = 14.0;
 const STEPPER_W: f32 = 116.0;
+/// Space between two buttons that stand side by side in a line.
+const GROUP_GAP: f32 = 6.0;
+/// The least width a radio button takes inside a line, so that the radio buttons of
+/// neighbouring lines stand under each other.
+const RADIO_MIN_W: f32 = 96.0;
+/// Width of an icon button, and the least width of a button in a line.
+const ICON_W: f32 = 38.0;
+const PUSH_MIN_W: f32 = 34.0;
+/// The two inks of a mark on a swatch: together they show on every colour.
+const MARK_DARK: Color = Color::rgb(20, 20, 24);
+const MARK_LIGHT: Color = Color::rgb(255, 255, 255);
 
 /// Sizes that give way in a low window.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,6 +90,8 @@ struct Metrics {
     /// Height of the title block and the space over the buttons.
     title: f32,
     footer_gap: f32,
+    /// Side of a swatch of a swatch grid.
+    swatch: f32,
 }
 
 const ROOMY: Metrics = Metrics {
@@ -88,6 +103,7 @@ const ROOMY: Metrics = Metrics {
     fact_row: 21.0,
     title: 50.0,
     footer_gap: 18.0,
+    swatch: 24.0,
 };
 
 const COMPACT: Metrics = Metrics {
@@ -99,6 +115,7 @@ const COMPACT: Metrics = Metrics {
     fact_row: 18.0,
     title: 44.0,
     footer_gap: 12.0,
+    swatch: 19.0,
 };
 
 /// A control as it lies in the window.
@@ -661,6 +678,21 @@ impl Draw<'_> {
         let cx = track.x + KNOB_R + t * run;
         let groove = Rect::new(track.x, self.snap(mid - 2.0), track.w, 4.0);
         self.list.round_rect(groove, 2.0, theme.hairline);
+        if !s.enabled {
+            // Nothing to set yet: the groove alone, the value faint, no pointer.
+            let w = font::measure(&s.value, SIZE, Weight::Regular);
+            self.text(
+                rect.right() - w,
+                mid,
+                &s.value,
+                SIZE,
+                Weight::Regular,
+                theme.disabled,
+                rect,
+                theme.raised,
+            );
+            return;
+        }
         self.list.round_rect(
             Rect::new(groove.x, groove.y, (cx - groove.x).max(4.0), 4.0),
             2.0,
@@ -689,19 +721,215 @@ impl Draw<'_> {
         });
     }
 
-    /// The parts of a form line from `x` on, in a line `w` wide.
-    fn parts(&mut self, parts: &[Part], x: f32, y: f32, w: f32) {
+    fn radio_width(r: &Radio) -> f32 {
+        (CHECK + 8.0 + font::measure(&r.label, SIZE, Weight::Regular)).ceil()
+    }
+
+    /// A radio button inside a line: a ring, with the accent and a dot when chosen.
+    fn radio(&mut self, r: &Radio, rect: Rect) {
+        let theme = self.theme;
+        let mid = rect.y + rect.h / 2.0;
+        let (cx, radius) = (rect.x + CHECK / 2.0, CHECK / 2.0 - 1.5);
+        let hover = r.enabled && !r.on && self.hovered(r.control.id, &rect);
+        let (rim, ink) = match (r.enabled, r.on) {
+            (false, _) => (theme.disabled, theme.disabled),
+            (true, true) => (theme.accent, theme.text),
+            (true, false) => (theme.text_dim, theme.text),
+        };
+        let well = if hover { theme.hover } else { theme.panel };
+        self.list.fill(Path::new().circle(cx, mid, radius), well);
+        self.list
+            .stroke(Path::new().circle(cx, mid, radius - 0.75), rim, 1.5);
+        if r.on {
+            self.list.fill(Path::new().circle(cx, mid, 3.5), rim);
+        }
+        self.text(
+            rect.x + CHECK + 8.0,
+            mid,
+            &r.label,
+            SIZE,
+            Weight::Regular,
+            ink,
+            rect,
+            theme.raised,
+        );
+        if r.enabled {
+            self.spot(r.control, rect);
+        }
+    }
+
+    /// The fill and the ink of a button in a line: latched on the accent, else quiet.
+    fn push_look(&self, on: bool, enabled: bool, hover: bool, pressed: bool) -> (Color, Color) {
+        let theme = self.theme;
+        match (enabled, on) {
+            (false, true) => (theme.hover, theme.text_dim),
+            (false, false) => (theme.panel, theme.disabled),
+            (true, true) => (default_fill(theme, hover, pressed), theme.on_accent),
+            (true, false) => (button_fill(theme, hover, pressed), theme.text),
+        }
+    }
+
+    fn push_width(b: &Push) -> f32 {
+        (font::measure(&b.label, SIZE, Weight::Medium) + 24.0)
+            .ceil()
+            .max(PUSH_MIN_W)
+    }
+
+    /// A button inside a line.
+    fn push(&mut self, b: &Push, rect: Rect) {
+        let theme = self.theme;
+        let hover = b.enabled && self.hovered(b.control.id, &rect);
+        let pressed = b.enabled && b.pressed;
+        let (fill, ink) = self.push_look(b.on, b.enabled, hover, pressed);
+        self.list.round_rect(rect, CONTROL_RADIUS, fill);
+        if !(b.on && b.enabled) {
+            self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+        } else if pressed {
+            self.list
+                .ring(rect, CONTROL_RADIUS, theme.on_accent.with_opacity(45), 2.0);
+        }
+        let label = font::fit(&b.label, rect.w - 8.0, SIZE, Weight::Medium);
+        let w = font::measure(&label, SIZE, Weight::Medium);
+        self.text(
+            rect.x + (rect.w - w) / 2.0,
+            rect.y + rect.h / 2.0,
+            &label,
+            SIZE,
+            Weight::Medium,
+            ink,
+            rect,
+            fill,
+        );
+        if b.enabled {
+            self.spot(b.control, rect);
+        }
+    }
+
+    /// A button with a pictogram inside a line.
+    fn icon(&mut self, b: &IconButton, rect: Rect) {
+        let theme = self.theme;
+        let hover = b.enabled && self.hovered(b.control.id, &rect);
+        let pressed = b.enabled && b.pressed;
+        let (fill, ink) = self.push_look(b.on, b.enabled, hover, pressed);
+        self.list.round_rect(rect, CONTROL_RADIUS, fill);
+        if !(b.on && b.enabled) {
+            self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+        }
+        let (cx, cy) = rect.center();
+        let (filled, stroked) = icons::glyph(b.glyph, cx, cy);
+        if !filled.is_empty() {
+            self.list.fill(filled, ink);
+        }
+        if !stroked.is_empty() {
+            self.list.stroke(stroked, ink, icons::MARK_STROKE);
+        }
+        if b.enabled {
+            self.spot(b.control, rect);
+        }
+    }
+
+    /// The palette as swatches; returns the height. The whole grid is one control, laid
+    /// out with equal cells like the Classic one, so a point on a swatch is a point on the
+    /// same swatch there.
+    fn swatches(&mut self, g: &Swatches, x: f32, y: f32, w: f32) -> f32 {
+        let theme = self.theme;
+        let (cols, rows) = (g.cols.max(1), g.rows());
+        let (cw, ch, x0) = if g.strip {
+            let ch = (self.m.swatch * 2.0 / rows as f32).clamp(9.0, self.m.swatch + 4.0);
+            (w / cols as f32, self.snap(ch), x)
+        } else {
+            let side = self.snap((w / cols as f32).min(self.m.swatch));
+            (side, side, self.snap(x + (w - side * cols as f32) / 2.0))
+        };
+        let frame = Rect::new(x0, y, cw * cols as f32, ch * rows as f32);
+        if g.strip {
+            self.list.rect(frame, theme.panel);
+        }
+        for (i, cell) in g.cells.iter().enumerate() {
+            let (col, row) = ((i % cols) as f32, (i / cols) as f32);
+            let (left, right) = (self.snap(x0 + col * cw), self.snap(x0 + (col + 1.0) * cw));
+            let outer = Rect::new(left, y + row * ch, right - left, ch);
+            let fill = Color::rgb(cell.rgb[0], cell.rgb[1], cell.rgb[2]);
+            let (cx, cy) = outer.center();
+            let small = outer.w.min(outer.h);
+            if g.strip {
+                self.list.rect(outer, fill);
+            } else {
+                let face = outer.inset(1.5);
+                self.list.round_rect(face, 3.0, fill);
+                self.list.ring(face, 3.0, theme.hairline, 1.0);
+            }
+            match cell.mark {
+                Mark::None => {}
+                Mark::Chosen if g.strip => {
+                    let r = (small / 2.0 - 2.0).clamp(2.0, 4.5);
+                    self.list.fill(Path::new().circle(cx, cy, r), MARK_DARK);
+                    self.list
+                        .fill(Path::new().circle(cx, cy, (r - 1.5).max(1.0)), MARK_LIGHT);
+                }
+                Mark::Chosen => {
+                    self.list
+                        .fill(Path::new().circle(cx, cy, small * 0.32), MARK_DARK);
+                    let k = (small / 24.0).min(1.0);
+                    self.list.stroke(
+                        icons::check_mark(0.0, 0.0).placed(k, cx, cy),
+                        MARK_LIGHT,
+                        icons::MARK_STROKE,
+                    );
+                }
+                Mark::Picked => {
+                    self.list.ring(outer.inset(0.5), 4.0, theme.accent, 2.0);
+                    self.list.fill(Path::new().circle(cx, cy, 4.0), MARK_DARK);
+                    self.list.fill(Path::new().circle(cx, cy, 2.5), MARK_LIGHT);
+                }
+                Mark::Target => {
+                    self.list.ring(outer.inset(0.5), 4.0, theme.text, 2.0);
+                    self.list.ring(outer.inset(2.5), 2.0, theme.raised, 1.0);
+                }
+            }
+        }
+        if g.strip {
+            self.list.ring(frame, 0.0, theme.hairline, 1.0);
+        }
+        self.spot(g.control, frame);
+        frame.h
+    }
+
+    /// The width a part asks for; `None` for a stepper or a slider, which take what is left.
+    fn natural(p: &Part) -> Option<f32> {
+        match p {
+            Part::Field(f) => Some(Self::field_width(f)),
+            Part::Cycle(c) => Self::segments_width(c),
+            Part::Check(c) => Some(Self::check_width(c)),
+            Part::Slider(_) => None,
+            Part::Text(t, _) => Some(font::measure(t, SIZE, Weight::Regular).ceil()),
+            Part::Radio(r) => Some(Self::radio_width(r)),
+            Part::Button(b) => Some(Self::push_width(b)),
+            Part::Icon(_) => Some(ICON_W),
+        }
+    }
+
+    /// The parts of a form line from `x` on, in a line `w` wide. `pad_radios`: radio
+    /// buttons take at least [`RADIO_MIN_W`].
+    fn parts(&mut self, parts: &[Part], x: f32, y: f32, w: f32, pad_radios: bool) {
         let theme = self.theme;
         let (line, ch) = (self.m.line, self.m.control);
         let top = self.snap(y + (line - ch) / 2.0);
         let mid = y + line / 2.0;
         let natural = |p: &Part| -> Option<f32> {
             match p {
-                Part::Field(f) => Some(Self::field_width(f)),
-                Part::Cycle(c) => Self::segments_width(c),
-                Part::Check(c) => Some(Self::check_width(c)),
-                Part::Slider(_) => None,
-                Part::Text(t, _) => Some(font::measure(t, SIZE, Weight::Regular).ceil()),
+                Part::Radio(r) if pad_radios => Some(Self::radio_width(r).max(RADIO_MIN_W)),
+                p => Self::natural(p),
+            }
+        };
+        // Buttons side by side stand closer together than other parts.
+        let gap_after = |i: usize| -> f32 {
+            match (&parts[i], parts.get(i + 1)) {
+                (_, None) => 0.0,
+                (Part::Button(_), Some(Part::Button(_))) | (Part::Icon(_), Some(Part::Icon(_))) => {
+                    GROUP_GAP
+                }
+                _ => PART_GAP,
             }
         };
         // The last stretchy part (a stepper or a slider) takes what the line has left; a
@@ -716,7 +944,7 @@ impl Draw<'_> {
                 None => STEPPER_W,
             })
             .sum::<f32>()
-            + PART_GAP * parts.len().saturating_sub(1) as f32;
+            + (0..parts.len()).map(gap_after).sum::<f32>();
         let rest = (w - fixed).max(60.0);
         let mut px = x;
         for (i, part) in parts.iter().enumerate() {
@@ -731,6 +959,9 @@ impl Draw<'_> {
                 Part::Cycle(c) => self.cycle(c, rect),
                 Part::Check(c) => self.check(c, rect),
                 Part::Slider(s) => self.slider(s, rect),
+                Part::Radio(r) => self.radio(r, rect),
+                Part::Button(b) => self.push(b, rect),
+                Part::Icon(b) => self.icon(b, rect),
                 Part::Text(t, tone) => {
                     let ink = self.ink(*tone);
                     self.text(
@@ -745,7 +976,7 @@ impl Draw<'_> {
                     );
                 }
             }
-            px += pw + PART_GAP;
+            px += pw + gap_after(i);
         }
     }
 
@@ -1049,6 +1280,14 @@ impl Draw<'_> {
                 _ => None,
             })
             .fold(0.0, f32::max);
+        // The first part of a row with more parts stands in the label column too.
+        let label_w = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Row(parts) if parts.len() > 1 => Self::natural(&parts[0]),
+                _ => None,
+            })
+            .fold(label_w, f32::max);
         let control_x = if label_w > 0.0 {
             (label_w + LABEL_GAP).ceil()
         } else {
@@ -1061,6 +1300,8 @@ impl Draw<'_> {
                 at += match &items[i - 1] {
                     Item::Heading(_) => 6.0,
                     Item::Text { .. } if matches!(item, Item::Text { .. }) => self.m.gap.min(8.0),
+                    // Rows of radio buttons belong together.
+                    Item::Row(_) if matches!(item, Item::Row(_)) => 4.0,
                     _ => self.m.gap,
                 };
             }
@@ -1106,9 +1347,19 @@ impl Draw<'_> {
                             theme.raised,
                         );
                         self.underline(x, mid, label, *key, SIZE, Weight::Regular, theme.text_dim);
-                        self.parts(parts, x + control_x, top, w - control_x);
+                        self.parts(parts, x + control_x, top, w - control_x, true);
                         self.m.line
                     }
+                    Item::Row(parts) => {
+                        if let Some((first, rest)) = parts.split_first() {
+                            self.parts(std::slice::from_ref(first), x, top, w, false);
+                            if !rest.is_empty() {
+                                self.parts(rest, x + control_x, top, w - control_x, true);
+                            }
+                        }
+                        self.m.line
+                    }
+                    Item::Swatches(grid) => self.swatches(grid, x, top, w),
                     Item::Choices(rows) => self.choices(rows, x, top, w),
                     Item::List(view) => self.list_view(view, x, top, w),
                     Item::Facts { rows, message } => {
@@ -1285,9 +1536,12 @@ mod tests {
     use crate::theme::ThemeKind;
     use dpx_core::Target;
     use dpx_ui::dialog::{ListRow, ScrollBar};
+    use dpx_ui::form_ctl;
     use dpx_ui::{
-        ChoiceRequester, NoteRequester, PageSizeRequester, Preset, ReqEvent, ReqKey,
-        ScreenFormatRequester,
+        ChoiceRequester, FillRequester, FillSettings, GridRequester, GridSettings, NoteRequester,
+        PageSizeRequester, Preset, ReqEvent, ReqKey, ScreenFormatRequester, SpacingMode,
+        SpacingRequester, SpacingSettings, SymmetryRequester, SymmetrySettings, ToolRequester,
+        TranslucencyRequester,
     };
 
     const WINDOWS: [(f32, f32); 3] = [(720.0, 520.0), (1280.0, 800.0), (1001.0, 640.0)];
@@ -1319,9 +1573,54 @@ mod tests {
         r.handle(ReqEvent::Release);
     }
 
-    /// The five converted dialogs in the states that change what they show.
+    fn palette() -> dpx_core::Palette {
+        dpx_core::Palette::dpaint_default_32()
+    }
+
+    fn tool(r: &ToolRequester) -> Dialog {
+        r.view(&palette()).expect("a converted requester")
+    }
+
+    fn spacing(mode: SpacingMode) -> ToolRequester {
+        ToolRequester::Spacing(SpacingRequester::new(SpacingSettings {
+            mode,
+            n: 8,
+            airbrush_radius: 10,
+        }))
+    }
+
+    fn fill() -> ToolRequester {
+        ToolRequester::Fill(FillRequester::new(FillSettings {
+            gradient: Some(dpx_core::GradientDirection::Horizontal),
+            dither: true,
+        }))
+    }
+
+    /// The requesters of slice 4b that are built on the shared form.
+    fn forms(out: &mut Vec<(&'static str, Dialog)>) {
+        let grid = ToolRequester::Grid(GridRequester::new(GridSettings { x: 16, y: 512 }));
+        out.push(("grid", tool(&grid)));
+        let symmetry = ToolRequester::Symmetry(SymmetryRequester::new(SymmetrySettings {
+            mirror: true,
+            order: 40,
+        }));
+        out.push(("symmetry", tool(&symmetry)));
+        out.push(("spacing", tool(&spacing(SpacingMode::Continuous))));
+        // A refused number: the message under the form.
+        let mut refused = spacing(SpacingMode::Airbrush);
+        for key in [ReqKey::Tab, ReqKey::Tab, ReqKey::Backspace, ReqKey::Enter] {
+            refused.handle(ReqEvent::Key(key));
+        }
+        out.push(("spacing, refused", tool(&refused)));
+        out.push(("fill", tool(&fill())));
+        let translucency = ToolRequester::Translucency(TranslucencyRequester::new(100));
+        out.push(("translucency", tool(&translucency)));
+    }
+
+    /// The converted dialogs in the states that change what they show.
     fn dialogs() -> Vec<(&'static str, Dialog)> {
         let mut out = Vec::new();
+        forms(&mut out);
         let notes = strings(&[
             "4 layers saved as one picture, as shown, 1 hidden layer left out (save as .dpxproj to keep them)",
             "PNG cannot store: display mode PAL:Low Res",
@@ -2498,5 +2797,331 @@ mod tests {
                 veiled(theme.panel)
             ));
         }
+    }
+
+    /// A form (slice 4b): the first radio button or check box of a row stands where the
+    /// labels stand, what follows it starts at one place in every line; the chosen radio
+    /// button has the accent and a dot; a ghosted one is faint and takes no pointer; a
+    /// refused number is shown under the form.
+    #[test]
+    fn form_rows_line_up_and_show_their_state() {
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let draw = |d: &Dialog| build(d, window, 1.0, &theme, &Pointer::default());
+        let b = draw(&tool(&spacing(SpacingMode::EveryN)));
+        let left = b.card.x + PAD;
+        let radios: Vec<Rect> = (0..4)
+            .map(|i| b.spot(form_ctl::RADIO + i).expect("a radio button").rect)
+            .collect();
+        assert!(radios.iter().all(|r| r.x == left), "{radios:?}");
+        for pair in radios.windows(2) {
+            assert!(
+                pair[1].y - pair[0].bottom() <= 8.0,
+                "the rows belong together"
+            );
+        }
+        let fields: Vec<Rect> = (0..4)
+            .map(|i| b.spot(form_ctl::FIELD + i).expect("a field").rect)
+            .collect();
+        assert!(
+            fields
+                .iter()
+                .all(|f| f.x == fields[0].x && f.w == fields[0].w)
+        );
+        assert!(
+            fields[0].x >= radios[2].right() + 4.0,
+            "{fields:?} {radios:?}"
+        );
+        assert!(
+            fields[3].y > fields[2].bottom() + 10.0,
+            "the rule lies between"
+        );
+        // The dots: only "Every Nth dot" has one, in the accent.
+        let dot = |rect: Rect| -> Vec<Color> {
+            b.list
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Path {
+                        path,
+                        fill: Some(c),
+                        ..
+                    } if path
+                        .bounds()
+                        .is_some_and(|p| rect.encloses(&p) && (p.w - 7.0).abs() < 0.1) =>
+                    {
+                        Some(*c)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let lit: Vec<bool> = radios.iter().map(|r| dot(*r) == [theme.accent]).collect();
+        assert_eq!(lit, [false, false, true, false]);
+        assert_eq!(text_color(&b, "pixels"), theme.text_dim);
+        assert_eq!(text_color(&b, "Airbrush size"), theme.text_dim);
+        // Fill Type: two columns of radio buttons, the second ghosted; the check box under
+        // the first column.
+        let b = draw(&tool(&fill()));
+        let solid = b.spot(form_ctl::RADIO).expect("Solid").rect;
+        let check = b.spot(form_ctl::CHECK).expect("Dither").rect;
+        assert_eq!((solid.x, check.x), (left, left));
+        for ghost in 5..10 {
+            assert!(
+                b.spot(form_ctl::RADIO + ghost).is_none(),
+                "ghosted: no pointer"
+            );
+        }
+        assert_eq!(text_color(&b, "Brush"), theme.disabled);
+        assert_eq!(text_color(&b, "Solid"), theme.text);
+        let brush = b.texts.iter().find(|t| t.text == "Brush").expect("Brush");
+        let ridge = b.texts.iter().find(|t| t.text == "Ridge").expect("Ridge");
+        assert_eq!(brush.ink.x, ridge.ink.x, "the second column lines up");
+        assert!(brush.ink.x > solid.right());
+        assert!(b.texts.iter().any(
+            |t| t.text == "Range: FG colour range, else FG to BG" && t.color == theme.text_dim
+        ));
+        // The refused number.
+        let mut refused = spacing(SpacingMode::Airbrush);
+        let before = draw(&tool(&refused));
+        for key in [ReqKey::Tab, ReqKey::Tab, ReqKey::Backspace, ReqKey::Enter] {
+            refused.handle(ReqEvent::Key(key));
+        }
+        let after = draw(&tool(&refused));
+        let message = after
+            .texts
+            .iter()
+            .find(|t| t.text == "Airbrush must be 1 to 999")
+            .expect("the message");
+        assert_eq!(message.color, theme.text);
+        assert!(after.card.h > before.card.h);
+        let ok = after.spot(form_ctl::OK).expect("Ok").rect;
+        assert!(message.ink.bottom() < ok.y);
+    }
+
+    fn part_line(parts: Vec<Part>) -> Dialog {
+        Dialog {
+            title: "Parts".into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![vec![Item::Line {
+                label: "Label".into(),
+                key: None,
+                parts,
+            }]],
+            buttons: Vec::new(),
+        }
+    }
+
+    /// Buttons and icon buttons inside a line: quiet with a hairline, latched on the accent,
+    /// under the pointer lighter, ghosted flat without a pointer; side by side they stand
+    /// closer together than other parts. Every pictogram draws something inside its button.
+    #[test]
+    fn buttons_in_a_line_are_quiet_latched_or_ghosted() {
+        use dpx_ui::dialog::Glyph;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let area = |i: i32| dpx_core::Rect::new(10 * i, 0, 9, 9);
+        let push = |id: ControlId, label: &str, on: bool, enabled: bool| {
+            Part::Button(Push {
+                control: Control::new(id, area(i32::from(id))),
+                label: label.into(),
+                on,
+                pressed: false,
+                enabled,
+            })
+        };
+        let glyphs = [
+            Glyph::Forward,
+            Glyph::Backward,
+            Glyph::PingPong,
+            Glyph::GoFrom,
+            Glyph::ComeTo,
+            Glyph::InPlace,
+            Glyph::StepForward,
+            Glyph::StepBackward,
+        ];
+        let mut parts = vec![
+            push(0, "Move", true, true),
+            push(1, "Ex", false, true),
+            push(2, "Clear", false, false),
+        ];
+        for (i, glyph) in glyphs.into_iter().enumerate() {
+            parts.push(Part::Icon(IconButton {
+                control: Control::new(10 + i as ControlId, area(10 + i as i32)),
+                glyph,
+                on: i == 1,
+                pressed: false,
+                enabled: i != 2,
+            }));
+        }
+        let dialog = part_line(parts);
+        let b = build(&dialog, window, 1.0, &theme, &Pointer::default());
+        let (on, off) = (b.spot(0).unwrap().rect, b.spot(1).unwrap().rect);
+        assert_eq!(fills(&b.list, on), [theme.accent]);
+        assert!(rings(&b.list, on).is_empty());
+        assert_eq!(fills(&b.list, off), [theme.hover]);
+        assert_eq!(rings(&b.list, off), [(theme.hairline, 1.0)]);
+        assert_eq!(off.x - on.right(), GROUP_GAP);
+        assert_eq!(
+            (text_color(&b, "Move"), text_color(&b, "Ex")),
+            (theme.on_accent, theme.text)
+        );
+        assert!(off.w >= PUSH_MIN_W && on.w > off.w && on.h == 28.0);
+        assert!(b.spot(2).is_none(), "ghosted: no pointer");
+        assert_eq!(text_color(&b, "Clear"), theme.disabled);
+        let over = Pointer {
+            at: Some(off.center()),
+            down: false,
+            captured: None,
+        };
+        let h = build(&dialog, window, 1.0, &theme, &over);
+        assert_eq!(fills(&h.list, off), [button_fill(&theme, true, false)]);
+        // The icon buttons: equal squares in a row, the second latched, the third ghosted.
+        let icons: Vec<Option<Rect>> = (0..8).map(|i| b.spot(10 + i).map(|s| s.rect)).collect();
+        assert!(icons[2].is_none());
+        let first = icons[0].expect("an icon button");
+        assert_eq!((first.w, first.h), (ICON_W, 28.0));
+        assert_eq!(icons[1].unwrap().x - first.right(), GROUP_GAP);
+        assert_eq!(fills(&b.list, icons[1].unwrap()), [theme.accent]);
+        for (i, rect) in icons.iter().enumerate() {
+            let Some(rect) = rect else { continue };
+            let ink = if i == 1 { theme.on_accent } else { theme.text };
+            let drawn = b
+                .list
+                .ops()
+                .iter()
+                .filter(|op| match op {
+                    Op::Path {
+                        path, fill, stroke, ..
+                    } => {
+                        path.bounds().is_some_and(|p| rect.inset(5.0).encloses(&p))
+                            && (*fill == Some(ink) || stroke.is_some_and(|s| s.color == ink))
+                    }
+                    _ => false,
+                })
+                .count();
+            assert!(drawn >= 1, "glyph {i} is drawn inside its button");
+        }
+    }
+
+    /// The palette as swatches: a grid of equal squares, centred, or a strip as wide as the
+    /// column; one control whose cells lie over the Classic cells, so a point on a swatch
+    /// is a point on the same swatch there, also in a short last row; the marks are drawn.
+    #[test]
+    fn swatches_lie_over_the_classic_cells() {
+        use dpx_ui::dialog::{Swatch, Swatches};
+        let pitch = 8;
+        let grid = |colours: usize, cols: usize, strip: bool| {
+            let rows = colours.div_ceil(cols) as i32;
+            let cells = (0..colours)
+                .map(|i| Swatch {
+                    rgb: [i as u8, 255 - i as u8, 128],
+                    mark: match i {
+                        1 => Mark::Chosen,
+                        2 => Mark::Picked,
+                        3 => Mark::Target,
+                        _ => Mark::None,
+                    },
+                })
+                .collect();
+            Dialog {
+                title: "Swatches".into(),
+                kind: Kind::Plain,
+                size: Size::Medium,
+                columns: vec![vec![Item::Swatches(Swatches {
+                    control: Control::new(
+                        7,
+                        dpx_core::Rect::new(56, 17, cols as i32 * pitch, rows * pitch),
+                    ),
+                    cols,
+                    cells,
+                    strip,
+                })]],
+                buttons: Vec::new(),
+            }
+        };
+        for (colours, cols, strip) in [
+            (32, 16, false),
+            (256, 16, false),
+            (20, 16, false),
+            (2, 2, true),
+            (32, 16, true),
+            (256, 32, true),
+        ] {
+            let dialog = grid(colours, cols, strip);
+            for window in WINDOWS {
+                for scale in SCALES {
+                    let at = format!("{colours} colours, strip {strip}, {window:?} at {scale}x");
+                    let b = built(&dialog, window, scale, ThemeKind::Dark);
+                    let win = Rect::new(0.0, 0.0, window.0, window.1);
+                    assert!(win.encloses(&b.card), "{at}: {:?}", b.card);
+                    let spot = b.spot(7).expect("the grid");
+                    let rows = colours.div_ceil(cols);
+                    let (cw, ch) = (spot.rect.w / cols as f32, spot.rect.h / rows as f32);
+                    if strip {
+                        assert!((spot.rect.w - (b.card.w - 2.0 * PAD)).abs() < 0.01, "{at}");
+                    } else {
+                        assert!((cw - ch).abs() < 0.01 && cw >= 18.0, "{at}: {cw} x {ch}");
+                        let centre = spot.rect.x + spot.rect.w / 2.0;
+                        assert!((centre - (b.card.x + b.card.w / 2.0)).abs() <= 1.0, "{at}");
+                    }
+                    // The middle and the corners of every swatch are that swatch in Classic.
+                    for i in 0..colours {
+                        let (col, row) = ((i % cols) as f32, (i / cols) as f32);
+                        for (fx, fy) in [(0.5, 0.5), (0.04, 0.04), (0.96, 0.96)] {
+                            let (x, y) =
+                                (spot.rect.x + (col + fx) * cw, spot.rect.y + (row + fy) * ch);
+                            let (id, p) = b.press(x, y);
+                            assert_eq!(id, Some(7), "{at}");
+                            let cell = ((p.1 - 17) / pitch) as usize * cols
+                                + ((p.0 - 56) / pitch) as usize;
+                            assert_eq!(cell, i, "{at}: ({x}, {y}) -> {p:?}");
+                        }
+                    }
+                }
+            }
+            // Every swatch is filled with its colour; the three marks draw over theirs.
+            let b = built(&dialog, WINDOWS[1], 1.0, ThemeKind::Light);
+            let colour = |i: usize| Color::rgb(i as u8, 255 - i as u8, 128);
+            let filled = |c: Color| {
+                b.list
+                    .ops()
+                    .iter()
+                    .filter(|op| matches!(op, Op::RoundRect { fill: Some(f), .. } if *f == c))
+                    .count()
+            };
+            for i in 0..colours {
+                assert_eq!(filled(colour(i)), 1, "swatch {i} of {colours}");
+            }
+            let marks = b
+                .list
+                .ops()
+                .iter()
+                .filter(|op| matches!(op, Op::Path { fill: Some(f), .. } if *f == MARK_DARK))
+                .count();
+            assert_eq!(marks, if colours > 2 { 2 } else { 1 }, "chosen and picked");
+        }
+    }
+
+    /// A ghosted slider shows its groove and its value faint and takes no pointer.
+    #[test]
+    fn a_ghosted_slider_takes_no_pointer() {
+        let theme = Theme::light();
+        let slider = |enabled| {
+            part_line(vec![Part::Slider(Slider {
+                control: Control::new(3, dpx_core::Rect::new(51, 70, 174, 9)),
+                knob: dpx_core::Rect::new(60, 71, 10, 7),
+                value: "16".into(),
+                enabled,
+            })])
+        };
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let on = build(&slider(true), window, 1.0, &theme, &Pointer::default());
+        let off = build(&slider(false), window, 1.0, &theme, &Pointer::default());
+        assert!(on.spot(3).is_some() && off.spot(3).is_none());
+        assert_eq!(text_color(&on, "16"), theme.text);
+        assert_eq!(text_color(&off, "16"), theme.disabled);
+        assert!(off.list.len() < on.list.len(), "no knob");
     }
 }

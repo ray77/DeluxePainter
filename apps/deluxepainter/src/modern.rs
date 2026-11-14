@@ -332,21 +332,13 @@ impl PainterApp {
             return self.compose_screen();
         }
         let tip = if own { self.ui.tooltip.take() } else { None };
-        let cards = card.then(|| {
-            (
-                self.ui.note_requester.take(),
-                self.ui.choice_requester.take(),
-                self.ui.page_size_requester.take(),
-            )
-        });
+        let cards = card.then(|| modern_dialog::Cards::take(&mut self.ui));
         let screen = self.compose_screen();
         if own {
             self.ui.tooltip = tip;
         }
-        if let Some((note, choice, page_size)) = cards {
-            self.ui.note_requester = note;
-            self.ui.choice_requester = choice;
-            self.ui.page_size_requester = page_size;
+        if let Some(cards) = cards {
+            cards.put_back(&mut self.ui);
         }
         screen
     }
@@ -1053,7 +1045,7 @@ pub(crate) fn snapshot_image(
 ) -> (u32, u32, Vec<u8>) {
     // The requester the Modern skin draws itself as a card (slice 4a), if one is on top.
     let card = modern_dialog::card(ui, screen_format.is_some(), false, false);
-    let dialog = card.and_then(|c| modern_dialog::view(c, ui, screen_format));
+    let dialog = card.and_then(|c| modern_dialog::view(c, ui, screen_format, doc.palette()));
     // The classic screen without its chrome, one image pixel per displayed pixel (the pixel
     // shape of the display mode applied), exactly as a Classic snapshot at scale 1 makes it.
     let mut bare = quad_ui(ui);
@@ -1513,7 +1505,8 @@ mod tests {
                 app.anim_control.preview.is_some(),
             )
             .expect("a converted requester is on top");
-            modern_dialog::view(card, &app.ui, app.requester.as_ref()).expect("its view")
+            modern_dialog::view(card, &app.ui, app.requester.as_ref(), app.palette())
+                .expect("its view")
         }
 
         /// The window point `frac` of the way across control `id` of the requester on top:
@@ -1552,8 +1545,17 @@ mod tests {
                 return self.point_at(Place::Screen(x, y), (fx, fy));
             }
             let (w, h) = app.view().ui_size();
-            let (ox, oy) = if let Some(r) = &app.ui.choice_requester {
+            // The requesters in the order `pass()` asks them.
+            let (ox, oy) = if let Some(r) = &app.ui.anim_control {
                 r.origin(w, h)
+            } else if let Some(r) = &app.ui.choice_requester {
+                r.origin(w, h)
+            } else if let Some(r) = &app.ui.tool_requester {
+                r.origin(w, h)
+            } else if let Some(r) = &app.ui.anim_requester {
+                r.origin(w, h)
+            } else if app.ui.range_requester.is_some() {
+                dpx_ui::RangeRequester::origin(w, h)
             } else if let Some(r) = &app.ui.note_requester {
                 r.origin(w, h)
             } else {
@@ -3524,33 +3526,6 @@ mod tests {
     const NEAR: (f32, f32) = (0.1, 0.1);
     const FAR: (f32, f32) = (0.9, 0.9);
 
-    /// A tool's settings (Grid, with the right button on its tool): Cancel by its first
-    /// pixel, Ok by its last; a pixel beside a button is not the button.
-    fn tool_requester_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
-        use dpx_ui::ToolReqResponse as R;
-        let (w, h) = rig.app.view().ui_size();
-        for (wanted, corner) in [(R::Cancel, NEAR), (R::Ok, FAR)] {
-            rig.click(Place::Tool(Tool::Grid, false), Secondary);
-            let req = rig.app.ui.tool_requester.clone().expect("Grid's requester");
-            let (ox, oy) = req.origin(w, h);
-            let (first, last) = pixels_where(|x, y| {
-                let mut r = req.clone();
-                r.handle(ReqEvent::Press(x, y)) == wanted || r.handle(ReqEvent::Release) == wanted
-            });
-            seen(rig, format!("the requester for {wanted:?}"));
-            // One pixel above the button's top row: not the button.
-            let above = ui_pixel(rig, (ox + first.0, oy + first.1 - 1));
-            rig.click_at(above, (0.5, 0.9), Primary);
-            assert!(rig.app.ui.tool_requester.is_some(), "beside {wanted:?}");
-            seen(rig, format!("a click above {wanted:?}"));
-            let pixel = if corner == NEAR { first } else { last };
-            let at = ui_pixel(rig, (ox + pixel.0, oy + pixel.1));
-            rig.click_at(at, corner, Primary);
-            assert!(rig.app.ui.tool_requester.is_none(), "{wanted:?} closes it");
-            seen(rig, format!("{wanted:?}"));
-        }
-    }
-
     /// The file requester (Picture ▸ Load..): typing goes to its File field; a pixel beside
     /// Cancel is not Cancel; Cancel by its last pixel.
     fn file_requester_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
@@ -3732,8 +3707,7 @@ mod tests {
     /// One requester of each kind, with the layer column shown: each opens in the Modern
     /// window, takes clicks on the first and last pixels of its buttons through the
     /// unchanged mapping, closes, and leaves the same state as in the Classic window.
-    const MODAL_SCRIPTS: [(&str, Script); 8] = [
-        ("tool settings", tool_requester_script),
+    const MODAL_SCRIPTS: [(&str, Script); 7] = [
         ("file", file_requester_script),
         ("Screen Format", screen_format_script),
         ("Show Page", show_page_script),
@@ -3783,10 +3757,7 @@ mod tests {
     #[test]
     fn the_chrome_is_veiled_and_takes_no_input_under_a_requester() {
         type Open = fn(&mut Rig);
-        let open: [(&str, Open); 3] = [
-            ("tool settings", |rig| {
-                rig.click(Place::Tool(Tool::Grid, false), Secondary)
-            }),
+        let open: [(&str, Open); 2] = [
             ("Color Mixer", |rig| rig.key('p')),
             ("file", |rig| rig.pick(Action::Command("picture.load"))),
         ];

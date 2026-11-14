@@ -332,7 +332,7 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 | Questions: Quit, Recover, Replace File?, AI & MCP questions | `choice_requester.rs` | **modern** | |
 | Page Size | `page_size_requester.rs` | **modern** | |
 | Screen Format | `requester.rs` | **modern** (a card, lead decision 27) | |
-| Grid, Symmetry, Spacing, Fill, Translucency | `tool_requesters.rs` on `form.rs` | classic look | one `Form::view()`: the form's radios, checks, fields and texts are placed by absolute pixel positions and have to be grouped into lines; after that each requester is a few lines |
+| Grid, Symmetry, Spacing, Fill, Translucency | `tool_requesters.rs` on `form.rs` | **modern** (slice 4b) | |
 | Stencil, Arrange | `stencil_requester.rs`, `arrange_requester.rs` (own code, no form) | classic look | a swatch grid part; Stencil toggles by click and drag-paint, Arrange drags a swatch to another place |
 | AnimBrush, Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | classic look | the form family plus icon buttons (AnimBrush direction) and one extra button (Perspective) |
 | Anim requesters | `anim_requester.rs` (forms) | classic look | the form family; the Move preview and playback keep the picture |

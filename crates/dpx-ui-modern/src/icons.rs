@@ -345,6 +345,46 @@ pub fn radio_dot(cx: f32, cy: f32) -> Path {
     Path::new().circle(cx, cy, 3.0)
 }
 
+/// The pictogram of an icon button of a dialog, centred on (`cx`, `cy`): the part that is
+/// filled and the part that is stroked with [`MARK_STROKE`] (either may be empty).
+pub fn glyph(glyph: dpx_ui::dialog::Glyph, cx: f32, cy: f32) -> (Path, Path) {
+    use dpx_ui::dialog::Glyph;
+    let tri = |p: Path, tip: f32, back: f32, half: f32| {
+        p.polygon(&[
+            (cx + back, cy - half),
+            (cx + tip, cy),
+            (cx + back, cy + half),
+        ])
+    };
+    let chevron = |p: Path, at: f32, dir: f32| {
+        p.move_to(cx + at - 2.5 * dir, cy - 5.0)
+            .line_to(cx + at + 2.5 * dir, cy)
+            .line_to(cx + at - 2.5 * dir, cy + 5.0)
+    };
+    let arrow = |p: Path, from: f32, to: f32| {
+        p.segment(cx + from, cy, cx + to, cy)
+            .move_to(cx + to - 4.0, cy - 4.0)
+            .line_to(cx + to, cy)
+            .line_to(cx + to - 4.0, cy + 4.0)
+    };
+    let none = Path::new;
+    match glyph {
+        Glyph::Forward => (tri(none(), 6.0, -4.0, 6.0), none()),
+        Glyph::Backward => (tri(none(), -6.0, 4.0, 6.0), none()),
+        Glyph::PingPong => (tri(tri(none(), -9.5, -2.0, 5.0), 9.5, 2.0, 5.0), none()),
+        Glyph::GoFrom => (none().circle(cx - 7.5, cy, 2.75), arrow(none(), -2.5, 9.0)),
+        Glyph::ComeTo => (none().circle(cx + 7.5, cy, 2.75), arrow(none(), -9.5, 2.0)),
+        Glyph::InPlace => (
+            none()
+                .round_rect(crate::paint::Rect::new(cx - 5.0, cy - 5.5, 3.5, 11.0), 1.0)
+                .round_rect(crate::paint::Rect::new(cx + 1.5, cy - 5.5, 3.5, 11.0), 1.0),
+            none(),
+        ),
+        Glyph::StepForward => (none(), chevron(chevron(none(), -3.0, 1.0), 4.0, 1.0)),
+        Glyph::StepBackward => (none(), chevron(chevron(none(), 3.0, -1.0), -4.0, -1.0)),
+    }
+}
+
 /// The chevron of an item that opens a submenu, centred on (`cx`, `cy`); stroked.
 pub fn chevron(cx: f32, cy: f32) -> Path {
     Path::new()

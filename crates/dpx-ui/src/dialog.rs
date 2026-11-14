@@ -132,6 +132,101 @@ pub struct Slider {
     pub knob: Rect,
     /// The value in words, shown beside the slider.
     pub value: String,
+    /// `false`: ghosted, takes no pointer (nothing to set yet).
+    pub enabled: bool,
+}
+
+/// One of a few choices that stand in a form line (a radio button).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Radio {
+    pub control: Control,
+    pub label: String,
+    pub on: bool,
+    pub enabled: bool,
+}
+
+/// A button inside a form line. `on`: it stays down (one of a few modes, or a switch).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Push {
+    pub control: Control,
+    pub label: String,
+    pub on: bool,
+    /// Held down with the pointer over it.
+    pub pressed: bool,
+    pub enabled: bool,
+}
+
+/// What an icon button shows (the Modern skin draws its own pictograms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    /// Play forward: a triangle pointing right.
+    Forward,
+    /// Play backward: a triangle pointing left.
+    Backward,
+    /// There and back: two triangles pointing apart.
+    PingPong,
+    /// Move away from here: an arrow leaving a dot.
+    GoFrom,
+    /// Arrive here: an arrow reaching a dot.
+    ComeTo,
+    /// Stay on the frame: two upright bars.
+    InPlace,
+    /// Step on frame by frame: two chevrons pointing right.
+    StepForward,
+    /// Step back frame by frame: two chevrons pointing left.
+    StepBackward,
+}
+
+/// A button that shows a pictogram, inside a form line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IconButton {
+    pub control: Control,
+    pub glyph: Glyph,
+    /// It is the chosen one of its group.
+    pub on: bool,
+    pub pressed: bool,
+    pub enabled: bool,
+}
+
+/// How a swatch is marked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    None,
+    /// Chosen (a protected colour, a colour of the range).
+    Chosen,
+    /// Picked up: the swatch a drag started on.
+    Picked,
+    /// Where a dragged swatch would land.
+    Target,
+}
+
+/// One colour of a swatch grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Swatch {
+    pub rgb: [u8; 3],
+    pub mark: Mark,
+}
+
+/// The palette as a grid of colours that takes the pointer as one control: the Classic
+/// requester has the same number of columns and rows in `control.area`, all cells alike, so a
+/// point on a swatch is a point on the same swatch there (also during a drag over several).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Swatches {
+    /// The whole grid: `cols` columns and as many full rows as `cells` need.
+    pub control: Control,
+    pub cols: usize,
+    /// Row by row; the last row may be short.
+    pub cells: Vec<Swatch>,
+    /// `true`: a palette strip (the cells touch and share the column's width); `false`:
+    /// separate square swatches.
+    pub strip: bool,
+}
+
+impl Swatches {
+    /// Rows of the grid (at least one).
+    pub fn rows(&self) -> usize {
+        self.cells.len().div_ceil(self.cols.max(1)).max(1)
+    }
 }
 
 /// One part of a form line.
@@ -142,6 +237,9 @@ pub enum Part {
     Check(Check),
     Slider(Slider),
     Text(String, Tone),
+    Radio(Radio),
+    Button(Push),
+    Icon(IconButton),
 }
 
 /// One of a few rows of which one is chosen (radio rows).
@@ -201,9 +299,14 @@ pub enum Item {
         key: Option<char>,
         parts: Vec<Part>,
     },
+    /// A form line without a label: its first part (a radio button or a check box) stands
+    /// where the labels of the other lines stand, the rest follows as in a `Line`.
+    Row(Vec<Part>),
     /// Rows of which one is chosen.
     Choices(Vec<Choice>),
     List(ListView),
+    /// The palette as swatches.
+    Swatches(Swatches),
     /// Names and values in a quiet panel (read-only facts). A message, if any, is shown in
     /// the panel in place of the facts it would cover in the Classic skin.
     Facts {
@@ -253,13 +356,16 @@ impl Dialog {
         let mut out = Vec::new();
         for item in self.columns.iter().flatten() {
             match item {
-                Item::Line { parts, .. } => {
+                Item::Line { parts, .. } | Item::Row(parts) => {
                     for part in parts {
                         match part {
                             Part::Field(f) => out.push(f.control),
                             Part::Cycle(c) => out.push(c.control),
                             Part::Check(c) => out.push(c.control),
                             Part::Slider(s) => out.push(s.control),
+                            Part::Radio(r) => out.push(r.control),
+                            Part::Button(b) => out.push(b.control),
+                            Part::Icon(b) => out.push(b.control),
                             Part::Text(..) => {}
                         }
                     }
@@ -269,6 +375,7 @@ impl Dialog {
                     out.extend(list.rows.iter().map(|r| r.control));
                     out.extend(list.scroll.map(|s| s.control));
                 }
+                Item::Swatches(grid) => out.push(grid.control),
                 Item::Heading(_)
                 | Item::Text { .. }
                 | Item::Facts { .. }

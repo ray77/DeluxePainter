@@ -11,8 +11,12 @@
 //! shown as a card. Every requester that is not converted yet is shown in the Classic look
 //! inside the picture quad, as before.
 
+use dpx_core::Palette;
 use dpx_ui::dialog::Dialog;
-use dpx_ui::{ScreenFormatRequester, UiState};
+use dpx_ui::{
+    AnimControlRequester, AnimRequester, ChoiceRequester, NoteRequester, PageSizeRequester,
+    RangeRequester, ScreenFormatRequester, ToolRequester, UiState,
+};
 use dpx_ui_modern::Theme;
 use dpx_ui_modern::dialog as kit;
 use eframe::egui;
@@ -30,6 +34,15 @@ pub(crate) enum Card {
     Note,
     /// Picture ▸ Page Size.
     PageSize,
+    /// A toolbox settings requester (Gridding, Symmetry, Spacing, Fill Type, Translucency ..).
+    Tool,
+}
+
+/// The toolbox settings requester that is open is one the Modern skin draws itself.
+fn tool_is_card(ui: &UiState) -> bool {
+    ui.tool_requester
+        .as_ref()
+        .is_some_and(ToolRequester::has_view)
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -58,6 +71,9 @@ pub(crate) fn card(
     if screen_format {
         return Some(Card::ScreenFormat);
     }
+    if tool_is_card(ui) {
+        return Some(Card::Tool);
+    }
     if ui.tool_requester.is_some()
         || playing
         || ui.anim_requester.is_some()
@@ -75,13 +91,15 @@ pub(crate) fn card(
     ui.page_size_requester.is_some().then_some(Card::PageSize)
 }
 
-/// What `card` shows.
+/// What `card` shows; `palette` gives the swatches of a palette requester their colours.
 pub(crate) fn view(
     card: Card,
     ui: &UiState,
     screen_format: Option<&ScreenFormatRequester>,
+    palette: &Palette,
 ) -> Option<Dialog> {
     match card {
+        Card::Tool => ui.tool_requester.as_ref().and_then(|r| r.view(palette)),
         Card::Choice => ui.choice_requester.as_ref().map(|r| r.view()),
         Card::ScreenFormat => screen_format.map(ScreenFormatRequester::view),
         Card::Note => ui.note_requester.as_ref().map(|r| r.view()),
@@ -92,7 +110,7 @@ pub(crate) fn view(
 /// A requester of the shared interface state that is still shown in the Classic look is
 /// open (the picture quad hosts it).
 pub(crate) fn classic_look_open(ui: &UiState) -> bool {
-    ui.tool_requester.is_some()
+    (ui.tool_requester.is_some() && !tool_is_card(ui))
         || ui.anim_requester.is_some()
         || ui.palette_requester.is_some()
         || ui.range_requester.is_some()
@@ -107,9 +125,53 @@ pub(crate) fn classic_look_open(ui: &UiState) -> bool {
 /// `ui` without the requesters the Modern skin draws itself: what the picture quad is
 /// composed from while a card is shown.
 pub(crate) fn without_cards(ui: &mut UiState) {
-    ui.note_requester = None;
-    ui.choice_requester = None;
-    ui.page_size_requester = None;
+    Cards::take(ui);
+}
+
+/// The converted requesters, taken out of the interface state for a while.
+pub(crate) struct Cards {
+    note: Option<NoteRequester>,
+    choice: Option<ChoiceRequester>,
+    page_size: Option<PageSizeRequester>,
+    tool: Option<ToolRequester>,
+    anim: Option<AnimRequester>,
+    range: Option<RangeRequester>,
+    anim_control: Option<AnimControlRequester>,
+}
+
+impl Cards {
+    /// Takes every requester the Modern skin draws itself out of `ui`.
+    pub(crate) fn take(ui: &mut UiState) -> Self {
+        let tool = tool_is_card(ui);
+        Self {
+            note: ui.note_requester.take(),
+            choice: ui.choice_requester.take(),
+            page_size: ui.page_size_requester.take(),
+            tool: if tool { ui.tool_requester.take() } else { None },
+            anim: None,
+            range: None,
+            anim_control: None,
+        }
+    }
+
+    /// Puts them back.
+    pub(crate) fn put_back(self, ui: &mut UiState) {
+        ui.note_requester = self.note;
+        ui.choice_requester = self.choice;
+        ui.page_size_requester = self.page_size;
+        if self.tool.is_some() {
+            ui.tool_requester = self.tool;
+        }
+        if self.anim.is_some() {
+            ui.anim_requester = self.anim;
+        }
+        if self.range.is_some() {
+            ui.range_requester = self.range;
+        }
+        if self.anim_control.is_some() {
+            ui.anim_control = self.anim_control;
+        }
+    }
 }
 
 impl PainterApp {
@@ -129,7 +191,12 @@ impl PainterApp {
 
     /// The description of the card that is shown.
     pub(crate) fn modern_dialog(&self) -> Option<Dialog> {
-        view(self.modern_card()?, &self.ui, self.requester.as_ref())
+        view(
+            self.modern_card()?,
+            &self.ui,
+            self.requester.as_ref(),
+            self.palette(),
+        )
     }
 
     /// The Screen Format requester while it has a screen of its own: in the Classic skin.

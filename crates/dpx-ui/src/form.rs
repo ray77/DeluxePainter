@@ -5,6 +5,10 @@
 
 use dpx_core::{IndexedImage, Rect};
 
+use crate::dialog::{
+    self, Button as ViewButton, Check as ViewCheck, Control, Dialog, Field as ViewField, Item,
+    Kind, Part, Radio as ViewRadio, Role, Size, Tone,
+};
 use crate::font::Font;
 use crate::pens::Pens;
 use crate::requester::{ReqEvent, ReqKey};
@@ -14,6 +18,26 @@ const BOX: i32 = 7;
 const ROW_H: i32 = 9;
 const BUTTON_W: i32 = 56;
 const BUTTON_H: i32 = 13;
+
+/// What lies at most this many pixels lower than the first part of a line belongs to it
+/// (a label is drawn one pixel lower than its field's box).
+const ROW_JOIN: i32 = 3;
+
+/// Ids of the controls in [`Form::view`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    pub const CANCEL: ControlId = 0;
+    pub const OK: ControlId = 1;
+    /// The radio buttons in the order the form got them: `RADIO + i`.
+    pub const RADIO: ControlId = 100;
+    /// The check boxes: `CHECK + i`.
+    pub const CHECK: ControlId = 200;
+    /// The number fields: `FIELD + i`.
+    pub const FIELD: ControlId = 300;
+    /// A requester's own controls beside its form start here.
+    pub const EXTRA: ControlId = 400;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormResponse {
@@ -370,6 +394,212 @@ impl Form {
         FormResponse::Continue
     }
 
+    /// The form as the Modern skin shows it (ADR-47).
+    pub fn view(&self) -> Dialog {
+        self.view_with(Vec::new(), None)
+    }
+
+    /// [`Form::view`] for a requester that adds to its form: `extra` are its own controls
+    /// with the place they have in the Classic requester (they join the form line at that
+    /// height); `message` is shown in place of the form's own message, as the requester
+    /// draws it over that line.
+    pub(crate) fn view_with(
+        &self,
+        extra: Vec<((i32, i32), Part)>,
+        message: Option<&str>,
+    ) -> Dialog {
+        enum El {
+            Text(String),
+            Part(Part),
+            Rule,
+        }
+        let mut els: Vec<((i32, i32), El)> = Vec::new();
+        for (at, t) in &self.texts {
+            els.push(((at.1, at.0), El::Text(t.clone())));
+        }
+        for &y in &self.rules {
+            els.push(((y, 0), El::Rule));
+        }
+        for (i, r) in self.radios.iter().enumerate() {
+            let part = Part::Radio(ViewRadio {
+                control: Control::new(ctl::RADIO + i as dialog::ControlId, self.radio_rect(r)),
+                label: r.label.clone(),
+                on: r.enabled && self.selected(r.group) == r.value,
+                enabled: r.enabled,
+            });
+            els.push(((r.at.1, r.at.0), El::Part(part)));
+        }
+        for (i, c) in self.checks.iter().enumerate() {
+            let part = Part::Check(ViewCheck {
+                control: Control::new(ctl::CHECK + i as dialog::ControlId, self.check_rect(c)),
+                label: c.label.clone(),
+                on: self.on[i],
+                enabled: c.enabled,
+                key: None,
+            });
+            els.push(((c.at.1, c.at.0), El::Part(part)));
+        }
+        for (i, f) in self.fields.iter().enumerate() {
+            if f.label_at.0 >= 0 {
+                els.push(((f.label_at.1, f.label_at.0), El::Text(f.label.clone())));
+            }
+            let part = Part::Field(ViewField {
+                control: Control::new(ctl::FIELD + i as dialog::ControlId, f.rect),
+                text: f.text.text(),
+                caret: (self.active == Some(i)).then_some(f.text.cursor),
+                enabled: true,
+                numeric: true,
+                max_chars: f.max.to_string().len(),
+            });
+            els.push(((f.rect.y + 1, f.rect.x), El::Part(part)));
+        }
+        for ((x, y), part) in extra {
+            els.push(((y, x), El::Part(part)));
+        }
+        els.sort_by_key(|(at, _)| *at);
+        // Lines: what stands at (nearly) the same height, from left to right.
+        let mut rows: Vec<Vec<((i32, i32), El)>> = Vec::new();
+        for (at, el) in els {
+            let rule = matches!(el, El::Rule);
+            match rows.last_mut() {
+                Some(row)
+                    if !rule && !matches!(row[0].1, El::Rule) && at.0 - row[0].0.0 <= ROW_JOIN =>
+                {
+                    row.push((at, el));
+                }
+                _ => rows.push(vec![(at, el)]),
+            }
+        }
+        for row in &mut rows {
+            row.sort_by_key(|(at, _)| at.1);
+        }
+        let texts_only =
+            |row: &[((i32, i32), El)]| row.iter().all(|(_, el)| matches!(el, El::Text(_)));
+        let fields = |row: &[((i32, i32), El)]| {
+            row.iter()
+                .filter(|(_, el)| matches!(el, El::Part(Part::Field(_))))
+                .count()
+        };
+        let starts_with_radio = |row: &[((i32, i32), El)]| {
+            row.iter()
+                .find_map(|(_, el)| match el {
+                    El::Part(p) => Some(matches!(p, Part::Radio(_))),
+                    _ => None,
+                })
+                .unwrap_or(false)
+                && !matches!(row[0].1, El::Text(_))
+        };
+        let last_controls = rows
+            .iter()
+            .rposition(|r| !texts_only(r) && !matches!(r[0].1, El::Rule));
+        let trim = |t: &str| t.trim_end_matches(':').to_string();
+        let mut items: Vec<Item> = Vec::new();
+        let mut captions: Vec<String> = Vec::new();
+        let mut rows = rows.into_iter().enumerate().peekable();
+        while let Some((i, row)) = rows.next() {
+            if matches!(row[0].1, El::Rule) {
+                items.push(Item::Rule);
+                continue;
+            }
+            if texts_only(&row) {
+                let words: Vec<String> = row
+                    .into_iter()
+                    .filter_map(|(_, el)| match el {
+                        El::Text(t) => Some(t),
+                        _ => None,
+                    })
+                    .collect();
+                let next = rows.peek().map(|(_, r)| r.as_slice());
+                // Captions over a line of fields stand before the fields.
+                if words.len() > 1 && next.is_some_and(|r| fields(r) == words.len()) {
+                    captions = words;
+                    continue;
+                }
+                let text = words.join(" ");
+                if next.is_some_and(starts_with_radio) {
+                    items.push(Item::Heading(trim(&text)));
+                } else if last_controls.is_some_and(|l| i < l) {
+                    items.push(Item::Text {
+                        text,
+                        tone: Tone::Normal,
+                        bullet: false,
+                    });
+                } else if let Some(Item::Text {
+                    text: before,
+                    tone: Tone::Dim,
+                    ..
+                }) = items.last_mut()
+                {
+                    // An explanation that runs over several Classic lines is one text.
+                    before.push(' ');
+                    before.push_str(&text);
+                } else {
+                    items.push(Item::Text {
+                        text,
+                        tone: Tone::Dim,
+                        bullet: false,
+                    });
+                }
+                continue;
+            }
+            let mut label = String::new();
+            let mut parts = Vec::new();
+            let mut caption = std::mem::take(&mut captions).into_iter();
+            for (n, (_, el)) in row.into_iter().enumerate() {
+                match el {
+                    El::Text(t) if n == 0 => label = trim(&t),
+                    El::Text(t) => parts.push(Part::Text(t, Tone::Dim)),
+                    El::Part(p) => {
+                        if matches!(p, Part::Field(_))
+                            && let Some(c) = caption.next()
+                        {
+                            parts.push(Part::Text(c, Tone::Dim));
+                        }
+                        parts.push(p);
+                    }
+                    El::Rule => {}
+                }
+            }
+            let leads = matches!(parts.first(), Some(Part::Radio(_) | Part::Check(_)));
+            items.push(if label.is_empty() && leads {
+                Item::Row(parts)
+            } else {
+                Item::Line {
+                    label,
+                    key: None,
+                    parts,
+                }
+            });
+        }
+        if let Some(m) = message.or(self.message.as_deref()) {
+            items.push(Item::Text {
+                text: m.to_string(),
+                tone: Tone::Alert,
+                bullet: false,
+            });
+        }
+        Dialog {
+            title: self.title.to_string(),
+            kind: Kind::Plain,
+            size: Size::Small,
+            columns: vec![items],
+            buttons: vec![
+                ViewButton::new(
+                    Control::new(ctl::CANCEL, self.button_rect(false)),
+                    "Cancel",
+                    Role::Cancel,
+                    self.pressed(Target::Cancel),
+                ),
+                ViewButton::new(
+                    Control::new(ctl::OK, self.button_rect(true)),
+                    "Ok",
+                    Role::Default,
+                    self.pressed(Target::Ok),
+                ),
+            ],
+        }
+    }
+
     /// Renders the form alone.
     pub fn render(&self, pens: &Pens) -> IndexedImage {
         let font = Font::builtin();
@@ -586,5 +816,92 @@ mod tests {
                 .count()
         };
         assert!(count(ghost) > 0);
+    }
+
+    /// The view (ADR-47): what stands at one height is one line, and the centre of every
+    /// control's rectangle is where the form takes that control's press.
+    #[test]
+    fn the_view_groups_lines_and_names_every_control() {
+        let mut f = sample();
+        f.text((8, 70), "An explanation");
+        f.text((8, 79), "in two lines");
+        let v = f.view();
+        assert_eq!((v.title.as_str(), v.size), ("Sample", Size::Small));
+        let ids: Vec<dialog::ControlId> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [
+                ctl::RADIO,
+                ctl::RADIO + 1,
+                ctl::FIELD,
+                ctl::RADIO + 2,
+                ctl::CHECK,
+                ctl::CANCEL,
+                ctl::OK
+            ]
+        );
+        for c in v.controls() {
+            let (x, y) = (c.area.x + c.area.w / 2, c.area.y + c.area.h / 2);
+            let wanted = match c.id {
+                ctl::CANCEL => Some(Target::Cancel),
+                ctl::OK => Some(Target::Ok),
+                // The third radio button is ghosted: it takes no press.
+                id if id == ctl::RADIO + 2 => None,
+                id if id >= ctl::FIELD => Some(Target::Field(usize::from(id - ctl::FIELD))),
+                id if id >= ctl::CHECK => Some(Target::Check(usize::from(id - ctl::CHECK))),
+                id => Some(Target::Radio(usize::from(id - ctl::RADIO))),
+            };
+            assert_eq!(f.target_at(x, y), wanted, "control {}", c.id);
+        }
+        let items = &v.columns[0];
+        // One, Two with its field (the caption "N" between them), Three, Dither, the text.
+        assert!(matches!(&items[0], Item::Row(p) if p.len() == 1));
+        let Item::Row(two) = &items[1] else {
+            panic!("the second line: {:?}", items[1]);
+        };
+        assert!(matches!(&two[0], Part::Radio(r) if r.label == "Two" && !r.on && r.enabled));
+        assert!(matches!(&two[1], Part::Text(t, Tone::Dim) if t == "N"));
+        assert!(
+            matches!(&two[2], Part::Field(x) if x.text == "5" && x.caret == Some(1) && x.max_chars == 2)
+        );
+        assert!(matches!(&items[2], Item::Row(p) if matches!(&p[0], Part::Radio(r) if !r.enabled)));
+        assert!(matches!(&items[3], Item::Row(p) if matches!(&p[0], Part::Check(c) if !c.on)));
+        assert_eq!(
+            items[4],
+            Item::Text {
+                text: "An explanation in two lines".into(),
+                tone: Tone::Dim,
+                bullet: false
+            }
+        );
+        assert_eq!(items.len(), 5);
+        // State: a chosen radio, a checked box, a held button, a message.
+        click(&mut f, 10, 33);
+        click(&mut f, 10, 58);
+        f.fields[0].text.set("");
+        f.handle(ReqEvent::Key(ReqKey::Enter));
+        let ok = f.button_rect(true);
+        f.handle(ReqEvent::Press(ok.x + 1, ok.y + 1));
+        let v = f.view();
+        let items = &v.columns[0];
+        assert!(matches!(&items[1], Item::Row(p) if matches!(&p[0], Part::Radio(r) if r.on)));
+        assert!(matches!(&items[3], Item::Row(p) if matches!(&p[0], Part::Check(c) if c.on)));
+        assert_eq!(
+            items[5],
+            Item::Text {
+                text: "N must be 1 to 99".into(),
+                tone: Tone::Alert,
+                bullet: false
+            }
+        );
+        assert!(v.buttons[1].pressed && !v.buttons[0].pressed);
+        assert_eq!(
+            f.view_with(Vec::new(), Some("Refused")).columns[0][5],
+            Item::Text {
+                text: "Refused".into(),
+                tone: Tone::Alert,
+                bullet: false
+            }
+        );
     }
 }

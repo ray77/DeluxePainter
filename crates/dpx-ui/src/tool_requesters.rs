@@ -343,6 +343,27 @@ impl ToolRequester {
         }
     }
 
+    /// Whether the Modern skin shows this requester itself ([`ToolRequester::view`]).
+    pub fn has_view(&self) -> bool {
+        matches!(
+            self,
+            ToolRequester::Grid(_)
+                | ToolRequester::Symmetry(_)
+                | ToolRequester::Spacing(_)
+                | ToolRequester::Fill(_)
+                | ToolRequester::Translucency(_)
+        )
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47); `None` for one that is still
+    /// shown in the Classic look. `palette` supplies the swatches.
+    pub fn view(&self, _palette: &Palette) -> Option<crate::dialog::Dialog> {
+        match self {
+            _ if !self.has_view() => None,
+            _ => self.form().map(Form::view),
+        }
+    }
+
     pub fn size(&self) -> (i32, i32) {
         match (self.form(), self) {
             (Some(f), _) => f.size(),

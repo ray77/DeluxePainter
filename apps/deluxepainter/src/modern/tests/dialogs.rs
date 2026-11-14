@@ -27,6 +27,12 @@ fn dialog_state(rig: &mut Rig) -> String {
     let choice = app.ui.choice_requester.take();
     let page = app.ui.page_size_requester.take();
     let format = app.requester.take();
+    let palette = app.palette().clone();
+    let tool = app
+        .ui
+        .tool_requester
+        .take_if(|r| r.view(&palette).is_some());
+    let percent = app.menu_data.effects.percent;
     let shown = format!(
         "{:?}",
         (
@@ -34,6 +40,8 @@ fn dialog_state(rig: &mut Rig) -> String {
             choice.as_ref().map(|r| r.view()),
             page.as_ref().map(|r| r.view()),
             format.as_ref().map(|r| (r.view(), r.command())),
+            tool.as_ref().map(|r| r.view(&palette)),
+            percent,
             open,
             pending,
             confirmed,
@@ -50,6 +58,9 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.choice_requester = choice;
     app.ui.page_size_requester = page;
     app.requester = format;
+    if tool.is_some() {
+        app.ui.tool_requester = tool;
+    }
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -653,6 +664,198 @@ fn the_screen_format_requester_does_the_same_in_both_skins() {
     both_at_every_scale(screen_format_all_script);
 }
 
+/// The requesters built on the shared form (slice 4b): Gridding, Symmetry, Spacing, Fill
+/// Type and Translucency. Every field with every editing key, Tab, a refused number, every
+/// radio button and check box, Cancel, Ok, Return and Esc.
+fn form_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::form_ctl as ctl;
+    use dpx_ui::{SpacingMode, ToolRequester};
+    let opened = |rig: &mut Rig, seen: Seen, name: &str| {
+        assert!(rig.app.ui.tool_requester.is_some(), "{name} is open");
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Tool), "{name}");
+        }
+        seen(rig, format!("{name}.."));
+    };
+    let open = |rig: &Rig| rig.app.ui.tool_requester.is_some();
+    let erase = |rig: &mut Rig, n: usize| {
+        for _ in 0..n {
+            rig.tap(egui::Key::Backspace);
+        }
+    };
+    // Gridding: two fields.
+    let grid = |rig: &mut Rig, seen: Seen| {
+        rig.click(Place::Tool(Tool::Grid, false), Secondary);
+        assert!(matches!(
+            rig.app.ui.tool_requester,
+            Some(ToolRequester::Grid(_))
+        ));
+        opened(rig, seen, "Gridding");
+    };
+    grid(rig, seen);
+    rig.click_control(ctl::FIELD + 1, (0.5, 0.5));
+    seen(rig, "the Y field".into());
+    for key in [
+        egui::Key::Backspace,
+        egui::Key::ArrowLeft,
+        egui::Key::Delete,
+        egui::Key::Home,
+        egui::Key::ArrowRight,
+        egui::Key::End,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        rig.tap(key);
+        seen(rig, format!("{key:?}"));
+        rig.type_text("7");
+        seen(rig, format!("7 after {key:?}"));
+        rig.tap(egui::Key::Backspace);
+    }
+    rig.type_text("ab-9");
+    seen(rig, "letters and a digit".into());
+    rig.pass(vec![egui::Event::Paste("1x2\n34".into())]);
+    seen(rig, "pasted text".into());
+    rig.tap(egui::Key::Tab);
+    seen(rig, "Tab".into());
+    erase(rig, 3);
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "an X spacing is missing");
+    seen(rig, "Return with an empty field".into());
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(open(rig));
+    seen(rig, "Ok with an empty field".into());
+    rig.type_text("0");
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "zero is no spacing");
+    seen(rig, "a zero spacing".into());
+    rig.click_control(ctl::FIELD, (0.9, 0.5));
+    rig.click_control(ctl::FIELD + 1, (0.04, 0.1));
+    seen(rig, "both fields by a click".into());
+    rig.tap(egui::Key::Escape);
+    assert!(!open(rig), "Esc closes it");
+    assert_eq!(
+        (rig.app.tools.grid_size.x, rig.app.tools.grid_size.y),
+        (16, 16)
+    );
+    seen(rig, "Esc".into());
+    grid(rig, seen);
+    rig.press_and_leave(ctl::OK);
+    rig.press_and_leave(ctl::CANCEL);
+    rig.click_beside();
+    rig.press_beside_and_enter(ctl::OK);
+    rig.wheel(-2.0);
+    assert!(open(rig));
+    seen(rig, "Ok and Cancel pressed and left, the wheel".into());
+    rig.click_control(ctl::CANCEL, (0.03, 0.06));
+    assert!(!open(rig), "Cancel closes it");
+    seen(rig, "Cancel".into());
+    grid(rig, seen);
+    erase(rig, 3);
+    rig.type_text("24");
+    rig.click_control(ctl::OK, (0.97, 0.94));
+    assert!(!open(rig), "Ok closes it");
+    assert_eq!(rig.app.tools.grid_size.x, 24);
+    seen(rig, "24 and Ok".into());
+    grid(rig, seen);
+    rig.tap(egui::Key::ArrowUp);
+    rig.tap(egui::Key::ArrowUp);
+    rig.tap(egui::Key::Enter);
+    assert_eq!(rig.app.tools.grid_size.x, 26);
+    seen(rig, "two steps up and Return".into());
+    // Symmetry: two radio buttons side by side and a field.
+    rig.click(Place::Tool(Tool::Symmetry, false), Secondary);
+    opened(rig, seen, "Symmetry");
+    rig.click_control(ctl::RADIO + 1, (0.03, 0.1));
+    seen(rig, "Mirror by its first pixel".into());
+    rig.click_control(ctl::RADIO, (0.97, 0.9));
+    seen(rig, "Cyclic by its last pixel".into());
+    rig.press_and_leave(ctl::RADIO + 1);
+    seen(rig, "Mirror pressed and left".into());
+    erase(rig, 2);
+    rig.type_text("41");
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "41 points are too many");
+    seen(rig, "an order that is refused".into());
+    erase(rig, 2);
+    rig.type_text("8");
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(!open(rig));
+    let s = rig.app.tools.symmetry_settings;
+    assert_eq!((s.mirror, s.order), (true, 8));
+    seen(rig, "Mirror, 8 points, Ok".into());
+    // Spacing: every radio button activates its field.
+    rig.click(Place::Tool(Tool::Line, false), Secondary);
+    opened(rig, seen, "Spacing");
+    for radio in 1..4 {
+        rig.click_control(ctl::RADIO + radio, (0.5, 0.5));
+        seen(rig, format!("radio button {radio}"));
+        rig.type_text("3");
+        seen(rig, "a digit in its field".into());
+    }
+    rig.click_control(ctl::RADIO, (0.5, 0.5));
+    seen(rig, "Continuous".into());
+    rig.click_control(ctl::FIELD + 3, (0.5, 0.5));
+    erase(rig, 2);
+    rig.type_text("25");
+    seen(rig, "the airbrush size".into());
+    rig.tap(egui::Key::Tab);
+    seen(rig, "Tab to the first field".into());
+    rig.click_control(ctl::RADIO + 2, (0.5, 0.5));
+    erase(rig, 3);
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "the chosen mode has no number");
+    seen(rig, "Return without a number".into());
+    rig.type_text("12");
+    rig.tap(egui::Key::Enter);
+    assert!(!open(rig));
+    let s = rig.app.tools.spacing;
+    assert_eq!(
+        (s.mode, s.n, s.airbrush_radius),
+        (SpacingMode::EveryN, 12, 25)
+    );
+    seen(rig, "every 12th dot, Return".into());
+    // Fill Type: the gradient directions and Dither.
+    rig.click(Place::Tool(Tool::Fill, false), Secondary);
+    opened(rig, seen, "Fill Type");
+    for radio in [1, 2, 3, 4, 0, 3] {
+        rig.click_control(ctl::RADIO + radio, (0.5, 0.5));
+        seen(rig, format!("radio button {radio}"));
+    }
+    for corner in [(0.5, 0.5), (0.03, 0.1), (0.97, 0.9)] {
+        rig.click_control(ctl::CHECK, corner);
+        seen(rig, format!("Dither at {corner:?}"));
+    }
+    rig.type_text("x5");
+    rig.tap(egui::Key::Tab);
+    seen(rig, "keys that mean nothing here".into());
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(!open(rig));
+    let fill = rig.app.tools.fill;
+    assert_eq!(
+        (fill.gradient, fill.dither),
+        (Some(dpx_core::GradientDirection::VerticalLine), true)
+    );
+    seen(rig, "Vertical Line, Dither, Ok".into());
+    // Translucency: one field.
+    rig.pick(Action::Command("translucency.settings"));
+    opened(rig, seen, "Translucency");
+    erase(rig, 3);
+    rig.type_text("101");
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "101 % is refused");
+    seen(rig, "101 %".into());
+    rig.tap(egui::Key::Backspace);
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(!open(rig));
+    assert_eq!(rig.app.menu_data.effects.percent, 10);
+    seen(rig, "10 % and Ok".into());
+}
+
+#[test]
+fn the_form_requesters_do_the_same_in_both_skins() {
+    both_at_every_scale(form_script);
+}
+
 /// Several requesters open at once: the pointer and the keys belong to the one `pass()`
 /// asks first, and that is the one the Modern skin shows as its card.
 fn stack_script(rig: &mut Rig, seen: Seen) {
@@ -921,7 +1124,22 @@ fn the_card_veils_the_window_and_follows_the_pointer() {
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 5] = [
+    let open: [(&str, Card, Open); 10] = [
+        ("grid", Card::Tool, |rig| {
+            rig.click(Place::Tool(Tool::Grid, false), Secondary)
+        }),
+        ("symmetry", Card::Tool, |rig| {
+            rig.click(Place::Tool(Tool::Symmetry, false), Secondary)
+        }),
+        ("spacing", Card::Tool, |rig| {
+            rig.click(Place::Tool(Tool::Line, false), Secondary)
+        }),
+        ("fill", Card::Tool, |rig| {
+            rig.click(Place::Tool(Tool::Fill, false), Secondary)
+        }),
+        ("translucency", Card::Tool, |rig| {
+            rig.pick(Action::Command("translucency.settings"))
+        }),
         ("note", Card::Note, |rig| rig.show_note()),
         ("about", Card::Note, |rig| {
             rig.pick(Action::Command("app.about"))
@@ -1046,9 +1264,7 @@ fn only_the_converted_requesters_are_cards() {
     );
     type Open = fn(&mut Rig);
     let others: [(&str, Open); 5] = [
-        ("tool settings", |rig| {
-            rig.click(Place::Tool(Tool::Grid, false), Secondary)
-        }),
+        ("Stencil", |rig| rig.pick(Action::Command("stencil.make"))),
         ("Color Mixer", |rig| rig.key('p')),
         ("file", |rig| rig.pick(Action::Command("picture.load"))),
         ("Generate", |rig| {

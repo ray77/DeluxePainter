@@ -53,6 +53,8 @@ pub use animbrush_requester::{AnimBrushReq, AnimBrushRequester};
 pub use arrange_requester::ArrangeRequester;
 pub use choice_requester::{ChoiceRequester, ChoiceResponse};
 pub use file_requester::{Browse, Entry, FileKind, FileRequester, FileResponse, PlaceKind};
+/// Ids of the controls of a requester built on the shared form (ADR-47).
+pub use form::ctl as form_ctl;
 pub use generate_requester::{
     GenControl, GenPhase, GenQuality, GenRow, GenStyle, GenTarget, GenerateOptions,
     GenerateRequester, GenerateResponse, ProviderInfo,

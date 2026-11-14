@@ -850,6 +850,7 @@ impl ScreenFormatRequester {
                     control: Control::new(ctl::COLORS, s.public()),
                     knob: dpx_core::Rect::new(self.slider_knob_x(), s.y + 1, geom::KNOB_W, s.h - 2),
                     value: self.colors().to_string(),
+                    enabled: true,
                 })],
             },
             Item::Line {
