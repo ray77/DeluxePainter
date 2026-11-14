@@ -335,7 +335,8 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 | Grid, Symmetry, Spacing, Fill, Translucency | `tool_requesters.rs` on `form.rs` | **modern** (slice 4b) | |
 | Stencil, Arrange | `stencil_requester.rs`, `arrange_requester.rs` (own code, no form) | classic look | a swatch grid part; Stencil toggles by click and drag-paint, Arrange drags a swatch to another place |
 | AnimBrush, Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | classic look | the form family plus icon buttons (AnimBrush direction) and one extra button (Perspective) |
-| Anim requesters | `anim_requester.rs` (forms) | classic look | the form family; the Move preview and playback keep the picture |
+| Anim requesters: Set Frame Count, Add, Copy and Delete Frames, Go to Frame, Set Rate | `anim_requester.rs` (forms) | **modern** (slice 4b) | |
+| Set Range | `anim_control.rs` (`PlayRangeRequester`, a form) | **modern** (slice 4b) | |
 | File requester (Load, Save, Export, brushes, anims) | `file_requester.rs` | classic look | the list part with scroll bar and the fields exist; needs Drawer / Pattern / File fields in one view, Disks / Assigns / Parent, "# of Frames", long names |
 | Color Mixer | `palette_requester.rs` | classic look | swatch grid, sample box, RGB/HSV sliders, SPREAD / COPY / EX / UNDO; it changes the palette of the whole screen live, so where the card stands over the picture is a visible decision |
 | Range | `range_requester.rs` | classic look | a palette strip that marks the range's span, range, speed, direction and active controls |

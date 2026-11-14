@@ -264,6 +264,12 @@ impl AnimRequester {
         self.form.size()
     }
 
+    /// The requester as the Modern skin shows it (ADR-47): its form, with the message the
+    /// app or a backwards range left on the message line.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        self.form.view_with(Vec::new(), self.message.as_deref())
+    }
+
     /// Top-left corner on a UI screen of this size: centred.
     pub fn origin(&self, screen_w: i32, screen_h: i32) -> (i32, i32) {
         let (w, h) = self.size();
@@ -465,6 +471,66 @@ mod tests {
             key(&mut r, ReqKey::Enter),
             AnimReqResponse::Ok(AnimChoice::DeleteAll)
         );
+    }
+
+    #[test]
+    fn the_view_is_the_form_with_the_message() {
+        use crate::dialog::{Item, Tone};
+        use crate::form::ctl;
+        let mut r = AnimRequester::copy_frames(10, 3);
+        let v = r.view();
+        assert_eq!(v.title, "Copy Frames");
+        assert_eq!(v.columns[0][0], Item::Heading("Current frame to".into()));
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [
+                ctl::RADIO,
+                ctl::RADIO + 1,
+                ctl::FIELD,
+                ctl::FIELD + 1,
+                ctl::RADIO + 2,
+                ctl::FIELD + 2,
+                ctl::FIELD + 3,
+                ctl::FIELD + 4,
+                ctl::CANCEL,
+                ctl::OK
+            ]
+        );
+        // "Insert before" names its field's line.
+        assert!(v.columns[0].iter().any(
+            |i| matches!(i, Item::Line { label, parts, .. } if label == "Insert before" && parts.len() == 1)
+        ));
+        // The centre of the Frames radio button is its press: its From field gets the keys.
+        let a = v.control(ctl::RADIO + 1).unwrap().area;
+        click(&mut r, a.x + a.w / 2, a.y + a.h / 2);
+        clear(&mut r, 1);
+        type_text(&mut r, "9");
+        key(&mut r, ReqKey::Tab);
+        clear(&mut r, 2);
+        type_text(&mut r, "2");
+        assert_eq!(key(&mut r, ReqKey::Enter), AnimReqResponse::Continue);
+        let v = r.view();
+        assert_eq!(
+            v.columns[0].last(),
+            Some(&Item::Text {
+                text: "From 9 is after To 2".into(),
+                tone: Tone::Alert,
+                bullet: false
+            })
+        );
+        r.set_message("Too many frames");
+        assert!(matches!(
+            r.view().columns[0].last(),
+            Some(Item::Text { text, .. }) if text == "Too many frames"
+        ));
+        for single in [AnimRequester::goto(12, 3), AnimRequester::rate(30)] {
+            let v = single.view();
+            assert!(matches!(
+                &v.columns[0][..],
+                [Item::Line { parts, .. }] if parts.len() == 2
+            ));
+        }
     }
 
     #[test]

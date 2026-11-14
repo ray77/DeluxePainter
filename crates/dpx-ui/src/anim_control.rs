@@ -93,6 +93,11 @@ impl PlayRangeRequester {
         self.form.size()
     }
 
+    /// The requester as the Modern skin shows it (ADR-47).
+    pub fn view(&self) -> crate::dialog::Dialog {
+        self.form.view_with(Vec::new(), self.message.as_deref())
+    }
+
     /// Handles one event in requester coordinates.
     pub fn handle(&mut self, event: ReqEvent) -> PlayRangeResponse {
         if !matches!(event, ReqEvent::Drag(..)) {
@@ -718,6 +723,20 @@ pub enum AnimControlRequester {
 }
 
 impl AnimControlRequester {
+    /// Whether the Modern skin shows this requester itself ([`AnimControlRequester::view`]).
+    pub fn has_view(&self) -> bool {
+        matches!(self, AnimControlRequester::PlayRange(_))
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47); `None` for one that is still
+    /// shown in the Classic look.
+    pub fn view(&self) -> Option<crate::dialog::Dialog> {
+        match self {
+            AnimControlRequester::PlayRange(r) => Some(r.view()),
+            AnimControlRequester::Move(_) => None,
+        }
+    }
+
     pub fn size(&self) -> (i32, i32) {
         match self {
             AnimControlRequester::PlayRange(r) => r.size(),

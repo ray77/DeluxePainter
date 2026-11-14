@@ -32,7 +32,13 @@ fn dialog_state(rig: &mut Rig) -> String {
         .ui
         .tool_requester
         .take_if(|r| r.view(&palette).is_some());
-    let percent = app.menu_data.effects.percent;
+    let anim = app.ui.anim_requester.take();
+    let control = app.ui.anim_control.take_if(|r| r.has_view());
+    let percent = (
+        app.menu_data.effects.percent,
+        app.engine.document().fps(),
+        app.anim_control.range,
+    );
     let shown = format!(
         "{:?}",
         (
@@ -41,6 +47,8 @@ fn dialog_state(rig: &mut Rig) -> String {
             page.as_ref().map(|r| r.view()),
             format.as_ref().map(|r| (r.view(), r.command())),
             tool.as_ref().map(|r| r.view(&palette)),
+            anim.as_ref().map(|r| r.view()),
+            control.as_ref().map(|r| r.view()),
             percent,
             open,
             pending,
@@ -60,6 +68,10 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.requester = format;
     if tool.is_some() {
         app.ui.tool_requester = tool;
+    }
+    app.ui.anim_requester = anim;
+    if control.is_some() {
+        app.ui.anim_control = control;
     }
     format!("{shown} closes: {closes} {rest}")
 }
@@ -856,6 +868,203 @@ fn the_form_requesters_do_the_same_in_both_skins() {
     both_at_every_scale(form_script);
 }
 
+/// The Anim requesters (slice 4b): Set Frame Count, Add Frames, Go to Frame, Set Rate, Set
+/// Range, Copy Frames and Delete Frames, with a refused number, a backwards range, every
+/// radio button, Cancel, Ok, Return and Esc.
+fn anim_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::form_ctl as ctl;
+    let open = |rig: &mut Rig, seen: Seen, command: &'static str| {
+        rig.pick(Action::Command(command));
+        let control = command == "anim.set_range";
+        assert_eq!(rig.app.ui.anim_requester.is_some(), !control, "{command}");
+        assert_eq!(rig.app.ui.anim_control.is_some(), control, "{command}");
+        if rig.app.is_modern() {
+            let card = if control {
+                Card::AnimControl
+            } else {
+                Card::Anim
+            };
+            assert_eq!(rig.card(), Some(card), "{command}");
+        }
+        seen(rig, format!("{command}.."));
+    };
+    let is_open =
+        |rig: &Rig| rig.app.ui.anim_requester.is_some() || rig.app.ui.anim_control.is_some();
+    let erase = |rig: &mut Rig, n: usize| {
+        for _ in 0..n {
+            rig.tap(egui::Key::Backspace);
+        }
+    };
+    // Whatever the command answers with (a note) is closed in both skins alike.
+    let settle = |rig: &mut Rig, seen: Seen, step: &str| {
+        seen(rig, step.to_string());
+        for _ in 0..2 {
+            if rig.app.modal_open() {
+                rig.tap(egui::Key::Enter);
+                seen(rig, format!("Return after {step}"));
+            }
+        }
+        assert!(!rig.app.modal_open(), "{step}: closed");
+    };
+    let frames = |rig: &Rig| rig.app.engine.document().frame_count();
+    // Set Frame Count: a refused number, then four frames.
+    open(rig, seen, "anim.set_frame_count");
+    erase(rig, 1);
+    rig.type_text("0");
+    rig.tap(egui::Key::Enter);
+    assert!(is_open(rig), "no frames is refused");
+    seen(rig, "a count of 0".into());
+    rig.click_control(ctl::FIELD, (0.5, 0.5));
+    for key in [
+        egui::Key::Home,
+        egui::Key::Delete,
+        egui::Key::End,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+    ] {
+        rig.tap(key);
+        seen(rig, format!("{key:?}"));
+    }
+    rig.type_text("x4");
+    rig.press_and_leave(ctl::OK);
+    rig.press_and_leave(ctl::CANCEL);
+    rig.click_beside();
+    assert!(is_open(rig));
+    seen(rig, "4, buttons pressed and left".into());
+    rig.click_control(ctl::OK, (0.97, 0.94));
+    settle(rig, seen, "four frames");
+    assert_eq!(frames(rig), 4);
+    // Add Frames: Cancel, Esc, then two more by the arrow key and Return.
+    open(rig, seen, "anim.add_frames");
+    rig.click_control(ctl::CANCEL, (0.03, 0.06));
+    assert!(!is_open(rig), "Cancel");
+    seen(rig, "Cancel".into());
+    open(rig, seen, "anim.add_frames");
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig), "Esc");
+    seen(rig, "Esc".into());
+    open(rig, seen, "anim.add_frames");
+    rig.tap(egui::Key::ArrowUp);
+    rig.tap(egui::Key::Tab);
+    seen(rig, "one step up, Tab".into());
+    rig.tap(egui::Key::Enter);
+    settle(rig, seen, "two frames added");
+    assert_eq!(frames(rig), 6);
+    // Go to Frame and Set Rate.
+    open(rig, seen, "anim.goto");
+    erase(rig, 1);
+    rig.type_text("3");
+    rig.tap(egui::Key::Enter);
+    settle(rig, seen, "frame 3");
+    assert_eq!(rig.app.engine.document().current_frame(), 2);
+    open(rig, seen, "anim.set_rate");
+    erase(rig, 2);
+    rig.type_text("61");
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(is_open(rig), "61 frames per second are refused");
+    seen(rig, "a rate of 61".into());
+    erase(rig, 2);
+    rig.type_text("12");
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    settle(rig, seen, "12 frames per second");
+    assert_eq!(rig.app.engine.document().fps(), 12);
+    // Set Range: a backwards range is refused, then frames 2 to 5, then all frames.
+    open(rig, seen, "anim.set_range");
+    rig.click_control(ctl::RADIO + 1, (0.5, 0.5));
+    seen(rig, "Frames".into());
+    erase(rig, 1);
+    rig.type_text("5");
+    rig.tap(egui::Key::Tab);
+    erase(rig, 1);
+    rig.type_text("2");
+    rig.tap(egui::Key::Enter);
+    assert!(is_open(rig), "5 to 2 is refused");
+    seen(rig, "from 5 to 2".into());
+    rig.click_control(ctl::FIELD, (0.5, 0.5));
+    seen(rig, "the From field".into());
+    erase(rig, 1);
+    rig.type_text("2");
+    rig.click_control(ctl::FIELD + 1, (0.5, 0.5));
+    erase(rig, 1);
+    rig.type_text("5");
+    rig.press_and_leave(ctl::OK);
+    seen(rig, "2 to 5, Ok pressed and left".into());
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    settle(rig, seen, "the range 2 to 5");
+    assert_eq!(rig.app.anim_control.range, Some((1, 4)));
+    open(rig, seen, "anim.set_range");
+    rig.click_control(ctl::CANCEL, (0.5, 0.5));
+    assert!(!is_open(rig));
+    seen(rig, "Cancel".into());
+    open(rig, seen, "anim.set_range");
+    rig.click_control(ctl::RADIO, (0.03, 0.1));
+    rig.tap(egui::Key::Enter);
+    settle(rig, seen, "all frames");
+    assert_eq!(rig.app.anim_control.range, None);
+    // Copy Frames: every choice; a backwards range; copies inserted before frame 1.
+    open(rig, seen, "anim.copy_frames");
+    for radio in [1, 2, 0, 1] {
+        rig.click_control(ctl::RADIO + radio, (0.5, 0.5));
+        seen(rig, format!("radio button {radio}"));
+    }
+    erase(rig, 1);
+    rig.type_text("6");
+    rig.tap(egui::Key::Tab);
+    erase(rig, 1);
+    rig.type_text("2");
+    rig.tap(egui::Key::Enter);
+    assert!(is_open(rig), "6 to 2 is refused");
+    seen(rig, "from 6 to 2".into());
+    rig.click_control(ctl::RADIO + 2, (0.97, 0.9));
+    seen(rig, "Copy frames".into());
+    for field in [4, 3, 2] {
+        rig.click_control(ctl::FIELD + field, (0.5, 0.5));
+        erase(rig, 1);
+        rig.type_text("1");
+        seen(rig, format!("1 in field {field}"));
+    }
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    settle(rig, seen, "a copy of frame 1 before it");
+    assert_eq!(frames(rig), 7);
+    open(rig, seen, "anim.copy_frames");
+    rig.tap(egui::Key::Enter);
+    settle(rig, seen, "the current frame to all frames");
+    // Delete Frames: a range, the current frame, Esc, all frames.
+    open(rig, seen, "anim.delete_frames");
+    rig.click_control(ctl::RADIO + 1, (0.5, 0.5));
+    erase(rig, 1);
+    rig.type_text("6");
+    seen(rig, "frames 6 to the last".into());
+    rig.tap(egui::Key::Enter);
+    settle(rig, seen, "frames 6 and 7 deleted");
+    assert_eq!(frames(rig), 5);
+    open(rig, seen, "anim.delete_frames");
+    rig.click_control(ctl::RADIO + 2, (0.5, 0.5));
+    rig.click_control(ctl::RADIO, (0.5, 0.5));
+    seen(rig, "All frames, then Current frame".into());
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    settle(rig, seen, "the current frame deleted");
+    assert_eq!(frames(rig), 4);
+    open(rig, seen, "anim.delete_frames");
+    rig.click_control(ctl::RADIO + 2, (0.5, 0.5));
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig));
+    seen(rig, "All frames and Esc".into());
+    assert_eq!(frames(rig), 4);
+    open(rig, seen, "anim.delete_frames");
+    rig.click_control(ctl::RADIO + 2, (0.5, 0.5));
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    settle(rig, seen, "all frames deleted");
+    assert_eq!(frames(rig), 1);
+    rig.key('u');
+    seen(rig, "undo".into());
+}
+
+#[test]
+fn the_anim_requesters_do_the_same_in_both_skins() {
+    both_at_every_scale(anim_script);
+}
+
 /// Several requesters open at once: the pointer and the keys belong to the one `pass()`
 /// asks first, and that is the one the Modern skin shows as its card.
 fn stack_script(rig: &mut Rig, seen: Seen) {
@@ -1124,7 +1333,28 @@ fn the_card_veils_the_window_and_follows_the_pointer() {
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 10] = [
+    let open: [(&str, Card, Open); 17] = [
+        ("anim-count", Card::Anim, |rig| {
+            rig.pick(Action::Command("anim.set_frame_count"))
+        }),
+        ("anim-add", Card::Anim, |rig| {
+            rig.pick(Action::Command("anim.add_frames"))
+        }),
+        ("anim-copy", Card::Anim, |rig| {
+            rig.pick(Action::Command("anim.copy_frames"))
+        }),
+        ("anim-delete", Card::Anim, |rig| {
+            rig.pick(Action::Command("anim.delete_frames"))
+        }),
+        ("anim-goto", Card::Anim, |rig| {
+            rig.pick(Action::Command("anim.goto"))
+        }),
+        ("anim-rate", Card::Anim, |rig| {
+            rig.pick(Action::Command("anim.set_rate"))
+        }),
+        ("anim-range", Card::AnimControl, |rig| {
+            rig.pick(Action::Command("anim.set_range"))
+        }),
         ("grid", Card::Tool, |rig| {
             rig.click(Place::Tool(Tool::Grid, false), Secondary)
         }),

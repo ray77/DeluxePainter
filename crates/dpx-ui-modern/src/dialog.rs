@@ -1538,10 +1538,10 @@ mod tests {
     use dpx_ui::dialog::{ListRow, ScrollBar};
     use dpx_ui::form_ctl;
     use dpx_ui::{
-        ChoiceRequester, FillRequester, FillSettings, GridRequester, GridSettings, NoteRequester,
-        PageSizeRequester, Preset, ReqEvent, ReqKey, ScreenFormatRequester, SpacingMode,
-        SpacingRequester, SpacingSettings, SymmetryRequester, SymmetrySettings, ToolRequester,
-        TranslucencyRequester,
+        AnimRequester, ChoiceRequester, FillRequester, FillSettings, GridRequester, GridSettings,
+        NoteRequester, PageSizeRequester, PlayRangeRequester, Preset, ReqEvent, ReqKey,
+        ScreenFormatRequester, SpacingMode, SpacingRequester, SpacingSettings, SymmetryRequester,
+        SymmetrySettings, ToolRequester, TranslucencyRequester,
     };
 
     const WINDOWS: [(f32, f32); 3] = [(720.0, 520.0), (1280.0, 800.0), (1001.0, 640.0)];
@@ -1615,6 +1615,22 @@ mod tests {
         out.push(("fill", tool(&fill())));
         let translucency = ToolRequester::Translucency(TranslucencyRequester::new(100));
         out.push(("translucency", tool(&translucency)));
+        // The Anim requesters, with the largest numbers their fields take.
+        out.push(("frame count", AnimRequester::frame_count(999, 999).view()));
+        out.push(("add frames", AnimRequester::add_frames(998).view()));
+        let mut copy = AnimRequester::copy_frames(999, 999);
+        out.push(("copy frames", copy.view()));
+        copy.set_message("Out of memory for 999 frames");
+        out.push(("copy frames, refused", copy.view()));
+        out.push(("delete frames", AnimRequester::delete_frames(999, 1).view()));
+        out.push(("go to frame", AnimRequester::goto(999, 999).view()));
+        out.push(("rate", AnimRequester::rate(30).view()));
+        let mut range = PlayRangeRequester::new(999, Some((500, 999)));
+        out.push(("play range", range.view()));
+        for key in [ReqKey::Backspace, ReqKey::Backspace, ReqKey::Enter] {
+            range.handle(ReqEvent::Key(key));
+        }
+        out.push(("play range, refused", range.view()));
     }
 
     /// The converted dialogs in the states that change what they show.

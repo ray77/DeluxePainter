@@ -36,6 +36,17 @@ pub(crate) enum Card {
     PageSize,
     /// A toolbox settings requester (Gridding, Symmetry, Spacing, Fill Type, Translucency ..).
     Tool,
+    /// An Anim menu requester (Set Frame Count, Add, Copy, Delete Frames, Go to Frame, Rate).
+    Anim,
+    /// Anim ▸ Control ▸ Set Range..
+    AnimControl,
+}
+
+/// The Anim control requester that is open is one the Modern skin draws itself.
+fn anim_control_is_card(ui: &UiState) -> bool {
+    ui.anim_control
+        .as_ref()
+        .is_some_and(AnimControlRequester::has_view)
 }
 
 /// The toolbox settings requester that is open is one the Modern skin draws itself.
@@ -55,8 +66,11 @@ pub(crate) fn card(
     playing: bool,
     preview: bool,
 ) -> Option<Card> {
-    if ui.anim_control.is_some() || preview {
+    if preview {
         return None;
+    }
+    if let Some(r) = &ui.anim_control {
+        return r.has_view().then_some(Card::AnimControl);
     }
     if ui.choice_requester.is_some() {
         return Some(Card::Choice);
@@ -71,15 +85,16 @@ pub(crate) fn card(
     if screen_format {
         return Some(Card::ScreenFormat);
     }
-    if tool_is_card(ui) {
-        return Some(Card::Tool);
+    if ui.tool_requester.is_some() {
+        return tool_is_card(ui).then_some(Card::Tool);
     }
-    if ui.tool_requester.is_some()
-        || playing
-        || ui.anim_requester.is_some()
-        || ui.palette_requester.is_some()
-        || ui.range_requester.is_some()
-    {
+    if playing {
+        return None;
+    }
+    if ui.anim_requester.is_some() {
+        return Some(Card::Anim);
+    }
+    if ui.palette_requester.is_some() || ui.range_requester.is_some() {
         return None;
     }
     if ui.note_requester.is_some() {
@@ -100,6 +115,8 @@ pub(crate) fn view(
 ) -> Option<Dialog> {
     match card {
         Card::Tool => ui.tool_requester.as_ref().and_then(|r| r.view(palette)),
+        Card::Anim => ui.anim_requester.as_ref().map(AnimRequester::view),
+        Card::AnimControl => ui.anim_control.as_ref().and_then(|r| r.view()),
         Card::Choice => ui.choice_requester.as_ref().map(|r| r.view()),
         Card::ScreenFormat => screen_format.map(ScreenFormatRequester::view),
         Card::Note => ui.note_requester.as_ref().map(|r| r.view()),
@@ -111,7 +128,6 @@ pub(crate) fn view(
 /// open (the picture quad hosts it).
 pub(crate) fn classic_look_open(ui: &UiState) -> bool {
     (ui.tool_requester.is_some() && !tool_is_card(ui))
-        || ui.anim_requester.is_some()
         || ui.palette_requester.is_some()
         || ui.range_requester.is_some()
         || ui.file_requester.is_some()
@@ -119,7 +135,7 @@ pub(crate) fn classic_look_open(ui: &UiState) -> bool {
         || ui.generate_requester.is_some()
         || ui.imagegen_setup.is_some()
         || ui.mcp_requester.is_some()
-        || ui.anim_control.is_some()
+        || (ui.anim_control.is_some() && !anim_control_is_card(ui))
 }
 
 /// `ui` without the requesters the Modern skin draws itself: what the picture quad is
@@ -143,14 +159,19 @@ impl Cards {
     /// Takes every requester the Modern skin draws itself out of `ui`.
     pub(crate) fn take(ui: &mut UiState) -> Self {
         let tool = tool_is_card(ui);
+        let anim_control = anim_control_is_card(ui);
         Self {
             note: ui.note_requester.take(),
             choice: ui.choice_requester.take(),
             page_size: ui.page_size_requester.take(),
             tool: if tool { ui.tool_requester.take() } else { None },
-            anim: None,
+            anim: ui.anim_requester.take(),
             range: None,
-            anim_control: None,
+            anim_control: if anim_control {
+                ui.anim_control.take()
+            } else {
+                None
+            },
         }
     }
 
