@@ -90,9 +90,25 @@ fn hint_width(item: &Item) -> f32 {
         (_, Key::Amiga(c)) => {
             CAP + CAP_GAP + font::measure(c.encode_utf8(&mut [0; 4]), SIZE, Weight::Regular)
         }
+        (_, Key::Plain(k)) if on_chip(k) => chip_width(k),
         (_, Key::Plain(k)) => font::measure(k, SIZE, Weight::Regular),
         (_, Key::None) => 0.0,
     }
+}
+
+/// Height of the chip a punctuation key stands on, and the least width.
+const CHIP: f32 = 18.0;
+
+/// A key that is one punctuation mark (the backtick, the tilde, a comma ..) is shown on a
+/// chip in the Medium weight: alone and in the subdued colour such a glyph is a speck that
+/// does not read as a key.
+fn on_chip(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_punctuation())
+}
+
+fn chip_width(key: &str) -> f32 {
+    (font::measure(key, SIZE, Weight::Medium) + 10.0).max(CHIP)
 }
 
 impl Card {
@@ -361,6 +377,23 @@ fn draw_card(
                     SIZE,
                     Weight::Regular,
                     hint_ink,
+                );
+            }
+            (_, Key::Plain(k)) if on_chip(k) => {
+                let w = chip_width(k);
+                let chip = Rect::new(hint_right - w, mid - CHIP / 2.0, w, CHIP);
+                if !lit {
+                    list.round_rect(chip, 4.0, theme.panel);
+                }
+                list.ring(chip, 4.0, hint_ink, 1.0);
+                let text_w = font::measure(k, SIZE, Weight::Medium);
+                list.text(
+                    chip.x + (chip.w - text_w) / 2.0,
+                    font::baseline_centered(mid, SIZE, Weight::Medium),
+                    k,
+                    SIZE,
+                    Weight::Medium,
+                    ink,
                 );
             }
             (_, Key::Plain(k)) => {
@@ -724,6 +757,76 @@ mod tests {
         assert_eq!(count(&ui), on);
         ui.prefs.set(Pref::Coords, true);
         assert_eq!(count(&ui), on + 1);
+    }
+
+    /// A key that is a single punctuation mark stands on a chip, in the text colour: alone
+    /// and subdued, the backtick of Stencil ▸ On/Off was a speck.
+    #[test]
+    fn a_punctuation_key_stands_on_a_chip() {
+        assert!(on_chip("`") && on_chip("~") && on_chip(","));
+        assert!(!on_chip("p") && !on_chip("F12") && !on_chip("TAB") && !on_chip(""));
+        for theme in [Theme::dark(), Theme::light()] {
+            let l = layout((1280.0, 800.0), 1.0);
+            let ctx = modern_ctx();
+            // Effect ▸ Stencil: Make.. (~) and On/Off (`).
+            let effect = MENUS
+                .iter()
+                .position(|m| m.title == "Effect")
+                .expect("Effect");
+            let stencil = MENUS[effect]
+                .items
+                .iter()
+                .position(|it| it.label == "Stencil")
+                .expect("Stencil");
+            let state = held(&l, effect, Some(stencil), None);
+            let mut list = List::new();
+            draw(&mut list, &l, &theme, &ctx, &state).expect("cards");
+            for key in ["~", "`"] {
+                let (at, size, weight, colour) = list
+                    .ops()
+                    .iter()
+                    .find_map(|op| match op {
+                        Op::Text {
+                            text,
+                            x,
+                            baseline,
+                            size,
+                            weight,
+                            color,
+                        } if text == key => Some(((*x, *baseline), *size, *weight, *color)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{key} is drawn"));
+                assert_eq!((weight, size), (Weight::Medium, SIZE), "{key}");
+                // Enabled or ghosted, the key has the label's ink, never the dim one.
+                assert!(colour == theme.text || colour == theme.disabled, "{key}");
+                // A ring of at least 18 x 18 points around it, filled with the panel.
+                let chip = list
+                    .ops()
+                    .iter()
+                    .find_map(|op| match op {
+                        Op::RoundRect {
+                            rect,
+                            fill: None,
+                            stroke: Some(_),
+                            ..
+                        } if rect.contains(at.0, at.1 - 3.0) && rect.h == CHIP => Some(*rect),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{key} has a chip"));
+                assert!(chip.w >= CHIP, "{chip:?}");
+                let text_w = font::measure(key, SIZE, Weight::Medium);
+                assert!(
+                    (at.0 - (chip.x + (chip.w - text_w) / 2.0)).abs() < 0.01,
+                    "{key} is centred"
+                );
+            }
+            // A letter key stays plain text in the subdued colour.
+            let state = held(&l, 0, None, None);
+            let mut list = List::new();
+            draw(&mut list, &l, &theme, &ctx, &state).expect("a card");
+            assert!(texts(&list).contains(&("Q".to_string(), theme.text_dim)));
+        }
     }
 
     #[test]

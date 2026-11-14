@@ -184,6 +184,22 @@ fn window_size(ui: (i32, i32), step: u8) -> egui::Vec2 {
     egui::vec2(ui.0 as f32, ui.1 as f32) * f32::from(step) / 2.0
 }
 
+/// The window a start with `settings` opens, in points. Classic: the default screen at the
+/// remembered Pixel Size. Modern (ADR-47): the remembered window; Pixel Size is the
+/// picture's zoom there and may ask for more than any monitor shows.
+fn start_window(settings: &config::Config) -> egui::Vec2 {
+    if settings.ui_style == dpx_ui::UiStyle::Modern {
+        modern::start_window(settings.modern_window)
+    } else if settings.pixel_size == PixelSize::default().0 {
+        egui::vec2(START_W, START_H)
+    } else {
+        window_size(
+            View::of_target(Target::default()).ui_size(),
+            settings.pixel_size,
+        )
+    }
+}
+
 /// Snapping state of the window (ADR-13).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Snap {
@@ -723,14 +739,7 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     };
-    let start = if settings.pixel_size == PixelSize::default().0 {
-        egui::vec2(START_W, START_H)
-    } else {
-        window_size(
-            View::of_target(Target::default()).ui_size(),
-            settings.pixel_size,
-        )
-    };
+    let start = start_window(&settings);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeluxePainter")
@@ -1482,7 +1491,7 @@ impl PainterApp {
             return (view, 1.0);
         };
         if let Some(modern) = self.modern_layout() {
-            return (view, modern.zoom as f32);
+            return (view, modern.shown);
         }
         let fit = fit_step(win.points(), view.ui_size());
         let step = if self.free {
@@ -1887,7 +1896,10 @@ impl eframe::App for PainterApp {
         // ADR-47: during a Modern pass the classic chrome is off for everything that lays
         // out, draws or hit-tests the screen; the Modern chrome lies around it.
         self.modern_begin_pass();
+        // A held mouse button keeps the Modern layout it went down in.
+        self.modern_hold_layout(ui.ctx());
         self.pass(ui);
+        self.modern_release_layout(ui.ctx());
         self.modern_end_pass();
         // A switch of the skin asked for in this pass (Prefs ▸ Modern UI, F12) happens
         // between two passes, so no pass is half Classic and half Modern.
@@ -1969,7 +1981,12 @@ impl PainterApp {
             ),
         };
         let origin = area.min + origin_px / ppp;
-        let rect = egui::Rect::from_min_size(origin, egui::vec2(img_w as f32, img_h as f32) / ppp);
+        let rect = match &modern_layout {
+            // The quad as the layout made it (a screen shown smaller than one physical
+            // pixel per pixel is rounded up to whole pixels there).
+            Some(l) => egui::Rect::from_min_size(origin, egui::vec2(l.picture.w, l.picture.h)),
+            None => egui::Rect::from_min_size(origin, egui::vec2(img_w as f32, img_h as f32) / ppp),
+        };
 
         if let Some(wait) = self.autosave_tick(now) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.5)));
@@ -2066,12 +2083,24 @@ impl PainterApp {
             )
         });
         self.tools.shift = shift;
+        let on_quad = modern_layout.is_some();
         let to_screen = |p: egui::Pos2| -> (i32, i32) {
             let v = (p - origin) * ppp;
-            (
+            let (sx, sy) = (
                 (v.x / (scale * view.fx as f32)).floor() as i32,
                 (v.y / (scale * view.fy as f32)).floor() as i32,
-            )
+            );
+            if on_quad && rect.contains(p) {
+                // ADR-47: every point of the Modern quad is a pixel of the screen. (Only a
+                // screen shown smaller than one physical pixel per pixel has a last
+                // fraction of a pixel that would count as the next one.)
+                (
+                    sx.clamp(0, view.screen_w - 1),
+                    sy.clamp(0, view.screen_h - 1),
+                )
+            } else {
+                (sx, sy)
+            }
         };
         // Menus and the toolbox live in UI (LoRes) coordinates.
         let ui_screen = view.ui_screen();
@@ -2260,6 +2289,7 @@ impl PainterApp {
             let chord = i.modifiers.command && i.modifiers.shift && !i.modifiers.alt;
             i.key_pressed(egui::Key::F12) || (chord && i.key_pressed(egui::Key::U))
         });
+        // With a mouse button held the switch waits for the release (`modern_apply_switch`).
         if skin_key && !was_typing && !self.typing() && !self.modal_open() {
             self.toggle_skin();
         }

@@ -25,6 +25,8 @@ pub const VERSION: u64 = 1;
 const FILE: &str = "settings.json";
 /// A change is written this many seconds after the last change.
 const DEBOUNCE: f64 = 1.0;
+/// The largest side of a remembered Modern window, in points.
+const MODERN_WINDOW_MAX: u16 = 16384;
 /// Name of the key in `drawers` for the Load/Save/Export requesters.
 pub const DRAWER_PICTURE: &str = "picture";
 
@@ -35,6 +37,10 @@ pub struct Config {
     pub ui_style: UiStyle,
     /// The Modern skin's theme (ADR-47): key `theme`, `"system"`, `"dark"` or `"light"`.
     pub theme: ThemeChoice,
+    /// The Modern window's size in whole points (ADR-47): key `modern_window` with `w` and
+    /// `h`. The Modern window is sized freely, so the next start opens it as it was; the
+    /// Classic window follows `pixel_size`. `None` until the Modern skin was shown.
+    pub modern_window: Option<(u16, u16)>,
     pub pixel_size: u8,
     pub prefs: Prefs,
     /// Last drawer per requester kind.
@@ -66,6 +72,7 @@ impl Default for Config {
         Self {
             ui_style: UiStyle::default(),
             theme: ThemeChoice::default(),
+            modern_window: None,
             pixel_size: PixelSize::default().0,
             prefs: Prefs::default(),
             drawers: BTreeMap::new(),
@@ -120,6 +127,16 @@ impl Config {
         c.theme = name("theme")
             .and_then(ThemeChoice::from_key)
             .unwrap_or(d.theme);
+        // Both sides or nothing; a size no window can have is dropped.
+        let side = |key: &str| {
+            o.get("modern_window")
+                .and_then(Value::as_object)
+                .and_then(|w| w.get(key))
+                .and_then(Value::as_u64)
+                .filter(|&v| (1..=u64::from(MODERN_WINDOW_MAX)).contains(&v))
+                .map(|v| v as u16)
+        };
+        c.modern_window = side("w").zip(side("h"));
         c.pixel_size = get_int(
             o,
             "pixel_size",
@@ -242,6 +259,7 @@ impl Config {
             "version": VERSION,
             "ui_style": self.ui_style.key(),
             "theme": self.theme.key(),
+            "modern_window": self.modern_window.map(|(w, h)| json!({ "w": w, "h": h })),
             "pixel_size": self.pixel_size,
             "prefs": prefs,
             "drawers": self.drawers,
@@ -292,6 +310,10 @@ impl Config {
         Config {
             ui_style: app.ui.ui_style,
             theme: app.ui.theme,
+            modern_window: app
+                .modern
+                .window_size()
+                .map(|(w, h)| (w.min(MODERN_WINDOW_MAX), h.min(MODERN_WINDOW_MAX))),
             pixel_size: app.ui.pixel_size.0,
             prefs: app.ui.prefs,
             drawers,
@@ -316,6 +338,7 @@ impl Config {
     pub fn apply(&self, app: &mut PainterApp) {
         app.ui.ui_style = self.ui_style;
         app.ui.theme = self.theme;
+        app.modern.set_window_size(self.modern_window);
         app.ui.pixel_size = PixelSize(self.pixel_size);
         app.ui.prefs = self.prefs;
         app.last_drawer = self
@@ -465,6 +488,7 @@ mod tests {
         let mut c = Config {
             ui_style: UiStyle::Modern,
             theme: ThemeChoice::Light,
+            modern_window: Some((1111, 777)),
             pixel_size: 9,
             ..Config::default()
         };
@@ -597,6 +621,41 @@ mod tests {
             (c.ui_style, c.theme),
             (UiStyle::Classic, ThemeChoice::System)
         );
+    }
+
+    /// ADR-47: the Modern window's size is remembered in whole points; old files have none
+    /// and a size no window can have is dropped.
+    #[test]
+    fn the_modern_window_size_round_trips_and_bad_sizes_are_dropped() {
+        let c = Config {
+            modern_window: Some((1001, 640)),
+            ..Config::default()
+        };
+        let v = c.to_json();
+        assert_eq!(v["modern_window"], json!({ "w": 1001, "h": 640 }));
+        assert_eq!(Config::from_json(&v), Some(c));
+        let none = Config::default();
+        assert_eq!(none.modern_window, None);
+        assert!(none.to_json()["modern_window"].is_null());
+        assert_eq!(Config::from_json(&none.to_json()), Some(none));
+        for (file, want) in [
+            (r#"{"version": 1, "pixel_size": 6}"#, None),
+            (
+                r#"{"modern_window": {"w": 900, "h": 600}}"#,
+                Some((900, 600)),
+            ),
+            (r#"{"modern_window": {"w": 900}}"#, None),
+            (r#"{"modern_window": {"w": 0, "h": 600}}"#, None),
+            (r#"{"modern_window": {"w": -5, "h": 600}}"#, None),
+            (r#"{"modern_window": {"w": 900.5, "h": 600}}"#, None),
+            (r#"{"modern_window": {"w": 99999, "h": 600}}"#, None),
+            (r#"{"modern_window": "large"}"#, None),
+            (r#"{"modern_window": [900, 600]}"#, None),
+        ] {
+            let v: Value = serde_json::from_str(file).unwrap();
+            let c = Config::from_json(&v).expect("an object");
+            assert_eq!(c.modern_window, want, "{file}");
+        }
     }
 
     #[test]

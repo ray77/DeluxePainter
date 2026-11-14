@@ -39,10 +39,10 @@ A second, switchable look for the same program; Classic stays the default on a f
 | P1 | Bar with always-visible menu titles; pull-downs while the right button is held, as in DPaint; left button multi-select | done (slice 1c) |
 | P1 | Dock at the right in toolbox order: brushes, 18 tools with split halves, colour indicator, palette up to 64 colours; tooltips | done (slices 1a–1c) |
 | P1 | Layer column left of the dock: eye, name, active layer, inline rename with caret, six icon buttons with tooltips, scroll arrows and wheel | done (slice 1d); same commands and undo steps as the Classic panel |
-| P1 | Picture zoom with Cmd/Ctrl `+` / `−` / `0` and Prefs ▸ Pixel Size; the window is sized freely (minimum 720 × 520 points) | done (slice 1b) |
-| P1 | Classic requesters hosted inside the picture, the interface around dimmed and without input; Screen Format on the whole window | done (slice 1d); still pixel look |
+| P1 | Picture zoom with Cmd/Ctrl `+` / `−` / `0` and Prefs ▸ Pixel Size; the window is sized freely (minimum 720 × 520 points) and its size is remembered | done (slice 1b); a screen that does not fit at one physical pixel per pixel (HiRes, interlace, SuperHiRes in a small window) is shown whole and smaller, as in Classic |
+| P1 | Classic requesters hosted inside the picture, the interface around dimmed and without input; Screen Format on the whole window | done (slice 1d); still pixel look; in a small window the requester's screen lies in the middle of the window, over the dimmed interface, so it is not smaller than Pixel Size asks for |
 | P2 | Animation Control Panel as a Modern strip | slice 2; today pixel look inside the picture |
-| P2 | Free picture viewport (more than one Amiga screen visible, optional pixel grid) | slice 3; today a screen larger than the free area is cut at its edges |
+| P2 | Free picture viewport (more than one Amiga screen visible, optional pixel grid) | slice 3; today one Amiga screen is shown, whole |
 | P2 | Requesters in the Modern look, one family at a time | slice 4 and later |
 
 Only run through automated tests and headless renders on one Mac so far; see ROADMAP.md, "Modern UI skin status".

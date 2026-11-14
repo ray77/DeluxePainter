@@ -30,9 +30,11 @@ pub const BUTTON_MIN_H: f32 = 22.0;
 pub const BRUSH_WELL_H: f32 = 44.0;
 /// Height of the colour indicator.
 pub const INDICATOR_H: f32 = 30.0;
-/// Height of a palette cell when there is room, and the least it shrinks to.
+/// Height of a palette cell when there is room.
 pub const CELL_H: f32 = 15.0;
-pub const CELL_MIN_H: f32 = 7.0;
+/// The cell height a low window keeps by making the tool buttons lower; only when the
+/// buttons are at their least height do the cells get lower than this.
+pub const CELL_KEPT_H: f32 = 10.0;
 /// The smallest window the layout is made for.
 pub const MIN_WINDOW: (f32, f32) = (720.0, 520.0);
 
@@ -180,13 +182,23 @@ pub struct MainLayout {
     pub layers: Option<LayerColumn>,
     /// Everything that is not chrome: canvas colour with the picture in its middle.
     pub viewport: Rect,
-    /// The picture quad. It may be larger than the viewport when even one physical pixel per
-    /// picture pixel does not fit; it is clipped to the viewport then.
+    /// The picture quad: always whole, in the middle of the viewport. While it hosts a
+    /// requester ([`Picture::hosts_requester`]) it may lie in the middle of the window
+    /// instead, over the veiled chrome.
     pub picture: Rect,
-    /// Physical pixels per picture pixel (a whole number, at least 1).
+    /// Physical pixels per picture pixel as a whole number (at least 1): what the zoom keys
+    /// count from. See [`MainLayout::shown`] for what is on screen.
     pub zoom: u32,
-    /// The largest `zoom` at which the whole picture fits the viewport (at least 1).
+    /// The largest `zoom` at which the whole picture fits (at least 1).
     pub fits: u32,
+    /// Physical pixels per picture pixel as shown: `zoom`, or less than 1 when the picture
+    /// does not fit at one physical pixel per pixel (a HiRes, interlaced or SuperHiRes screen
+    /// in a small window). The picture is then made as large as fits, as the Classic skin
+    /// does, so every pixel of the screen can be reached.
+    pub shown: f32,
+    /// The picture lies over the chrome (it hosts a requester that would be smaller or cut
+    /// inside the viewport): it is painted after bar, dock and layer column.
+    pub over_chrome: bool,
     /// The picture's size in its own pixels (the screen as displayed: pixel shape applied).
     pub picture_size: (u32, u32),
 }
@@ -201,6 +213,10 @@ pub struct Picture {
     pub per_ui_pixel: u32,
     /// Prefs ▸ Pixel Size: the wanted size of an interface pixel, in half points.
     pub pixel_size: PixelSize,
+    /// The image shows a requester, a note or Show Page in the Classic look. The chrome is
+    /// veiled and takes no input then, so the quad may use the whole window when the
+    /// viewport alone would show it smaller than wanted.
+    pub hosts_requester: bool,
 }
 
 /// Physical pixels per picture pixel that `pixel_size` asks for at `scale` physical pixels
@@ -258,6 +274,7 @@ impl MainLayout {
             size: picture_size,
             per_ui_pixel: 1,
             pixel_size,
+            hosts_requester: false,
         };
         MainLayout::for_picture(window, scale, chrome, palette_len, picture)
     }
@@ -335,20 +352,41 @@ impl MainLayout {
 
         // The picture: a whole number of physical pixels per picture pixel, centred.
         let (pw, ph) = (picture_size.0.max(1), picture_size.1.max(1));
-        let (vw_px, vh_px) = (
-            (viewport.w * scale).round().max(0.0) as u32,
-            (viewport.h * scale).round().max(0.0) as u32,
-        );
+        let px = |v: f32| (v * scale).round().max(0.0) as u32;
+        let fit = |room: &Rect| (px(room.w) / pw).min(px(room.h) / ph);
         let wanted = wanted_zoom(picture.pixel_size, picture.per_ui_pixel, scale);
-        let fits = (vw_px / pw).min(vh_px / ph).max(1);
-        let zoom = wanted.min(fits);
-        let (w_px, h_px) = (pw * zoom, ph * zoom);
+        // A hosted requester takes the whole window when that shows it larger (up to the
+        // wanted size) or the viewport cannot show it whole.
+        let in_view = fit(&viewport);
+        let over_chrome = picture.hosts_requester
+            && viewport != window
+            && (in_view == 0 || wanted.min(fit(&window)) > wanted.min(in_view));
+        let room = if over_chrome { window } else { viewport };
+        let (room_w, room_h) = (px(room.w), px(room.h));
+        let fits = fit(&room);
+        let zoom = wanted.min(fits).max(1);
+        // Not even one physical pixel per pixel fits: as large as fits, like Classic.
+        let shown = if fits >= 1 {
+            zoom as f32
+        } else {
+            (room_w as f32 / pw as f32).min(room_h as f32 / ph as f32)
+        };
+        // A reduced screen is rounded up to whole physical pixels, so its last row and
+        // column lie inside the quad with their whole (fractional) extent.
+        let size = |n: u32, room_px: u32| {
+            if fits >= 1 {
+                n * zoom
+            } else {
+                ((n as f32 * shown - 1e-3).ceil().max(1.0) as u32).min(room_px.max(1))
+            }
+        };
+        let (w_px, h_px) = (size(pw, room_w), size(ph, room_h));
         let origin = |view_px: u32, size_px: u32| {
             ((i64::from(view_px) - i64::from(size_px)).div_euclid(2)) as f32 / scale
         };
         let picture = Rect::new(
-            viewport.x + origin(vw_px, w_px),
-            viewport.y + origin(vh_px, h_px),
+            room.x + origin(room_w, w_px),
+            room.y + origin(room_h, h_px),
             w_px as f32 / scale,
             h_px as f32 / scale,
         );
@@ -363,7 +401,9 @@ impl MainLayout {
             viewport,
             picture,
             zoom,
-            fits,
+            fits: fits.max(1),
+            shown,
+            over_chrome,
             picture_size: (pw, ph),
         }
     }
@@ -431,14 +471,15 @@ fn dock(rect: Rect, palette_len: usize, snap: &dyn Fn(f32) -> f32) -> Dock {
     let (cols, rows) = (cols.max(1) as usize, rows.max(1) as usize);
     let shown = palette_len.clamp(1, 64).min(cols * rows);
 
-    // Heights: everything but the tool buttons and the palette is fixed; a low window first
-    // shrinks the palette cells, then the buttons.
+    // Heights: everything but the tool buttons and the palette is fixed. A low window first
+    // lowers the palette cells to `CELL_KEPT_H`, then the buttons to `BUTTON_MIN_H`, and
+    // only then the cells further.
     let fixed =
         DOCK_PAD + BRUSH_WELL_H + SECTION_GAP + SECTION_GAP + INDICATOR_H + SECTION_GAP + DOCK_PAD;
     let gaps = 8.0 * GAP;
     let room = (rect.h - fixed - gaps).max(0.0);
-    let palette_least = rows as f32 * CELL_MIN_H;
-    let button_h = ((room - palette_least) / 9.0)
+    let palette_kept = rows as f32 * CELL_KEPT_H;
+    let button_h = ((room - palette_kept) / 9.0)
         .floor()
         .clamp(BUTTON_MIN_H, BUTTON);
     let tools_h = 9.0 * button_h + gaps;
@@ -644,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn a_low_window_shrinks_palette_cells_first_and_buttons_second() {
+    fn a_low_window_lowers_the_buttons_before_the_palette_cells_get_tiny() {
         let roomy = layout((1280.0, 800.0), 1.0, 32);
         let dock = roomy.dock.as_ref().expect("dock");
         assert_eq!((dock.tools[0].h, dock.cells[0].h), (BUTTON, CELL_H));
@@ -653,11 +694,21 @@ mod tests {
         let dock = many.dock.as_ref().expect("dock");
         assert_eq!((dock.palette_rows, dock.tools[0].h), (16, BUTTON));
         assert!(dock.cells[0].h >= 12.0, "{}", dock.cells[0].h);
-        // The smallest window: lower buttons, cells still there.
+        // The smallest window with the 32-colour palette: the buttons give way, the cells
+        // keep a height at which a swatch and its mark can be told apart.
+        for scale in SCALES {
+            let low = layout(MIN_WINDOW, scale, 32);
+            let dock = low.dock.as_ref().expect("dock");
+            assert!(dock.tools[0].h < BUTTON && dock.tools[0].h >= BUTTON_MIN_H);
+            for cell in &dock.cells {
+                assert!(cell.h >= CELL_KEPT_H - 0.5, "{scale}: {}", cell.h);
+            }
+        }
+        // With 16 rows the buttons are at their least height and the cells are lower.
         let low = layout(MIN_WINDOW, 1.0, 64);
         let dock = low.dock.as_ref().expect("dock");
-        assert!(dock.tools[0].h < BUTTON && dock.tools[0].h >= BUTTON_MIN_H);
-        assert!(dock.cells[0].h >= CELL_MIN_H, "{}", dock.cells[0].h);
+        assert_eq!(dock.tools[0].h, BUTTON_MIN_H);
+        assert!(dock.cells[0].h >= 7.0, "{}", dock.cells[0].h);
         assert_eq!(dock.tools[0].w, BUTTON, "buttons keep their width");
     }
 
@@ -687,10 +738,168 @@ mod tests {
             "{:?}",
             l.picture
         );
-        // A picture larger than the viewport stays at 1x and is centred over it.
-        let big = MainLayout::new((800.0, 600.0), 1.0, Chrome::ALL, 32, (1280, 1024), pixel(6));
-        assert_eq!(big.zoom, 1);
-        assert!(big.picture.x < big.viewport.x && big.picture.y < big.viewport.y);
+        assert_eq!((l.shown, l.over_chrome), (2.0, false));
+    }
+
+    /// The screens of every display mode as the picture quad gets them (pixel shape
+    /// applied), with their picture pixels per interface pixel.
+    const SCREENS: [((u32, u32), u32); 6] = [
+        ((320, 256), 1),
+        ((320, 200), 1),
+        ((640, 512), 2),
+        ((640, 400), 2),
+        ((1280, 1024), 4),
+        ((1280, 800), 4),
+    ];
+
+    #[test]
+    fn a_screen_that_does_not_fit_at_one_pixel_is_shown_whole_and_smaller() {
+        // Every screen in windows from the smallest up, with and without the layer column,
+        // at Pixel Sizes from the smallest to the largest: the quad lies in the viewport,
+        // whole, on physical pixels.
+        for (size, per_ui_pixel) in SCREENS {
+            for window in [
+                MIN_WINDOW,
+                (800.0, 600.0),
+                (1024.0, 768.0),
+                (1920.0, 1050.0),
+            ] {
+                for scale in SCALES {
+                    for chrome in [Chrome::ALL, Chrome::WITH_LAYERS] {
+                        for half in [PixelSize::MIN, 4, 6, PixelSize::MAX] {
+                            let picture = Picture {
+                                size,
+                                per_ui_pixel,
+                                pixel_size: PixelSize(half),
+                                hosts_requester: false,
+                            };
+                            let l = MainLayout::for_picture(window, scale, chrome, 32, picture);
+                            let what = format!("{size:?} in {window:?} at {scale}x, {chrome:?}");
+                            assert!(l.viewport.encloses(&l.picture), "{what}: {:?}", l.picture);
+                            assert!(!l.over_chrome, "{what}");
+                            for v in [l.picture.x, l.picture.y, l.picture.right()] {
+                                assert!(on_pixels(v, scale), "{what}: {:?}", l.picture);
+                            }
+                            let (w_px, h_px) = (l.picture.w * scale, l.picture.h * scale);
+                            if l.shown >= 1.0 {
+                                // An exact enlargement.
+                                assert_eq!(l.shown, l.zoom as f32, "{what}");
+                                assert_eq!(w_px.round() as u32, size.0 * l.zoom, "{what}");
+                                assert_eq!(h_px.round() as u32, size.1 * l.zoom, "{what}");
+                            } else {
+                                // As large as fits: one side fills the viewport, and the
+                                // shape of the screen is kept to the pixel.
+                                assert_eq!((l.zoom, l.fits), (1, 1), "{what}");
+                                let (vw, vh) = (l.viewport.w * scale, l.viewport.h * scale);
+                                assert!(
+                                    (w_px - vw).abs() < 1.5 || (h_px - vh).abs() < 1.5,
+                                    "{what}: {:?}",
+                                    l.picture
+                                );
+                                for (px, n) in [(w_px, size.0), (h_px, size.1)] {
+                                    let exact = n as f32 * l.shown;
+                                    assert!(px >= exact - 0.01 && px < exact + 1.0, "{what}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The reviewers' cases at device scale 1: interlace in the smallest window, beside
+        // the layer column, and SuperHiRes in a 1024 x 768 window.
+        let at = |window, chrome, size, per_ui_pixel| {
+            let picture = Picture {
+                size,
+                per_ui_pixel,
+                pixel_size: PixelSize(6),
+                hosts_requester: false,
+            };
+            MainLayout::for_picture(window, 1.0, chrome, 32, picture)
+        };
+        let l = at(MIN_WINDOW, Chrome::ALL, (640, 512), 2);
+        assert!(l.shown < 1.0 && l.picture.h == l.viewport.h, "{l:?}");
+        let l = at(MIN_WINDOW, Chrome::WITH_LAYERS, (640, 512), 2);
+        assert_eq!((l.picture.x, l.picture.w), (0.0, 428.0));
+        let l = at((1024.0, 768.0), Chrome::ALL, (1280, 1024), 4);
+        assert_eq!(l.picture.h, 738.0);
+        assert!(l.picture.x >= 0.0 && l.picture.right() <= l.viewport.right());
+    }
+
+    #[test]
+    fn a_hosted_requester_takes_the_window_when_the_viewport_would_show_it_smaller() {
+        let at = |window, scale, chrome, size, per_ui_pixel, hosts_requester| {
+            let picture = Picture {
+                size,
+                per_ui_pixel,
+                pixel_size: PixelSize(6),
+                hosts_requester,
+            };
+            MainLayout::for_picture(window, scale, chrome, 32, picture)
+        };
+        // 800 x 600 with the layer column: the picture is 1x beside the chrome; with a
+        // requester in it it is 2x in the middle of the window, over the chrome.
+        let plain = at(
+            (800.0, 600.0),
+            1.0,
+            Chrome::WITH_LAYERS,
+            (320, 256),
+            1,
+            false,
+        );
+        assert_eq!((plain.zoom, plain.over_chrome), (1, false));
+        let hosted = at(
+            (800.0, 600.0),
+            1.0,
+            Chrome::WITH_LAYERS,
+            (320, 256),
+            1,
+            true,
+        );
+        assert_eq!((hosted.zoom, hosted.over_chrome), (2, true));
+        assert_eq!(hosted.picture, Rect::new(80.0, 44.0, 640.0, 512.0));
+        // The chrome itself does not move.
+        assert_eq!((&hosted.dock, &hosted.layers), (&plain.dock, &plain.layers));
+        assert_eq!(hosted.viewport, plain.viewport);
+        // The smallest window, with and without the column: 2x as well.
+        for chrome in [Chrome::ALL, Chrome::WITH_LAYERS] {
+            let l = at(MIN_WINDOW, 1.0, chrome, (320, 256), 1, true);
+            assert_eq!((l.zoom, l.over_chrome), (2, true), "{chrome:?}");
+            assert!(l.window.encloses(&l.picture), "{:?}", l.picture);
+        }
+        // Where the viewport shows it as large as wanted, nothing moves.
+        for scale in SCALES {
+            let plain = at(
+                (1280.0, 800.0),
+                scale,
+                Chrome::WITH_LAYERS,
+                (320, 256),
+                1,
+                false,
+            );
+            let hosted = at(
+                (1280.0, 800.0),
+                scale,
+                Chrome::WITH_LAYERS,
+                (320, 256),
+                1,
+                true,
+            );
+            assert_eq!(plain.picture, hosted.picture, "{scale}");
+            assert!(!hosted.over_chrome, "{scale}");
+        }
+        // An interlaced screen beside the column in the smallest window: whole in the
+        // window at one physical pixel per pixel, not cut.
+        let l = at(MIN_WINDOW, 1.0, Chrome::WITH_LAYERS, (640, 512), 2, true);
+        assert_eq!((l.shown, l.over_chrome), (1.0, true));
+        assert_eq!(l.picture, Rect::new(40.0, 4.0, 640.0, 512.0));
+        // Without chrome there is nothing to lie over.
+        let none = Chrome {
+            bar: false,
+            dock: false,
+            layers: false,
+        };
+        assert!(!at(MIN_WINDOW, 1.0, none, (640, 512), 2, true).over_chrome);
     }
 
     #[test]
@@ -701,6 +910,7 @@ mod tests {
             size: (640, 512),
             per_ui_pixel: 2,
             pixel_size: PixelSize(4),
+            hosts_requester: false,
         };
         let l = MainLayout::for_picture((1280.0, 800.0), 1.0, Chrome::ALL, 32, picture);
         assert_eq!((l.zoom, l.fits), (1, 1));

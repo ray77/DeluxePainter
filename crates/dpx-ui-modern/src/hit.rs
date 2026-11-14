@@ -107,14 +107,21 @@ pub fn hit(layout: &MainLayout, x: f32, y: f32) -> Spot {
         return Spot::Ui(Hit::ToolboxBackground);
     }
     if layout.viewport.contains(x, y) && layout.picture.contains(x, y) {
-        // In physical pixels, where the picture is an exact enlargement.
-        let px = ((x - layout.picture.x) * layout.scale).floor() as i64;
-        let py = ((y - layout.picture.y) * layout.scale).floor() as i64;
-        let zoom = i64::from(layout.zoom.max(1));
         let (w, h) = layout.picture_size;
+        let pixel = |at: f32, size: f32, n: u32| {
+            if layout.shown >= 1.0 {
+                // In physical pixels, where the picture is an exact enlargement.
+                let zoom = i64::from(layout.zoom.max(1));
+                (((at * layout.scale).floor() as i64) / zoom).clamp(0, i64::from(n) - 1) as i32
+            } else {
+                // A screen shown smaller than one physical pixel per pixel: by proportion.
+                ((f64::from(at) / f64::from(size.max(1e-3)) * f64::from(n)).floor() as i64)
+                    .clamp(0, i64::from(n) - 1) as i32
+            }
+        };
         return Spot::Picture {
-            x: (px / zoom).clamp(0, i64::from(w) - 1) as i32,
-            y: (py / zoom).clamp(0, i64::from(h) - 1) as i32,
+            x: pixel(x - layout.picture.x, layout.picture.w, w),
+            y: pixel(y - layout.picture.y, layout.picture.h, h),
         };
     }
     Spot::Canvas
@@ -253,6 +260,50 @@ mod tests {
             assert_eq!(hit(&l, p.right(), p.y + 5.0), Spot::Canvas);
             let (cx, cy) = p.center();
             assert_eq!(hit(&l, cx, cy), Spot::Picture { x: 160, y: 128 });
+        }
+    }
+
+    #[test]
+    fn a_screen_shown_smaller_answers_from_its_first_to_its_last_pixel() {
+        use crate::layout::{MIN_WINDOW, Picture};
+        // An interlaced HiRes screen in the smallest window, beside the layer column: less
+        // than one physical pixel per pixel, whole in the viewport.
+        for scale in [1.0, 1.25] {
+            let l = MainLayout::for_picture(
+                MIN_WINDOW,
+                scale,
+                Chrome::WITH_LAYERS,
+                32,
+                Picture {
+                    size: (640, 512),
+                    per_ui_pixel: 2,
+                    pixel_size: PixelSize(6),
+                    hosts_requester: false,
+                },
+            );
+            assert!(l.shown < 1.0, "{scale}: {}", l.shown);
+            let p = l.picture;
+            assert!(l.viewport.encloses(&p));
+            assert_eq!(hit(&l, p.x, p.y), Spot::Picture { x: 0, y: 0 });
+            assert_eq!(
+                hit(&l, p.right() - 0.01, p.bottom() - 0.01),
+                Spot::Picture { x: 639, y: 511 }
+            );
+            let (cx, cy) = p.center();
+            assert_eq!(hit(&l, cx, cy), Spot::Picture { x: 320, y: 256 });
+            // Left to right the pixels only grow, and none is skipped by more than one.
+            let mut last = 0;
+            let step = 1.0 / scale;
+            let mut x = p.x;
+            while x < p.right() {
+                let Spot::Picture { x: sx, .. } = hit(&l, x, cy) else {
+                    panic!("({x}, {cy}) is on the picture");
+                };
+                assert!(sx >= last && sx <= last + 2, "{scale}: {last} -> {sx}");
+                last = sx;
+                x += step;
+            }
+            assert!(last >= 638, "{scale}: {last}");
         }
     }
 

@@ -179,7 +179,7 @@ scripts / tests ──stdio or HTTP──► deluxepainter mcp [--http] ──�
 - Unit + property tests (proptest) for raster algorithms, ByteRun1, IFF parsing with fuzzed bytes.
 - Golden files: ILBM fixtures we generate ourselves + a small set of redistributable third-party files (licence checked), compared pixel-by-pixel after decode.
 - UI golden screenshots rendered headless by `dpx-ui`.
-- Classic guard (ADR-47): four scenes of the classic screen and snapshot pinned by hash (`classic_pin_tests.rs`). Modern skin: list-level tests in `dpx-ui-modern` (bit-identical everywhere), raster probes, and parity scripts that run in both skins through real `ui()` passes.
+- Classic guard (ADR-47): four scenes of the classic screen and snapshot pinned by hash (`classic_pin_tests.rs`). Modern skin: list-level tests in `dpx-ui-modern` (no rasteriser involved; run on one Mac only so far, and the lists hold `f32` results of `sin`/`cos`/`tan`, so equality across systems is not verified), raster probes, and parity scripts that run in both skins through real `ui()` passes.
 - MCP: tool tests on the headless workspace, ui-loop tests on the GUI workspace, integration tests against the real `deluxepainter mcp` (stdio and HTTP) and the real bridge binary; see [`MCP_API.md`](MCP_API.md) §9.
 - CI: `fmt --check`, `clippy -D warnings`, `test`, release build on macOS, Windows, Linux.
 

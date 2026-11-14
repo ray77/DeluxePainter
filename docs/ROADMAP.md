@@ -78,9 +78,10 @@ Not verified:
 - The Modern skin was never used by hand in a real window; what the GPU shows (region textures, the overlay's alpha) is outside the tests. The owner declines remote control of the app, so this needs the owner's own look.
 - Windows and Linux: not built, not run. Whether the raster probes hold there (anti-aliasing) is open; the Classic pin hashes were made on one Mac.
 - F12 and Cmd/Ctrl+Shift+U reaching the app on each system; the system theme reported at runtime.
-- Display modes other than PAL LoRes in the Modern window; a screen larger than the free area (HiRes beside the layer column in a small window) is cut at both edges until slice 3.
+- Display modes other than PAL LoRes are covered by one test (every mode, three windows, with and without the layer column: the screen is whole and its corner pixels can be painted); menus, requesters other than Load.. and the layer column's buttons were run on PAL LoRes only. A screen shown smaller than one physical pixel per pixel drops pixels (nearest neighbour), as in Classic: not every pixel is under the pointer there; Magnify is.
+- The start window of the Modern skin (remembered size, cut to the monitor once) was tested as functions and through injected window sizes, not by starting the app; the test window reports no monitor.
 - Requesters other than the eight kinds above, playback and Show Page beyond one click, in Modern.
-- Rendering times of the Modern chrome.
+- Rendering times of the Modern chrome beyond one measurement (ADR-47, Consequences): one Mac, release build, the viewport region only.
 
 ## Wave 8 status (2026-11-13)
 

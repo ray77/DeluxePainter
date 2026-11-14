@@ -68,8 +68,8 @@ impl Theme {
             hover: Color::hex(0x3D414A),
             hairline: Color::hex(0x3A3D45),
             text: Color::hex(0xE4E6EB),
-            text_dim: Color::hex(0x9A9FAA),
-            disabled: Color::hex(0x5C606A),
+            text_dim: Color::hex(0xADB2BC),
+            disabled: Color::hex(0x7A7F8A),
             accent: Color::hex(0xFF8A1F),
             on_accent: Color::hex(0x1A1206),
             scrim: Color::hex(0x000000).with_opacity(45),
@@ -87,7 +87,7 @@ impl Theme {
             hairline: Color::hex(0xC9CDD5),
             text: Color::hex(0x1C1E24),
             text_dim: Color::hex(0x5E636E),
-            disabled: Color::hex(0xA4A8B1),
+            disabled: Color::hex(0x858A94),
             accent: Color::hex(0xD66214),
             // Dark ink as in the dark scheme: white on this orange reaches only 3.7:1.
             on_accent: Color::hex(0x1A1206),
@@ -132,10 +132,25 @@ mod tests {
                 ("text on raised", t.text, t.raised),
                 ("text on hover", t.text, t.hover),
                 ("dim text on panel", t.text_dim, t.panel),
+                ("dim text on raised", t.text_dim, t.raised),
+                ("dim text on hover", t.text_dim, t.hover),
                 ("ink on accent", t.on_accent, t.accent),
             ] {
                 let ratio = ink.contrast(ground);
                 assert!(ratio >= 4.5, "{kind:?}: {name} is only {ratio:.2}:1");
+            }
+            // Ghosted items and buttons are faint on purpose, but stay readable: 3:1 on the
+            // surfaces they stand on, and clearly fainter than the dim text.
+            for (name, ground) in [("panel", t.panel), ("raised", t.raised)] {
+                let ratio = t.disabled.contrast(ground);
+                assert!(
+                    ratio >= 3.0,
+                    "{kind:?}: ghosted ink on {name} is only {ratio:.2}:1"
+                );
+                assert!(
+                    ratio + 1.0 < t.text_dim.contrast(ground),
+                    "{kind:?}: ghosted ink on {name} reads like dim text"
+                );
             }
             // The accent must stand out from the surfaces it marks.
             for (name, ground) in [("panel", t.panel), ("raised", t.raised)] {

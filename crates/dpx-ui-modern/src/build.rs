@@ -89,18 +89,36 @@ pub fn window(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List {
     list.append(layers(layout, theme, model));
     list.append(dock(layout, theme, model));
     list.append(title_bar(layout, theme, model));
+    if layout.over_chrome {
+        // A hosted requester larger than the viewport: over the veiled chrome.
+        list.image(layout.picture, PICTURE_IMAGE);
+    }
     if let Some((_, over)) = overlay(layout, theme, model) {
         list.append(over);
     }
     list
 }
 
-/// What lies over bar, dock and picture: the cards of the menu that is held open, or the
-/// tooltip of the dock button the pointer rests on. With the rectangle the drawing covers
-/// (shadows included, cut to the window); `None` when there is nothing to show.
+/// What lies over bar, dock and picture: the cards of the menu that is held open, the
+/// tooltip of the dock button the pointer rests on, or the rim of a picture that lies over
+/// the chrome. With the rectangle the drawing covers (shadows included, cut to the window);
+/// `None` when there is nothing to show.
 pub fn overlay(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> Option<(Rect, List)> {
     let ui = model.ui;
     let mut list = List::new();
+    if layout.over_chrome {
+        // A hosted requester over the veiled chrome (which takes no input: no menu, no
+        // tooltip): the fine rim around its screen, which no region can draw whole.
+        picture_rim(&mut list, layout, theme);
+        let (px, window) = (1.0 / layout.scale, layout.window);
+        let around = layout.picture.inset(-px);
+        let (x0, y0) = (around.x.max(window.x), around.y.max(window.y));
+        let (x1, y1) = (
+            around.right().min(window.right()),
+            around.bottom().min(window.bottom()),
+        );
+        return Some((Rect::new(x0, y0, x1 - x0, y1 - y0), list));
+    }
     let bounds = if ui.menu.active {
         menu::draw(&mut list, layout, theme, &ui.menu_context(), &ui.menu)
     } else {
@@ -205,9 +223,15 @@ fn tooltip(list: &mut List, layout: &MainLayout, theme: &Theme, tip: &Tooltip) -
     Some(rect.inset(-menu::SHADOW_REACH))
 }
 
-/// The picture viewport: canvas colour, a soft shadow around the picture and the picture
-/// itself, clipped to the viewport. `dimmed`: a requester is open (it is part of the
-/// picture's image), so the canvas around the picture lies under the scrim like the chrome.
+/// The picture viewport: canvas colour, a soft shadow and a fine rim around the picture, and
+/// the picture itself. `dimmed`: a requester is open (it is part of the picture's image), so
+/// the canvas around the picture lies under the scrim like the chrome.
+///
+/// The picture always lies inside the viewport; only its shadow can reach a few points
+/// beyond, where bar, dock and layer column are drawn over it (a region's image ends at its
+/// edge anyway). So nothing here needs a clip, which would cost a mask the size of the
+/// viewport every time the region is drawn. A picture that lies over the chrome
+/// ([`MainLayout::over_chrome`]) is not drawn here: see [`window`].
 pub fn canvas(layout: &MainLayout, theme: &Theme, dimmed: bool) -> List {
     let mut list = List::new();
     let view = layout.viewport;
@@ -215,22 +239,45 @@ pub fn canvas(layout: &MainLayout, theme: &Theme, dimmed: bool) -> List {
         return list;
     }
     list.rect(view, theme.canvas);
-    list.clip(Path::new().round_rect(view, 0.0));
-    // The shadow: three rings of falling strength, wider below than above.
-    let step = Color {
-        a: theme.shadow.a / 3,
-        ..theme.shadow
-    };
-    for (grow, drop) in [(6.0, 3.0), (3.0, 2.0), (1.0, 1.0)] {
-        let r = layout.picture.inset(-grow);
-        list.round_rect(Rect::new(r.x, r.y + drop, r.w, r.h), grow + 1.0, step);
+    if !layout.over_chrome {
+        // The shadow: three rings of falling strength, wider below than above. Rings, not
+        // filled cards: what would lie under the picture is never seen.
+        let step = Color {
+            a: theme.shadow.a / 3,
+            ..theme.shadow
+        };
+        for (grow, drop) in [(6.0, 3.0), (3.0, 2.0), (1.0, 1.0)] {
+            let r = layout.picture.inset(-grow);
+            list.ring(
+                Rect::new(r.x, r.y + drop, r.w, r.h),
+                grow + 1.0,
+                step,
+                grow + drop,
+            );
+        }
+        picture_rim(&mut list, layout, theme);
     }
     if dimmed {
         list.rect(view, theme.scrim);
     }
-    list.image(layout.picture, PICTURE_IMAGE);
-    list.unclip();
+    if !layout.over_chrome {
+        list.image(layout.picture, PICTURE_IMAGE);
+    }
     list
+}
+
+/// One physical pixel in the hairline colour around the picture: the edge of the page stays
+/// visible when the picture has the canvas colour (a black page in the dark theme).
+fn picture_rim(list: &mut List, layout: &MainLayout, theme: &Theme) {
+    let (p, px) = (layout.picture, 1.0 / layout.scale);
+    for edge in [
+        Rect::new(p.x - px, p.y - px, p.w + 2.0 * px, px),
+        Rect::new(p.x - px, p.bottom(), p.w + 2.0 * px, px),
+        Rect::new(p.x - px, p.y, px, p.h),
+        Rect::new(p.right(), p.y, px, p.h),
+    ] {
+        list.rect(edge, theme.hairline);
+    }
 }
 
 /// The bar: the menu titles at the left, the status after them (program name or frame
@@ -642,6 +689,10 @@ fn tool_button(list: &mut List, rect: Rect, tool: Tool, theme: &Theme, model: &M
     let toggled = model.toggles.on(tool) && !selected;
 
     list.round_rect(rect, radius, theme.raised);
+    if !selected {
+        // A fine edge: the step from the panel to a button alone is faint (light theme).
+        list.ring(rect, radius, theme.hairline, 1.0);
+    }
     if tool.is_split() {
         let (upper, lower) = halves(rect);
         let half = |filled: bool| if filled { lower.clone() } else { upper.clone() };
@@ -718,19 +769,13 @@ fn indicator(list: &mut List, dock: &Dock, theme: &Theme, model: &Model<'_>) {
 }
 
 fn palette(list: &mut List, dock: &Dock, theme: &Theme, model: &Model<'_>) {
+    // Very low cells (many colours in a low window) are a plain grid: flat colours on whole
+    // pixels, no air, rims or round corners, which would be smears at that size.
+    let flat = dock.cells.first().is_some_and(|c| c.h < FLAT_CELL_H);
     for (i, cell) in dock.cells.iter().enumerate() {
         let index = i as u8;
         let colour = rgb(model.palette, index);
-        // Cells touch; a swatch keeps a little air unless the cells are very low.
-        let air = if cell.h >= 10.0 { 1.0 } else { 0.5 };
-        let swatch = Rect::new(
-            cell.x + air,
-            cell.y + air,
-            cell.w - 2.0 * air,
-            cell.h - 2.0 * air,
-        );
-        let radius = RADIUS_SWATCH.min(swatch.h / 3.0);
-        let ring = if index == model.ui.fg {
+        let mark = if index == model.ui.fg {
             Some((theme.accent, 2.0))
         } else if index == model.ui.bg {
             Some((theme.text_dim, 1.0))
@@ -739,7 +784,38 @@ fn palette(list: &mut List, dock: &Dock, theme: &Theme, model: &Model<'_>) {
         } else {
             None
         };
-        match ring.filter(|_| swatch.h >= 8.0) {
+        if flat {
+            list.rect(*cell, colour);
+            continue;
+        }
+        if cell.h < ROOMY_CELL_H {
+            // A low cell: the colour up to the cell's edge, and a mark without the line of
+            // panel colour, so the colour keeps most of the cell.
+            let swatch = cell.inset(0.5);
+            let radius = RADIUS_SWATCH.min(swatch.h / 4.0);
+            match mark {
+                Some((mark_colour, width)) => {
+                    list.round_rect(swatch, radius, mark_colour);
+                    list.round_rect(swatch.inset(width), (radius - width).max(0.5), colour);
+                }
+                None => {
+                    list.round_rect(swatch, radius, colour);
+                    list.ring(swatch, radius, theme.hairline, 1.0);
+                }
+            }
+            continue;
+        }
+        // Cells touch; a swatch keeps a little air.
+        let air = 1.0;
+        let swatch = Rect::new(
+            cell.x + air,
+            cell.y + air,
+            cell.w - 2.0 * air,
+            cell.h - 2.0 * air,
+        );
+        let radius = RADIUS_SWATCH.min(swatch.h / 3.0);
+        let ring = mark;
+        match ring {
             Some((ring_colour, width)) => {
                 // Ring, a line of panel colour, then the colour.
                 list.round_rect(swatch, radius, ring_colour);
@@ -753,14 +829,38 @@ fn palette(list: &mut List, dock: &Dock, theme: &Theme, model: &Model<'_>) {
             None => {
                 list.round_rect(swatch, radius, colour);
                 // A fine rim, so that a colour close to the panel's keeps its shape.
-                let rim = ring.map_or(theme.hairline, |(c, _)| c);
-                if swatch.h >= 6.0 {
-                    list.ring(swatch, radius, rim, 1.0);
-                }
+                list.ring(swatch, radius, theme.hairline, 1.0);
+            }
+        }
+    }
+    if flat {
+        // One frame around the grid, and the marks over it: the foreground colour's cell
+        // in the accent, the background colour's and the hovered one's with a fine line.
+        list.ring(dock.palette, 0.0, theme.hairline, 1.0);
+        for (index, colour, width) in [
+            (Some(model.ui.bg), theme.text_dim, 1.0),
+            (
+                match model.hover {
+                    Some(Hit::PaletteCell(i)) => Some(i),
+                    _ => None,
+                },
+                theme.text,
+                1.0,
+            ),
+            (Some(model.ui.fg), theme.accent, 2.0),
+        ] {
+            if let Some(cell) = index.and_then(|i| dock.cells.get(usize::from(i))) {
+                list.ring(*cell, 0.0, colour, width);
             }
         }
     }
 }
+
+/// Below this height palette cells are drawn as a plain grid.
+const FLAT_CELL_H: f32 = 9.0;
+/// From this height on a palette swatch has air around it and a line of panel colour
+/// inside its mark.
+const ROOMY_CELL_H: f32 = 12.0;
 
 #[cfg(test)]
 mod tests {
@@ -1492,6 +1592,213 @@ mod tests {
             .filter(|op| matches!(op, Op::RoundRect { fill: Some(c), .. } if *c == theme.scrim))
             .count();
         assert_eq!(veils, 4);
+    }
+
+    #[test]
+    fn the_canvas_needs_no_clip_and_rims_the_picture() {
+        for (theme, scale) in [(Theme::dark(), 1.0), (Theme::light(), 2.0)] {
+            let l = MainLayout::new(
+                (1280.0, 800.0),
+                scale,
+                Chrome::ALL,
+                32,
+                (320, 256),
+                PixelSize::default(),
+            );
+            let list = canvas(&l, &theme, false);
+            // A clip would cost a mask as large as the viewport on every redraw.
+            assert!(!list.ops().iter().any(|op| matches!(op, Op::Clip(_))));
+            // One physical pixel of hairline on each side of the picture, under it.
+            let (p, px) = (l.picture, 1.0 / scale);
+            let rim = fills(&list, theme.hairline);
+            assert_eq!(rim.len(), 4, "{rim:?}");
+            for side in [
+                Rect::new(p.x - px, p.y - px, p.w + 2.0 * px, px),
+                Rect::new(p.x - px, p.bottom(), p.w + 2.0 * px, px),
+                Rect::new(p.x - px, p.y, px, p.h),
+                Rect::new(p.right(), p.y, px, p.h),
+            ] {
+                assert!(rim.contains(&side), "{side:?} in {rim:?}");
+            }
+            // The shadow is three rings, not filled cards under the picture.
+            let rings = list
+                .ops()
+                .iter()
+                .filter(|op| {
+                    matches!(op, Op::RoundRect { fill: None, stroke: Some(s), .. }
+                        if s.color.a < 255)
+                })
+                .count();
+            assert_eq!(rings, 3);
+            assert!(
+                fills(
+                    &list,
+                    Color {
+                        a: theme.shadow.a / 3,
+                        ..theme.shadow
+                    }
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                list.ops().last(),
+                Some(&Op::Image {
+                    rect: p,
+                    image: PICTURE_IMAGE
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_requester_larger_than_the_viewport_is_drawn_over_the_chrome() {
+        use crate::layout::Picture;
+        let (theme, palette) = (Theme::dark(), Palette::dpaint_default_32());
+        let ui = UiState::default();
+        let dimmed = Model {
+            dimmed: true,
+            ..Model::new(&ui, &palette)
+        };
+        let l = MainLayout::for_picture(
+            (800.0, 600.0),
+            1.0,
+            Chrome::WITH_LAYERS,
+            32,
+            Picture {
+                size: (320, 256),
+                per_ui_pixel: 1,
+                pixel_size: PixelSize::default(),
+                hosts_requester: true,
+            },
+        );
+        assert!(l.over_chrome);
+        // Not in the viewport's own list (its image would be cut at the viewport) ..
+        let own = canvas(&l, &theme, true);
+        assert!(!own.ops().iter().any(|op| matches!(op, Op::Image { .. })));
+        assert!(fills(&own, theme.hairline).is_empty(), "no rim under it");
+        // .. but once in the window's, after every veil.
+        let whole = window(&l, &theme, &dimmed);
+        let images: Vec<usize> = whole
+            .ops()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| matches!(op, Op::Image { .. }).then_some(i))
+            .collect();
+        assert_eq!(images.len(), 1);
+        let last_veil = whole
+            .ops()
+            .iter()
+            .rposition(|op| matches!(op, Op::RoundRect { fill: Some(c), .. } if *c == theme.scrim))
+            .expect("veils");
+        assert!(images[0] > last_veil);
+        assert_eq!(
+            whole.ops()[images[0]],
+            Op::Image {
+                rect: l.picture,
+                image: PICTURE_IMAGE
+            }
+        ); // Its rim is the overlay: one physical pixel around the picture, over everything.
+        let (bounds, rim) = overlay(&l, &theme, &dimmed).expect("the rim");
+        assert_eq!(bounds, l.picture.inset(-1.0));
+        assert_eq!(fills(&rim, theme.hairline).len(), 4);
+        assert_eq!(rim.len(), 4);
+        assert!(l.window.encloses(&bounds));
+    }
+
+    #[test]
+    fn low_palette_cells_are_a_plain_grid_with_marks_on_whole_pixels() {
+        use crate::layout::MIN_WINDOW;
+        let theme = Theme::dark();
+        let palette = Palette::new(
+            (0..64u8)
+                .map(|i| dpx_core::Rgb8::new(i * 4, 255 - i * 4, i))
+                .collect(),
+        )
+        .expect("64 colours");
+        let ui = UiState {
+            fg: 5,
+            bg: 20,
+            ..UiState::default()
+        };
+        let model = Model {
+            hover: Some(Hit::PaletteCell(33)),
+            ..Model::new(&ui, &palette)
+        };
+        let l = MainLayout::new(MIN_WINDOW, 1.0, Chrome::ALL, 64, (320, 256), PixelSize(6));
+        let dock_ = l.dock.as_ref().expect("dock");
+        assert!(dock_.cells[0].h < FLAT_CELL_H, "{}", dock_.cells[0].h);
+        let list = dock(&l, &theme, &model);
+        // Every cell is one flat rectangle of its colour over the whole cell.
+        for (i, cell) in dock_.cells.iter().enumerate() {
+            let flat = Op::RoundRect {
+                rect: *cell,
+                radius: 0.0,
+                fill: Some(rgb(&palette, i as u8)),
+                stroke: None,
+            };
+            assert!(list.ops().contains(&flat), "cell {i}");
+        }
+        // The marks: rings on the cells of FG (accent, wider), BG and the hovered one.
+        let ring = |cell: usize, colour: Color, width: f32| Op::RoundRect {
+            rect: dock_.cells[cell],
+            radius: 0.0,
+            fill: None,
+            stroke: Some(crate::paint::Stroke::new(colour, width)),
+        };
+        let at = |op: Op| list.ops().iter().position(|o| *o == op).expect("the mark");
+        let (fg, bg, hover) = (
+            at(ring(5, theme.accent, 2.0)),
+            at(ring(20, theme.text_dim, 1.0)),
+            at(ring(33, theme.text, 1.0)),
+        );
+        assert!(fg > bg && fg > hover, "the foreground mark lies on top");
+        // With room the cells are swatches again: no flat cell-sized fill.
+        let roomy = MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome::ALL,
+            64,
+            (320, 256),
+            PixelSize(6),
+        );
+        let cell = roomy.dock.as_ref().expect("dock").cells[0];
+        assert!(
+            fills(&dock(&roomy, &theme, &model), rgb(&palette, 0))
+                .iter()
+                .all(|r| *r != cell)
+        );
+    }
+
+    #[test]
+    fn a_low_swatch_keeps_its_colour_inside_the_mark() {
+        use crate::layout::MIN_WINDOW;
+        let (theme, palette) = (Theme::light(), Palette::dpaint_default_32());
+        let ui = UiState {
+            fg: 3,
+            bg: 9,
+            ..UiState::default()
+        };
+        let l = MainLayout::new(MIN_WINDOW, 1.0, Chrome::ALL, 32, (320, 256), PixelSize(6));
+        let cells = &l.dock.as_ref().expect("dock").cells;
+        assert!(cells[0].h >= FLAT_CELL_H && cells[0].h < ROOMY_CELL_H);
+        let list = dock(&l, &theme, &Model::new(&ui, &palette));
+        // Inside the 2 pt accent mark at least 5 pt of the colour are left.
+        let inner = fills(&list, rgb(&palette, 3));
+        let inner = inner
+            .iter()
+            .find(|r| cells[3].encloses(r))
+            .expect("the foreground swatch");
+        assert!(inner.h >= 5.0, "{inner:?}");
+        assert!(
+            fills(&list, theme.accent)
+                .iter()
+                .any(|r| cells[3].encloses(r))
+        );
+        assert!(
+            fills(&list, theme.text_dim)
+                .iter()
+                .any(|r| cells[9].encloses(r))
+        );
     }
 
     #[test]

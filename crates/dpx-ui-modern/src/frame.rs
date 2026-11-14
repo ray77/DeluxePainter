@@ -43,6 +43,8 @@ impl Frame<'_> {
                 size: (self.picture.width, self.picture.height),
                 per_ui_pixel: self.per_ui_pixel,
                 pixel_size: ui.pixel_size,
+                // A requester in the picture's image may use the whole window.
+                hosts_requester: self.model.dimmed,
             },
         )
     }
@@ -429,6 +431,96 @@ mod tests {
             let status = crate::paint::Rect::new(l.status_x(), 6.0, 90.0, 18.0);
             assert!(has_ink(status), "status {kind:?} {scale}x");
         }
+    }
+
+    /// A black page in the dark theme: one physical pixel of hairline says where it ends.
+    #[test]
+    fn a_fine_rim_marks_the_edge_of_the_picture() {
+        let (ui, palette) = (UiState::default(), Palette::dpaint_default_32());
+        for (kind, scale) in CASES {
+            let theme = Theme::of(kind);
+            let (shot, l) = shoot(&ui, &palette, kind, scale);
+            let (p, px) = (l.picture, 1.0 / scale);
+            let (cx, cy) = p.center();
+            for (x, y) in [
+                (p.x - px, cy),
+                (p.right(), cy),
+                (cx, p.y - px),
+                (cx, p.bottom()),
+                (p.x - px, p.y - px),
+                (p.right(), p.bottom()),
+            ] {
+                assert_eq!(
+                    shot.at(x, y),
+                    theme.hairline,
+                    "{kind:?} {scale}x at {x}, {y}"
+                );
+            }
+            // The rim stands out from a black page and from the canvas.
+            assert!(
+                theme.hairline.contrast(Color::rgb(0, 0, 0)) >= 1.5,
+                "{kind:?}"
+            );
+            assert_ne!(theme.hairline, theme.canvas);
+        }
+    }
+
+    /// A screen that does not fit at one physical pixel per pixel (HiRes interlace in the
+    /// smallest window) is drawn whole, from its first pixel to its last.
+    #[test]
+    fn a_screen_larger_than_the_viewport_is_drawn_whole() {
+        let (ui, palette) = (UiState::default(), Palette::dpaint_default_32());
+        // 640 x 512: red at the left edge, green at the right, blue rows at top and bottom.
+        let mut rgba = vec![0u8; 640 * 512 * 4];
+        for y in 0..512usize {
+            for x in 0..640usize {
+                let at = (y * 640 + x) * 4;
+                let colour = match (x, y) {
+                    (_, 0..=1) | (_, 510..) => [0, 0, 255],
+                    (0..=1, _) => [255, 0, 0],
+                    (638.., _) => [0, 255, 0],
+                    _ => [90, 90, 90],
+                };
+                rgba[at..at + 3].copy_from_slice(&colour);
+                rgba[at + 3] = 255;
+            }
+        }
+        let frame = Frame {
+            size: crate::layout::MIN_WINDOW,
+            scale: 1.0,
+            theme: Theme::dark(),
+            model: Model::new(&ui, &palette),
+            picture: Image {
+                width: 640,
+                height: 512,
+                rgba: &rgba,
+            },
+            per_ui_pixel: 2,
+        };
+        let l = frame.layout();
+        assert!(l.shown < 1.0 && l.viewport.encloses(&l.picture), "{l:?}");
+        let (w, _, out) = render_window(&frame, &mut Renderer::new());
+        let shot = Shot {
+            w,
+            scale: 1.0,
+            rgba: out,
+        };
+        let p = l.picture;
+        let (cx, cy) = p.center();
+        assert_eq!(shot.at(p.x, cy), Color::rgb(255, 0, 0), "left edge");
+        assert_eq!(
+            shot.at(p.right() - 1.0, cy),
+            Color::rgb(0, 255, 0),
+            "right edge"
+        );
+        assert_eq!(shot.at(cx, p.y), Color::rgb(0, 0, 255), "top edge");
+        assert_eq!(
+            shot.at(cx, p.bottom() - 1.0),
+            Color::rgb(0, 0, 255),
+            "bottom"
+        );
+        assert_eq!(shot.at(cx, cy), Color::rgb(90, 90, 90));
+        assert_eq!(shot.at(p.x - 1.0, cy), Theme::dark().hairline);
     }
 
     #[test]
