@@ -61,7 +61,7 @@ Noted for Phase 3: choose the colour used for transparent pixels on import (owne
 The owner asked for a second, modern look: no pixels in the interface, only in the picture; dark and light; same hotkeys; switchable. Slice 1 (the main window) is built in four steps, 1a–1d.
 
 Modern now (drawn by `dpx-ui-modern`):
-- Bar (menu titles, program name or frame counter, paint mode, flags, coordinates, layer name) and the pull-down menus held with the right button, with submenus, marks, ghosting and shortcuts.
+- Bar (menu titles, program name or frame counter, paint mode, flags, coordinates, layer name) and the pull-down menus held with the right button, with submenus, marks, ghosting and shortcuts; they also open with a left click on a title and stay open, like a usual menu bar (owner decision 2a of ADR-47).
 - Dock: built-in brushes, 18 tools with split halves, toggles, colour indicator, palette up to 64 colours, tooltips.
 - Layer column (Prefs ▸ Layers / `L`): rows with eye and name, active layer, rename by double-click with a caret, six buttons with tooltips, scroll arrows and wheel. Same commands and undo steps as the Classic panel.
 - Picture quad with zoom (Cmd/Ctrl `+` / `−` / `0`, Prefs ▸ Pixel Size), free window size, device scales, dark and light theme (system or fixed), the switch (Prefs ▸ Modern UI, `F12`, Cmd/Ctrl+Shift+U) remembered in the settings.

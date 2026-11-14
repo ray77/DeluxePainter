@@ -1052,6 +1052,10 @@ pub struct MenuState {
     pub menu: Option<usize>,
     pub item: Option<usize>,
     pub sub_item: Option<usize>,
+    /// The menus were opened with the left button and stay open without a button held
+    /// (Modern skin only, ADR-47). Never set in the Classic skin; `open` and `close` clear
+    /// it.
+    pub sticky: bool,
 }
 
 impl MenuState {
@@ -1683,6 +1687,7 @@ mod tests {
                 menu: Some(m),
                 item: Some(item),
                 sub_item: None,
+                sticky: false,
             };
             draw(&mut img, &pens, &ctx(), &st, 320, 256);
             let Entry::Submenu(items) = MENUS[m].items[item].entry else {

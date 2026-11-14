@@ -21,14 +21,14 @@
 
 ## Two skins: Classic and Modern
 
-DeluxePainter has two looks for the same program. **Classic** is the pixel interface shown above and what a first start shows. **Modern** (Prefs ▸ Modern UI, `F12` or Cmd/Ctrl+Shift+U; the choice is remembered) draws the interface as sharp vector graphics in a dark or a light theme (Prefs ▸ Theme ▸ System / Dark / Light) and keeps pixels for the picture only, enlarged at whole factors. Both skins share one state: the same tools, the same hotkeys, the same pull-down menus held with the right mouse button on the bar at the top, the same undo history. Switching never touches the picture.
+DeluxePainter has two looks for the same program. **Classic** is the pixel interface shown above and what a first start shows. **Modern** (Prefs ▸ Modern UI, `F12` or Cmd/Ctrl+Shift+U; the choice is remembered) draws the interface as sharp vector graphics in a dark or a light theme (Prefs ▸ Theme ▸ System / Dark / Light) and keeps pixels for the picture only, enlarged at whole factors. Both skins share one state: the same tools, the same hotkeys, the same pull-down menus held with the right mouse button on the bar at the top, the same undo history. In the Modern skin the menus also work like a usual menu bar: a left click on a title opens its menu and it stays open, a click on an item picks it, and a click on the title, beside the menu or Esc closes it. Switching never touches the picture.
 
 <p align="center">
   <img src="docs/design/screenshots/modern-layers-dark.png" alt="Modern skin, dark theme: bar, picture, layer column and dock" width="400">
   <img src="docs/design/screenshots/modern-light-1x.png" alt="Modern skin, light theme" width="400">
 </p>
 <p align="center">
-  <img src="docs/design/screenshots/modern-menu-dark.png" alt="Modern skin: the Mode menu held open with the right mouse button" width="400">
+  <img src="docs/design/screenshots/modern-menu-dark.png" alt="Modern skin: the Mode menu open" width="400">
   <img src="docs/design/screenshots/modern-requester-dark.png" alt="Modern skin: the Color Mixer in the Classic look inside the picture, the interface around it dimmed" width="400">
 </p>
 
@@ -63,7 +63,7 @@ Claude can paint in DeluxePainter for you: you ask in plain words, Claude uses D
 You need DeluxePainter (there are no ready-made downloads yet, see [Building](#building)) and [Claude Code](https://code.claude.com/docs/en/setup) or [Claude Desktop](https://claude.ai/download).
 
 1. **Start DeluxePainter.**
-2. **Open Prefs ▸ AI & MCP..** (as for every menu: hold the right mouse button on the title bar, release on the item).
+2. **Open Prefs ▸ AI & MCP..** (as for every menu: hold the right mouse button on the title bar, release on the item; in the Modern skin a left click on the title and on the item works too).
 3. **Set MCP control to On.** The status line says "Ready on 127.0.0.1:8765".
 4. **Connect one Claude app:**
    - **Claude Code:** click **Claude Code**. DeluxePainter shows the exact command it is going to run (`claude mcp add --scope user deluxe-painter -- <DeluxePainter> mcp-bridge`) and runs it only when you click **Run**. Then start a new Claude Code session. If DeluxePainter cannot find Claude Code, it copies the command to the clipboard instead, so you can paste it into a terminal, and offers Claude Code's setup page.

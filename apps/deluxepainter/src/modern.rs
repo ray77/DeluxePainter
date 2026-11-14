@@ -105,6 +105,10 @@ pub(crate) struct State {
     /// a stroke or a rubber band does not get a stray segment from a quad that moved under
     /// the resting pointer.
     frozen: Option<(Chrome, PixelSize)>,
+    /// A press closed the menus that stay open (a click beside them, the right button, a
+    /// key during a drag): until every button is up again the pointer does nothing, so the
+    /// click that only closed a menu neither paints nor presses a tool.
+    swallow: bool,
     /// The size of the Modern window in whole points, as last seen while it was neither
     /// maximised nor full screen: what the next start opens (settings key `modern_window`).
     window_size: Option<(u16, u16)>,
@@ -631,6 +635,108 @@ impl PainterApp {
     /// itself running, not a question: the chrome stays as it is while they play.
     fn modern_dimmed(&self) -> bool {
         self.modal_open() && self.anim.playing.is_none() && self.anim_control.preview.is_none()
+    }
+
+    /// Once per pass, before the pointer is looked at: whether it is still taken by the
+    /// press that closed the menus (see `State::swallow`). It is free again once no button
+    /// is down.
+    pub(crate) fn modern_swallows_pointer(&mut self, any_down: bool) -> bool {
+        self.modern.swallow &= any_down;
+        self.modern.swallow
+    }
+
+    /// The left button went down on the Modern bar at the window point `p`: on a title its
+    /// menu opens and stays open (owner decision, ADR-47). Returns whether it did.
+    pub(crate) fn modern_open_menu(&mut self, layout: &MainLayout, p: egui::Vec2) -> bool {
+        let opened = dpx_ui_modern::menu::open_sticky(layout, &mut self.ui.menu, p.x, p.y);
+        self.dirty |= opened;
+        opened
+    }
+
+    /// Closes the menus that stay open without picking anything. `held`: a mouse button
+    /// is down, and what it does until it is up belongs to the menu that just closed.
+    fn modern_close_menu(&mut self, held: bool) {
+        self.ui.menu.close();
+        self.modern.swallow = held;
+        self.dirty = true;
+    }
+
+    /// One pass of the menus that were opened with the left button and stay open
+    /// (`MenuState::sticky`), with the pointer at the window point `p`. The pointer rules
+    /// and the action of an item are those of the held menus; only the buttons differ:
+    ///
+    /// - moving over another title opens that menu, items and submenus follow the pointer;
+    /// - the left button let go over an enabled item picks it and closes the menus (this is
+    ///   a click on the item as well as press on the title, drag, release); over a ghosted
+    ///   item or a submenu's row nothing happens and the menus stay; away from the menus
+    ///   (after a drag out of them) they close;
+    /// - the left button pressed on the open title or beside the menus closes them, and
+    ///   that click does nothing else;
+    /// - the right button pressed on the bar takes the menus over as held menus (the
+    ///   DeluxePaint protocol); pressed elsewhere it closes them.
+    pub(crate) fn modern_sticky_menu(
+        &mut self,
+        ctx: &egui::Context,
+        layout: &MainLayout,
+        p: egui::Vec2,
+        (press_l, release_l, press_r): (bool, bool, bool),
+        held: bool,
+    ) {
+        use dpx_ui_modern::menu;
+        let was_open = self.ui.menu.menu;
+        if menu::pointer(layout, &mut self.ui.menu, p.x, p.y) {
+            self.dirty = true;
+        }
+        let menu_ctx = self.ui.menu_context();
+        let title = dpx_ui_modern::hit::menu_title(layout, p.x, p.y);
+        let covered = menu::covers(layout, &menu_ctx, &self.ui.menu, p.x, p.y);
+        if press_r {
+            if layout.bar.is_some_and(|bar| bar.contains(p.x, p.y)) {
+                menu::open(layout, &mut self.ui.menu, p.x, p.y);
+                self.dirty = true;
+            } else {
+                self.modern_close_menu(held);
+            }
+            return;
+        }
+        if press_l {
+            // A title that only now came under the pointer (move and press in one pass)
+            // has just opened its menu: the press is not a second click on it.
+            let reopened = title.is_some() && title != was_open;
+            if !covered || (title.is_some() && !reopened) {
+                // With the button let go in the same pass nothing is left to swallow.
+                self.modern_close_menu(held);
+                return;
+            }
+        }
+        if release_l {
+            if let Some(action) = self.ui.menu.hovered_action(&menu_ctx) {
+                self.modern_close_menu(false);
+                self.run_action(action, ctx);
+            } else if !covered {
+                self.modern_close_menu(held);
+            }
+        }
+    }
+
+    /// The keys of a pass while the menus stay open: any key closes them. Esc does only
+    /// that (`true`: the keys of this pass are used up); every other key is then handled as
+    /// with no menu open, so a hotkey works at once.
+    pub(crate) fn modern_sticky_keys(&mut self, ctx: &egui::Context) -> bool {
+        let (key, esc, held) = ctx.input(|i| {
+            let key = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+                )
+            });
+            (key, i.key_pressed(egui::Key::Escape), i.pointer.any_down())
+        });
+        if !key {
+            return true;
+        }
+        self.modern_close_menu(held);
+        esc
     }
 
     /// Prefs ▸ Modern UI, F12 and Cmd/Ctrl+Shift+U: the other skin. It is shown from the
@@ -2487,6 +2593,406 @@ mod tests {
         rig.tap(egui::Key::F12);
         assert_eq!(rig.app.ui.tooltip, None);
         assert_eq!(rig.app.ui.menu, dpx_ui::MenuState::default());
+    }
+
+    // ---- The menus with the left button (owner decision after slice 1, ADR-47) ----
+
+    impl Rig {
+        /// A left click on the title of the menu that holds `wanted`: the menu opens and
+        /// stays open with no button held. Returns the points on the way to the item.
+        fn click_menu_open(&mut self, wanted: Action) -> Vec<egui::Pos2> {
+            let points = self.menu_points(wanted);
+            self.pass(vec![
+                egui::Event::PointerMoved(points[0]),
+                pointer_button(points[0], Primary, true),
+            ]);
+            assert!(self.app.ui.menu.sticky, "the press opens the menu");
+            self.pass(vec![pointer_button(points[0], Primary, false)]);
+            let menu = self.app.ui.menu;
+            assert!(menu.active && menu.sticky, "the menu stays open");
+            assert_eq!(menu.menu, Some(menu_place(wanted).0));
+            points
+        }
+
+        /// Moves along `points` (title, item, sub item) and checks that the pointer is over
+        /// the item that runs `wanted`.
+        fn hover_to(&mut self, wanted: Action, points: &[egui::Pos2]) -> egui::Pos2 {
+            for &p in &points[1..] {
+                self.pass(vec![egui::Event::PointerMoved(p)]);
+            }
+            let (m, item, sub) = menu_place(wanted);
+            let menu = self.app.ui.menu;
+            assert_eq!(
+                (menu.menu, menu.item, menu.sub_item, menu.sticky),
+                (Some(m), Some(item), sub, true),
+                "the pointer is over {wanted:?}"
+            );
+            points[points.len() - 1]
+        }
+
+        /// Whether the open menus have a title or a card at `at`. (The submenu of a ghosted
+        /// item is not shown: where its items would be is beside the menu.)
+        fn menu_covers(&self, at: egui::Pos2) -> bool {
+            let l = self.app.modern_layout().expect("layout");
+            let ctx = self.app.ui.menu_context();
+            modern_menu::covers(&l, &ctx, &self.app.ui.menu, at.x, at.y)
+        }
+
+        /// What happens after the left button went up over the item of `wanted`: an enabled
+        /// item was picked and the menu is closed (`closes`); a ghosted one does nothing
+        /// and the menu stays until Esc.
+        fn after_left_pick(&mut self, wanted: Action, closes: bool) {
+            if closes {
+                assert!(!self.app.ui.menu.active, "{wanted:?} closes the menu");
+            } else {
+                assert!(self.app.ui.menu.sticky, "ghosted {wanted:?}: still open");
+                self.tap(egui::Key::Escape);
+                assert!(!self.app.ui.menu.active, "Esc closes the menu");
+            }
+        }
+
+        /// Picks as in a usual menu bar: click on the title, move to the item, click it.
+        fn pick_left(&mut self, wanted: Action) {
+            let enabled = wanted.enabled(&self.app.ui.menu_context());
+            let points = self.click_menu_open(wanted);
+            let at = self.hover_to(wanted, &points);
+            let before = self.app.engine.can_undo();
+            let covered = self.menu_covers(at);
+            self.pass(vec![pointer_button(at, Primary, true)]);
+            if !covered {
+                assert!(!enabled && !self.app.ui.menu.active, "{wanted:?}: beside");
+                self.pass(vec![pointer_button(at, Primary, false)]);
+                return;
+            }
+            assert!(
+                self.app.ui.menu.sticky,
+                "{wanted:?}: the press alone picks nothing"
+            );
+            assert_eq!(self.app.engine.can_undo(), before);
+            self.pass(vec![pointer_button(at, Primary, false)]);
+            self.after_left_pick(wanted, enabled);
+        }
+
+        /// Picks with one gesture: left button down on the title, along to the item, up.
+        fn pick_drag(&mut self, wanted: Action) {
+            let enabled = wanted.enabled(&self.app.ui.menu_context());
+            let points = self.menu_points(wanted);
+            self.pass(vec![
+                egui::Event::PointerMoved(points[0]),
+                pointer_button(points[0], Primary, true),
+            ]);
+            let at = self.hover_to(wanted, &points);
+            let closes = enabled || !self.menu_covers(at);
+            self.pass(vec![pointer_button(at, Primary, false)]);
+            self.after_left_pick(wanted, closes);
+        }
+    }
+
+    /// The picks of `menu_script` that need no second button: an item of every menu, one in
+    /// a submenu, radio and check items, ghosted items and three requesters.
+    fn left_pick_script(rig: &mut Rig, pick: fn(&mut Rig, Action)) -> Vec<(String, String)> {
+        let mut states = Vec::new();
+        rig.click(Place::Page(40, 40), Primary);
+        rig.click(Place::Cell(5), Primary);
+        let rest = Place::Page(200, 200);
+        let actions = [
+            Action::Command("picture.flip_horizontal"),
+            Action::Mode(PaintMode::Smear),
+            Action::Command("anim.method_expanded"),
+            Action::Command("color.bg_to_fg"),
+            Action::Command("antialias.high"),
+            Action::Pref(Pref::Coords),
+            Action::Pref(Pref::Coords),
+            Action::PixelSize(PixelSize(4)),
+            Action::PixelSize(PixelSize(6)),
+            Action::Command("picture.print"),
+            Action::Command("brush.halve"),
+            Action::Theme(Choice::Light),
+        ];
+        let mut menus: Vec<usize> = actions.iter().map(|&a| menu_place(a).0).collect();
+        menus.sort_unstable();
+        menus.dedup();
+        assert_eq!(menus, (0..MENUS.len()).collect::<Vec<_>>(), "every menu");
+        assert!(
+            actions.iter().any(|&a| menu_place(a).2.is_some()),
+            "a submenu"
+        );
+        for action in actions {
+            pick(rig, action);
+            assert!(!rig.app.modal_open(), "{action:?} opens nothing");
+            rig.move_to(rest);
+            states.push((format!("picked {action:?}"), rig.state()));
+        }
+        assert_eq!(rig.app.ui.mode, PaintMode::Smear);
+        assert!(rig.app.ui.anim_expanded);
+        assert_eq!(rig.app.ui.theme, Choice::Light);
+        for id in ["palette.mixer", "picture.page_size", "anim.set_rate"] {
+            pick(rig, Action::Command(id));
+            assert!(rig.app.modal_open(), "{id} opens its requester");
+            assert!(!rig.app.ui.menu.active, "no menu under the requester");
+            states.push((format!("picked {id}"), rig.state()));
+            rig.tap(egui::Key::Escape);
+            assert!(!rig.app.modal_open(), "Esc closes {id}");
+            rig.move_to(rest);
+            states.push((format!("Esc after {id}"), rig.state()));
+        }
+        states
+    }
+
+    #[test]
+    fn left_button_picks_run_the_same_actions_as_right_button_picks() {
+        for (size, ppp) in [((1280.0, 800.0), 1.0), ((1001.0, 700.0), 1.5)] {
+            let run = |pick: fn(&mut Rig, Action)| {
+                let mut rig = Rig::new(UiStyle::Modern, size, ppp);
+                left_pick_script(&mut rig, pick)
+            };
+            let right = run(|rig, a| rig.pick(a));
+            assert!(right.len() > 15);
+            for (name, picks) in [
+                ("click", run(|rig, a| rig.pick_left(a))),
+                ("drag", run(|rig, a| rig.pick_drag(a))),
+            ] {
+                assert_eq!(picks.len(), right.len());
+                for ((step, r), (_, l)) in right.iter().zip(&picks) {
+                    assert!(r == l, "{name} at {ppp}: the state differs after: {step}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_left_click_on_a_title_opens_its_menu_until_it_is_closed() {
+        let mut rig = Rig::modern();
+        let smear = Action::Mode(PaintMode::Smear);
+        let (mode, size) = (rig.app.ui.mode, rig.app.ui.pixel_size);
+        assert_ne!(size, PixelSize(4), "the submenu item below would change it");
+        let points = rig.click_menu_open(smear);
+        // It needs no button and no further input to stay.
+        for _ in 0..5 {
+            rig.pass(vec![]);
+        }
+        assert!(rig.app.ui.menu.sticky);
+        // Items follow the pointer; a submenu opens beside its item.
+        rig.hover_to(smear, &points);
+        let pixel = Action::PixelSize(PixelSize(4));
+        let points = rig.menu_points(pixel);
+        rig.pass(vec![egui::Event::PointerMoved(points[0])]);
+        rig.pass(vec![egui::Event::PointerMoved(points[1])]);
+        let l = rig.app.modern_layout().expect("layout");
+        let ctx = rig.app.ui.menu_context();
+        assert_eq!(modern_menu::cards(&l, &ctx, &rig.app.ui.menu).len(), 2);
+        // A click on the submenu's own row picks nothing and leaves everything open.
+        rig.pass(vec![pointer_button(points[1], Primary, true)]);
+        rig.pass(vec![pointer_button(points[1], Primary, false)]);
+        assert!(rig.app.ui.menu.sticky && rig.app.ui.menu.sub_item.is_none());
+        // A second click on the open title closes the menu.
+        rig.pass(vec![egui::Event::PointerMoved(points[0])]);
+        rig.pass(vec![pointer_button(points[0], Primary, true)]);
+        assert!(!rig.app.ui.menu.active, "the open title closes its menu");
+        rig.pass(vec![pointer_button(points[0], Primary, false)]);
+        assert!(
+            !rig.app.ui.menu.active,
+            "and the release does not reopen it"
+        );
+        // Esc closes it and does nothing else.
+        rig.click_menu_open(smear);
+        rig.tap(egui::Key::Escape);
+        assert!(!rig.app.ui.menu.active);
+        assert_eq!(rig.app.ui.mode, mode);
+        assert!(!rig.app.engine.can_undo(), "nothing was picked or painted");
+        assert_eq!(rig.app.ui.pixel_size, size);
+        // The bar beside the titles opens nothing, and neither does the Classic bar.
+        let beside = egui::pos2(l.window.right() - 20.0, points[0].y);
+        rig.pass(vec![
+            egui::Event::PointerMoved(beside),
+            pointer_button(beside, Primary, true),
+        ]);
+        rig.pass(vec![pointer_button(beside, Primary, false)]);
+        assert!(!rig.app.ui.menu.active);
+        let mut classic = Rig::classic();
+        let title = classic.menu_points(smear)[0];
+        classic.pass(vec![
+            egui::Event::PointerMoved(title),
+            pointer_button(title, Primary, true),
+        ]);
+        assert!(!classic.app.ui.menu.active, "Classic: right button only");
+        classic.pass(vec![pointer_button(title, Primary, false)]);
+        assert!(!classic.app.ui.menu.active);
+    }
+
+    #[test]
+    fn an_open_menu_follows_the_pointer_from_title_to_title() {
+        let mut rig = Rig::new(UiStyle::Modern, (900.0, 620.0), 2.0);
+        rig.click_menu_open(Action::Command("picture.flip_horizontal"));
+        let l = rig.app.modern_layout().expect("layout");
+        let middle = |r: Rect| egui::pos2(r.x + r.w / 2.0, r.y + r.h / 2.0);
+        for m in (0..MENUS.len()).rev() {
+            rig.pass(vec![egui::Event::PointerMoved(middle(l.menu_titles[m]))]);
+            let menu = rig.app.ui.menu;
+            assert_eq!((menu.menu, menu.item, menu.sticky), (Some(m), None, true));
+        }
+        // A title reached and pressed in one pass has just opened: it stays open.
+        let other = middle(l.menu_titles[3]);
+        rig.pass(vec![
+            egui::Event::PointerMoved(other),
+            pointer_button(other, Primary, true),
+        ]);
+        assert_eq!(rig.app.ui.menu.menu, Some(3));
+        rig.pass(vec![pointer_button(other, Primary, false)]);
+        assert!(rig.app.ui.menu.sticky, "the new menu is open");
+        // Below the bar, beside the card, the menu stays as it is (no item).
+        let away = rig.point(Place::Page(200, 150));
+        rig.pass(vec![egui::Event::PointerMoved(away)]);
+        let menu = rig.app.ui.menu;
+        assert_eq!((menu.menu, menu.item, menu.sticky), (Some(3), None, true));
+        assert!(!rig.app.engine.can_undo());
+    }
+
+    #[test]
+    fn a_click_beside_an_open_menu_closes_it_and_does_nothing_else() {
+        let mut rig = Rig::modern();
+        let fg = rig.app.ui.fg;
+        let smear = Action::Mode(PaintMode::Smear);
+        let tool = rig.app.ui.tool;
+        // On the page: no dot, and dragging on with the button held draws nothing either.
+        rig.click_menu_open(smear);
+        let (a, b) = (
+            rig.point(Place::Page(200, 150)),
+            rig.point(Place::Page(230, 170)),
+        );
+        rig.pass(vec![
+            egui::Event::PointerMoved(a),
+            pointer_button(a, Primary, true),
+        ]);
+        assert!(!rig.app.ui.menu.active, "the press closes the menu");
+        rig.pass(vec![egui::Event::PointerMoved(b)]);
+        rig.pass(vec![pointer_button(b, Primary, false)]);
+        assert!(!rig.app.engine.can_undo(), "nothing was painted");
+        assert_ne!(rig.app.page().get(200, 150), Some(fg));
+        assert_ne!(rig.app.page().get(230, 170), Some(fg));
+        // On a tool and on a palette cell: neither is chosen.
+        for place in [Place::Tool(Tool::Rectangle, true), Place::Cell(9)] {
+            rig.click_menu_open(smear);
+            rig.click(place, Primary);
+            assert!(!rig.app.ui.menu.active);
+            assert_eq!((rig.app.ui.tool, rig.app.ui.fg), (tool, fg), "{place:?}");
+        }
+        // The right button beside the menu closes it too, without its own action.
+        let bg = rig.app.ui.bg;
+        rig.click_menu_open(smear);
+        rig.click(Place::Cell(9), Secondary);
+        assert!(!rig.app.ui.menu.active);
+        assert_eq!(rig.app.ui.bg, bg);
+        assert_eq!(rig.app.ui.mode, PaintMode::Color);
+        // The next click is an ordinary one again.
+        rig.click(Place::Page(200, 150), Primary);
+        assert_eq!(rig.app.page().get(200, 150), Some(fg));
+        rig.click(Place::Cell(9), Primary);
+        assert_eq!(rig.app.ui.fg, 9);
+    }
+
+    #[test]
+    fn a_left_drag_from_the_title_picks_on_release_or_closes_away_from_the_menu() {
+        let mut rig = Rig::modern();
+        rig.pick_drag(Action::Mode(PaintMode::Shade));
+        assert_eq!(rig.app.ui.mode, PaintMode::Shade);
+        rig.pick_drag(Action::PixelSize(PixelSize(4)));
+        assert_eq!(rig.app.ui.pixel_size, PixelSize(4));
+        // Dragged out of the menu and let go: closed, nothing picked, nothing painted.
+        let points = rig.menu_points(Action::Mode(PaintMode::Blend));
+        rig.pass(vec![
+            egui::Event::PointerMoved(points[0]),
+            pointer_button(points[0], Primary, true),
+        ]);
+        rig.pass(vec![egui::Event::PointerMoved(points[1])]);
+        let away = rig.point(Place::Page(250, 180));
+        rig.pass(vec![egui::Event::PointerMoved(away)]);
+        assert!(rig.app.ui.menu.sticky, "open while the button is held");
+        rig.pass(vec![pointer_button(away, Primary, false)]);
+        assert!(!rig.app.ui.menu.active);
+        assert_eq!(rig.app.ui.mode, PaintMode::Shade);
+        assert!(!rig.app.engine.can_undo());
+        // Dragged down and back to the title: it stays open, as after a click.
+        rig.pass(vec![
+            egui::Event::PointerMoved(points[0]),
+            pointer_button(points[0], Primary, true),
+        ]);
+        rig.pass(vec![egui::Event::PointerMoved(points[1])]);
+        rig.pass(vec![egui::Event::PointerMoved(points[0])]);
+        rig.pass(vec![pointer_button(points[0], Primary, false)]);
+        assert!(rig.app.ui.menu.sticky);
+        rig.tap(egui::Key::Escape);
+    }
+
+    /// The right button on the bar takes an open menu over: from then on it is the held
+    /// menu of DeluxePaint, with the left button for several picks.
+    #[test]
+    fn the_right_button_takes_an_open_menu_over_as_a_held_menu() {
+        let mut rig = Rig::modern();
+        let points = rig.click_menu_open(Action::Mode(PaintMode::Shade));
+        rig.pass(vec![pointer_button(points[0], Secondary, true)]);
+        let menu = rig.app.ui.menu;
+        assert!(menu.active && !menu.sticky, "held, no longer sticky");
+        rig.pass(vec![egui::Event::PointerMoved(points[1])]);
+        rig.pass(vec![pointer_button(points[1], Primary, true)]);
+        rig.pass(vec![pointer_button(points[1], Primary, false)]);
+        assert_eq!(rig.app.ui.mode, PaintMode::Shade);
+        assert!(rig.app.ui.menu.active, "multi-select keeps the menu");
+        let at = rig.menu_points(Action::Mode(PaintMode::Cycle))[1];
+        rig.pass(vec![egui::Event::PointerMoved(at)]);
+        rig.pass(vec![pointer_button(at, Secondary, false)]);
+        assert_eq!(rig.app.ui.mode, PaintMode::Cycle);
+        assert!(!rig.app.ui.menu.active);
+        // And the plain right-button pick is what it was.
+        rig.pick(Action::Mode(PaintMode::Smear));
+        assert_eq!(rig.app.ui.mode, PaintMode::Smear);
+    }
+
+    #[test]
+    fn a_key_closes_an_open_menu_and_is_then_handled() {
+        use egui::Key;
+        let mut rig = Rig::modern();
+        let smear = Action::Mode(PaintMode::Smear);
+        // A hotkey: the menu goes and the key does its work in the same pass.
+        rig.click_menu_open(smear);
+        rig.tap(Key::F3);
+        assert!(!rig.app.ui.menu.active);
+        assert_eq!(rig.app.ui.mode, PaintMode::Replace);
+        rig.click_menu_open(smear);
+        rig.key('r');
+        assert!(!rig.app.ui.menu.active);
+        assert_eq!(rig.app.ui.tool, Tool::Rectangle);
+        // A modifier alone is no key.
+        rig.click_menu_open(smear);
+        rig.pass(vec![egui::Event::ModifiersChanged(egui::Modifiers::SHIFT)]);
+        rig.pass(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        assert!(rig.app.ui.menu.sticky);
+        // F12: the menu closes and the skin switches; Classic shows no menu, and back in
+        // Modern none is open and the pointer works as usual.
+        rig.tap(Key::F12);
+        assert!(!rig.app.is_modern(), "F12 switches with a menu open");
+        assert_eq!(rig.app.ui.menu, dpx_ui::MenuState::default());
+        rig.pass(vec![]);
+        assert!(!rig.app.ui.menu.active);
+        rig.tap(Key::F12);
+        rig.pass(vec![]);
+        assert!(rig.app.is_modern());
+        assert_eq!(rig.app.ui.menu, dpx_ui::MenuState::default());
+        let fg = rig.app.ui.fg;
+        rig.click(Place::Tool(Tool::DottedFreehand, false), Primary);
+        rig.click(Place::Page(60, 60), Primary);
+        assert_eq!(rig.app.page().get(60, 60), Some(fg));
+        // The chord, with the menu open and the pointer over an item: no item is picked.
+        let points = rig.click_menu_open(smear);
+        rig.hover_to(smear, &points);
+        let held = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        let mut events = vec![egui::Event::ModifiersChanged(held)];
+        events.extend(chord(Key::U, Key::U, held, ""));
+        rig.pass(events);
+        rig.pass(vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        assert!(!rig.app.is_modern());
+        assert_eq!(rig.app.ui.menu, dpx_ui::MenuState::default());
+        assert_eq!(rig.app.ui.mode, PaintMode::Replace);
     }
 
     // ---- The layer column, requesters in the quad, the Control Panel (slice 1d of ADR-47) ----

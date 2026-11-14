@@ -1,6 +1,8 @@
 //! The Modern skin's pull-down menus (ADR-47). They work as in DeluxePaint: while the right
 //! mouse button is held on the bar, the menu under the pointer drops down as a card, a
-//! submenu opens beside its item, and letting go over an item picks it.
+//! submenu opens beside its item, and letting go over an item picks it. They also work as
+//! a usual menu bar: a left click on a title opens its menu and it stays open
+//! ([`open_sticky`]); the pointer rules are the same, the app decides what a click does.
 //!
 //! Only the geometry and the look are new. What is open and what is under the pointer is
 //! written into the same [`MenuState`] the Classic skin uses, so the action under the
@@ -200,6 +202,27 @@ pub fn open(layout: &MainLayout, state: &mut MenuState, x: f32, y: f32) {
         ..MenuState::default()
     };
     pointer(layout, state, x, y);
+}
+
+/// The left button went down on a title of the bar at the window point (`x`, `y`): its
+/// menu drops down and stays open after the button is let go (`MenuState::sticky`).
+/// Returns whether a menu opened: nothing happens beside the titles or with the bar hidden.
+pub fn open_sticky(layout: &MainLayout, state: &mut MenuState, x: f32, y: f32) -> bool {
+    if crate::hit::menu_title(layout, x, y).is_none() {
+        return false;
+    }
+    open(layout, state, x, y);
+    state.sticky = true;
+    true
+}
+
+/// Whether the window point (`x`, `y`) belongs to the open menus: a title of the bar or a
+/// card that is shown. A left click anywhere else closes menus that stay open.
+pub fn covers(layout: &MainLayout, ctx: &MenuContext, state: &MenuState, x: f32, y: f32) -> bool {
+    crate::hit::menu_title(layout, x, y).is_some()
+        || cards(layout, ctx, state)
+            .iter()
+            .any(|(card, ..)| card.contains(x, y))
 }
 
 /// Tracks the pointer at the window point (`x`, `y`) while the menus are held; returns
@@ -491,7 +514,8 @@ mod tests {
                         active: true,
                         menu: Some(m),
                         item: None,
-                        sub_item: None
+                        sub_item: None,
+                        sticky: false,
                     }
                 );
                 let card = menu_card(&l, m).expect("bar shown");
@@ -878,6 +902,48 @@ mod tests {
             .count();
         assert_eq!(caps, amiga);
         assert!(amiga > 0);
+    }
+
+    /// A left click opens a menu only on a title, and what belongs to the open menus is
+    /// the titles and the cards that are shown.
+    #[test]
+    fn a_menu_that_stays_open_starts_on_a_title_and_covers_titles_and_cards() {
+        let ctx = modern_ctx();
+        for (window, scale) in WINDOWS {
+            let l = layout(window, scale);
+            let bar = l.bar.expect("bar shown");
+            let mut state = MenuState::default();
+            // Beside the titles and below the bar nothing opens.
+            assert!(!open_sticky(&l, &mut state, bar.right() - 2.0, bar.y + 2.0));
+            assert!(!open_sticky(&l, &mut state, 20.0, bar.bottom() + 30.0));
+            assert_eq!(state, MenuState::default());
+            for m in 0..MENUS.len() {
+                let (tx, ty) = title_point(&l, m);
+                assert!(open_sticky(&l, &mut state, tx, ty));
+                assert!(state.active && state.sticky);
+                assert_eq!((state.menu, state.item), (Some(m), None));
+                let card = menu_card(&l, m).expect("bar shown");
+                let row = card.row(0);
+                let (ix, iy) = (row.x + row.w / 2.0, row.y + row.h / 2.0);
+                // The pointer rules are those of the held menus; the flag stays.
+                assert!(pointer(&l, &mut state, ix, iy));
+                assert_eq!((state.item, state.sticky), (Some(0), true));
+                assert!(covers(&l, &ctx, &state, tx, ty), "its title");
+                assert!(covers(&l, &ctx, &state, ix, iy), "its card");
+                assert!(!covers(&l, &ctx, &state, bar.right() - 2.0, bar.y + 2.0));
+                let below = card.rect.bottom() + 6.0;
+                if below < l.window.bottom() {
+                    assert!(!covers(&l, &ctx, &state, ix, below), "below the card");
+                }
+            }
+            // The right button's `open` and `close` both drop the flag.
+            let (tx, ty) = title_point(&l, 2);
+            open(&l, &mut state, tx, ty);
+            assert!(state.active && !state.sticky);
+            assert!(open_sticky(&l, &mut state, tx, ty));
+            state.close();
+            assert_eq!(state, MenuState::default());
+        }
     }
 
     #[test]

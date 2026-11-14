@@ -2072,7 +2072,7 @@ impl PainterApp {
         }
 
         // Input.
-        let (hover, press_l, press_r, down_l, down_r, shift) = ctx.input(|i| {
+        let (hover, press_l, press_r, down_l, down_r, shift, release_l) = ctx.input(|i| {
             (
                 i.pointer.hover_pos(),
                 i.pointer.primary_pressed(),
@@ -2080,6 +2080,7 @@ impl PainterApp {
                 i.pointer.primary_down(),
                 i.pointer.secondary_down(),
                 i.modifiers.shift,
+                i.pointer.primary_released(),
             )
         });
         self.tools.shift = shift;
@@ -2105,7 +2106,28 @@ impl PainterApp {
         // Menus and the toolbox live in UI (LoRes) coordinates.
         let ui_screen = view.ui_screen();
         let (sw, sh) = (ui_screen.width, ui_screen.height);
-        if self.ui.menu.active {
+        // ADR-47: the press that closed a Modern menu does nothing else until it is let go.
+        let swallowed = self.modern_swallows_pointer(down_l || down_r);
+        if self.ui.menu.active && self.ui.menu.sticky {
+            // ADR-47: a Modern menu opened with the left button stays open with no button
+            // held. Nothing under it is hovered, pressed or painted meanwhile.
+            match (&modern_layout, hover) {
+                (Some(l), Some(pos)) => self.modern_sticky_menu(
+                    &ctx,
+                    l,
+                    pos - area.min,
+                    (press_l, release_l, press_r),
+                    down_l || down_r,
+                ),
+                // The pointer is outside the window: the menu waits.
+                (Some(_), None) => {}
+                // No Modern layout (the skin changed under it): the menu goes.
+                (None, _) => {
+                    self.ui.menu.close();
+                    self.dirty = true;
+                }
+            }
+        } else if self.ui.menu.active {
             // Menu strip held with the right button: track, multi-select with the left button,
             // select on release.
             if let Some(pos) = hover {
@@ -2143,6 +2165,8 @@ impl PainterApp {
                     self.run_action(a, &ctx);
                 }
             }
+        } else if swallowed {
+            // The button that closed a Modern menu is still down.
         } else if let Some(pos) = hover {
             let (sx, sy) = to_screen(pos);
             let (ux, uy) = view.ui_pos((sx, sy));
@@ -2202,6 +2226,13 @@ impl PainterApp {
                     None => self.ui.menu.open(sw, sh, ux, uy),
                 }
                 self.dirty = true;
+            } else if press_l
+                && hit == Some(Hit::TitleBar)
+                && let Some(l) = &modern_layout
+                && self.modern_open_menu(l, pos - area.min)
+            {
+                // ADR-47: a left click on a title of the Modern bar opened its menu; it
+                // stays open (`modern_sticky_menu`). The Classic bar has no such click.
             } else if press_l || press_r {
                 if let Some(hit) = hit {
                     self.handle_press(hit, press_r);
@@ -2228,8 +2259,10 @@ impl PainterApp {
             self.release();
         }
         self.tick(&ctx);
-        if self.ui.menu.active {
-            // Keyboard shortcuts are ignored while the menu strip is shown.
+        // Keyboard shortcuts are ignored while the menu strip is shown. ADR-47: a Modern menu
+        // that stays open is closed by any key; Esc does only that, another key is then
+        // handled below as with no menu open.
+        if self.ui.menu.active && (!self.ui.menu.sticky || self.modern_sticky_keys(&ctx)) {
             self.upload_and_paint(ui, &ctx, rect, area);
             return;
         }
