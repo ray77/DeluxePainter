@@ -1,6 +1,6 @@
 # ADR-47: Modern UI skin
 
-- Status: accepted (2026-11-13). Written from three design proposals and three code maps at HEAD f4d9512. Slice 0 (groundwork, no visible change), slice 1a (the renderer crate `dpx-ui-modern`, the bundled font and headless snapshots of bar, dock and picture) slice 1b (the live window: bar, dock and picture with pointer, keys, zoom, HiDPI and the region cache) slice 1c (the Modern pull-down menus and tooltips, the switch by Prefs ▸ Modern UI, F12 and Cmd/Ctrl+Shift+U, Prefs ▸ Theme) and slice 1d (the layer column, the scrim over the chrome under a requester, Screen Format on the whole window) are implemented: slice 1 of the owner's decision 3 is complete. After slice 1 the owner changed decision 2: the Modern menus also open with the left button like a normal menu bar (implemented, see owner decision 2a and lead decision 25). Slice 4a (2026-11-14: the dialog kit, and the first requesters in the Modern look: notes, questions, About, Page Size, Screen Format) is implemented; see "Slice 4a" and lead decisions 26 to 31, which change decisions 17 and 18 for those requesters. Slices 2, 3 and the rest of slice 4 are the plan, not the program.
+- Status: accepted (2026-11-13). Written from three design proposals and three code maps at HEAD f4d9512. Slice 0 (groundwork, no visible change), slice 1a (the renderer crate `dpx-ui-modern`, the bundled font and headless snapshots of bar, dock and picture) slice 1b (the live window: bar, dock and picture with pointer, keys, zoom, HiDPI and the region cache) slice 1c (the Modern pull-down menus and tooltips, the switch by Prefs ▸ Modern UI, F12 and Cmd/Ctrl+Shift+U, Prefs ▸ Theme) and slice 1d (the layer column, the scrim over the chrome under a requester, Screen Format on the whole window) are implemented: slice 1 of the owner's decision 3 is complete. After slice 1 the owner changed decision 2: the Modern menus also open with the left button like a normal menu bar (implemented, see owner decision 2a and lead decision 25). Slice 4a (2026-11-14: the dialog kit, and the first requesters in the Modern look: notes, questions, About, Page Size, Screen Format) is implemented; see "Slice 4a" and lead decisions 26 to 31, which change decisions 17 and 18 for those requesters. Slice 4b (2026-11-14: the tool, palette and anim requesters in the Modern look; three more kit parts) is implemented; see "Slice 4b" and lead decisions 32 to 37. Slices 2, 3 and the rest of slice 4 are the plan, not the program.
 - Amends: ADR-3 (whole UI software-rendered into a low-res framebuffer), ADR-13 (the screen fills the window), ADR-33 (settings file: two new keys), and the first non-negotiable of `CLAUDE.md`.
 
 ## Context
@@ -69,6 +69,13 @@ The owner was not asked again about these visible points; each is a small, local
 29. (Slice 4a.) A cycle gadget with exactly two values is shown as two segments side by side (the selected one filled with the accent); a press on the other segment is the press on the Classic gadget. A gadget with more values is a stepper that shows the value with a chevron and moves on with every press, as in Classic. No drop-down lists: they would need behaviour the Classic requester does not have.
 30. (Slice 4a.) A refused value is shown as a line in the alert colour with a bar at its left, inside the panel of facts where the dialog has one. About has a head with the program's name; its text is the Classic text, re-flowed.
 31. (Slice 4a.) One card at a time: the requester that has the pointer and the keys. A converted requester that lies under another one is not drawn until it is on top (in Classic it is visible underneath but takes no input either). A card over an unconverted requester (a question over the file requester) lies over the veiled picture that still shows that requester in the Classic look. Text fields have a caret and a focus ring and no selection: the Classic fields have none.
+
+32. (Slice 4b.) A requester built on the shared form is one column: what stands at one height in the Classic requester is one line; a radio button or check box that begins a line stands where the labels of the other lines stand, and what follows it starts at one place in every line (so the fields of Spacing or Copy Frames stand under each other). A text over radio buttons is a small heading, an explanation at the end is one subdued paragraph, the captions X / Y / Z over the Perspective fields stand before their fields. Labels lose their colon.
+33. (Slice 4b.) A refused number is shown as the last line of the form, in the alert look; the card grows by that line while it is shown (the Classic requester has a reserved line; a reserved empty line in every card would be the worse look).
+34. (Slice 4b.) The palette is shown as swatches: a grid of separate squares in Make Stencil and Arrange Palette (as wide as the card for up to four rows, smaller squares for more, so 256 colours fit the smallest window), a strip of touching cells in Range. A protected colour has a check mark on a dark disc, a colour of the range a light dot with a dark rim, the swatch a drag started on an accent frame and a dot, the place it would land a frame in the text colour. The marks use one dark and one light ink together, so they show on every colour in both themes.
+35. (Slice 4b.) Buttons that are a mode or belong to a line stand in that line, not at the bottom: Move / Ex in Arrange Palette (the chosen one filled with the accent; the count of moved colours beside them), the range numbers 1 to 8, Active and Clear in Range, From Brush in Perspective, Clear / Go Back and Preview / Trails / Fill in Move. Read line by line and then along the bottom row, the buttons are in the Classic order (decision 28). In Move the bottom row is Draw (the button Return presses, filled with the accent), Cancel, Load, Save, Exit; in Make Stencil it is Make, Clear, Invert, Cancel.
+36. (Slice 4b.) Range's Forward / Reverse button is shown as two segments (decision 29); `r` is underlined in its label "Direction". Its span text and its info line are one line under the controls ("Colors 20-27: 8 colors, 15/s, off"). The rate slider is ghosted while the range has no span.
+37. (Slice 4b.) Icon buttons (the three AnimBrush directions, Move's Go from / Come to and the three Record choices) show our own pictograms: triangles, an arrow with a dot, double chevrons, two bars. None is traced from the Classic bitmaps.
 
 ## Options considered
 
@@ -337,6 +344,7 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 | AnimBrush (Pick up, Make, Settings), Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | **modern** (slice 4b) | |
 | Anim requesters: Set Frame Count, Add, Copy and Delete Frames, Go to Frame, Set Rate | `anim_requester.rs` (forms) | **modern** (slice 4b) | |
 | Set Range | `anim_control.rs` (`PlayRangeRequester`, a form) | **modern** (slice 4b) | |
+| Move | `anim_control.rs` (`MoveRequester`, own code) | **modern** (slice 4b) | its preview plays in the picture, without the card |
 | File requester (Load, Save, Export, brushes, anims) | `file_requester.rs` | classic look | the list part with scroll bar and the fields exist; needs Drawer / Pattern / File fields in one view, Disks / Assigns / Parent, "# of Frames", long names |
 | Color Mixer | `palette_requester.rs` | classic look | swatch grid, sample box, RGB/HSV sliders, SPREAD / COPY / EX / UNDO; it changes the palette of the whole screen live, so where the card stands over the picture is a visible decision |
 | Range | `range_requester.rs` | **modern** (slice 4b) | |
@@ -355,6 +363,60 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 - Screenshots (`--snapshot --ui modern --no-settings --commands docs/design/screenshots/wave8-layer-panel.json --tool rectangle:filled --fg 5 --theme dark|light` plus the flag): `modern-dialog-about-*.png` (`--about`), `modern-dialog-question-*.png` (`--quit-question`), `modern-dialog-recover-*.png` (`--recover-requester`), `modern-dialog-replace-*.png` (`--mcp-question castle.iff`), `modern-dialog-note-*.png` (`--export-note castle.png`), `modern-dialog-page-size-*.png` (`--page-size-requester --layers-panel`), `modern-dialog-screen-format-*.png` (`--requester`), each as `-dark` and `-light`; `modern-dialog-screen-format-compact-2x.png` (`--theme dark --requester --size 720x520 --device-scale 2`), `modern-dialog-page-size-compact.png` (`--theme light --page-size-requester --size 720x520`). All were looked at. The two `recover` images show the time of the run in their text and do not regenerate byte-identically.
 - Replaced: `modern-requester-light.png` showed Page Size in the Classic look; it now shows the Range requester (`--theme light --layers-panel --range-requester`), which is still hosted. `modern-live-screen-format.png` was written again by the live-window test (`DPX_MODERN_SHOTS`): Screen Format as a card.
 - Classic identity: the four pin scenes pass unchanged. A binary built from the commit before this slice (1d5d381) and the new one wrote byte-identical `--snapshot` images for ten Classic scenes (the start screen; with `--commands wave8-layer-panel.json`: plain, `--page-size-requester`, `--requester`, `--mcp-question castle.iff`, `--export-note castle.png`, `--menu 2:3`, `--palette-requester`, `--layers-panel`, `--range-requester`) and for seven Modern scenes without a card (dark, light at 2x, `--layers-panel --palette-requester` at 1280x800 and 800x600, `--menu 2:3`, `--frames 4 --anim-panel`, `--layers-panel --range-requester`).
+
+## Slice 4b: the tool, palette and anim requesters
+
+Batch 1 of the remaining requesters, converted by the recipe above; nothing of a requester's state or behaviour exists twice.
+
+### What was converted
+
+| Family | Requesters | How it describes itself |
+|---|---|---|
+| Form | Gridding, Symmetry, Spacing, Fill Type, Translucency | `Form::view()` (`form.rs`): groups radios, checks, fields, texts and rules by their Classic height into lines |
+| Anim | Set Frame Count, Add Frames, Copy Frames, Delete Frames, Go to Frame, Set Rate; Set Range | the form's view with the requester's own message line (`AnimRequester::view`, `PlayRangeRequester::view`) |
+| AnimBrush, Perspective | Pick up AnimBrush, Make AnimBrush, AnimBrush Settings; Perspective | `Form::view_with`: the form plus the requester's own controls at their Classic place (three Direction icon buttons; From Brush) |
+| Palette | Make Stencil, Arrange Palette, Range | own `view(palette)`: the palette as one swatch control, the buttons, the slider |
+| Move | Anim ▸ Move.. | own `view()` (`MoveRequester`): nine fields, three check boxes, five icon buttons, ten buttons |
+
+`ToolRequester::view(palette)` and `AnimControlRequester::view()` choose among them; `modern_dialog::Card` got `Tool`, `Anim`, `AnimControl` and `Range`, and `Cards` takes all converted requesters out of the interface state while the picture quad is composed.
+
+### Kit parts added (`dpx_ui::dialog` as data, `dpx_ui_modern::dialog` as drawing and spots)
+
+- `Item::Row`: a form line whose first part (radio button or check box) stands in the label column.
+- `Part::Radio`: a radio button inside a line (ring, accent and dot when chosen, ghosted without a pointer); at least 96 pt wide after the first part, so the radio buttons of neighbouring lines stand under each other.
+- `Part::Button(Push)`: a button inside a line, plain or latched (`on`: filled with the accent), held, ghosted; buttons side by side stand 6 pt apart.
+- `Part::Icon(IconButton)` with `Glyph` (`Forward`, `Backward`, `PingPong`, `GoFrom`, `ComeTo`, `InPlace`, `StepForward`, `StepBackward`); the paths are in `icons::glyph`.
+- `Item::Swatches`: the palette as a grid (`strip: false`) or a strip (`strip: true`) with `Mark::{Chosen, Picked, Target}` per swatch. **One control for the whole grid**: its Classic rectangle is the grid of all cells (columns × rows × pitch), the Modern grid has the same columns and rows with equal cells, so the proportional mapping of `Spot::to_classic` puts a point on a swatch onto the same swatch in the Classic requester, also while the pointer is dragged over several (Stencil paints, Arrange moves, Range sets a span) and when it leaves the grid.
+- `Slider.enabled`: a ghosted slider (groove and faint value, no pointer).
+- A new metric `swatch` (24 pt roomy, 19 pt compact).
+
+No colour token was added; the two mark inks are fixed (near black and white) and independent of the theme.
+
+### Deviations from the recipe, each small
+
+- `range_requester.rs`: the info line's text moved into `RangeRequester::info()`, used by the Classic `render` and by `view()` (as `info_rows()` in slice 4a). The Classic image is the same (compared, see below).
+- `lib.rs`: `form::ctl` is exported as `dpx_ui::form_ctl` (the form module itself stays crate-private).
+- The older Modern tests that used Gridding as "a requester in the Classic look" (`tool_requester_script`, one entry of the veil test) were removed; the form parity script covers Gridding now, and the Color Mixer and the file requester remain as the hosted examples.
+
+### Tests
+
+- `dpx-ui`: per requester a view test: the centre of every control's rectangle sent as a press reaches that control (for the swatch grids: the middle of every cell of the control's rectangle is that cell), and the description follows the state (chosen radio, checked box, caret, held button, message, marks, latched buttons).
+- Kit (`dpx-ui-modern/src/dialog.rs`): the `dialogs()` table now holds 45 descriptions (all requesters above in the states that change what they show: refused numbers, the largest numbers, 2 / 32 / 256 colours, a drag in progress, one frame, no brush); every one fits its card and every text its box at 720 × 520, 1280 × 800 and 1001 × 640, at scales 1, 1.5 and 2, in both themes; contrast with the pointer over every control; the mapping of every spot. New list tests for the form rows, the buttons and icon buttons in a line, the swatches (2, 20, 32 and 256 colours, grid and strip: the middle and the corners of every swatch map to that swatch) and the ghosted slider.
+- App (`apps/deluxepainter/src/modern/tests/dialogs.rs`), each with `both_at_every_scale` (a Classic and a Modern window, device scales 1, 2 and 1.5, compared after every step): `form_script` (Gridding with every editing key, paste, Tab, refused and missing numbers, Esc, Cancel, Ok, Return; Symmetry; Spacing; Fill Type; Translucency), `anim_script` (the six Anim requesters and Set Range with refused and backwards ranges), `animbrush_perspective_script` (Pick up through the real flow, Settings with the three Direction buttons, Make with a refused number, Perspective with and without a brush and From Brush), `stencil_script` (clicks, a drag that paints, a drag that clears and leaves the grid, Clear, Invert, Make, Return, Esc), `arrange_script` (move, exchange, a drag that ends beside the grid, Undo, Revert, Cancel, Ok, Return, with the marks compared while the button is held), `range_script` (range numbers by button and key, span by two clicks and by drags, the slider by steps and by the knob beyond both ends, direction, Active, Clear, Cancel, Esc, Ok, Return), `move_script` (every field, box and icon button, a refused count, Exit, Cancel, Go Back, Esc, Preview running and coming back, Draw, Return, Trails). `every_card_fits_the_smallest_window` opens 24 cards in the live window at 720 × 520.
+
+### Screenshots
+
+All with `--snapshot --ui modern --no-settings --commands docs/design/screenshots/wave8-layer-panel.json --tool rectangle:filled --fg 5 --theme dark|light` plus the flag, each as `-dark` and `-light`, all looked at. No new snapshot flag was needed: every requester already had one.
+
+- `modern-dialog-grid-*` (`--grid-requester`), `-symmetry-*` (`--symmetry-requester`), `-spacing-*` (`--spacing-requester`), `-fill-*` (`--fill-requester`), `-translucency-*` (`--translucency-requester`), `-perspective-*` (`--perspective-requester`);
+- `modern-dialog-stencil-*` (`--stencil-requester --protect 1,2,3,12,20`), `-arrange-*` (`--arrange-requester --moves 9:0,31:2`), `-range-*` (`--range-requester`);
+- with `--frames 4`: `modern-dialog-anim-{count,add,copy,delete,goto,rate}-*` (`--anim-requester count|add|copy|delete|goto|rate`), `modern-dialog-anim-range-*` (`--anim-control range`), `modern-dialog-move-*` (`--anim-control move`), `modern-dialog-animbrush-{pick,make,settings}-*` (`--animbrush-requester pick|make|settings`);
+- `modern-dialog-fill-compact-2x.png` (`--theme dark --fill-requester --size 720x520 --device-scale 2`), `modern-dialog-range-compact-2x.png` (`--theme light --range-requester --size 720x520 --device-scale 2`), `modern-dialog-move-compact.png` (`--frames 4 --theme light --anim-control move --size 720x520`).
+- Replaced: `modern-requester-light.png` showed Range in the Classic look; it now shows the Color Mixer (`--theme light --layers-panel --palette-requester`), which is still hosted.
+
+### Classic identity
+
+The four pin scenes pass unchanged. A binary built from the commit before this slice (629b52c) and the new one wrote byte-identical `--snapshot` images for 25 Classic scenes with `--commands wave8-layer-panel.json` (plain; every requester converted here by its flag, 20 of them; `--palette-requester`, `--page-size-requester`, `--menu 2:3`, `--layers-panel`) and for 4 Modern scenes without a card (dark, light at 2x, `--layers-panel --palette-requester`, `--menu 2:3`).
 
 ## Consequences
 
@@ -396,3 +458,9 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 - A card over an unconverted requester was run for one pair (a question over the file requester).
 - The classic comparison of slice 4a covers the scenes listed there, not every committed classic screenshot.
 - The effort notes in the table of requesters are estimates from reading the code, not from a trial conversion.
+- Slice 4b was built and run on one Apple-silicon Mac only, through tests and `--snapshot`. No card of it was seen or used in a real window (no remote control of the app): how dragging over the swatches, the slider knob and the icon buttons feel is not verified. Windows and Linux: not built, not run.
+- Slice 4b ran every requester on a PAL LoRes picture with the 32-colour palette. The swatch grid and the strip with 2, 16, 64 and 256 colours were laid out, mapped and rendered in the kit's tests (256 and 2 colours were looked at as test renders), but not opened in the live window.
+- Make AnimBrush was set by hand in the parity script (a refused number, a step, Esc); its Ok through Brush ▸ Spare ▸ Metamorph.. was not run in both skins. Perspective was opened by the app's own function, not by its menu item or the right click on Grid. Move's Load, Save and Fill are ghosted in both skins and were not pressed in the Modern window (they have a place on the card; a press there reaches the Classic rectangle, where it does nothing).
+- A drag that leaves a swatch grid goes on outside it in the direction of the pointer, scaled like the grid; the parity scripts compare such a drag only for end points given relative to the grid. A drag to an arbitrary window point may cross other swatches on its way in the two skins, because the grids differ in size and place.
+- While the Range card is open, the swatches follow the palette as shown (cycling); that the card is redrawn for every cycle step was not measured or looked at.
+- The Classic comparison of slice 4b covers the 29 scenes listed there; the start screen and the other committed Classic screenshots were not regenerated.

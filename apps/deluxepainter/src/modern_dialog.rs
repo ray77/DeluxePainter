@@ -41,15 +41,8 @@ pub(crate) enum Card {
     Range,
     /// An Anim menu requester (Set Frame Count, Add, Copy, Delete Frames, Go to Frame, Rate).
     Anim,
-    /// Anim ▸ Control ▸ Set Range..
+    /// Anim ▸ Control ▸ Set Range.. and Anim ▸ Move..
     AnimControl,
-}
-
-/// The Anim control requester that is open is one the Modern skin draws itself.
-fn anim_control_is_card(ui: &UiState) -> bool {
-    ui.anim_control
-        .as_ref()
-        .is_some_and(AnimControlRequester::has_view)
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -65,8 +58,8 @@ pub(crate) fn card(
     if preview {
         return None;
     }
-    if let Some(r) = &ui.anim_control {
-        return r.has_view().then_some(Card::AnimControl);
+    if ui.anim_control.is_some() {
+        return Some(Card::AnimControl);
     }
     if ui.choice_requester.is_some() {
         return Some(Card::Choice);
@@ -116,7 +109,7 @@ pub(crate) fn view(
         Card::Tool => ui.tool_requester.as_ref().map(|r| r.view(palette)),
         Card::Range => ui.range_requester.as_ref().map(|r| r.view(palette)),
         Card::Anim => ui.anim_requester.as_ref().map(AnimRequester::view),
-        Card::AnimControl => ui.anim_control.as_ref().and_then(|r| r.view()),
+        Card::AnimControl => ui.anim_control.as_ref().map(AnimControlRequester::view),
         Card::Choice => ui.choice_requester.as_ref().map(|r| r.view()),
         Card::ScreenFormat => screen_format.map(ScreenFormatRequester::view),
         Card::Note => ui.note_requester.as_ref().map(|r| r.view()),
@@ -133,7 +126,6 @@ pub(crate) fn classic_look_open(ui: &UiState) -> bool {
         || ui.generate_requester.is_some()
         || ui.imagegen_setup.is_some()
         || ui.mcp_requester.is_some()
-        || (ui.anim_control.is_some() && !anim_control_is_card(ui))
 }
 
 /// `ui` without the requesters the Modern skin draws itself: what the picture quad is
@@ -156,7 +148,6 @@ pub(crate) struct Cards {
 impl Cards {
     /// Takes every requester the Modern skin draws itself out of `ui`.
     pub(crate) fn take(ui: &mut UiState) -> Self {
-        let anim_control = anim_control_is_card(ui);
         Self {
             note: ui.note_requester.take(),
             choice: ui.choice_requester.take(),
@@ -164,11 +155,7 @@ impl Cards {
             tool: ui.tool_requester.take(),
             anim: ui.anim_requester.take(),
             range: ui.range_requester.take(),
-            anim_control: if anim_control {
-                ui.anim_control.take()
-            } else {
-                None
-            },
+            anim_control: ui.anim_control.take(),
         }
     }
 
@@ -180,9 +167,7 @@ impl Cards {
         ui.tool_requester = self.tool;
         ui.anim_requester = self.anim;
         ui.range_requester = self.range;
-        if self.anim_control.is_some() {
-            ui.anim_control = self.anim_control;
-        }
+        ui.anim_control = self.anim_control;
     }
 }
 

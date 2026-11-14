@@ -1541,7 +1541,7 @@ mod tests {
     use dpx_ui::form_ctl;
     use dpx_ui::{
         AnimBrushRequester, AnimRequester, ArrangeRequester, ChoiceRequester, FillRequester,
-        FillSettings, GridRequester, GridSettings, NoteRequester, PageSizeRequester,
+        FillSettings, GridRequester, GridSettings, MoveRequester, NoteRequester, PageSizeRequester,
         PerspectiveRequester, PerspectiveSettings, PlayRangeRequester, Preset, RangeRequester,
         ReqEvent, ReqKey, ScreenFormatRequester, SpacingMode, SpacingRequester, SpacingSettings,
         StencilRequester, SymmetryRequester, SymmetrySettings, ToolRequester,
@@ -1695,6 +1695,23 @@ mod tests {
             assert!(r.current().defined(), "{name}");
             out.push((name, r.view(&pal)));
         }
+        // Move, with the longest numbers, with one frame only, and refused.
+        let far = dpx_core::anim_move::MovePath {
+            dist: [-99_999, 99_999, -12_345],
+            angle: [-99_999, 360, 0],
+            dist_brush: true,
+            cyclic: true,
+            come_to: true,
+            ease_out: 999,
+            ease_in: 999,
+            count: 999,
+            ..Default::default()
+        };
+        out.push(("move", MoveRequester::new(&far, 999).view()));
+        let mut still = MoveRequester::new(&Default::default(), 1);
+        out.push(("move, one frame", still.view()));
+        still.set_message("Dist X must be -99999 to 99999");
+        out.push(("move, refused", still.view()));
         let mut range = PlayRangeRequester::new(999, Some((500, 999)));
         out.push(("play range", range.view()));
         for key in [ReqKey::Backspace, ReqKey::Backspace, ReqKey::Enter] {

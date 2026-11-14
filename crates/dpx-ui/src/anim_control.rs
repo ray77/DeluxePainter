@@ -280,6 +280,32 @@ const IN_PLACE: [&str; 7] = [
     "..##.##..",
 ];
 
+/// Ids of the controls in [`MoveRequester::view`].
+pub mod move_ctl {
+    use crate::dialog::ControlId;
+
+    /// The nine number fields: `FIELD + 0..9` (Dist X Y Z, Angle X Y Z, Ease-Out, Ease-In,
+    /// Count).
+    pub const FIELD: ControlId = 0;
+    pub const DIST_BRUSH: ControlId = 10;
+    pub const ANGLE_BRUSH: ControlId = 11;
+    pub const CYCLIC: ControlId = 12;
+    pub const GO_FROM: ControlId = 13;
+    pub const COME_TO: ControlId = 14;
+    /// Record forward, in place, backward: `RECORD + 0..3`.
+    pub const RECORD: ControlId = 15;
+    pub const CLEAR: ControlId = 20;
+    pub const GO_BACK: ControlId = 21;
+    pub const PREVIEW: ControlId = 22;
+    pub const TRAILS: ControlId = 23;
+    pub const FILL: ControlId = 24;
+    pub const DRAW: ControlId = 25;
+    pub const CANCEL: ControlId = 26;
+    pub const LOAD: ControlId = 27;
+    pub const SAVE: ControlId = 28;
+    pub const EXIT: ControlId = 29;
+}
+
 /// Anim ▸ Move.. (AGA p.252-255).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoveRequester {
@@ -357,6 +383,169 @@ impl MoveRequester {
     /// Shows `text` on the message line (e.g. why the move was refused).
     pub fn set_message(&mut self, text: impl Into<String>) {
         self.message = Some(text.into());
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): Dist and Angle with their X, Y
+    /// and Z fields and the Brush boxes, Clear / Go Back / Cyclic, the eases and the count,
+    /// the Move and Record icon buttons, then Preview / Trails / Fill in a line and Draw
+    /// (Return), Cancel, Load, Save and Exit at the bottom, in the Classic order.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Check, Control, Dialog, Field, Glyph, IconButton, Item, Kind,
+            Part, Push, Role, Size, Tone,
+        };
+        use move_ctl as ctl;
+        let rects = self.targets();
+        let rect = |t: Target| {
+            rects
+                .iter()
+                .find(|(x, _)| *x == t)
+                .map_or(Rect::new(0, 0, 1, 1), |(_, r)| *r)
+        };
+        let field = |i: usize| {
+            let f = &self.fields[i];
+            Part::Field(Field {
+                control: Control::new(ctl::FIELD + i as crate::dialog::ControlId, f.rect),
+                text: f.text.text(),
+                caret: (self.active == Some(i)).then_some(f.text.cursor),
+                enabled: true,
+                numeric: true,
+                max_chars: f.max.to_string().len() + usize::from(f.min < 0),
+            })
+        };
+        let check = |t: Target, id, label: &str, on: bool| {
+            Part::Check(Check {
+                control: Control::new(id, rect(t)),
+                label: label.into(),
+                on,
+                enabled: true,
+                key: None,
+            })
+        };
+        let axes = |first: usize, brush: Part| {
+            let mut parts = Vec::new();
+            for (i, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
+                parts.push(Part::Text(axis.into(), Tone::Dim));
+                parts.push(field(first + i));
+            }
+            parts.push(brush);
+            parts
+        };
+        let push = |b: MoveButton, id| {
+            let t = Target::Button(b);
+            Part::Button(Push {
+                control: Control::new(id, rect(t)),
+                label: button_label(b).into(),
+                on: false,
+                pressed: self.pressed(t),
+                enabled: self.enabled(t),
+            })
+        };
+        let icon = |t: Target, id, glyph, on: bool| {
+            Part::Icon(IconButton {
+                control: Control::new(id, rect(t)),
+                glyph,
+                on,
+                pressed: self.pressed(t),
+                enabled: self.enabled(t),
+            })
+        };
+        let line = |label: &str, parts: Vec<Part>| Item::Line {
+            label: label.into(),
+            key: None,
+            parts,
+        };
+        let button = |b: MoveButton, id, role| {
+            let t = Target::Button(b);
+            ViewButton {
+                enabled: self.enabled(t),
+                ..ViewButton::new(
+                    Control::new(id, rect(t)),
+                    button_label(b),
+                    role,
+                    self.pressed(t),
+                )
+            }
+        };
+        let record =
+            |r: Record, i, glyph| icon(Target::Record(r), ctl::RECORD + i, glyph, self.record == r);
+        let mut items = vec![
+            line(
+                "Dist",
+                axes(
+                    0,
+                    check(Target::DistBrush, ctl::DIST_BRUSH, "Brush", self.dist_brush),
+                ),
+            ),
+            line(
+                "Angle",
+                axes(
+                    3,
+                    check(
+                        Target::AngleBrush,
+                        ctl::ANGLE_BRUSH,
+                        "Brush",
+                        self.angle_brush,
+                    ),
+                ),
+            ),
+            line(
+                "",
+                vec![
+                    push(MoveButton::Clear, ctl::CLEAR),
+                    push(MoveButton::GoBack, ctl::GO_BACK),
+                    check(Target::Cyclic, ctl::CYCLIC, "Cyclic", self.cyclic),
+                ],
+            ),
+            Item::Rule,
+            line("Ease-Out", vec![field(6)]),
+            line("Ease-In", vec![field(7)]),
+            line("Count", vec![field(8)]),
+            line(
+                "Move",
+                vec![
+                    icon(Target::GoFrom, ctl::GO_FROM, Glyph::GoFrom, !self.come_to),
+                    icon(Target::ComeTo, ctl::COME_TO, Glyph::ComeTo, self.come_to),
+                ],
+            ),
+            line(
+                "Record",
+                vec![
+                    record(Record::Forward, 0, Glyph::StepForward),
+                    record(Record::InPlace, 1, Glyph::InPlace),
+                    record(Record::Backward, 2, Glyph::StepBackward),
+                ],
+            ),
+            Item::Rule,
+            line(
+                "",
+                vec![
+                    push(MoveButton::Preview, ctl::PREVIEW),
+                    push(MoveButton::Trails, ctl::TRAILS),
+                    push(MoveButton::Fill, ctl::FILL),
+                ],
+            ),
+        ];
+        if let Some(m) = &self.message {
+            items.push(Item::Text {
+                text: m.clone(),
+                tone: Tone::Alert,
+                bullet: false,
+            });
+        }
+        Dialog {
+            title: "Move".into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![items],
+            buttons: vec![
+                button(MoveButton::Draw, ctl::DRAW, Role::Default),
+                button(MoveButton::Cancel, ctl::CANCEL, Role::Cancel),
+                button(MoveButton::Load, ctl::LOAD, Role::Plain),
+                button(MoveButton::Save, ctl::SAVE, Role::Plain),
+                button(MoveButton::Exit, ctl::EXIT, Role::Plain),
+            ],
+        }
     }
 
     fn check_rect(y: i32, label: &str) -> Rect {
@@ -723,17 +912,11 @@ pub enum AnimControlRequester {
 }
 
 impl AnimControlRequester {
-    /// Whether the Modern skin shows this requester itself ([`AnimControlRequester::view`]).
-    pub fn has_view(&self) -> bool {
-        matches!(self, AnimControlRequester::PlayRange(_))
-    }
-
-    /// The requester as the Modern skin shows it (ADR-47); `None` for one that is still
-    /// shown in the Classic look.
-    pub fn view(&self) -> Option<crate::dialog::Dialog> {
+    /// The requester as the Modern skin shows it (ADR-47).
+    pub fn view(&self) -> crate::dialog::Dialog {
         match self {
-            AnimControlRequester::PlayRange(r) => Some(r.view()),
-            AnimControlRequester::Move(_) => None,
+            AnimControlRequester::PlayRange(r) => r.view(),
+            AnimControlRequester::Move(r) => r.view(),
         }
     }
 
@@ -776,6 +959,112 @@ mod tests {
     fn click(r: &mut MoveRequester, rect: Rect) -> MoveResponse {
         r.handle(ReqEvent::Press(rect.x + 2, rect.y + 2));
         r.handle(ReqEvent::Release)
+    }
+
+    /// The view (ADR-47): every control's rectangle is the target's, so its centre is where
+    /// the requester takes that control's press; the state shows in the parts.
+    #[test]
+    fn the_move_view_names_every_target_and_follows_the_state() {
+        use crate::dialog::{Glyph, Item, Part, Role};
+        use move_ctl as ctl;
+        let mut r = MoveRequester::new(&MovePath::default(), 4);
+        let v = r.view();
+        assert_eq!(v.controls().len(), r.targets().len());
+        let by_id = |id: u16| -> Target {
+            match id {
+                ctl::DIST_BRUSH => Target::DistBrush,
+                ctl::ANGLE_BRUSH => Target::AngleBrush,
+                ctl::CYCLIC => Target::Cyclic,
+                ctl::GO_FROM => Target::GoFrom,
+                ctl::COME_TO => Target::ComeTo,
+                15 => Target::Record(Record::Forward),
+                16 => Target::Record(Record::InPlace),
+                17 => Target::Record(Record::Backward),
+                ctl::CLEAR => Target::Button(MoveButton::Clear),
+                ctl::GO_BACK => Target::Button(MoveButton::GoBack),
+                ctl::PREVIEW => Target::Button(MoveButton::Preview),
+                ctl::TRAILS => Target::Button(MoveButton::Trails),
+                ctl::FILL => Target::Button(MoveButton::Fill),
+                ctl::DRAW => Target::Button(MoveButton::Draw),
+                ctl::CANCEL => Target::Button(MoveButton::Cancel),
+                ctl::LOAD => Target::Button(MoveButton::Load),
+                ctl::SAVE => Target::Button(MoveButton::Save),
+                ctl::EXIT => Target::Button(MoveButton::Exit),
+                i => Target::Field(usize::from(i)),
+            }
+        };
+        for c in v.controls() {
+            let t = by_id(c.id);
+            let (x, y) = (c.area.x + c.area.w / 2, c.area.y + c.area.h / 2);
+            // Fill, Load and Save are ghosted: they take no press.
+            let wanted = r.enabled(t).then_some(t);
+            assert_eq!(r.target_at(x, y), wanted, "control {}", c.id);
+        }
+        // Reading order: Preview, Trails, Fill in a line, then Draw .. Exit at the bottom.
+        let labels: Vec<&str> = v.buttons.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["Draw", "Cancel", "Load", "Save", "Exit"]);
+        assert_eq!(v.buttons[0].role, Role::Default);
+        assert!(!v.buttons[2].enabled && !v.buttons[3].enabled && v.buttons[4].enabled);
+        let parts = |v: &crate::dialog::Dialog, label: &str, nth: usize| -> Vec<Part> {
+            v.columns[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Line {
+                        label: l, parts, ..
+                    } if l == label => Some(parts.clone()),
+                    _ => None,
+                })
+                .nth(nth)
+                .expect("the line")
+        };
+        let dist = parts(&v, "Dist", 0);
+        assert_eq!(dist.len(), 7);
+        assert!(matches!(&dist[1], Part::Field(f) if f.caret == Some(1) && f.max_chars == 6));
+        assert!(matches!(&dist[6], Part::Check(c) if c.label == "Brush" && !c.on));
+        let icons = |v: &crate::dialog::Dialog, label: &str| -> Vec<(Glyph, bool, bool)> {
+            parts(v, label, 0)
+                .iter()
+                .map(|p| match p {
+                    Part::Icon(b) => (b.glyph, b.on, b.enabled),
+                    p => panic!("{p:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            icons(&v, "Move"),
+            [(Glyph::GoFrom, true, true), (Glyph::ComeTo, false, true)]
+        );
+        assert_eq!(icons(&v, "Record").len(), 3);
+        // Change everything a press changes; the view follows.
+        for t in [
+            Target::DistBrush,
+            Target::Cyclic,
+            Target::ComeTo,
+            Target::Record(Record::Backward),
+        ] {
+            let rect = r.targets().into_iter().find(|(x, _)| *x == t).unwrap().1;
+            click(&mut r, rect);
+        }
+        let v = r.view();
+        assert!(matches!(&parts(&v, "Dist", 0)[6], Part::Check(c) if c.on));
+        let cyclic = !MovePath::default().cyclic;
+        assert!(
+            matches!(&parts(&v, "", 0)[2], Part::Check(c) if c.on == cyclic && c.label == "Cyclic")
+        );
+        assert_eq!(icons(&v, "Move")[1], (Glyph::ComeTo, true, true));
+        assert_eq!(icons(&v, "Record")[2], (Glyph::StepBackward, true, true));
+        // One frame: Record and Trails are ghosted. A message is the last item.
+        let mut one = MoveRequester::new(&MovePath::default(), 1);
+        assert!(icons(&one.view(), "Record").iter().all(|i| !i.2));
+        assert!(matches!(&parts(&one.view(), "", 1)[1], Part::Button(b) if !b.enabled));
+        one.set_message("Stencil Show is on: nothing is painted");
+        assert!(matches!(
+            one.view().columns[0].last(),
+            Some(Item::Text { text, .. }) if text.starts_with("Stencil Show")
+        ));
+        let draw = MoveRequester::button_rect(MoveButton::Draw);
+        r.handle(ReqEvent::Press(draw.x + 1, draw.y + 1));
+        assert!(r.view().buttons[0].pressed);
     }
 
     fn keys(r: &mut MoveRequester, text: &str) {

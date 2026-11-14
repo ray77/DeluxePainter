@@ -45,7 +45,8 @@ A second, switchable look for the same program; Classic stays the default on a f
 | P1 | The other requesters hosted in the Classic look inside the picture, the interface around dimmed and without input | done (slice 1d); still pixel look; in a small window the requester's screen lies in the middle of the window, over the dimmed interface, so it is not smaller than Pixel Size asks for |
 | P2 | Animation Control Panel as a Modern strip | slice 2; today pixel look inside the picture |
 | P2 | Free picture viewport (more than one Amiga screen visible, optional pixel grid) | slice 3; today one Amiga screen is shown, whole |
-| P2 | The remaining requesters in the Modern look, one family at a time (tool settings and anim forms, Stencil/Arrange, file requester, Color Mixer and Range, Import/Generate/AI & MCP) | slice 4b and later; table and recipe in ADR-47 |
+| P1 | More dialogs in the Modern look: Gridding, Symmetry, Spacing, Fill Type, Translucency, Perspective; Make Stencil and Arrange Palette (the palette as swatches, toggled, painted over and dragged as in Classic); Range (palette strip with the span, range numbers, rate slider, direction, Active, Clear); Set Frame Count, Add / Copy / Delete Frames, Go to Frame, Set Rate, Set Range, Move; Pick up AnimBrush, Make AnimBrush, AnimBrush Settings | done (slice 4b); second views of the Classic requesters like slice 4a, with a parity script per requester |
+| P2 | The remaining requesters in the Modern look (file requester, Color Mixer, Import, Generate and the Image Generator setup, AI & MCP) | later slices; table and recipe in ADR-47 |
 
 Only run through automated tests and headless renders on one Mac so far; see ROADMAP.md, "Modern UI skin status".
 

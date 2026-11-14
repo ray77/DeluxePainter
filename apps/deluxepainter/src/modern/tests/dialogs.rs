@@ -31,7 +31,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     let tool = app.ui.tool_requester.take();
     let range = app.ui.range_requester.take();
     let anim = app.ui.anim_requester.take();
-    let control = app.ui.anim_control.take_if(|r| r.has_view());
+    let control = app.ui.anim_control.take();
     let percent = (
         app.menu_data.effects.percent,
         app.engine.document().fps(),
@@ -43,6 +43,7 @@ fn dialog_state(rig: &mut Rig) -> String {
         app.perspective.settings,
         app.stencil.clone(),
         app.extras.ranges.clone(),
+        (app.anim_control.settings, app.anim_control.moved_to),
     );
     let shown = format!(
         "{:?}",
@@ -75,9 +76,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.tool_requester = tool;
     app.ui.range_requester = range;
     app.ui.anim_requester = anim;
-    if control.is_some() {
-        app.ui.anim_control = control;
-    }
+    app.ui.anim_control = control;
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -1618,6 +1617,169 @@ fn the_range_requester_does_the_same_in_both_skins() {
     both_at_every_scale(range_script);
 }
 
+/// Anim ▸ Move.. (slice 4b): the nine number fields, the Brush and Cyclic boxes, the Move
+/// and Record icon buttons, Clear, Go Back, a refused number, Preview (which runs and comes
+/// back), Draw by its button and by Return, Trails, Exit, Cancel and Esc.
+fn move_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::AnimControlRequester;
+    use dpx_ui::anim_control::move_ctl as ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let erase = |rig: &mut Rig, n: usize| {
+        for _ in 0..n {
+            rig.tap(egui::Key::Backspace);
+        }
+    };
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("anim.move"));
+        assert!(matches!(
+            rig.app.ui.anim_control,
+            Some(AnimControlRequester::Move(_))
+        ));
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::AnimControl));
+        }
+        seen(rig, "Move..".into());
+    };
+    let is_open = |rig: &Rig| rig.app.ui.anim_control.is_some();
+    // Four frames, a colour, and the brush clicked down once.
+    rig.pick(Action::Command("anim.set_frame_count"));
+    erase(rig, 1);
+    rig.type_text("4");
+    rig.tap(egui::Key::Enter);
+    rig.click(Place::Cell(5), Primary);
+    rig.click(Place::Page(40, 30), Primary);
+    seen(rig, "four frames and a dot".into());
+    open(rig, seen);
+    // Every field: a click, a number, the editing keys, a minus sign.
+    for field in 0..9 {
+        rig.click_control(ctl::FIELD + field, MID);
+        erase(rig, 6);
+        rig.type_text(["12", "-3", "0", "x7", "45", "-0", "2", "1", "4"][usize::from(field)]);
+        seen(rig, format!("field {field}"));
+    }
+    rig.click_control(ctl::FIELD + 1, (0.9, 0.5));
+    for key in [
+        egui::Key::Home,
+        egui::Key::Delete,
+        egui::Key::End,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+        egui::Key::Tab,
+    ] {
+        rig.tap(key);
+        seen(rig, format!("{key:?}"));
+    }
+    rig.pass(vec![egui::Event::Paste("-1a2".into())]);
+    seen(rig, "pasted text".into());
+    // The boxes and the icon buttons act on the press.
+    for id in [
+        ctl::DIST_BRUSH,
+        ctl::ANGLE_BRUSH,
+        ctl::CYCLIC,
+        ctl::COME_TO,
+        ctl::GO_FROM,
+        ctl::RECORD + 2,
+        ctl::RECORD + 1,
+        ctl::RECORD,
+        ctl::ANGLE_BRUSH,
+    ] {
+        rig.click_control(id, MID);
+        seen(rig, format!("control {id}"));
+    }
+    rig.click_control(ctl::COME_TO, (0.06, 0.1));
+    rig.click_control(ctl::RECORD + 1, (0.94, 0.9));
+    rig.press_and_leave(ctl::GO_FROM);
+    seen(
+        rig,
+        "icon buttons by their corners, one pressed and left".into(),
+    );
+    // Buttons pressed and left, a click beside, keys that mean nothing.
+    for id in [
+        ctl::CLEAR,
+        ctl::GO_BACK,
+        ctl::PREVIEW,
+        ctl::TRAILS,
+        ctl::DRAW,
+        ctl::CANCEL,
+        ctl::EXIT,
+    ] {
+        rig.press_and_leave(id);
+    }
+    rig.click_beside();
+    rig.type_text("q");
+    rig.wheel(-1.0);
+    assert!(is_open(rig));
+    seen(rig, "buttons pressed and left".into());
+    // A refused number: the field gets the keys and the message says why.
+    rig.click_control(ctl::FIELD + 8, MID);
+    erase(rig, 3);
+    rig.type_text("0");
+    rig.click_control(ctl::DRAW, MID);
+    assert!(is_open(rig), "a count of 0 is refused");
+    seen(rig, "Draw with a count of 0".into());
+    erase(rig, 1);
+    rig.type_text("4");
+    seen(rig, "a count of 4".into());
+    // Exit keeps the settings; they are there when it opens again.
+    rig.click_control(ctl::EXIT, (0.95, 0.9));
+    assert!(!is_open(rig));
+    let kept = rig
+        .app
+        .anim_control
+        .settings
+        .expect("Exit keeps the settings");
+    assert_eq!((kept.dist[0], kept.count, kept.cyclic), (12, 4, false));
+    seen(rig, "Exit".into());
+    open(rig, seen);
+    rig.click_control(ctl::CLEAR, MID);
+    seen(rig, "Clear".into());
+    rig.click_control(ctl::CANCEL, (0.05, 0.1));
+    assert!(!is_open(rig));
+    assert_eq!(rig.app.anim_control.settings, Some(kept), "Cancel");
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.click_control(ctl::GO_BACK, MID);
+    assert!(is_open(rig), "Go Back stays open");
+    seen(rig, "Go Back".into());
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig));
+    seen(rig, "Esc".into());
+    // Preview: the wire frame runs on the picture (no card), then the requester is back.
+    open(rig, seen);
+    rig.click_control(ctl::PREVIEW, MID);
+    assert!(rig.app.anim_control.preview.is_some(), "the preview runs");
+    assert_eq!(rig.card(), None, "the picture alone");
+    for _ in 0..400 {
+        if rig.app.anim_control.preview.is_none() {
+            break;
+        }
+        rig.pass(vec![]);
+    }
+    assert!(rig.app.anim_control.preview.is_none() && is_open(rig));
+    seen(rig, "after the preview".into());
+    // Draw: by Return, by its button, and with trails.
+    rig.tap(egui::Key::Enter);
+    assert!(!is_open(rig), "Return draws");
+    seen(rig, "Return".into());
+    rig.key('u');
+    seen(rig, "undo".into());
+    open(rig, seen);
+    rig.click_control(ctl::DRAW, (0.05, 0.1));
+    assert!(!is_open(rig), "Draw");
+    seen(rig, "Draw".into());
+    open(rig, seen);
+    rig.click_control(ctl::TRAILS, MID);
+    assert!(!is_open(rig), "Trails draws");
+    seen(rig, "Trails".into());
+}
+
+#[test]
+fn the_move_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(move_script);
+}
+
 /// Several requesters open at once: the pointer and the keys belong to the one `pass()`
 /// asks first, and that is the one the Modern skin shows as its card.
 fn stack_script(rig: &mut Rig, seen: Seen) {
@@ -1886,7 +2048,10 @@ fn the_card_veils_the_window_and_follows_the_pointer() {
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 23] = [
+    let open: [(&str, Card, Open); 24] = [
+        ("move", Card::AnimControl, |rig| {
+            rig.pick(Action::Command("anim.move"))
+        }),
         ("stencil", Card::Tool, |rig| {
             rig.pick(Action::Command("stencil.make"))
         }),
