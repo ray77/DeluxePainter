@@ -1558,6 +1558,8 @@ mod tests {
                 dpx_ui::RangeRequester::origin(w, h)
             } else if let Some(r) = &app.ui.note_requester {
                 r.origin(w, h)
+            } else if app.ui.file_requester.is_some() {
+                dpx_ui::FileRequester::origin(w, h)
             } else {
                 dpx_ui::PageSizeRequester::origin(w, h)
             };
@@ -3526,33 +3528,6 @@ mod tests {
     const NEAR: (f32, f32) = (0.1, 0.1);
     const FAR: (f32, f32) = (0.9, 0.9);
 
-    /// The file requester (Picture ▸ Load..): typing goes to its File field; a pixel beside
-    /// Cancel is not Cancel; Cancel by its last pixel.
-    fn file_requester_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
-        use dpx_ui::FileResponse as R;
-        rig.pick(Action::Command("picture.load"));
-        let req = rig.app.ui.file_requester.clone().expect("Load..");
-        seen(rig, "Load..".into());
-        let (w, h) = rig.app.view().ui_size();
-        let (ox, oy) = dpx_ui::FileRequester::origin(w, h);
-        let (first, last) = pixels_where(|x, y| {
-            let mut r = req.clone();
-            r.handle(ReqEvent::Press(x, y), 0) == R::Cancel
-                || r.handle(ReqEvent::Release, 0) == R::Cancel
-        });
-        rig.pass(vec![egui::Event::Text("abc".into())]);
-        let file = rig.app.ui.file_requester.as_ref().map(|r| r.file());
-        assert_eq!(file.as_deref(), Some("abc"));
-        seen(rig, "typed into the File field".into());
-        let above = ui_pixel(rig, (ox + first.0, oy + first.1 - 1));
-        rig.click_at(above, (0.5, 0.9), Primary);
-        assert!(rig.app.ui.file_requester.is_some(), "beside Cancel");
-        seen(rig, "a click above Cancel".into());
-        rig.click_at(ui_pixel(rig, (ox + last.0, oy + last.1)), FAR, Primary);
-        assert!(rig.app.ui.file_requester.is_none(), "Cancel closes it");
-        seen(rig, "Cancel".into());
-    }
-
     /// Screen Format: the Chipset gadget, then Cancel by its first pixel. In Classic it
     /// has a HiRes screen of its own; in the Modern window it is a card over the main
     /// window (slice 4a), whose chrome stays where it is.
@@ -3707,8 +3682,7 @@ mod tests {
     /// One requester of each kind, with the layer column shown: each opens in the Modern
     /// window, takes clicks on the first and last pixels of its buttons through the
     /// unchanged mapping, closes, and leaves the same state as in the Classic window.
-    const MODAL_SCRIPTS: [(&str, Script); 7] = [
-        ("file", file_requester_script),
+    const MODAL_SCRIPTS: [(&str, Script); 6] = [
         ("Screen Format", screen_format_script),
         ("Show Page", show_page_script),
         ("Color Mixer", color_mixer_script),
@@ -3759,7 +3733,7 @@ mod tests {
         type Open = fn(&mut Rig);
         let open: [(&str, Open); 2] = [
             ("Color Mixer", |rig| rig.key('p')),
-            ("file", |rig| rig.pick(Action::Command("picture.load"))),
+            ("AI & MCP", |rig| rig.pick(Action::Command("app.ai_mcp"))),
         ];
         for (kind, ppp) in [(ThemeKind::Dark, 1.0), (ThemeKind::Light, 2.0)] {
             let theme = Theme::of(kind);
@@ -4036,8 +4010,8 @@ mod tests {
     /// of the window, over the veiled chrome, and is clicked where it is drawn.
     #[test]
     fn a_requester_is_whole_and_readable_in_a_small_window() {
-        // Picture ▸ Load.. on PAL HiRes interlace, the smallest window, the layer column
-        // shown: the requester's screen is whole in the window, and Cancel answers on its
+        // Prefs ▸ AI & MCP.. on PAL HiRes interlace, the smallest window, the layer column
+        // shown: the requester's screen is whole in the window, and Close answers on its
         // last pixel (which lay under the layer column before).
         let mut rig = Rig::new(UiStyle::Modern, (720.0, 520.0), 1.0);
         let mode = dpx_core::DisplayMode::new(dpx_core::Video::Pal, dpx_core::Resolution::Hi, true);
@@ -4054,8 +4028,8 @@ mod tests {
         rig.pass(vec![]);
         let plain = rig.app.modern_layout().expect("layout");
         assert!(plain.layers.is_some() && plain.shown < 1.0);
-        file_requester_script(&mut rig, &mut |rig, step| {
-            if step == "Load.." {
+        mcp_script(&mut rig, &mut |rig, step| {
+            if step == "AI & MCP.." {
                 rig.pass(vec![]);
                 let l = rig.app.modern_layout().expect("layout");
                 assert!(

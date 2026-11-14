@@ -154,6 +154,7 @@ impl PageSizeRequester {
                 enabled: true,
                 numeric: true,
                 max_chars: MAX_DIGITS,
+                stops: Vec::new(),
             })
         };
         let prompt = match &self.message {

@@ -411,6 +411,7 @@ impl MoveRequester {
                 enabled: true,
                 numeric: true,
                 max_chars: f.max.to_string().len() + usize::from(f.min < 0),
+                stops: Vec::new(),
             })
         };
         let check = |t: Target, id, label: &str, on: bool| {

@@ -793,6 +793,7 @@ impl ScreenFormatRequester {
                 enabled: custom,
                 numeric: true,
                 max_chars: 4,
+                stops: Vec::new(),
             })
         };
         let screen_label = match self.screen_choice {

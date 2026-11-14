@@ -14,8 +14,8 @@
 use dpx_core::Palette;
 use dpx_ui::dialog::Dialog;
 use dpx_ui::{
-    AnimControlRequester, AnimRequester, ChoiceRequester, NoteRequester, PageSizeRequester,
-    RangeRequester, ScreenFormatRequester, ToolRequester, UiState,
+    AnimControlRequester, AnimRequester, ChoiceRequester, FileRequester, NoteRequester,
+    PageSizeRequester, RangeRequester, ScreenFormatRequester, ToolRequester, UiState,
 };
 use dpx_ui_modern::Theme;
 use dpx_ui_modern::dialog as kit;
@@ -43,6 +43,8 @@ pub(crate) enum Card {
     Anim,
     /// Anim ▸ Control ▸ Set Range.. and Anim ▸ Move..
     AnimControl,
+    /// The file requester: Load, Save, Export, Delete, palettes, brushes, stencils, anims.
+    File,
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -93,7 +95,7 @@ pub(crate) fn card(
         return Some(Card::Note);
     }
     if ui.file_requester.is_some() {
-        return None;
+        return Some(Card::File);
     }
     ui.page_size_requester.is_some().then_some(Card::PageSize)
 }
@@ -114,6 +116,7 @@ pub(crate) fn view(
         Card::ScreenFormat => screen_format.map(ScreenFormatRequester::view),
         Card::Note => ui.note_requester.as_ref().map(|r| r.view()),
         Card::PageSize => ui.page_size_requester.as_ref().map(|r| r.view()),
+        Card::File => ui.file_requester.as_ref().map(FileRequester::view),
     }
 }
 
@@ -121,7 +124,6 @@ pub(crate) fn view(
 /// open (the picture quad hosts it).
 pub(crate) fn classic_look_open(ui: &UiState) -> bool {
     ui.palette_requester.is_some()
-        || ui.file_requester.is_some()
         || ui.import_requester.is_some()
         || ui.generate_requester.is_some()
         || ui.imagegen_setup.is_some()
@@ -143,6 +145,7 @@ pub(crate) struct Cards {
     anim: Option<AnimRequester>,
     range: Option<RangeRequester>,
     anim_control: Option<AnimControlRequester>,
+    file: Option<FileRequester>,
 }
 
 impl Cards {
@@ -156,6 +159,7 @@ impl Cards {
             anim: ui.anim_requester.take(),
             range: ui.range_requester.take(),
             anim_control: ui.anim_control.take(),
+            file: ui.file_requester.take(),
         }
     }
 
@@ -168,6 +172,7 @@ impl Cards {
         ui.anim_requester = self.anim;
         ui.range_requester = self.range;
         ui.anim_control = self.anim_control;
+        ui.file_requester = self.file;
     }
 }
 

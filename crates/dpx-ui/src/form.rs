@@ -450,6 +450,7 @@ impl Form {
                 enabled: true,
                 numeric: true,
                 max_chars: f.max.to_string().len(),
+                stops: Vec::new(),
             });
             els.push(((f.rect.y + 1, f.rect.x), El::Part(part)));
         }

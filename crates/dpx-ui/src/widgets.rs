@@ -58,6 +58,38 @@ impl TextField {
         }
     }
 
+    /// Where a press in the field drawn in `r` sets the cursor: cursor positions with the x
+    /// that puts the cursor there (the left edge of each visible character and the place
+    /// after the last one), for the requesters that find the pressed character by walking
+    /// the visible text from `r.x + 2`.
+    pub fn stops(&self, r: Rect) -> Vec<(usize, i32)> {
+        let font = Font::builtin();
+        let mut x = r.x + 2;
+        let mut out = Vec::new();
+        for i in self.first_visible(r.w - 4)..=self.chars.len() {
+            if x >= r.x + r.w {
+                break;
+            }
+            out.push((i, x));
+            x += self.chars.get(i).map_or(0, |&c| font.char_advance(c));
+        }
+        out
+    }
+
+    /// The field as the Modern skin shows it (`dialog::Field`): the text, the caret while
+    /// it is `active`, and the caret stops of [`TextField::stops`] in `control.area`.
+    pub fn view(&self, control: crate::dialog::Control, active: bool) -> crate::dialog::Field {
+        crate::dialog::Field {
+            control,
+            text: self.text(),
+            caret: active.then_some(self.cursor),
+            enabled: true,
+            numeric: false,
+            max_chars: self.max,
+            stops: self.stops(control.area),
+        }
+    }
+
     /// Width of the cursor cell at `i`: the character there, or a space at the end.
     pub fn cell_width(&self, i: usize) -> i32 {
         self.chars

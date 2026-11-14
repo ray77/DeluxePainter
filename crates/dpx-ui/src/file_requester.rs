@@ -72,6 +72,30 @@ mod geom {
     pub const CONFIRM_H: i32 = 60;
 }
 
+/// The controls of the requester's description for the Modern skin ([`FileRequester::view`]).
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// The visible rows of the list: `ROW + 0..8`.
+    pub const ROW: ControlId = 0;
+    /// The scroll bar's track.
+    pub const SCROLL: ControlId = 8;
+    pub const DRAWER: ControlId = 10;
+    pub const PATTERN: ControlId = 11;
+    pub const FILE: ControlId = 12;
+    pub const DISKS: ControlId = 13;
+    pub const ASSIGNS: ControlId = 14;
+    pub const PARENT: ControlId = 15;
+    /// Load, Save, Export or Delete.
+    pub const ACTION: ControlId = 16;
+    pub const CANCEL: ControlId = 17;
+    /// The ghosted "# of Frames" field of Load Picture.
+    pub const FRAMES: ControlId = 18;
+    /// The two answers of the Replace / Delete question.
+    pub const YES: ControlId = 20;
+    pub const NO: ControlId = 21;
+}
+
 /// What the requester is for; sets the title and the action button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
@@ -686,6 +710,169 @@ impl FileRequester {
         self.drag == Some(Drag::Button(b)) && b.rect().contains(self.pointer.0, self.pointer.1)
     }
 
+    /// The question of the Replace / Delete confirmation, after the quoted file name.
+    fn question(&self) -> &'static str {
+        if self.kind == FileKind::DeleteFile {
+            "Delete this file?"
+        } else {
+            "exists. Replace it?"
+        }
+    }
+
+    /// What the requester shows, for the Modern skin (ADR-47): the list with its scroll
+    /// bar, the three fields, Disks / Assigns / Parent, "# of Frames" and the two buttons;
+    /// while it asks whether a file may be replaced or deleted, that question alone. The
+    /// list's two arrow buttons are not described: the bar, the wheel and the arrow keys
+    /// scroll it.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, Dialog, Field as ViewField, Item, Kind, ListRow,
+            ListView, Part, Push, Role, ScrollBar, Size, Tone,
+        };
+        let button = |b: Button, id, role| {
+            ViewButton::new(
+                Control::new(id, b.rect()),
+                b.label(self.kind),
+                role,
+                self.pressed(b),
+            )
+        };
+        if self.confirm {
+            return Dialog {
+                title: self.kind.title().into(),
+                kind: Kind::Plain,
+                size: Size::Small,
+                columns: vec![vec![Item::Text {
+                    text: format!("\"{}\" {}", self.file.text(), self.question()),
+                    tone: Tone::Normal,
+                    bullet: false,
+                }]],
+                buttons: vec![
+                    button(Button::Yes, ctl::YES, Role::Plain).key('Y'),
+                    button(Button::No, ctl::NO, Role::Cancel).key('N'),
+                ],
+            };
+        }
+        let chosen = self.file.text();
+        let rows = (0..geom::ROWS as usize)
+            .filter_map(|row| {
+                let entry = &self.entries[*self.shown.get(self.top + row)?];
+                let control = Control::new(
+                    ctl::ROW + row as crate::dialog::ControlId,
+                    Rect::new(
+                        geom::LIST_X,
+                        geom::ROWS_Y + row as i32 * geom::ROW_H,
+                        geom::LIST_W,
+                        geom::ROW_H,
+                    ),
+                );
+                Some(match entry {
+                    Entry::File(name) => ListRow {
+                        control,
+                        label: name.clone(),
+                        detail: String::new(),
+                        selected: *name == chosen,
+                    },
+                    Entry::Place { kind, label, .. } => ListRow {
+                        control,
+                        label: label.clone(),
+                        detail: match kind {
+                            PlaceKind::Dir => "Drawer",
+                            PlaceKind::Volume => "Disk",
+                            PlaceKind::Assign => "Assign",
+                        }
+                        .into(),
+                        selected: false,
+                    },
+                })
+            })
+            .collect();
+        // The knob runs inside the track's frame.
+        let track = track_rect().inset(1);
+        let (ky, kh) = self.knob();
+        let scroll = (self.max_top() > 0).then(|| ScrollBar {
+            control: Control::new(ctl::SCROLL, track),
+            knob: Rect::new(track.x, ky, track.w, kh),
+        });
+        let field = |f: Field, id| Item::Line {
+            label: f.label().into(),
+            key: None,
+            parts: vec![Part::Field(
+                self.field(f)
+                    .view(Control::new(id, f.rect()), self.active == Some(f)),
+            )],
+        };
+        let push = |b: Button, id| {
+            Part::Button(Push {
+                control: Control::new(id, b.rect()),
+                label: b.label(self.kind).into(),
+                on: false,
+                pressed: self.pressed(b),
+                enabled: true,
+            })
+        };
+        let mut items = vec![
+            Item::List(ListView {
+                rows,
+                capacity: geom::ROWS as usize,
+                scroll,
+            }),
+            field(Field::Drawer, ctl::DRAWER),
+            field(Field::Pattern, ctl::PATTERN),
+            field(Field::File, ctl::FILE),
+            Item::Line {
+                label: "Go to".into(),
+                key: None,
+                parts: vec![
+                    push(Button::Disks, ctl::DISKS),
+                    push(Button::Assigns, ctl::ASSIGNS),
+                    push(Button::Parent, ctl::PARENT),
+                ],
+            },
+        ];
+        // "# of Frames" exists for Load only; ghosted until animation frames exist.
+        if self.kind == FileKind::LoadPicture {
+            items.push(Item::Line {
+                label: "# of Frames".into(),
+                key: None,
+                parts: vec![Part::Field(ViewField {
+                    control: Control::new(
+                        ctl::FRAMES,
+                        Rect::new(
+                            geom::FRAMES_FIELD_X,
+                            geom::FRAMES_Y,
+                            geom::FRAMES_FIELD_W,
+                            geom::FIELD_H,
+                        ),
+                    ),
+                    text: "1".into(),
+                    caret: None,
+                    enabled: false,
+                    numeric: true,
+                    max_chars: 4,
+                    stops: Vec::new(),
+                })],
+            });
+        }
+        if let Some(message) = &self.message {
+            items.push(Item::Text {
+                text: message.clone(),
+                tone: Tone::Alert,
+                bullet: false,
+            });
+        }
+        Dialog {
+            title: self.kind.title().into(),
+            kind: Kind::Plain,
+            size: Size::Large,
+            columns: vec![items],
+            buttons: vec![
+                button(Button::Action, ctl::ACTION, Role::Default),
+                button(Button::Cancel, ctl::CANCEL, Role::Cancel),
+            ],
+        }
+    }
+
     /// Draws the requester onto a UI screen at [`FileRequester::origin`].
     pub fn draw(&self, img: &mut IndexedImage, pens: &Pens) {
         let (x, y) = Self::origin(img.width() as i32, img.height() as i32);
@@ -856,12 +1043,7 @@ impl FileRequester {
             r.w - 12,
             pens.dark,
         );
-        let question = if self.kind == FileKind::DeleteFile {
-            "Delete this file?"
-        } else {
-            "exists. Replace it?"
-        };
-        centred(img, r.x, r.w, r.y + 20, question, pens.dark);
+        centred(img, r.x, r.w, r.y + 20, self.question(), pens.dark);
         for b in [Button::Yes, Button::No] {
             draw_button(img, b.rect(), b.label(self.kind), self.pressed(b), pens);
         }
@@ -1240,5 +1422,224 @@ mod tests {
             !(geom::FRAMES_Y..geom::FRAMES_Y + 9)
                 .any(|y| (20..250).any(|x| save.get(x, y) == Some(pens.dark)))
         );
+    }
+    fn centre(r: &FileRequester, id: crate::dialog::ControlId) -> (i32, i32) {
+        let a = r.view().control(id).expect("the control").area;
+        (a.x + a.w / 2, a.y + a.h / 2)
+    }
+
+    fn press(r: &mut FileRequester, id: crate::dialog::ControlId) -> FileResponse {
+        let (x, y) = centre(r, id);
+        // A row answers on the press, a button on the release.
+        match r.handle(ReqEvent::Press(x, y), 0) {
+            FileResponse::Continue => r.handle(ReqEvent::Release, 0),
+            answer => answer,
+        }
+    }
+
+    #[test]
+    fn the_view_names_every_control_where_the_requester_takes_it() {
+        use crate::dialog::{Item, Part, Role};
+        let mut r = req(FileKind::LoadPicture);
+        let view = r.view();
+        assert_eq!(view.title, "Load Picture");
+        assert_eq!(
+            view.buttons
+                .iter()
+                .map(|b| (b.label.as_str(), b.role))
+                .collect::<Vec<_>>(),
+            [("Load", Role::Default), ("Cancel", Role::Cancel)]
+        );
+        // The list: eight of sixteen rows, places with what they are, a scroll bar.
+        let Item::List(list) = &view.columns[0][0] else {
+            panic!("the list comes first");
+        };
+        assert_eq!((list.rows.len(), list.capacity), (8, 8));
+        assert_eq!(
+            (list.rows[0].label.as_str(), list.rows[0].detail.as_str()),
+            ("Brushes", "Drawer")
+        );
+        assert_eq!(list.rows[2].label, "alpha.IFF");
+        assert!(list.scroll.is_some());
+        // The File field has the keys; "# of Frames" is shown ghosted.
+        let fields: Vec<_> = view.columns[0]
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line { label, parts, .. } => match &parts[0] {
+                    Part::Field(f) => Some((label.as_str(), f.caret, f.enabled)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("Drawer", None, true),
+                ("Pattern", None, true),
+                ("File", Some(0), true),
+                ("# of Frames", None, false)
+            ]
+        );
+        // A row with a file puts its name into the File field and is then the chosen one.
+        assert_eq!(press(&mut r, ctl::ROW + 2), FileResponse::Continue);
+        assert_eq!(r.file(), "alpha.IFF");
+        let Item::List(list) = &r.view().columns[0][0] else {
+            panic!();
+        };
+        assert!(list.rows[2].selected && !list.rows[3].selected);
+        // A row with a drawer lists it.
+        assert_eq!(
+            press(&mut r, ctl::ROW + 1),
+            FileResponse::Browse(Browse::Drawer("/x/pictures".into()))
+        );
+        // The three places and the two buttons.
+        assert_eq!(
+            press(&mut r, ctl::DISKS),
+            FileResponse::Browse(Browse::Disks)
+        );
+        assert_eq!(
+            press(&mut r, ctl::ASSIGNS),
+            FileResponse::Browse(Browse::Assigns)
+        );
+        assert_eq!(
+            press(&mut r, ctl::PARENT),
+            FileResponse::Browse(Browse::Parent)
+        );
+        assert_eq!(press(&mut r, ctl::CANCEL), FileResponse::Cancel);
+        assert!(matches!(
+            press(&mut r, ctl::ACTION),
+            FileResponse::Accept { file, .. } if file == "alpha.IFF"
+        ));
+        // The fields take the keys where they are pressed.
+        for (id, f) in [
+            (ctl::DRAWER, Field::Drawer),
+            (ctl::PATTERN, Field::Pattern),
+            (ctl::FILE, Field::File),
+        ] {
+            press(&mut r, id);
+            assert_eq!(r.active, Some(f));
+        }
+        // A held button is shown held while the pointer is on it.
+        let (x, y) = centre(&r, ctl::ACTION);
+        r.handle(ReqEvent::Press(x, y), 0);
+        assert!(r.view().buttons[0].pressed);
+        r.handle(ReqEvent::Drag(0, 0), 0);
+        assert!(!r.view().buttons[0].pressed);
+        r.handle(ReqEvent::Release, 0);
+        // A message is shown; other kinds have no "# of Frames".
+        r.set_message("Cannot read that file");
+        assert!(r.view().columns[0].iter().any(
+            |i| matches!(i, Item::Text { text, tone, .. } if text.contains("Cannot") && *tone == crate::dialog::Tone::Alert)
+        ));
+        let save = req(FileKind::SavePicture).view();
+        assert_eq!(
+            (save.title.as_str(), save.buttons[0].label.as_str()),
+            ("Save Project", "Save")
+        );
+        assert!(save.control(ctl::FRAMES).is_none());
+        // A short listing has no scroll bar.
+        let mut short = FileRequester::new(FileKind::LoadBrush);
+        short.set_listing("/x", vec![Entry::File("a.iff".into())]);
+        let Item::List(list) = &short.view().columns[0][0] else {
+            panic!();
+        };
+        assert!(list.scroll.is_none() && list.rows.len() == 1);
+    }
+
+    #[test]
+    fn the_view_scrolls_by_its_bar_and_sets_the_caret_by_its_stops() {
+        use crate::dialog::{Item, Part};
+        let mut r = req(FileKind::LoadPicture);
+        let bar = |r: &FileRequester| {
+            let Item::List(list) = &r.view().columns[0][0] else {
+                panic!();
+            };
+            list.scroll.expect("a scroll bar")
+        };
+        // The knob is inside the track; a press under it pages down, a drag moves it.
+        let b = bar(&r);
+        let (track, knob) = (b.control.area, b.knob);
+        assert!(knob.y >= track.y && knob.y + knob.h <= track.y + track.h);
+        assert_eq!(knob.y, track.y, "at the top");
+        r.handle(ReqEvent::Press(track.x + 2, track.y + track.h - 1), 0);
+        r.handle(ReqEvent::Release, 0);
+        assert_eq!(r.top, 8);
+        let knob = bar(&r).knob;
+        assert_eq!(knob.y + knob.h, track.y + track.h, "at the bottom");
+        r.handle(ReqEvent::Press(knob.x + 2, knob.y + 1), 0);
+        r.handle(ReqEvent::Drag(knob.x + 2, track.y - 20), 0);
+        r.handle(ReqEvent::Release, 0);
+        assert_eq!(r.top, 0);
+        // Every stop of a field puts the caret at its position.
+        r.set_file("castle.iff");
+        let stops = |r: &FileRequester| {
+            r.view().columns[0]
+                .iter()
+                .find_map(|i| match i {
+                    Item::Line { label, parts, .. } if label == "File" => match &parts[0] {
+                        Part::Field(f) => Some((f.control.area, f.stops.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("the File field")
+        };
+        let (area, list) = stops(&r);
+        assert_eq!(list.len(), "castle.iff".len() + 1);
+        for (caret, x) in list {
+            assert!(x >= area.x && x < area.x + area.w);
+            r.handle(ReqEvent::Press(x, area.y + area.h / 2), 0);
+            assert_eq!(r.file.cursor, caret, "stop {caret}");
+        }
+        // A text longer than the field: only what the field shows has a stop.
+        r.set_file(&"m".repeat(80));
+        let (area, list) = stops(&r);
+        assert!(list.len() < 40 && list.last().expect("stops").0 == 80);
+        for (caret, x) in list {
+            r.handle(ReqEvent::Press(x, area.y + 1), 0);
+            assert_eq!(r.file.cursor, caret);
+            r.handle(ReqEvent::Key(ReqKey::End), 0);
+        }
+    }
+
+    #[test]
+    fn the_view_of_the_question_has_only_its_answers() {
+        use crate::dialog::{Item, Role};
+        let mut r = req(FileKind::SavePicture);
+        r.set_file("castle.dpxproj");
+        r.ask_overwrite();
+        let view = r.view();
+        assert_eq!(view.title, "Save Project");
+        assert!(matches!(&view.columns[0][..],
+            [Item::Text { text, .. }] if text == "\"castle.dpxproj\" exists. Replace it?"));
+        assert_eq!(
+            view.buttons
+                .iter()
+                .map(|b| (b.label.as_str(), b.role, b.key))
+                .collect::<Vec<_>>(),
+            [
+                ("Yes", Role::Plain, Some('Y')),
+                ("No", Role::Cancel, Some('N'))
+            ]
+        );
+        assert_eq!(press(&mut r, ctl::NO), FileResponse::Continue);
+        assert!(
+            r.view().control(ctl::ACTION).is_some(),
+            "the requester again"
+        );
+        r.ask_overwrite();
+        assert!(matches!(
+            press(&mut r, ctl::YES),
+            FileResponse::Accept {
+                overwrite: true,
+                ..
+            }
+        ));
+        let mut del = req(FileKind::DeleteFile);
+        del.set_file("old.iff");
+        press(&mut del, ctl::ACTION);
+        assert!(matches!(&del.view().columns[0][..],
+            [Item::Text { text, .. }] if text == "\"old.iff\" Delete this file?"));
     }
 }

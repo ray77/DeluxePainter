@@ -200,9 +200,33 @@ pub struct Built {
     pub texts: Vec<TextBox>,
     /// The low-window sizes were used.
     pub compact: bool,
+    /// For a text field with caret stops: the window x of each caret position it shows,
+    /// with the Classic x that puts the caret there.
+    carets: Vec<(ControlId, Vec<(f32, i32)>)>,
 }
 
 impl Built {
+    /// The Classic position the window point stands for on `spot`. In a text field with
+    /// caret stops it is the stop nearest to the pointer; elsewhere [`Spot::to_classic`].
+    fn classic(&self, spot: &Spot, x: f32, y: f32) -> (i32, i32) {
+        let stops = self
+            .carets
+            .iter()
+            .find(|(id, _)| *id == spot.control.id)
+            .map(|(_, stops)| stops);
+        let nearest = stops.and_then(|stops| {
+            stops
+                .iter()
+                .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
+        });
+        match nearest {
+            Some(&(_, cx)) if spot.rect.contains(x, y) => {
+                (cx, spot.control.area.y + spot.control.area.h / 2)
+            }
+            _ => spot.to_classic(x, y),
+        }
+    }
+
     /// The control under the window point.
     pub fn spot_at(&self, x: f32, y: f32) -> Option<&Spot> {
         self.spots.iter().rev().find(|s| s.rect.contains(x, y))
@@ -218,7 +242,7 @@ impl Built {
     /// requester's `Press` event.
     pub fn press(&self, x: f32, y: f32) -> (Option<ControlId>, (i32, i32)) {
         match self.spot_at(x, y) {
-            Some(spot) => (Some(spot.control.id), spot.to_classic(x, y)),
+            Some(spot) => (Some(spot.control.id), self.classic(spot, x, y)),
             None => (None, NOWHERE),
         }
     }
@@ -228,7 +252,7 @@ impl Built {
     pub fn drag(&self, captured: Option<ControlId>, x: f32, y: f32) -> (i32, i32) {
         captured
             .and_then(|id| self.spot(id))
-            .map_or(NOWHERE, |spot| spot.to_classic(x, y))
+            .map_or(NOWHERE, |spot| self.classic(spot, x, y))
     }
 }
 
@@ -299,6 +323,7 @@ struct Draw<'a> {
     list: List,
     spots: Vec<Spot>,
     texts: Vec<TextBox>,
+    carets: Vec<(ControlId, Vec<(f32, i32)>)>,
     theme: &'a Theme,
     pointer: &'a Pointer,
     m: Metrics,
@@ -528,6 +553,16 @@ impl Draw<'_> {
         }
         if f.enabled {
             self.spot(f.control, rect);
+            // The caret positions that are shown here and can be reached there.
+            let shown: Vec<(f32, i32)> = f
+                .stops
+                .iter()
+                .filter(|(i, _)| (start..=end).contains(i))
+                .map(|&(i, cx)| (rect.x + pad + width(start, i), cx))
+                .collect();
+            if !shown.is_empty() {
+                self.carets.push((f.control.id, shown));
+            }
         }
     }
 
@@ -900,6 +935,8 @@ impl Draw<'_> {
     /// The width a part asks for; `None` for a stepper or a slider, which take what is left.
     fn natural(p: &Part) -> Option<f32> {
         match p {
+            // A field for long text (a file name, a prompt) takes what the line has left.
+            Part::Field(f) if !f.numeric && f.max_chars > 32 => None,
             Part::Field(f) => Some(Self::field_width(f)),
             Part::Cycle(c) => Self::segments_width(c),
             Part::Check(c) => Some(Self::check_width(c)),
@@ -955,7 +992,11 @@ impl Draw<'_> {
                 None if Some(i) == last_stretchy => rest,
                 None => STEPPER_W,
             };
-            let rect = Rect::new(self.snap(px), top, self.snap(pw), ch);
+            let mut rect = Rect::new(self.snap(px), top, self.snap(pw), ch);
+            if matches!(part, Part::Field(_)) && natural(part).is_none() {
+                // A field that takes the rest of the line ends on a pixel inside it.
+                rect.w = ((px + pw) * self.scale).floor() / self.scale - rect.x;
+            }
             match part {
                 Part::Field(f) => self.field(f, rect),
                 Part::Cycle(c) => self.cycle(c, rect),
@@ -1383,6 +1424,7 @@ struct Laid {
     list: List,
     spots: Vec<Spot>,
     texts: Vec<TextBox>,
+    carets: Vec<(ControlId, Vec<(f32, i32)>)>,
     size: (f32, f32),
 }
 
@@ -1400,6 +1442,7 @@ fn lay_out(
         list: List::new(),
         spots: Vec::new(),
         texts: Vec::new(),
+        carets: Vec::new(),
         theme,
         pointer,
         m,
@@ -1471,6 +1514,7 @@ fn lay_out(
         list: d.list,
         spots: d.spots,
         texts: d.texts,
+        carets: d.carets,
         size: (width, height),
     }
 }
@@ -1527,6 +1571,7 @@ pub fn build(dialog: &Dialog, window: Rect, scale: f32, theme: &Theme, pointer: 
         spots: drawn.spots,
         texts: drawn.texts,
         compact,
+        carets: drawn.carets,
     }
 }
 
@@ -1805,7 +1850,65 @@ mod tests {
         }
         assert!(!hires.chipset_switchable(), "Super-High Res is AGA only");
         out.push(("screen format, chipset ghosted", hires.view()));
+        files(&mut out);
         out
+    }
+
+    /// A drawer as the file requester lists it: `files` files after two drawers.
+    fn listing(files: usize) -> Vec<dpx_ui::Entry> {
+        let place = |label: &str| dpx_ui::Entry::Place {
+            kind: dpx_ui::PlaceKind::Dir,
+            label: label.into(),
+            drawer: format!("/work/{label}"),
+        };
+        let mut entries = vec![place("Brushes"), place("Pictures")];
+        entries.extend((0..files).map(|i| dpx_ui::Entry::File(format!("castle-{i:02}.iff"))));
+        entries.push(dpx_ui::Entry::File(format!(
+            "a-{}.iff",
+            "very-long-name-".repeat(12)
+        )));
+        entries
+    }
+
+    fn file_requester(kind: dpx_ui::FileKind, files: usize) -> dpx_ui::FileRequester {
+        let mut r = dpx_ui::FileRequester::new(kind);
+        r.set_listing("/work/pictures/castles", listing(files));
+        r
+    }
+
+    /// The file requester (slice 4c) in the states that change what it shows.
+    fn files(out: &mut Vec<(&'static str, Dialog)>) {
+        use dpx_ui::FileKind as K;
+        out.push(("load picture", file_requester(K::LoadPicture, 30).view()));
+        let mut chosen = file_requester(K::LoadPicture, 30);
+        chosen.set_file("castle-03.iff");
+        chosen.set_message("castle-03.iff is not a picture this program reads");
+        out.push(("load picture, a file and a message", chosen.view()));
+        let mut short = file_requester(K::SavePicture, 2);
+        short.set_file(&"a very long project name ".repeat(8));
+        out.push(("save project, a short list", short.view()));
+        let mut empty = dpx_ui::FileRequester::new(K::ExportPicture);
+        empty.set_listing("", Vec::new());
+        out.push(("export, nothing listed", empty.view()));
+        for (name, kind) in [
+            ("load animation", K::LoadAnim),
+            ("save animation", K::SaveAnim),
+            ("delete file", K::DeleteFile),
+            ("load palette", K::LoadPalette),
+            ("save brush", K::SaveBrush),
+            ("load stencil", K::LoadStencil),
+            ("save animbrush", K::SaveAnimBrush),
+        ] {
+            out.push((name, file_requester(kind, 9).view()));
+        }
+        let mut replace = file_requester(K::ExportPicture, 3);
+        replace.set_file("castle-01.iff");
+        replace.ask_overwrite();
+        out.push(("export, replace?", replace.view()));
+        let mut delete = file_requester(K::DeleteFile, 3);
+        delete.set_file(&format!("a-{}.iff", "very-long-name-".repeat(12)));
+        delete.ask_overwrite();
+        out.push(("delete, a long name?", delete.view()));
     }
 
     fn built(dialog: &Dialog, window: (f32, f32), scale: f32, kind: ThemeKind) -> Built {
@@ -1862,13 +1965,27 @@ mod tests {
                     }
                 }
             }
-            // Nothing is cut that the dialog did not cut itself.
+            // Nothing is cut that the dialog did not cut itself; only a list row's long
+            // name (a file name) may end in an ellipsis.
             let source = format!("{dialog:?}");
             let b = built(&dialog, WINDOWS[0], 1.0, ThemeKind::Dark);
+            let rows: Vec<&str> = dialog
+                .columns
+                .iter()
+                .flatten()
+                .filter_map(|i| match i {
+                    Item::List(list) => Some(list.rows.iter().map(|r| r.label.as_str())),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
             for t in &b.texts {
                 let own = t.text.matches('\u{2026}').count();
+                let row = rows
+                    .iter()
+                    .any(|r| r.starts_with(t.text.trim_end_matches('\u{2026}')));
                 assert!(
-                    own == 0 || source.contains(&t.text) || name == "command",
+                    own == 0 || row || source.contains(&t.text) || name == "command",
                     "{name}: '{}' was cut",
                     t.text
                 );
@@ -1969,7 +2086,14 @@ mod tests {
                             assert_eq!(b.spot_at(x, y).map(|t| t.control.id), Some(s.control.id));
                             let p = s.to_classic(x, y);
                             assert!(inside(p), "{name}: {:?} at ({x}, {y}) -> {p:?}", s.control);
-                            assert_eq!(b.press(x, y), (Some(s.control.id), p));
+                            let (taken, at) = b.press(x, y);
+                            assert_eq!(taken, Some(s.control.id));
+                            if b.carets.iter().any(|(id, _)| *id == s.control.id) {
+                                // A text field sends the press at a caret stop.
+                                assert!(inside(at), "{name}: {:?} -> {at:?}", s.control);
+                            } else {
+                                assert_eq!(at, p);
+                            }
                         }
                         if s.slider.is_some() {
                             // A slider follows the pointer along its length only.
@@ -3226,5 +3350,95 @@ mod tests {
         assert_eq!(text_color(&on, "16"), theme.text);
         assert_eq!(text_color(&off, "16"), theme.disabled);
         assert!(off.list.len() < on.list.len(), "no knob");
+    }
+    /// The file requester's fields (slice 4c): a text field for a long text takes the
+    /// line's width, all three stand under each other, and a press sets the caret under
+    /// the pointer: it is sent at the Classic x of the caret position nearest to it.
+    #[test]
+    fn a_text_field_takes_the_line_and_sets_the_caret_under_the_pointer() {
+        use dpx_ui::file_requester::ctl;
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = file_requester(dpx_ui::FileKind::SavePicture, 4);
+        req.set_file("castle.dpxproj");
+        let b = build(
+            &req.view(),
+            window,
+            1.0,
+            &Theme::dark(),
+            &Pointer::default(),
+        );
+        let (drawer, pattern, file) = (
+            b.spot(ctl::DRAWER).unwrap().rect,
+            b.spot(ctl::PATTERN).unwrap().rect,
+            b.spot(ctl::FILE).unwrap().rect,
+        );
+        assert_eq!((drawer.x, drawer.w), (file.x, file.w));
+        assert_eq!((pattern.x, pattern.w), (file.x, file.w));
+        assert_eq!(
+            file.right(),
+            b.card.right() - PAD,
+            "to the card's inner edge"
+        );
+        // Every caret position of the shown text: a press just right of it lands on it.
+        let text = "castle.dpxproj";
+        let mid = file.y + file.h / 2.0;
+        for caret in 0..=text.len() {
+            let x = file.x + 10.0 + font::measure(&text[..caret], SIZE, Weight::Regular);
+            let (taken, at) = b.press(x + 0.4, mid);
+            assert_eq!(taken, Some(ctl::FILE));
+            let mut r = req.clone();
+            r.handle(ReqEvent::Press(at.0, at.1), 0);
+            for _ in caret..text.len() {
+                r.handle(ReqEvent::Key(ReqKey::Delete), 0);
+            }
+            assert_eq!(r.file(), &text[..caret], "caret {caret}");
+        }
+        // Far right of the text: the end. Left of it: the start.
+        for (x, kept) in [(file.right() - 1.0, text), (file.x + 1.0, "")] {
+            let (_, at) = b.press(x, mid);
+            let mut r = req.clone();
+            r.handle(ReqEvent::Press(at.0, at.1), 0);
+            for _ in 0..text.len() {
+                r.handle(ReqEvent::Key(ReqKey::Delete), 0);
+            }
+            assert_eq!(r.file(), kept);
+        }
+        // The position is inside the field's Classic rectangle.
+        let area = req.view().control(ctl::FILE).unwrap().area;
+        let (_, at) = b.press(file.x + 40.0, mid);
+        assert!(at.0 >= area.x && at.0 < area.x + area.w);
+        assert!(at.1 >= area.y && at.1 < area.y + area.h);
+    }
+
+    /// The file list (slice 4c): drawers say what they are, the chosen file is marked, a
+    /// long name ends in an ellipsis inside its row, and the bar's knob follows the list.
+    #[test]
+    fn the_file_list_shows_places_the_chosen_file_and_long_names() {
+        use dpx_ui::file_requester::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = file_requester(dpx_ui::FileKind::LoadPicture, 30);
+        req.set_file("castle-02.iff");
+        let b = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        let texts: Vec<&str> = b.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(texts.contains(&"Brushes") && texts.contains(&"Drawer"));
+        let long = b
+            .texts
+            .iter()
+            .find(|t| t.text.starts_with("a-very-long-name-"))
+            .expect("the long name");
+        assert!(long.text.ends_with('…'), "{}", long.text);
+        assert!(long.within.encloses(&long.ink));
+        let row = b.spot(ctl::ROW + 5).expect("the chosen row").rect;
+        assert!(fills(&b.list, row).contains(&theme.accent));
+        assert_eq!(text_color(&b, "castle-02.iff"), theme.on_accent);
+        // The scroll bar maps into the Classic track, top to top and bottom to bottom.
+        let bar = b.spot(ctl::SCROLL).expect("the bar");
+        let area = bar.control.area;
+        assert_eq!(bar.to_classic(bar.rect.x + 1.0, bar.rect.y).1, area.y);
+        assert_eq!(
+            bar.to_classic(bar.rect.x + 1.0, bar.rect.bottom() - 0.01).1,
+            area.y + area.h - 1
+        );
     }
 }

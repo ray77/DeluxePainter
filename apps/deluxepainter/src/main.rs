@@ -7,8 +7,10 @@
 //!     [--fg N] [--tool NAME[:filled]]   foreground colour and selected tool
 //!     [--menu M[:I[:S]]]                open menu M (0 = Picture), highlight item I / sub item S
 //!     [--requester]                     show the Screen Format requester instead
-//!     [--file-requester load|save|export] show the Load/Save/Export requester
+//!     [--file-requester load|save|export|load-anim|save-anim|delete]
+//!                                       show the file requester of that kind
 //!     [--drawer DIR] [--file NAME]      … listing DIR, with NAME in the File field
+//!     [--file-question]                 … asking whether NAME may be replaced (or deleted)
 //!     [--drawer-as TEXT]                … showing TEXT in the Drawer field (doc screenshots)
 //!     [--page WxH] [--scroll X,Y]       page size (BG colour 0) and the part of it shown
 //!     [--commands FILE.json]            apply a JSON array of commands first (ADR-14)
@@ -513,8 +515,12 @@ fn main() -> eframe::Result {
                 "export" => FileKind::ExportPicture,
                 "load-anim" => FileKind::LoadAnim,
                 "save-anim" => FileKind::SaveAnim,
+                "delete" => FileKind::DeleteFile,
                 _ => {
-                    eprintln!("--file-requester expects load, save or export");
+                    eprintln!(
+                        "--file-requester expects load, save, export, load-anim, save-anim or \
+                         delete"
+                    );
                     std::process::exit(2);
                 }
             };
@@ -532,6 +538,10 @@ fn main() -> eframe::Result {
             }
             if let Some(name) = arg_value(&args, "--file") {
                 req.set_file(&name);
+            }
+            // The Replace / Delete question about that file.
+            if args.iter().any(|a| a == "--file-question") {
+                req.ask_overwrite();
             }
             ui.file_requester = Some(req);
         }

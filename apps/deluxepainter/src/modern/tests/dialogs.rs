@@ -32,6 +32,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     let range = app.ui.range_requester.take();
     let anim = app.ui.anim_requester.take();
     let control = app.ui.anim_control.take();
+    let file = app.ui.file_requester.take();
     let percent = (
         app.menu_data.effects.percent,
         app.engine.document().fps(),
@@ -56,10 +57,10 @@ fn dialog_state(rig: &mut Rig) -> String {
             range.as_ref().map(|r| (r.view(&palette), r.ranges())),
             anim.as_ref().map(|r| r.view()),
             control.as_ref().map(|r| r.view()),
+            // Slice 4c (a tuple holds at most twelve values).
+            (file.as_ref().map(|r| (r.view(), r.drawer().to_string())),),
             percent,
-            open,
-            pending,
-            confirmed,
+            (open, pending, confirmed),
         )
     );
     let closes = rig
@@ -77,6 +78,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.range_requester = range;
     app.ui.anim_requester = anim;
     app.ui.anim_control = control;
+    app.ui.file_requester = file;
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -2043,12 +2045,340 @@ fn the_card_veils_the_window_and_follows_the_pointer() {
     }
 }
 
+/// A drawer of its own for the file requester scripts: twenty files that are no pictures,
+/// a drawer inside, a very long name. Made anew for every run, so the Classic and the
+/// Modern window list the same.
+fn file_drawer(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("dpx-modern-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("brushes")).expect("a drawer");
+    for i in 0..20 {
+        std::fs::write(dir.join(format!("pic{i:02}.iff")), b"no picture").expect("a file");
+    }
+    std::fs::write(dir.join("notes.txt"), b"text").expect("a file");
+    let long = format!("a-{}.iff", "very-long-name-".repeat(8));
+    std::fs::write(dir.join(long), b"no picture").expect("a file");
+    dir.to_string_lossy().into_owned()
+}
+
+/// The labels of the list rows the file requester shows, and whether it has a scroll bar.
+fn file_rows(rig: &Rig) -> (Vec<String>, bool) {
+    let dialog = rig.dialog();
+    let list = dialog.columns[0]
+        .iter()
+        .find_map(|i| match i {
+            dpx_ui::dialog::Item::List(list) => Some(list),
+            _ => None,
+        })
+        .expect("the list");
+    (
+        list.rows.iter().map(|r| r.label.clone()).collect(),
+        list.scroll.is_some(),
+    )
+}
+
+/// The control of the shown row with this label.
+fn file_row(rig: &Rig, label: &str) -> ControlId {
+    let at = file_rows(rig)
+        .0
+        .iter()
+        .position(|l| l == label)
+        .unwrap_or_else(|| panic!("a row '{label}'"));
+    dpx_ui::file_requester::ctl::ROW + at as ControlId
+}
+
+/// The file requester (slice 4c): Load with the list (wheel, arrow keys, the scroll bar by
+/// a press and by a drag of its knob, a file, a double click, a drawer), the three fields
+/// (typing, paste, Tab, the caret by a click, a pattern), Disks, Assigns, Parent, messages,
+/// Cancel, Esc; Save with the Replace question (Yes, No, the keys); Export; Delete with its
+/// question.
+fn file_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::file_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let drawer = file_drawer("file");
+    let open = |rig: &mut Rig, seen: Seen, command: &'static str| {
+        rig.app.last_drawer = Some(drawer.clone());
+        rig.pick(Action::Command(command));
+        assert!(rig.app.ui.file_requester.is_some(), "{command}");
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::File));
+        }
+        seen(rig, command.to_string());
+    };
+    let file = |rig: &Rig| rig.app.ui.file_requester.as_ref().expect("open").file();
+    let is_open = |rig: &Rig| rig.app.ui.file_requester.is_some();
+
+    // Load: the list.
+    open(rig, seen, "picture.load");
+    let (rows, bar) = file_rows(rig);
+    assert_eq!((rows.len(), bar), (8, true));
+    assert_eq!(rows[0], "brushes");
+    assert!(rows[1].starts_with("a-very-long-name-"));
+    rig.wheel(-3.0);
+    assert_eq!(
+        file_rows(rig).0[0],
+        "pic00.iff",
+        "the wheel scrolls three rows"
+    );
+    seen(rig, "the wheel".into());
+    rig.tap(egui::Key::ArrowDown);
+    rig.tap(egui::Key::ArrowDown);
+    rig.tap(egui::Key::ArrowUp);
+    assert_eq!(file_rows(rig).0[0], "pic01.iff");
+    seen(rig, "arrow keys".into());
+    rig.wheel(40.0);
+    assert_eq!(file_rows(rig).0[0], "brushes", "back at the top");
+    seen(rig, "the wheel back".into());
+    // The scroll bar: a press under the knob pages, a press over it pages back.
+    rig.click_control(ctl::SCROLL, (0.5, 0.97));
+    assert_eq!(file_rows(rig).0[0], "pic05.iff");
+    seen(rig, "a press under the knob".into());
+    rig.click_control(ctl::SCROLL, (0.5, 0.02));
+    assert_eq!(file_rows(rig).0[0], "brushes");
+    seen(rig, "a press over the knob".into());
+    // The knob dragged down, beyond the end, and back up a little.
+    let from = rig.control_point(ctl::SCROLL, (0.5, 0.1));
+    rig.pass(vec![
+        egui::Event::PointerMoved(from),
+        pointer_button(from, Primary, true),
+    ]);
+    seen(rig, "the knob held".into());
+    for to in [0.4, 0.75, 1.0, 0.6] {
+        let pos = rig.control_point(ctl::SCROLL, (0.5, to));
+        rig.pass(vec![egui::Event::PointerMoved(pos)]);
+        seen(rig, format!("the knob dragged to {to}"));
+    }
+    let end = rig.control_point(ctl::SCROLL, (0.5, 1.0));
+    rig.pass(vec![egui::Event::PointerMoved(end)]);
+    assert_eq!(file_rows(rig).0[7], "pic19.iff", "the end of the list");
+    rig.pass(vec![pointer_button(end, Primary, false)]);
+    seen(rig, "the knob let go at the end".into());
+    rig.wheel(40.0);
+    // A file: its name goes into the File field, the row is the chosen one.
+    let row = file_row(rig, "pic02.iff");
+    rig.click_control(row, MID);
+    assert_eq!(file(rig), "pic02.iff");
+    seen(rig, "a file".into());
+    // The first and the last pixel of a row are that row.
+    let row = file_row(rig, "pic03.iff");
+    rig.click_control(row, (0.01, 0.05));
+    assert_eq!(file(rig), "pic03.iff");
+    rig.t += 1.0;
+    let row = file_row(rig, "pic04.iff");
+    rig.click_control(row, (0.99, 0.95));
+    assert_eq!(file(rig), "pic04.iff");
+    seen(rig, "rows by their corners".into());
+    // A double click loads; this file is no picture, so the requester says so and stays.
+    rig.t += 1.0;
+    rig.click_control(row, MID);
+    rig.click_control(row, MID);
+    seen(rig, "a double click on a file that is no picture".into());
+    if rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+        seen(rig, "the note closed".into());
+    }
+    if !is_open(rig) {
+        open(rig, seen, "picture.load");
+    }
+    // The long name ends in an ellipsis on the card and is whole in the File field.
+    let long = file_rows(rig).0[1].clone();
+    let row = file_row(rig, &long);
+    rig.click_control(row, MID);
+    assert_eq!(file(rig), long);
+    seen(rig, "the long name".into());
+    // A drawer, and Parent back.
+    let row = file_row(rig, "brushes");
+    rig.click_control(row, MID);
+    assert!(file_rows(rig).0.is_empty(), "an empty drawer");
+    assert!(!file_rows(rig).1, "nothing to scroll");
+    seen(rig, "into a drawer".into());
+    rig.click_control(ctl::PARENT, MID);
+    assert_eq!(file_rows(rig).0[0], "brushes");
+    seen(rig, "Parent".into());
+    // Disks and Assigns, each by a corner; then the drawer typed into its field.
+    rig.click_control(ctl::DISKS, (0.02, 0.05));
+    seen(rig, "Disks".into());
+    rig.click_control(ctl::ASSIGNS, (0.98, 0.95));
+    seen(rig, "Assigns".into());
+    rig.click_control(ctl::DRAWER, MID);
+    rig.type_text(&drawer);
+    seen(rig, "the drawer typed".into());
+    rig.tap(egui::Key::Enter);
+    assert_eq!(file_rows(rig).0[0], "brushes");
+    seen(rig, "Return lists it".into());
+    // The fields: Tab goes round, typing and pasting go to the one that has the keys.
+    rig.click_control(ctl::FILE, (0.99, 0.5));
+    rig.tap(egui::Key::Backspace);
+    rig.tap(egui::Key::Home);
+    rig.type_text("x");
+    rig.tap(egui::Key::ArrowRight);
+    rig.tap(egui::Key::Delete);
+    rig.tap(egui::Key::End);
+    rig.pass(vec![egui::Event::Paste("-pasted\nname".into())]);
+    seen(rig, "editing keys and paste in the File field".into());
+    rig.tap(egui::Key::Tab);
+    rig.tap(egui::Key::Tab);
+    rig.type_text("#?.txt");
+    seen(rig, "a pattern typed".into());
+    rig.tap(egui::Key::Enter);
+    assert_eq!(file_rows(rig).0, ["brushes", "notes.txt"]);
+    seen(rig, "Return applies the pattern".into());
+    rig.click_control(ctl::PATTERN, (0.99, 0.5));
+    for _ in 0..6 {
+        rig.tap(egui::Key::Backspace);
+    }
+    rig.type_text("(");
+    rig.tap(egui::Key::Tab);
+    seen(rig, "a broken pattern says why".into());
+    rig.click_control(ctl::PATTERN, (0.99, 0.5));
+    rig.tap(egui::Key::Backspace);
+    rig.click_control(ctl::FILE, (0.01, 0.5));
+    rig.type_text("^");
+    assert!(
+        file(rig).contains('^'),
+        "the caret where the field was pressed"
+    );
+    seen(rig, "a click at the start of the File field".into());
+    // Buttons held and left; a press beside the card.
+    for id in [
+        ctl::DISKS,
+        ctl::ASSIGNS,
+        ctl::PARENT,
+        ctl::ACTION,
+        ctl::CANCEL,
+    ] {
+        rig.press_and_leave(id);
+        assert!(is_open(rig));
+        seen(rig, format!("control {id} pressed and left"));
+    }
+    rig.press_beside_and_enter(ctl::CANCEL);
+    rig.click_beside();
+    assert!(is_open(rig));
+    seen(rig, "pressed beside".into());
+    // No name: Load refuses with a message.
+    rig.tap(egui::Key::Escape);
+    open(rig, seen, "picture.load");
+    assert_eq!(file(rig), "");
+    rig.click_control(ctl::ACTION, (0.02, 0.05));
+    assert!(is_open(rig));
+    seen(rig, "Load without a name".into());
+    rig.tap(egui::Key::Enter);
+    seen(rig, "Return without a name".into());
+    rig.click_control(ctl::CANCEL, (0.98, 0.95));
+    assert!(!is_open(rig), "Cancel closes it");
+    seen(rig, "Cancel".into());
+    open(rig, seen, "picture.load");
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig), "Esc closes it");
+    seen(rig, "Esc".into());
+
+    // Save: a new project is written; saving it again asks.
+    rig.click(Place::Page(40, 40), Primary);
+    open(rig, seen, "picture.save");
+    rig.type_text("castle");
+    rig.tap(egui::Key::Enter);
+    assert!(!is_open(rig), "saved");
+    seen(rig, "Save by Return".into());
+    assert!(
+        std::path::Path::new(&drawer)
+            .join("castle.dpxproj")
+            .exists()
+    );
+    type Answer = fn(&mut Rig);
+    let answers: [(&str, bool, Answer); 6] = [
+        ("No", false, |rig| rig.click_control(ctl::NO, (0.5, 0.5))),
+        ("the n key", false, |rig| rig.type_text("n")),
+        ("Esc", false, |rig| rig.tap(egui::Key::Escape)),
+        ("Yes", true, |rig| rig.click_control(ctl::YES, (0.02, 0.05))),
+        ("the y key", true, |rig| rig.type_text("Y")),
+        ("Yes, at its last pixel", true, |rig| {
+            rig.click_control(ctl::YES, (0.98, 0.95))
+        }),
+    ];
+    for (name, saves, answer) in answers {
+        open(rig, seen, "picture.save");
+        rig.click_control(ctl::ACTION, MID);
+        let asks = rig.dialog();
+        assert_eq!(asks.buttons.len(), 2, "the question");
+        assert!(asks.control(ctl::ACTION).is_none());
+        seen(rig, "Replace it?".into());
+        rig.tap(egui::Key::Enter);
+        rig.tap(egui::Key::Tab);
+        rig.type_text("q");
+        rig.wheel(-2.0);
+        rig.click_beside();
+        rig.press_and_leave(ctl::YES);
+        rig.press_and_leave(ctl::NO);
+        assert_eq!(rig.dialog(), asks, "still asking");
+        seen(rig, "keys and presses that do not answer".into());
+        answer(rig);
+        assert_eq!(is_open(rig), !saves, "{name}");
+        seen(rig, name.to_string());
+        if !saves {
+            assert!(rig.dialog().control(ctl::ACTION).is_some(), "the requester");
+            rig.tap(egui::Key::Escape);
+            seen(rig, "Esc".into());
+        }
+    }
+
+    // Export: IFF beside the project; a second export of the same name asks too.
+    open(rig, seen, "picture.export");
+    rig.click_control(ctl::FILE, (0.99, 0.5));
+    for _ in 0..40 {
+        rig.tap(egui::Key::Backspace);
+    }
+    rig.type_text("castle.iff");
+    rig.click_control(ctl::ACTION, MID);
+    seen(rig, "Export".into());
+    while rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+        seen(rig, "the export note closed".into());
+    }
+    assert!(!rig.app.modal_open());
+    assert!(std::path::Path::new(&drawer).join("castle.iff").exists());
+
+    // Delete: the question first, then the file is gone.
+    open(rig, seen, "picture.delete");
+    let row = file_row(rig, "castle.iff");
+    rig.click_control(row, MID);
+    rig.click_control(ctl::ACTION, MID);
+    assert_eq!(rig.dialog().buttons.len(), 2, "Delete this file?");
+    seen(rig, "Delete asks".into());
+    rig.click_control(ctl::NO, MID);
+    seen(rig, "No".into());
+    rig.tap(egui::Key::Enter);
+    seen(rig, "Return asks again".into());
+    rig.click_control(ctl::YES, MID);
+    seen(rig, "Yes".into());
+    assert!(!std::path::Path::new(&drawer).join("castle.iff").exists());
+    if is_open(rig) {
+        rig.tap(egui::Key::Escape);
+    }
+    while rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+    }
+    assert!(!rig.app.modal_open());
+    seen(rig, "closed".into());
+    let _ = std::fs::remove_dir_all(&drawer);
+}
+
+#[test]
+fn the_file_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(file_script);
+}
+
 /// Every converted requester fits the smallest window and is drawn there, in both themes
 /// and at device scale 1 and 2 (the images go to `DPX_MODERN_SHOTS` for a look).
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 24] = [
+    let open: [(&str, Card, Open); 26] = [
+        ("file-load", Card::File, |rig| {
+            rig.pick(Action::Command("picture.load"))
+        }),
+        ("file-save", Card::File, |rig| {
+            rig.pick(Action::Command("picture.save"))
+        }),
         ("move", Card::AnimControl, |rig| {
             rig.pick(Action::Command("anim.move"))
         }),
@@ -2161,18 +2491,19 @@ fn every_card_fits_the_smallest_window() {
     }
 }
 
-/// A question over a requester that is still shown in the Classic look (here the file
-/// requester): the quad hosts that one as before, the question is the card over it, and
-/// when it is answered the file requester takes its clicks through the Classic mapping.
+/// A question over another converted requester (here the file requester): only the one on
+/// top is a card, nothing is hosted in the picture, the keys belong to the question, and
+/// when it is answered the file requester is the card and takes the keys.
 #[test]
-fn a_card_lies_over_a_requester_in_the_classic_look() {
+fn a_question_over_another_card_is_the_only_card() {
     use dpx_ui::choice_requester::BUTTONS;
     let mut rig = Rig::new(UiStyle::Modern, (800.0, 600.0), 1.0);
+    let plain = rig.app.modern_layout().expect("layout");
     rig.pick(Action::Command("picture.load"));
     rig.pass(vec![]);
     assert!(rig.app.ui.file_requester.is_some());
-    assert_eq!(rig.card(), None, "the file requester is not converted yet");
-    let hosting = rig.app.modern_layout().expect("layout");
+    assert_eq!(rig.card(), Some(Card::File));
+    assert_eq!(rig.app.modern_layout().expect("layout"), plain);
     rig.app.ui.choice_requester = Some(dpx_ui::ChoiceRequester::new(
         "Replace file?",
         &["castle.iff exists.".to_string()],
@@ -2183,29 +2514,18 @@ fn a_card_lies_over_a_requester_in_the_classic_look() {
     rig.app.dirty = true;
     rig.pass(vec![]);
     assert_eq!(rig.card(), Some(Card::Choice));
-    assert!(!rig.app.modern_plain_picture());
-    assert_eq!(rig.app.modern_layout().expect("layout"), hosting);
-    // The quad still shows the file requester (and not the question in the Classic look).
+    assert!(rig.app.modern_plain_picture());
+    assert_eq!(rig.app.modern_layout().expect("layout"), plain);
+    // The quad shows neither of them in the Classic look.
     let screen = rig.app.compose_for_skin();
-    let mut hosted = rig.app.ui.clone();
-    hosted.choice_requester = None;
+    let mut bare = rig.app.ui.clone();
+    bare.choice_requester = None;
+    bare.file_requester = None;
     assert_eq!(
         screen,
         rig.app
             .view()
-            .compose(&rig.app.page(), rig.app.scroll, rig.app.palette(), &hosted)
-    );
-    assert_ne!(
-        screen,
-        rig.app.view().compose(
-            &rig.app.page(),
-            rig.app.scroll,
-            rig.app.palette(),
-            &UiState {
-                file_requester: None,
-                ..hosted.clone()
-            }
-        )
+            .compose(&rig.app.page(), rig.app.scroll, rig.app.palette(), &bare)
     );
     rig.type_text("abc");
     let file = rig.app.ui.file_requester.as_ref().map(|r| r.file());
@@ -2213,7 +2533,7 @@ fn a_card_lies_over_a_requester_in_the_classic_look() {
     rig.click_control(BUTTONS[1], (0.5, 0.5));
     assert!(rig.app.ui.choice_requester.is_none(), "Keep answers");
     assert!(rig.app.ui.file_requester.is_some());
-    assert_eq!(rig.card(), None);
+    assert_eq!(rig.card(), Some(Card::File));
     rig.type_text("abc");
     let file = rig.app.ui.file_requester.as_ref().map(|r| r.file());
     assert_eq!(file.as_deref(), Some("abc"));
@@ -2236,9 +2556,8 @@ fn only_the_converted_requesters_are_cards() {
             .is_none()
     );
     type Open = fn(&mut Rig);
-    let others: [(&str, Open); 4] = [
+    let others: [(&str, Open); 3] = [
         ("Color Mixer", |rig| rig.key('p')),
-        ("file", |rig| rig.pick(Action::Command("picture.load"))),
         ("Generate", |rig| {
             rig.pick(Action::Command("picture.generate"))
         }),
@@ -2253,8 +2572,6 @@ fn only_the_converted_requesters_are_cards() {
         assert!(rig.app.modern_dialog().is_none());
         // A converted requester under it does not become a card either.
         rig.show_note();
-        let top = rig.card();
-        let note_first = matches!(name, "file");
-        assert_eq!(top.is_some(), note_first, "{name}: {top:?}");
+        assert_eq!(rig.card(), None, "{name}");
     }
 }

@@ -97,8 +97,14 @@ pub struct Field {
     pub enabled: bool,
     /// Digits only (the field is as wide as `max_chars` digits).
     pub numeric: bool,
-    /// Most characters the field takes; its width follows.
+    /// Most characters the field takes; its width follows (a text field for more than 32
+    /// characters takes the width its line has left).
     pub max_chars: usize,
+    /// Where a press sets the caret in the Classic field: caret positions with the Classic
+    /// x that puts the caret there (in the coordinates of `control.area`). The Modern skin
+    /// sends a press at the x of the caret position nearest to the pointer, so the caret
+    /// lands under the pointer in both skins. Empty: the press is mapped proportionally.
+    pub stops: Vec<(usize, i32)>,
 }
 
 /// A gadget whose press moves on to the next of a few values.
