@@ -6,7 +6,7 @@ Read `docs/FEATURES.md`, `docs/ARCHITECTURE.md` and `docs/ROADMAP.md` before wor
 
 - **Rust only** for product code. Desktop host: `eframe`/`egui`, used only for the window, input and presenting textures. The visible UI is our own software-rendered UI in two switchable skins that share one state, one input path and the same hotkeys (ADR-47):
   - **Classic skin** (default on first start): the pixel UI (bitmap font, bevels, icons) drawn by `dpx-ui` into the low-res framebuffer and shown with nearest-neighbour scaling at integer factors. Its output must not change when the Modern skin is worked on.
-  - **Modern skin**: a resolution-independent vector UI with a dark and a light theme, drawn by `dpx-ui-modern` on the CPU. Only the picture is pixels (nearest neighbour, integer factors). Until a requester is converted it is shown in the Classic look.
+  - **Modern skin**: a resolution-independent vector UI with a dark and a light theme, drawn by `dpx-ui-modern` on the CPU. Only the picture is pixels (nearest neighbour, integer factors). Its dialogs are modern cards; Show Page and the Animation Control Panel still show in the Classic look.
   - No standard egui widgets and no egui text in either skin.
 - **Design basis: DeluxePaint IV AGA (v4.5).** Don't mix in DPaint III/V behaviour without documenting it. Both skins keep its structure, its right-button menus and its hotkeys. All Classic window/menu/requester corners are square; the Modern skin has its own look (ADR-47) and never copies original artwork.
 - OCS/AGA hardware limits are document rules, validated on export. Never silently reduce size, palette, colours, transparency or frames.

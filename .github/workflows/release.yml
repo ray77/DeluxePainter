@@ -1,0 +1,57 @@
+name: Release
+
+# Builds the Windows x86_64 package for a version tag and attaches it to the GitHub release
+# of that tag. The macOS package is built by the owner's machine and uploaded by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the app and the bridge
+        run: cargo build --release --target x86_64-pc-windows-msvc -p deluxepainter -p dpx-mcp-bridge
+
+      # The Claude Desktop extension with the same bridge; the app looks for it next to itself.
+      - name: Build the extension
+        run: cargo run -p xtask -- mcpb --bridge target/x86_64-pc-windows-msvc/release/dpx-mcp-bridge.exe
+
+      - name: Package
+        shell: bash
+        run: |
+          name="DeluxePainter-${GITHUB_REF_NAME}-windows-x86_64"
+          mkdir "$name"
+          cp target/x86_64-pc-windows-msvc/release/deluxepainter.exe "$name/"
+          cp target/x86_64-pc-windows-msvc/release/dpx-mcp-bridge.exe "$name/"
+          cp target/mcpb/*.mcpb "$name/"
+          cp LICENSE.md README.md "$name/"
+          7z a "$name.zip" "$name"
+          echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --prerelease --title "DeluxePainter $GITHUB_REF_NAME" --notes "Release notes follow."
+          gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber
