@@ -1957,7 +1957,68 @@ mod tests {
         files(&mut out);
         imports(&mut out);
         generators(&mut out);
+        mcp(&mut out);
         out
+    }
+
+    fn mcp_view() -> dpx_ui::McpView {
+        dpx_ui::McpView {
+            on: true,
+            status: "Ready on 127.0.0.1:8765, connected: claude-code via deluxepainter-bridge"
+                .into(),
+            read: true,
+            edit: true,
+            overwrite: false,
+            folder: "~/Pictures/DeluxePainter".into(),
+            activity: (1..=7)
+                .map(|i| format!("{i}s draw_rectangle 10,{i} 200x100 colour {i} on layer 2"))
+                .collect(),
+            message: None,
+            generation: "OpenAI, key set".into(),
+            busy: false,
+        }
+    }
+
+    /// Prefs ▸ AI & MCP (slice 4c) in the states that change what it shows.
+    fn mcp(out: &mut Vec<(&'static str, Dialog)>) {
+        let ready = dpx_ui::McpRequester::new(mcp_view(), (320, 256));
+        out.push(("ai & mcp", ready.dialog()));
+        let off = dpx_ui::McpView {
+            on: false,
+            status: "Off".into(),
+            read: false,
+            activity: Vec::new(),
+            generation: "None set up".into(),
+            ..mcp_view()
+        };
+        out.push((
+            "ai & mcp, off",
+            dpx_ui::McpRequester::new(off, (320, 200)).dialog(),
+        ));
+        let busy = dpx_ui::McpView {
+            busy: true,
+            message: Some("Asking Claude Code whether deluxe-painter is registered..".into()),
+            overwrite: true,
+            ..mcp_view()
+        };
+        out.push((
+            "ai & mcp, connecting",
+            dpx_ui::McpRequester::new(busy, (736, 566)).dialog(),
+        ));
+        let failed = dpx_ui::McpView {
+            status: "Could not start: the token file in /dev/null/DeluxePainter cannot be \
+                     written (not a directory); the server tries again when the settings \
+                     change"
+                .into(),
+            message: Some("Claude Code not found: the command was copied.".into()),
+            folder: "/Volumes/Work/Projects/A very long folder name/Pictures/DeluxePainter".into(),
+            generation: "OpenAI, key kept for this session only (no keychain here)".into(),
+            ..mcp_view()
+        };
+        out.push((
+            "ai & mcp, an error",
+            dpx_ui::McpRequester::new(failed, (320, 256)).dialog(),
+        ));
     }
 
     fn generate_requester(prompt: &str, screen: (i32, i32)) -> dpx_ui::GenerateRequester {
@@ -3975,6 +4036,65 @@ mod tests {
                 .ops()
                 .iter()
                 .any(|op| matches!(op, Op::Pixels { .. }))
+        );
+    }
+    /// Prefs ▸ AI & MCP (slice 4c): two columns, the permissions as check boxes under each
+    /// other (a ghosted one is faint), the connect buttons in two lines that start at the
+    /// same x, the last calls one line each in a quiet panel, cut with an ellipsis.
+    #[test]
+    fn ai_and_mcp_shows_status_permissions_and_the_last_calls() {
+        use dpx_ui::mcp_requester::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let req = dpx_ui::McpRequester::new(mcp_view(), (320, 256));
+        let b = build(&req.dialog(), window, 1.0, &theme, &Pointer::default());
+        let rect = |id| b.spot(id).unwrap_or_else(|| panic!("control {id}")).rect;
+        assert_eq!(rect(ctl::CONNECT_DESKTOP).x, rect(ctl::DISCONNECT).x);
+        assert!(rect(ctl::CONNECT_DESKTOP).bottom() < rect(ctl::DISCONNECT).y);
+        assert_eq!(
+            rect(ctl::CONNECT_DESKTOP).right() + GROUP_GAP,
+            rect(ctl::CONNECT_CODE).x
+        );
+        let (read, edit, over) = (rect(ctl::READ), rect(ctl::EDIT), rect(ctl::OVERWRITE));
+        assert!(read.x == edit.x && edit.x == over.x);
+        assert!(read.bottom() <= edit.y && edit.bottom() <= over.y);
+        assert!(read.x > rect(ctl::CONNECT_CODE).right(), "the right column");
+        assert!(rect(ctl::SET_UP).y > over.bottom());
+        // On is chosen; the status is whole.
+        assert!(
+            b.texts
+                .iter()
+                .any(|t| t.text.starts_with("Status: Ready on 127.0.0.1:8765"))
+        );
+        // Five calls, each in the panel, the newest last.
+        let calls: Vec<&TextBox> = b
+            .texts
+            .iter()
+            .filter(|t| t.text.contains("draw_rectangle"))
+            .collect();
+        assert_eq!(calls.len(), 5);
+        assert!(calls[4].text.starts_with("7s ") && calls[4].ink.y > calls[0].ink.y);
+        for call in &calls {
+            assert_eq!(call.ground, theme.panel);
+            assert!(call.within.encloses(&call.ink));
+        }
+        // Without reading, the other permissions are faint.
+        let none = dpx_ui::McpView {
+            read: false,
+            ..mcp_view()
+        };
+        let b = build(
+            &dpx_ui::McpRequester::new(none, (320, 256)).dialog(),
+            window,
+            1.0,
+            &theme,
+            &Pointer::default(),
+        );
+        assert_eq!(text_color(&b, "Read document info"), theme.text);
+        assert_eq!(text_color(&b, "Edit pictures and palettes"), theme.disabled);
+        assert_eq!(
+            text_color(&b, "Overwrite files without asking"),
+            theme.disabled
         );
     }
 }

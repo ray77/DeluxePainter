@@ -15,8 +15,8 @@ use dpx_core::Palette;
 use dpx_ui::dialog::Dialog;
 use dpx_ui::{
     AnimControlRequester, AnimRequester, ChoiceRequester, FileRequester, GenerateRequester,
-    ImportRequester, NoteRequester, PageSizeRequester, RangeRequester, ScreenFormatRequester,
-    ToolRequester, UiState,
+    ImportRequester, McpRequester, NoteRequester, PageSizeRequester, RangeRequester,
+    ScreenFormatRequester, ToolRequester, UiState,
 };
 use dpx_ui_modern::Theme;
 use dpx_ui_modern::dialog as kit;
@@ -52,6 +52,8 @@ pub(crate) enum Card {
     Generate,
     /// The Image Generator setup (Set up.. in Generate, and Prefs ▸ AI & MCP..).
     Setup,
+    /// Prefs ▸ AI & MCP..
+    Mcp,
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -83,7 +85,7 @@ pub(crate) fn card(
         return Some(Card::Generate);
     }
     if ui.mcp_requester.is_some() {
-        return None;
+        return Some(Card::Mcp);
     }
     if screen_format {
         return Some(Card::ScreenFormat);
@@ -132,13 +134,14 @@ pub(crate) fn view(
         Card::Import => ui.import_requester.as_ref().map(ImportRequester::view),
         Card::Generate => ui.generate_requester.as_ref().map(GenerateRequester::view),
         Card::Setup => ui.imagegen_setup.as_ref().map(|r| r.view()),
+        Card::Mcp => ui.mcp_requester.as_ref().map(McpRequester::dialog),
     }
 }
 
 /// A requester of the shared interface state that is still shown in the Classic look is
 /// open (the picture quad hosts it).
 pub(crate) fn classic_look_open(ui: &UiState) -> bool {
-    ui.palette_requester.is_some() || ui.mcp_requester.is_some()
+    ui.palette_requester.is_some()
 }
 
 /// `ui` without the requesters the Modern skin draws itself: what the picture quad is
@@ -160,6 +163,7 @@ pub(crate) struct Cards {
     import: Option<ImportRequester>,
     generate: Option<GenerateRequester>,
     setup: Option<dpx_ui::ImageGenSetupRequester>,
+    mcp: Option<McpRequester>,
 }
 
 impl Cards {
@@ -177,6 +181,7 @@ impl Cards {
             import: ui.import_requester.take(),
             generate: ui.generate_requester.take(),
             setup: ui.imagegen_setup.take(),
+            mcp: ui.mcp_requester.take(),
         }
     }
 
@@ -193,6 +198,7 @@ impl Cards {
         ui.import_requester = self.import;
         ui.generate_requester = self.generate;
         ui.imagegen_setup = self.setup;
+        ui.mcp_requester = self.mcp;
     }
 }
 

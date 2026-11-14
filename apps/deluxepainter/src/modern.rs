@@ -1556,6 +1556,8 @@ mod tests {
                 r.origin()
             } else if let Some(r) = &app.ui.generate_requester {
                 r.origin()
+            } else if let Some(r) = &app.ui.mcp_requester {
+                r.origin()
             } else if let Some(r) = &app.ui.tool_requester {
                 r.origin(w, h)
             } else if let Some(r) = &app.ui.anim_requester {
@@ -3131,7 +3133,6 @@ mod tests {
     // ---- The layer column, requesters in the quad, the Control Panel (slice 1d of ADR-47) ----
 
     use dpx_core::Command;
-    use dpx_ui::ReqEvent;
 
     fn layer(hit: LayerHit) -> Place {
         Place::Layer(hit)
@@ -3512,19 +3513,6 @@ mod tests {
         assert_eq!(rig.app.modern.layer_renders(), layers);
     }
 
-    /// The first and the last pixel, row by row, of a 640 × 512 area where `wanted` holds:
-    /// for a button, its top-left and its bottom-right pixel.
-    fn pixels_where(wanted: impl Fn(i32, i32) -> bool) -> ((i32, i32), (i32, i32)) {
-        let all: Vec<(i32, i32)> = (0..512)
-            .flat_map(|y| (0..640).map(move |x| (x, y)))
-            .filter(|&(x, y)| wanted(x, y))
-            .collect();
-        (
-            *all.first().expect("a pixel that answers"),
-            *all.last().expect("a pixel that answers"),
-        )
-    }
-
     /// The screen pixel of UI pixel (`x`, `y`) of the screen `rig` shows.
     fn ui_pixel(rig: &Rig, (x, y): (i32, i32)) -> Place {
         let view = rig.app.view();
@@ -3631,33 +3619,15 @@ mod tests {
         seen(rig, "Esc".into());
     }
 
-    /// Prefs ▸ AI & MCP..: Close by its last pixel.
-    fn mcp_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
-        use dpx_ui::{McpControl, McpResponse};
-        rig.pick(Action::Command("app.ai_mcp"));
-        let req = rig.app.ui.mcp_requester.clone().expect("AI & MCP");
-        seen(rig, "AI & MCP..".into());
-        let (ox, oy) = req.origin();
-        let close = McpResponse::Pick(McpControl::Close);
-        let (_, last) = pixels_where(|x, y| {
-            let mut r = req.clone();
-            r.handle(ReqEvent::Press(x, y)) == close || r.handle(ReqEvent::Release) == close
-        });
-        rig.click_at(ui_pixel(rig, (ox + last.0, oy + last.1)), FAR, Primary);
-        assert!(rig.app.ui.mcp_requester.is_none(), "Close closes it");
-        seen(rig, "Close".into());
-    }
-
     type Script = fn(&mut Rig, &mut dyn FnMut(&mut Rig, String));
 
     /// One requester of each kind, with the layer column shown: each opens in the Modern
     /// window, takes clicks on the first and last pixels of its buttons through the
     /// unchanged mapping, closes, and leaves the same state as in the Classic window.
-    const MODAL_SCRIPTS: [(&str, Script); 4] = [
+    const MODAL_SCRIPTS: [(&str, Script); 3] = [
         ("Screen Format", screen_format_script),
         ("Show Page", show_page_script),
         ("Color Mixer", color_mixer_script),
-        ("AI & MCP", mcp_script),
     ];
 
     fn modal_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
@@ -3700,10 +3670,7 @@ mod tests {
     #[test]
     fn the_chrome_is_veiled_and_takes_no_input_under_a_requester() {
         type Open = fn(&mut Rig);
-        let open: [(&str, Open); 2] = [
-            ("Color Mixer", |rig| rig.key('p')),
-            ("AI & MCP", |rig| rig.pick(Action::Command("app.ai_mcp"))),
-        ];
+        let open: [(&str, Open); 1] = [("Color Mixer", |rig| rig.key('p'))];
         for (kind, ppp) in [(ThemeKind::Dark, 1.0), (ThemeKind::Light, 2.0)] {
             let theme = Theme::of(kind);
             let mut rig = Rig::new(UiStyle::Modern, (1280.0, 800.0), ppp);
@@ -3979,41 +3946,6 @@ mod tests {
     /// of the window, over the veiled chrome, and is clicked where it is drawn.
     #[test]
     fn a_requester_is_whole_and_readable_in_a_small_window() {
-        // Prefs ▸ AI & MCP.. on PAL HiRes interlace, the smallest window, the layer column
-        // shown: the requester's screen is whole in the window, and Close answers on its
-        // last pixel (which lay under the layer column before).
-        let mut rig = Rig::new(UiStyle::Modern, (720.0, 520.0), 1.0);
-        let mode = dpx_core::DisplayMode::new(dpx_core::Video::Pal, dpx_core::Resolution::Hi, true);
-        rig.app.run(Command::SetFormat {
-            mode,
-            colors: 16,
-            width: 640,
-            height: 512,
-            retain: false,
-            screen: None,
-            chipset: None,
-        });
-        rig.key('L');
-        rig.pass(vec![]);
-        let plain = rig.app.modern_layout().expect("layout");
-        assert!(plain.layers.is_some() && plain.shown < 1.0);
-        mcp_script(&mut rig, &mut |rig, step| {
-            if step == "AI & MCP.." {
-                rig.pass(vec![]);
-                let l = rig.app.modern_layout().expect("layout");
-                assert!(
-                    l.over_chrome && l.window.encloses(&l.picture),
-                    "{:?}",
-                    l.picture
-                );
-                assert_eq!((l.shown, l.picture.w, l.picture.h), (1.0, 640.0, 512.0));
-                // The chrome did not move.
-                assert_eq!((&l.dock, &l.layers), (&plain.dock, &plain.layers));
-            }
-        });
-        rig.pass(vec![]);
-        assert_eq!(rig.app.modern_layout().expect("layout"), plain);
-
         // The Color Mixer on a LoRes picture in an 800 x 600 window with the column: two
         // physical pixels per pixel instead of one, and its cells and sliders answer.
         for (size, ppp) in [

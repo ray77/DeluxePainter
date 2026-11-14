@@ -36,6 +36,29 @@ fn dialog_state(rig: &mut Rig) -> String {
     let import = app.ui.import_requester.take();
     let generate = app.ui.generate_requester.take();
     let setup = app.ui.imagegen_setup.take();
+    let mcp = app.ui.mcp_requester.take();
+    // The server listens on any free port: the number is not compared.
+    let port = match app.mcp.status() {
+        crate::mcp::Status::Running { port, .. } => Some(port.to_string()),
+        _ => None,
+    };
+    let mcp_shown = mcp.as_ref().map(|r| {
+        let shown = format!("{:?}", r.dialog());
+        match &port {
+            Some(port) => shown.replace(port.as_str(), "PORT"),
+            None => shown,
+        }
+    });
+    let mcp_settings = format!(
+        "{:?}",
+        (
+            app.mcp.settings.enabled,
+            app.mcp.settings.allow_read,
+            app.mcp.settings.allow_edit,
+            app.mcp.settings.overwrite_without_asking,
+            port.is_some(),
+        )
+    );
     let percent = (
         app.menu_data.effects.percent,
         app.engine.document().fps(),
@@ -82,6 +105,7 @@ fn dialog_state(rig: &mut Rig) -> String {
                     app.imagegen.settings.openai.model.clone(),
                     app.imagegen.opened_url.clone(),
                 ),
+                (mcp_shown, mcp_settings),
             ),
             percent,
             (open, pending, confirmed),
@@ -106,6 +130,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.import_requester = import;
     app.ui.generate_requester = generate;
     app.ui.imagegen_setup = setup;
+    app.ui.mcp_requester = mcp;
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -2914,12 +2939,207 @@ fn the_image_generator_setup_does_the_same_in_both_skins() {
     both_at_every_scale(setup_script);
 }
 
+/// A computer without Claude for the connect flows: nothing is found, run or opened.
+struct NoClaude;
+
+impl crate::connect::System for NoClaude {
+    fn exe(&self) -> Option<std::path::PathBuf> {
+        Some("/Apps/Deluxe Painter/deluxepainter".into())
+    }
+
+    fn find_claude(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn find_mcpb(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn desktop_installed(&self) -> bool {
+        false
+    }
+
+    fn run(
+        &self,
+        _program: &std::path::Path,
+        _args: &[String],
+    ) -> Result<crate::connect::RunOutput, String> {
+        Err("no process is run in this test".into())
+    }
+
+    fn open_file(&self, _path: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Prefs ▸ AI & MCP.. (slice 4c) on a computer without Claude: MCP control on and off (the
+/// server on any free port), the three permissions and what each ghosts, Revoke access,
+/// both connect buttons and Disconnect with the questions they ask (cards of their own),
+/// Set up.. with the Image Generator setup over it, Close, Return and Esc.
+fn mcp_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::choice_requester::BUTTONS;
+    use dpx_ui::mcp_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    // Any free port: a test never takes 8765 from a running app. No approved folder is
+    // made, nothing of this machine's Claude is looked at.
+    rig.app.mcp.settings.port = 0;
+    rig.app.mcp.settings.approved_dirs.clear();
+    rig.app.mcp_prefs.system = std::sync::Arc::new(NoClaude);
+    offline_generator(rig);
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("app.ai_mcp"));
+        assert!(rig.app.ui.mcp_requester.is_some());
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Mcp));
+        }
+        seen(rig, "AI & MCP..".into());
+    };
+    let is_open = |rig: &Rig| rig.app.ui.mcp_requester.is_some();
+    let settings = |rig: &Rig| {
+        let s = &rig.app.mcp.settings;
+        (
+            s.enabled,
+            s.allow_read,
+            s.allow_edit,
+            s.overwrite_without_asking,
+        )
+    };
+    // A question the requester asks is a card of its own; either answer returns here.
+    let answer = |rig: &mut Rig, seen: Seen, what: &str| {
+        let mut asked = 0;
+        while rig.app.ui.choice_requester.is_some() {
+            if rig.app.is_modern() {
+                assert_eq!(rig.card(), Some(Card::Choice), "{what}");
+            }
+            seen(rig, format!("{what}: a question"));
+            rig.click_control(BUTTONS[1], MID);
+            asked += 1;
+            assert!(asked < 4, "{what}: the questions end");
+        }
+        rig.pass(vec![]);
+        assert!(
+            rig.app.ui.mcp_requester.is_some(),
+            "{what}: back in AI & MCP"
+        );
+        seen(rig, format!("{what}: answered ({asked})"));
+    };
+    open(rig, seen);
+    // On and off, by both radio buttons and their corners.
+    for (id, at, on) in [
+        (ctl::ON, (0.02, 0.1), true),
+        (ctl::OFF, (0.98, 0.9), false),
+        (ctl::ON, MID, true),
+        (ctl::ON, MID, true),
+    ] {
+        rig.click_control(id, at);
+        rig.pass(vec![]);
+        assert_eq!(settings(rig).0, on);
+        seen(rig, format!("MCP control {id}"));
+    }
+    // The permissions: without reading nothing else can be set.
+    let before = settings(rig);
+    for (id, at) in [
+        (ctl::OVERWRITE, MID),
+        (ctl::EDIT, (0.02, 0.1)),
+        (ctl::READ, (0.98, 0.9)),
+        (ctl::EDIT, MID),
+        (ctl::OVERWRITE, MID),
+        (ctl::READ, MID),
+        (ctl::EDIT, (0.5, 0.9)),
+    ] {
+        rig.click_control(id, at);
+        seen(rig, format!("permission {id} at {at:?}"));
+    }
+    assert_ne!(settings(rig), before, "the permissions took the clicks");
+    // Revoke access turns them all off and says so.
+    rig.click_control(ctl::REVOKE, MID);
+    rig.pass(vec![]);
+    let s = settings(rig);
+    assert_eq!((s.1, s.2, s.3), (false, false, false));
+    seen(rig, "Revoke access".into());
+    rig.click_control(ctl::READ, MID);
+    rig.click_control(ctl::EDIT, MID);
+    seen(rig, "reading and editing again".into());
+    // The connect buttons: nothing is installed here, so each says so or asks.
+    for (id, what) in [
+        (ctl::CONNECT_CODE, "Claude Code"),
+        (ctl::CONNECT_DESKTOP, "Claude Desktop"),
+        (ctl::DISCONNECT, "Disconnect"),
+    ] {
+        rig.press_and_leave(id);
+        assert!(rig.app.ui.choice_requester.is_none());
+        seen(rig, format!("{what} pressed and left"));
+        rig.click_control(id, MID);
+        rig.pass(vec![]);
+        answer(rig, seen, what);
+    }
+    // Keys and presses that do nothing.
+    rig.type_text("x");
+    rig.tap(egui::Key::Tab);
+    rig.wheel(-2.0);
+    rig.click_beside();
+    for id in [ctl::REVOKE, ctl::SET_UP, ctl::CLOSE] {
+        rig.press_and_leave(id);
+        rig.press_beside_and_enter(id);
+        assert!(is_open(rig) && rig.app.ui.imagegen_setup.is_none());
+        seen(rig, format!("button {id} pressed and left"));
+    }
+    // Set up..: the Image Generator setup over it; closing it returns here.
+    rig.click_control(ctl::SET_UP, MID);
+    assert!(
+        rig.app.ui.imagegen_setup.is_some(),
+        "Set up.. opens the setup"
+    );
+    if rig.app.is_modern() {
+        assert_eq!(rig.card(), Some(Card::Setup));
+    }
+    seen(rig, "Set up..".into());
+    rig.click_control(dpx_ui::imagegen_setup::ctl::PROVIDER + 1, MID);
+    rig.click_control(dpx_ui::imagegen_setup::ctl::OK, MID);
+    assert!(rig.app.ui.imagegen_setup.is_none() && is_open(rig));
+    seen(rig, "the setup's Ok: the generator line follows".into());
+    rig.click_control(ctl::SET_UP, (0.9, 0.9));
+    rig.tap(egui::Key::Escape);
+    assert!(rig.app.ui.imagegen_setup.is_none() && is_open(rig));
+    seen(rig, "the setup's Esc".into());
+    // Close, Return and Esc close it; the settings stay.
+    rig.click_control(ctl::CLOSE, (0.98, 0.95));
+    assert!(!is_open(rig), "Close closes it");
+    seen(rig, "Close".into());
+    open(rig, seen);
+    rig.tap(egui::Key::Enter);
+    assert!(!is_open(rig), "Return closes it");
+    seen(rig, "Return".into());
+    open(rig, seen);
+    rig.click_control(ctl::OFF, MID);
+    rig.pass(vec![]);
+    assert!(!settings(rig).0);
+    seen(rig, "Off".into());
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig), "Esc closes it");
+    seen(rig, "Esc".into());
+    rig.app.mcp_stop();
+    assert!(!rig.app.modal_open());
+}
+
+#[test]
+fn the_ai_and_mcp_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(mcp_script);
+}
+
 /// Every converted requester fits the smallest window and is drawn there, in both themes
 /// and at device scale 1 and 2 (the images go to `DPX_MODERN_SHOTS` for a look).
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 29] = [
+    let open: [(&str, Card, Open); 31] = [
+        ("ai-mcp", Card::Mcp, |rig| {
+            rig.pick(Action::Command("app.ai_mcp"))
+        }),
+        ("imagegen-setup", Card::Setup, |rig| {
+            rig.app.open_imagegen_setup();
+            rig.pass(vec![]);
+        }),
         ("generate", Card::Generate, |rig| {
             rig.pick(Action::Command("picture.generate"))
         }),
@@ -3117,10 +3337,7 @@ fn only_the_converted_requesters_are_cards() {
             .is_none()
     );
     type Open = fn(&mut Rig);
-    let others: [(&str, Open); 2] = [
-        ("Color Mixer", |rig| rig.key('p')),
-        ("AI & MCP", |rig| rig.pick(Action::Command("app.ai_mcp"))),
-    ];
+    let others: [(&str, Open); 1] = [("Color Mixer", |rig| rig.key('p'))];
     for (name, open) in others {
         let mut rig = Rig::modern();
         open(&mut rig);

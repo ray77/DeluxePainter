@@ -61,6 +61,24 @@ const CONNECT_LABEL: &str = "Connect:";
 const ACTIVITY_LABEL: &str = "Last calls:";
 const GENERATION_LABEL: &str = "Image generation:";
 
+/// The controls of the requester's description for the Modern skin
+/// ([`McpRequester::dialog`]): the ids are the places in [`McpRequester::controls`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    pub const ON: ControlId = 0;
+    pub const OFF: ControlId = 1;
+    pub const CONNECT_DESKTOP: ControlId = 2;
+    pub const CONNECT_CODE: ControlId = 3;
+    pub const DISCONNECT: ControlId = 4;
+    pub const REVOKE: ControlId = 5;
+    pub const READ: ControlId = 6;
+    pub const EDIT: ControlId = 7;
+    pub const OVERWRITE: ControlId = 8;
+    pub const SET_UP: ControlId = 9;
+    pub const CLOSE: ControlId = 10;
+}
+
 /// What the requester shows: the app's MCP state, made again every pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct McpView {
@@ -314,6 +332,111 @@ impl McpRequester {
             ReqEvent::Scroll(_) => McpResponse::Continue,
             ReqEvent::Key(ReqKey::Enter | ReqKey::Escape) => McpResponse::Pick(McpControl::Close),
             ReqEvent::Key(_) => McpResponse::Continue,
+        }
+    }
+
+    /// What the requester shows, for the Modern skin (ADR-47; `view()` is the app's state
+    /// it shows, so this description is called `dialog`): at the left MCP control, the
+    /// status, the connect buttons, what the last connect action did and the last calls; at
+    /// the right the permissions, the approved folder and the image generator.
+    pub fn dialog(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Check, Control, ControlId, Dialog, Item, Kind, Part, Push, Radio,
+            Role, Size, Tone,
+        };
+        let v = &self.view;
+        let controls = self.controls();
+        let kind = |id: ControlId| controls[usize::from(id)].0;
+        let control = |id: ControlId| Control::new(id, controls[usize::from(id)].1);
+        let radio = |id: ControlId, on: bool| {
+            Part::Radio(Radio {
+                control: control(id),
+                label: label(kind(id)).into(),
+                on,
+                enabled: true,
+            })
+        };
+        let push = |id: ControlId| {
+            let c = kind(id);
+            Part::Button(Push {
+                control: control(id),
+                label: label(c).into(),
+                on: false,
+                pressed: self.pressed(c),
+                enabled: self.enabled(c),
+            })
+        };
+        let check = |id: ControlId, on: bool| {
+            let c = kind(id);
+            Item::Row(vec![Part::Check(Check {
+                control: control(id),
+                label: label(c).into(),
+                on,
+                enabled: self.enabled(c),
+                key: None,
+            })])
+        };
+        let text = |text: String, tone| Item::Text {
+            text,
+            tone,
+            bullet: false,
+        };
+        let mut left = vec![
+            Item::Line {
+                label: CONTROL_LABEL.trim_end_matches(':').into(),
+                key: None,
+                parts: vec![radio(ctl::ON, v.on), radio(ctl::OFF, !v.on)],
+            },
+            text(format!("Status: {}", v.status), Tone::Normal),
+            Item::Line {
+                label: CONNECT_LABEL.trim_end_matches(':').into(),
+                key: None,
+                parts: vec![push(ctl::CONNECT_DESKTOP), push(ctl::CONNECT_CODE)],
+            },
+            Item::Line {
+                label: String::new(),
+                key: None,
+                parts: vec![push(ctl::DISCONNECT), push(ctl::REVOKE)],
+            },
+        ];
+        if let Some(m) = &v.message {
+            left.push(text(m.clone(), Tone::Alert));
+        }
+        let shown = self.shown_activity();
+        left.push(Item::Heading(
+            ACTIVITY_LABEL.trim_end_matches(':').to_string(),
+        ));
+        if shown.is_empty() {
+            left.push(text("None yet".into(), Tone::Dim));
+        } else {
+            // One line each, the newest last; a long one is cut, as in Classic.
+            left.push(Item::Facts {
+                rows: shown.iter().map(|l| (String::new(), l.clone())).collect(),
+                message: None,
+            });
+        }
+        let right = vec![
+            Item::Heading("Permissions".into()),
+            check(ctl::READ, v.read),
+            check(ctl::EDIT, v.edit),
+            check(ctl::OVERWRITE, v.overwrite),
+            Item::Heading("Folder".into()),
+            text(v.folder.clone(), Tone::Normal),
+            Item::Heading(GENERATION_LABEL.trim_end_matches(':').into()),
+            text(v.generation.clone(), Tone::Normal),
+            Item::Row(vec![push(ctl::SET_UP)]),
+        ];
+        Dialog {
+            title: TITLE.into(),
+            kind: Kind::Plain,
+            size: Size::Large,
+            columns: vec![left, right],
+            buttons: vec![ViewButton::new(
+                control(ctl::CLOSE),
+                label(McpControl::Close),
+                Role::Default,
+                self.pressed(McpControl::Close),
+            )],
         }
     }
 
@@ -722,5 +845,145 @@ mod tests {
             assert!(text_w(state) + GAP <= room, "{state}");
         }
         assert!(text_w(GENERATION_LABEL) + GAP <= room);
+    }
+    #[test]
+    fn the_dialog_names_every_control_where_the_requester_takes_it() {
+        use crate::dialog::{Item, Part, Role, Tone};
+        let mut r = McpRequester::new(view(), (320, 256));
+        let d = r.dialog();
+        assert_eq!(d.title, "AI & MCP");
+        // The ids are the places in `controls()`, with the same rectangles; a press in the
+        // middle of each is that control.
+        let controls = r.controls();
+        assert_eq!(d.controls().len(), controls.len());
+        for c in d.controls() {
+            let (kind, rect) = controls[usize::from(c.id)];
+            assert_eq!(c.area, rect, "control {}", c.id);
+            assert_eq!(kind, ALL[usize::from(c.id)]);
+            let mut probe = r.clone();
+            let (x, y) = (rect.x + rect.w / 2, rect.y + rect.h / 2);
+            let first = probe.handle(ReqEvent::Press(x, y));
+            let second = probe.handle(ReqEvent::Release);
+            let answer = if first == McpResponse::Continue {
+                second
+            } else {
+                first
+            };
+            assert_eq!(answer, McpResponse::Pick(kind));
+        }
+        assert_eq!(d.buttons.len(), 1);
+        assert_eq!(
+            (d.buttons[0].label.as_str(), d.buttons[0].role),
+            ("Close", Role::Default)
+        );
+        // Left: control, status, the connect buttons, the last calls (the newest that fit).
+        let texts = |d: &crate::dialog::Dialog, col: usize, tone: Tone| -> Vec<String> {
+            d.columns[col]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Text { text, tone: t, .. } if *t == tone => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(matches!(&d.columns[0][0],
+            Item::Line { label, parts, .. } if label == "MCP control"
+                && matches!(&parts[..], [Part::Radio(on), Part::Radio(off)] if on.on && !off.on)));
+        assert_eq!(
+            texts(&d, 0, Tone::Normal),
+            ["Status: Ready on 127.0.0.1:8765"]
+        );
+        let pushes: Vec<(String, bool)> = d
+            .columns
+            .concat()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line { parts, .. } | Item::Row(parts) => Some(parts.clone()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|p| match p {
+                Part::Button(b) => Some((b.label, b.enabled)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pushes.iter().map(|p| p.0.as_str()).collect::<Vec<_>>(),
+            [
+                "Claude Desktop",
+                "Claude Code",
+                "Disconnect",
+                "Revoke access",
+                "Set up.."
+            ]
+        );
+        assert!(pushes.iter().all(|p| p.1));
+        let calls = |d: &crate::dialog::Dialog| -> Vec<String> {
+            d.columns[0]
+                .iter()
+                .find_map(|i| match i {
+                    Item::Facts { rows, .. } => Some(rows.iter().map(|r| r.1.clone()).collect()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(calls(&d), r.shown_activity());
+        assert_eq!(
+            calls(&d).last().map(String::as_str),
+            Some("7s draw_pixel 7,7")
+        );
+        // Right: the permissions, the folder, the generator.
+        let checks = |d: &crate::dialog::Dialog| -> Vec<(String, bool, bool)> {
+            d.columns[1]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Row(parts) => match &parts[0] {
+                        Part::Check(c) => Some((c.label.clone(), c.on, c.enabled)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            checks(&d),
+            [
+                ("Read document info".to_string(), true, true),
+                ("Edit pictures and palettes".to_string(), true, true),
+                ("Overwrite files without asking".to_string(), false, true)
+            ]
+        );
+        assert_eq!(
+            texts(&d, 1, Tone::Normal),
+            ["~/Pictures/DeluxePainter", "OpenAI, key set"]
+        );
+        // Off, nothing readable, a connect action running, a message, no calls.
+        r.set_view(McpView {
+            on: false,
+            status: "Off".into(),
+            read: false,
+            edit: true,
+            busy: true,
+            message: Some("Asking Claude Code..".into()),
+            activity: Vec::new(),
+            ..view()
+        });
+        let d = r.dialog();
+        assert!(matches!(&d.columns[0][0],
+            Item::Line { parts, .. }
+                if matches!(&parts[..], [Part::Radio(on), Part::Radio(off)] if !on.on && off.on)));
+        assert_eq!(texts(&d, 0, Tone::Alert), ["Asking Claude Code.."]);
+        assert_eq!(texts(&d, 0, Tone::Dim), ["None yet"]);
+        assert!(calls(&d).is_empty());
+        assert_eq!(
+            checks(&d).iter().map(|c| (c.1, c.2)).collect::<Vec<_>>(),
+            [(false, true), (true, false), (false, false)]
+        );
+        // A held button is shown held while the pointer is on it.
+        let close = rect_of(&r, McpControl::Close);
+        r.handle(ReqEvent::Press(close.x + 2, close.y + 2));
+        assert!(r.dialog().buttons[0].pressed);
+        r.handle(ReqEvent::Drag(0, 0));
+        assert!(!r.dialog().buttons[0].pressed);
     }
 }
