@@ -352,6 +352,8 @@ impl ToolRequester {
                 | ToolRequester::Spacing(_)
                 | ToolRequester::Fill(_)
                 | ToolRequester::Translucency(_)
+                | ToolRequester::AnimBrush(_)
+                | ToolRequester::Perspective(_)
         )
     }
 
@@ -360,6 +362,8 @@ impl ToolRequester {
     pub fn view(&self, _palette: &Palette) -> Option<crate::dialog::Dialog> {
         match self {
             _ if !self.has_view() => None,
+            ToolRequester::AnimBrush(r) => Some(r.view()),
+            ToolRequester::Perspective(r) => Some(r.view()),
             _ => self.form().map(Form::view),
         }
     }

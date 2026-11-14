@@ -1538,10 +1538,11 @@ mod tests {
     use dpx_ui::dialog::{ListRow, ScrollBar};
     use dpx_ui::form_ctl;
     use dpx_ui::{
-        AnimRequester, ChoiceRequester, FillRequester, FillSettings, GridRequester, GridSettings,
-        NoteRequester, PageSizeRequester, PlayRangeRequester, Preset, ReqEvent, ReqKey,
-        ScreenFormatRequester, SpacingMode, SpacingRequester, SpacingSettings, SymmetryRequester,
-        SymmetrySettings, ToolRequester, TranslucencyRequester,
+        AnimBrushRequester, AnimRequester, ChoiceRequester, FillRequester, FillSettings,
+        GridRequester, GridSettings, NoteRequester, PageSizeRequester, PerspectiveRequester,
+        PerspectiveSettings, PlayRangeRequester, Preset, ReqEvent, ReqKey, ScreenFormatRequester,
+        SpacingMode, SpacingRequester, SpacingSettings, SymmetryRequester, SymmetrySettings,
+        ToolRequester, TranslucencyRequester,
     };
 
     const WINDOWS: [(f32, f32); 3] = [(720.0, 520.0), (1280.0, 800.0), (1001.0, 640.0)];
@@ -1625,6 +1626,34 @@ mod tests {
         out.push(("delete frames", AnimRequester::delete_frames(999, 1).view()));
         out.push(("go to frame", AnimRequester::goto(999, 999).view()));
         out.push(("rate", AnimRequester::rate(30).view()));
+        // AnimBrush and Perspective: forms with their own buttons.
+        let brush = |r: AnimBrushRequester| tool(&ToolRequester::AnimBrush(r));
+        out.push((
+            "pick up animbrush",
+            brush(AnimBrushRequester::pick_up(2, 999)),
+        ));
+        let mut make = AnimBrushRequester::make(200, 134);
+        for key in [ReqKey::Backspace, ReqKey::Backspace, ReqKey::Enter] {
+            make.handle(ReqEvent::Key(key));
+        }
+        assert!(format!("{:?}", make).contains("must be 2 to 134"));
+        out.push(("make animbrush, refused", brush(make)));
+        let settings =
+            AnimBrushRequester::settings(999, 999, 999, dpx_core::CelDirection::Backward);
+        out.push(("animbrush settings", brush(settings)));
+        let wide = PerspectiveSettings {
+            grid: [4096, 4096, 4096],
+            angle_step: 360,
+            brush_axes: true,
+            show_position: true,
+        };
+        let perspective = |brush| {
+            tool(&ToolRequester::Perspective(PerspectiveRequester::new(
+                wide, brush,
+            )))
+        };
+        out.push(("perspective", perspective(Some((320, 200)))));
+        out.push(("perspective, no brush", perspective(None)));
         let mut range = PlayRangeRequester::new(999, Some((500, 999)));
         out.push(("play range", range.view()));
         for key in [ReqKey::Backspace, ReqKey::Backspace, ReqKey::Enter] {

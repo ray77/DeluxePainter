@@ -48,6 +48,10 @@ const WIDTH: i32 = 196;
 const HEIGHT: i32 = 134;
 const FROM_BRUSH: &str = "From Brush";
 
+/// Id of the From Brush button in [`PerspectiveRequester::view`]. The other controls are the
+/// form's ([`crate::form::ctl`]).
+pub const FROM_BRUSH_ID: crate::dialog::ControlId = crate::form::ctl::EXTRA;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PerspectiveRequester {
     pub(crate) form: Form,
@@ -107,6 +111,21 @@ impl PerspectiveRequester {
 
     pub fn size(&self) -> (i32, i32) {
         self.form.size()
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): its form with the From Brush
+    /// button under the Grid fields.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{Control, Part, Push};
+        let r = Self::from_brush_rect();
+        let button = Part::Button(Push {
+            control: Control::new(FROM_BRUSH_ID, r),
+            label: FROM_BRUSH.into(),
+            on: false,
+            pressed: self.held && self.over,
+            enabled: self.brush.is_some(),
+        });
+        self.form.view_with(vec![((r.x, r.y), button)], None)
     }
 
     pub fn settings(&self) -> PerspectiveSettings {
@@ -242,6 +261,75 @@ mod tests {
         key(&mut r, ReqKey::Char('0'));
         assert_eq!(key(&mut r, ReqKey::Enter), FormResponse::Continue);
         assert_eq!(key(&mut r, ReqKey::Escape), FormResponse::Cancel);
+    }
+
+    #[test]
+    fn the_view_has_the_grid_line_the_button_and_two_choices() {
+        use crate::dialog::{Item, Part, Tone};
+        use crate::form::ctl;
+        let s = PerspectiveSettings::defaults((24, 10));
+        let mut r = PerspectiveRequester::new(s, Some((7, 5)));
+        let v = r.view();
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [
+                ctl::FIELD,
+                ctl::FIELD + 1,
+                ctl::FIELD + 2,
+                FROM_BRUSH_ID,
+                ctl::FIELD + 3,
+                ctl::RADIO,
+                ctl::RADIO + 1,
+                ctl::RADIO + 2,
+                ctl::RADIO + 3,
+                ctl::CANCEL,
+                ctl::OK
+            ]
+        );
+        let items = &v.columns[0];
+        // Grid: X [..] Y [..] Z [..]; the captions stand before their fields.
+        let Item::Line { label, parts, .. } = &items[0] else {
+            panic!("the Grid line: {:?}", items[0]);
+        };
+        assert_eq!(label, "Grid");
+        let kinds: Vec<String> = parts
+            .iter()
+            .map(|p| match p {
+                Part::Text(t, Tone::Dim) => t.clone(),
+                Part::Field(f) => format!("[{}]", f.text),
+                p => panic!("{p:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["X", "[24]", "Y", "[10]", "Z", "[10]"]);
+        assert!(matches!(
+            &items[1],
+            Item::Line { label, parts, .. }
+                if label.is_empty() && matches!(&parts[..], [Part::Button(b)] if b.enabled && !b.pressed)
+        ));
+        assert_eq!(items[2], Item::Rule);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Grid", "", "Angle Step", "Type", "Display"]);
+        // The button's centre is its press; without a brush it is ghosted.
+        let a = v.control(FROM_BRUSH_ID).unwrap().area;
+        r.handle(ReqEvent::Press(a.x + a.w / 2, a.y + a.h / 2));
+        assert!(matches!(
+            &r.view().columns[0][1],
+            Item::Line { parts, .. } if matches!(&parts[..], [Part::Button(b)] if b.pressed)
+        ));
+        r.handle(ReqEvent::Release);
+        assert_eq!(r.settings().grid, [7, 5, 10]);
+        let none = PerspectiveRequester::new(s, None).view();
+        assert!(matches!(
+            &none.columns[0][1],
+            Item::Line { parts, .. } if matches!(&parts[..], [Part::Button(b)] if !b.enabled)
+        ));
     }
 
     #[test]

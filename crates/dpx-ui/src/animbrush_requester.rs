@@ -55,6 +55,11 @@ fn int(n: usize) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
+/// Ids of the three Direction buttons in [`AnimBrushRequester::view`]: `DIRECTION + 0..3`
+/// (forward, backward, ping-pong). The other controls are the form's
+/// ([`crate::form::ctl`]).
+pub const DIRECTION: crate::dialog::ControlId = crate::form::ctl::EXTRA;
+
 const DIRECTIONS: [CelDirection; 3] = [
     CelDirection::Forward,
     CelDirection::Backward,
@@ -168,6 +173,30 @@ impl AnimBrushRequester {
 
     pub fn size(&self) -> (i32, i32) {
         self.form.size()
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): its form, and for the Settings
+    /// the three Direction buttons in the line of their label.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{Control, Glyph, IconButton, Part};
+        let mut extra = Vec::new();
+        if self.kind == AnimBrushReq::Settings {
+            let glyphs = [Glyph::Forward, Glyph::Backward, Glyph::PingPong];
+            for (i, (d, glyph)) in DIRECTIONS.into_iter().zip(glyphs).enumerate() {
+                let r = Self::direction_rect(d);
+                extra.push((
+                    (r.x, r.y),
+                    Part::Icon(IconButton {
+                        control: Control::new(DIRECTION + i as crate::dialog::ControlId, r),
+                        glyph,
+                        on: d == self.direction,
+                        pressed: self.held == Some(d) && self.over,
+                        enabled: true,
+                    }),
+                ));
+            }
+        }
+        self.form.view_with(extra, None)
     }
 
     /// The Direction button of `d` (Settings only), in requester coordinates.
@@ -347,6 +376,70 @@ mod tests {
         r.handle(ReqEvent::Drag(1, 1));
         r.handle(ReqEvent::Release);
         assert_eq!(r.direction(), CelDirection::PingPong);
+    }
+
+    #[test]
+    fn the_view_has_the_form_and_the_direction_buttons() {
+        use crate::dialog::{Glyph, Item, Part};
+        use crate::form::ctl;
+        let v = AnimBrushRequester::pick_up(20, 20).view();
+        assert_eq!(v.title, "Pick up AnimBrush");
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(ids, [ctl::FIELD, ctl::CANCEL, ctl::OK]);
+        let mut r = AnimBrushRequester::settings(20, 20, 3, CelDirection::Forward);
+        let v = r.view();
+        let ids: Vec<u16> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [
+                ctl::FIELD,
+                ctl::FIELD + 1,
+                DIRECTION,
+                DIRECTION + 1,
+                DIRECTION + 2,
+                ctl::CANCEL,
+                ctl::OK
+            ]
+        );
+        assert!(
+            matches!(&v.columns[0][0], Item::Text { text, .. } if text == "Number of cels: 20")
+        );
+        let buttons = |v: &crate::dialog::Dialog| -> Vec<(Glyph, bool, bool)> {
+            v.columns[0]
+                .iter()
+                .find_map(|i| match i {
+                    Item::Line { label, parts, .. } if label == "Direction" => Some(
+                        parts
+                            .iter()
+                            .map(|p| match p {
+                                Part::Icon(b) => (b.glyph, b.on, b.pressed),
+                                p => panic!("an icon button: {p:?}"),
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .expect("the Direction line")
+        };
+        assert_eq!(
+            buttons(&v),
+            [
+                (Glyph::Forward, true, false),
+                (Glyph::Backward, false, false),
+                (Glyph::PingPong, false, false)
+            ]
+        );
+        // The centre of a button's rectangle is its press: held, then chosen.
+        let a = v.control(DIRECTION + 2).unwrap().area;
+        assert_eq!(
+            a,
+            AnimBrushRequester::direction_rect(CelDirection::PingPong)
+        );
+        r.handle(ReqEvent::Press(a.x + a.w / 2, a.y + a.h / 2));
+        assert_eq!(buttons(&r.view())[2], (Glyph::PingPong, false, true));
+        r.handle(ReqEvent::Release);
+        assert_eq!(buttons(&r.view())[2], (Glyph::PingPong, true, false));
+        assert!(!buttons(&r.view())[0].1);
     }
 
     #[test]

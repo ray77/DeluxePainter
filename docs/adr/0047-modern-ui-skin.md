@@ -334,7 +334,7 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 | Screen Format | `requester.rs` | **modern** (a card, lead decision 27) | |
 | Grid, Symmetry, Spacing, Fill, Translucency | `tool_requesters.rs` on `form.rs` | **modern** (slice 4b) | |
 | Stencil, Arrange | `stencil_requester.rs`, `arrange_requester.rs` (own code, no form) | classic look | a swatch grid part; Stencil toggles by click and drag-paint, Arrange drags a swatch to another place |
-| AnimBrush, Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | classic look | the form family plus icon buttons (AnimBrush direction) and one extra button (Perspective) |
+| AnimBrush (Pick up, Make, Settings), Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | **modern** (slice 4b) | |
 | Anim requesters: Set Frame Count, Add, Copy and Delete Frames, Go to Frame, Set Rate | `anim_requester.rs` (forms) | **modern** (slice 4b) | |
 | Set Range | `anim_control.rs` (`PlayRangeRequester`, a form) | **modern** (slice 4b) | |
 | File requester (Load, Save, Export, brushes, anims) | `file_requester.rs` | classic look | the list part with scroll bar and the fields exist; needs Drawer / Pattern / File fields in one view, Disks / Assigns / Parent, "# of Frames", long names |

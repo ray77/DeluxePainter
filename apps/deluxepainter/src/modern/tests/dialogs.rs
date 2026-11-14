@@ -38,6 +38,11 @@ fn dialog_state(rig: &mut Rig) -> String {
         app.menu_data.effects.percent,
         app.engine.document().fps(),
         app.anim_control.range,
+        app.animbrush
+            .brush
+            .as_ref()
+            .map(|b| (b.len(), b.duration, b.current(), b.direction)),
+        app.perspective.settings,
     );
     let shown = format!(
         "{:?}",
@@ -1065,6 +1070,176 @@ fn the_anim_requesters_do_the_same_in_both_skins() {
     both_at_every_scale(anim_script);
 }
 
+/// The AnimBrush requesters and Perspective (slice 4b): forms with buttons of their own.
+/// Pick up AnimBrush through the real flow (four frames, Pick up.., a frame with the Brush
+/// Selector), the Settings with their three Direction buttons, Make AnimBrush with a
+/// refused number, and the Perspective settings with From Brush.
+fn animbrush_perspective_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::animbrush_requester::DIRECTION;
+    use dpx_ui::form_ctl as ctl;
+    use dpx_ui::perspective_requester::FROM_BRUSH_ID;
+    use dpx_ui::{AnimBrushRequester, ToolRequester};
+    let erase = |rig: &mut Rig, n: usize| {
+        for _ in 0..n {
+            rig.tap(egui::Key::Backspace);
+        }
+    };
+    let open = |rig: &Rig| rig.app.ui.tool_requester.is_some();
+    let card = |rig: &mut Rig, seen: Seen, name: &str| {
+        assert!(rig.app.ui.tool_requester.is_some(), "{name} is open");
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Tool), "{name}");
+        }
+        seen(rig, format!("{name}.."));
+    };
+    // Four frames with something on them.
+    rig.click(Place::Page(20, 20), Primary);
+    rig.pick(Action::Command("anim.set_frame_count"));
+    erase(rig, 1);
+    rig.type_text("4");
+    rig.tap(egui::Key::Enter);
+    seen(rig, "four frames".into());
+    // Perspective without a brush: From Brush is ghosted and does nothing.
+    rig.app.open_perspective_requester();
+    rig.pass(vec![]);
+    card(rig, seen, "Perspective");
+    let without = rig.dialog();
+    assert!(without.control(FROM_BRUSH_ID).is_some());
+    rig.tap(egui::Key::Escape);
+    assert!(!open(rig));
+    seen(rig, "Esc".into());
+    // Pick up AnimBrush: three cels.
+    rig.pick(Action::Command("animbrush.pick_up"));
+    seen(rig, "Pick up.. is armed".into());
+    rig.drag(
+        &[
+            Place::Page(60, 60),
+            Place::Page(75, 70),
+            Place::Page(90, 80),
+        ],
+        Primary,
+    );
+    assert!(matches!(
+        rig.app.ui.tool_requester,
+        Some(ToolRequester::AnimBrush(_))
+    ));
+    card(rig, seen, "Pick up AnimBrush");
+    erase(rig, 1);
+    rig.type_text("9");
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(open(rig), "nine cels of four frames are refused");
+    seen(rig, "nine cels".into());
+    rig.press_and_leave(ctl::OK);
+    rig.press_and_leave(ctl::CANCEL);
+    rig.click_beside();
+    rig.click_control(ctl::FIELD, (0.5, 0.5));
+    erase(rig, 1);
+    rig.type_text("3");
+    seen(rig, "three cels".into());
+    rig.tap(egui::Key::Enter);
+    assert!(!open(rig), "Return picks it up");
+    assert!(rig.app.animbrush.brush.is_some(), "an AnimBrush");
+    seen(rig, "the AnimBrush is picked up".into());
+    // AnimBrush Settings: the fields and the three Direction buttons.
+    let settings = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("animbrush.settings"));
+        card(rig, seen, "AnimBrush Settings");
+    };
+    let direction = |rig: &Rig| rig.app.animbrush.brush.as_ref().expect("brush").direction;
+    settings(rig, seen);
+    for button in [1, 2, 0, 2] {
+        rig.click_control(DIRECTION + button, (0.5, 0.5));
+        seen(rig, format!("direction button {button}"));
+    }
+    rig.click_control(DIRECTION, (0.04, 0.1));
+    seen(rig, "forward by its first pixel".into());
+    rig.click_control(DIRECTION + 1, (0.96, 0.9));
+    seen(rig, "backward by its last pixel".into());
+    rig.press_and_leave(DIRECTION + 2);
+    seen(rig, "ping-pong pressed and left".into());
+    let held = rig.control_point(DIRECTION + 2, (0.5, 0.5));
+    rig.pass(vec![
+        egui::Event::PointerMoved(held),
+        pointer_button(held, Primary, true),
+    ]);
+    seen(rig, "ping-pong held".into());
+    rig.pass(vec![pointer_button(held, Primary, false)]);
+    seen(rig, "ping-pong let go".into());
+    erase(rig, 2);
+    rig.type_text("7");
+    rig.tap(egui::Key::Tab);
+    erase(rig, 1);
+    rig.type_text("5");
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "cel 5 of 3 is refused");
+    seen(rig, "duration 7, cel 5".into());
+    erase(rig, 1);
+    rig.type_text("2");
+    rig.click_control(ctl::OK, (0.5, 0.5));
+    assert!(!open(rig));
+    let brush = rig.app.animbrush.brush.as_ref().expect("brush");
+    assert_eq!((brush.duration, brush.current() + 1), (7, 2));
+    assert_eq!(direction(rig), dpx_core::CelDirection::PingPong);
+    seen(rig, "the settings are kept".into());
+    settings(rig, seen);
+    rig.click_control(DIRECTION, (0.5, 0.5));
+    rig.click_control(ctl::CANCEL, (0.5, 0.5));
+    assert!(!open(rig));
+    assert_eq!(direction(rig), dpx_core::CelDirection::PingPong, "Cancel");
+    seen(rig, "Cancel keeps the direction".into());
+    // Make AnimBrush (set as Brush ▸ Spare ▸ Metamorph.. sets it): a refused number, Esc.
+    rig.app.ui.tool_requester = Some(ToolRequester::AnimBrush(AnimBrushRequester::make(8, 20)));
+    rig.app.dirty = true;
+    rig.pass(vec![]);
+    card(rig, seen, "Make AnimBrush");
+    erase(rig, 1);
+    rig.type_text("21");
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "21 cels are refused");
+    seen(rig, "21 cels".into());
+    rig.tap(egui::Key::ArrowDown);
+    seen(rig, "one step down".into());
+    rig.tap(egui::Key::Escape);
+    assert!(!open(rig));
+    seen(rig, "Esc".into());
+    // Perspective with the brush: every field, both choices, From Brush.
+    rig.app.open_perspective_requester();
+    rig.pass(vec![]);
+    card(rig, seen, "Perspective");
+    for field in 0..4 {
+        rig.click_control(ctl::FIELD + field, (0.5, 0.5));
+        erase(rig, 4);
+        rig.type_text(["99", "88", "77", "45"][usize::from(field)]);
+        seen(rig, format!("field {field}"));
+    }
+    for radio in [1, 3, 0, 2, 1, 3] {
+        rig.click_control(ctl::RADIO + radio, (0.5, 0.5));
+        seen(rig, format!("radio button {radio}"));
+    }
+    rig.press_and_leave(FROM_BRUSH_ID);
+    seen(rig, "From Brush pressed and left".into());
+    rig.click_control(FROM_BRUSH_ID, (0.04, 0.1));
+    seen(rig, "From Brush by its first pixel".into());
+    rig.click_control(ctl::FIELD + 2, (0.5, 0.5));
+    erase(rig, 4);
+    rig.tap(egui::Key::Enter);
+    assert!(open(rig), "Grid Z is missing");
+    seen(rig, "Return without Grid Z".into());
+    rig.type_text("12");
+    rig.click_control(ctl::OK, (0.97, 0.94));
+    assert!(!open(rig));
+    let s = rig.app.perspective.settings;
+    assert_eq!((s.grid[2], s.angle_step), (12, 45));
+    assert!(s.brush_axes && s.show_position);
+    assert_ne!((s.grid[0], s.grid[1]), (99, 88), "From Brush set X and Y");
+    seen(rig, "the settings are kept".into());
+}
+
+#[test]
+fn the_animbrush_and_perspective_requesters_do_the_same_in_both_skins() {
+    both_at_every_scale(animbrush_perspective_script);
+}
+
 /// Several requesters open at once: the pointer and the keys belong to the one `pass()`
 /// asks first, and that is the one the Modern skin shows as its card.
 fn stack_script(rig: &mut Rig, seen: Seen) {
@@ -1333,7 +1508,23 @@ fn the_card_veils_the_window_and_follows_the_pointer() {
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 17] = [
+    let open: [(&str, Card, Open); 20] = [
+        ("perspective", Card::Tool, |rig| {
+            rig.app.open_perspective_requester();
+            rig.pass(vec![]);
+        }),
+        ("animbrush-settings", Card::Tool, |rig| {
+            rig.app.ui.tool_requester = Some(dpx_ui::ToolRequester::AnimBrush(
+                dpx_ui::AnimBrushRequester::settings(20, 20, 3, dpx_core::CelDirection::Forward),
+            ));
+            rig.pass(vec![]);
+        }),
+        ("animbrush-pick", Card::Tool, |rig| {
+            rig.app.ui.tool_requester = Some(dpx_ui::ToolRequester::AnimBrush(
+                dpx_ui::AnimBrushRequester::pick_up(4, 20),
+            ));
+            rig.pass(vec![]);
+        }),
         ("anim-count", Card::Anim, |rig| {
             rig.pick(Action::Command("anim.set_frame_count"))
         }),
