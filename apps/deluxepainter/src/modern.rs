@@ -1552,6 +1552,10 @@ mod tests {
                 r.origin(w, h)
             } else if let Some(r) = &app.ui.import_requester {
                 r.origin()
+            } else if let Some(r) = &app.ui.imagegen_setup {
+                r.origin()
+            } else if let Some(r) = &app.ui.generate_requester {
+                r.origin()
             } else if let Some(r) = &app.ui.tool_requester {
                 r.origin(w, h)
             } else if let Some(r) = &app.ui.anim_requester {
@@ -3627,22 +3631,6 @@ mod tests {
         seen(rig, "Esc".into());
     }
 
-    /// Picture ▸ Generate..: Cancel by its first pixel.
-    fn generate_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
-        use dpx_ui::GenerateResponse as R;
-        rig.pick(Action::Command("picture.generate"));
-        let req = rig.app.ui.generate_requester.clone().expect("Generate");
-        seen(rig, "Generate..".into());
-        let (ox, oy) = req.origin();
-        let (first, _) = pixels_where(|x, y| {
-            let mut r = req.clone();
-            r.handle(ReqEvent::Press(x, y)) == R::Cancel || r.handle(ReqEvent::Release) == R::Cancel
-        });
-        rig.click_at(ui_pixel(rig, (ox + first.0, oy + first.1)), NEAR, Primary);
-        assert!(rig.app.ui.generate_requester.is_none(), "Cancel closes it");
-        seen(rig, "Cancel".into());
-    }
-
     /// Prefs ▸ AI & MCP..: Close by its last pixel.
     fn mcp_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
         use dpx_ui::{McpControl, McpResponse};
@@ -3665,11 +3653,10 @@ mod tests {
     /// One requester of each kind, with the layer column shown: each opens in the Modern
     /// window, takes clicks on the first and last pixels of its buttons through the
     /// unchanged mapping, closes, and leaves the same state as in the Classic window.
-    const MODAL_SCRIPTS: [(&str, Script); 5] = [
+    const MODAL_SCRIPTS: [(&str, Script); 4] = [
         ("Screen Format", screen_format_script),
         ("Show Page", show_page_script),
         ("Color Mixer", color_mixer_script),
-        ("Generate", generate_script),
         ("AI & MCP", mcp_script),
     ];
 

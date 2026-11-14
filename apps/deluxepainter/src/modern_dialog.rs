@@ -14,9 +14,9 @@
 use dpx_core::Palette;
 use dpx_ui::dialog::Dialog;
 use dpx_ui::{
-    AnimControlRequester, AnimRequester, ChoiceRequester, FileRequester, ImportRequester,
-    NoteRequester, PageSizeRequester, RangeRequester, ScreenFormatRequester, ToolRequester,
-    UiState,
+    AnimControlRequester, AnimRequester, ChoiceRequester, FileRequester, GenerateRequester,
+    ImportRequester, NoteRequester, PageSizeRequester, RangeRequester, ScreenFormatRequester,
+    ToolRequester, UiState,
 };
 use dpx_ui_modern::Theme;
 use dpx_ui_modern::dialog as kit;
@@ -48,6 +48,10 @@ pub(crate) enum Card {
     File,
     /// Import Picture (after Picture ▸ Load.. of a PNG or JPEG).
     Import,
+    /// Picture ▸ Generate..
+    Generate,
+    /// The Image Generator setup (Set up.. in Generate, and Prefs ▸ AI & MCP..).
+    Setup,
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -72,8 +76,13 @@ pub(crate) fn card(
     if ui.import_requester.is_some() {
         return Some(Card::Import);
     }
-    if ui.generate_requester.is_some() || ui.imagegen_setup.is_some() || ui.mcp_requester.is_some()
-    {
+    if ui.imagegen_setup.is_some() {
+        return Some(Card::Setup);
+    }
+    if ui.generate_requester.is_some() {
+        return Some(Card::Generate);
+    }
+    if ui.mcp_requester.is_some() {
         return None;
     }
     if screen_format {
@@ -121,16 +130,15 @@ pub(crate) fn view(
         Card::PageSize => ui.page_size_requester.as_ref().map(|r| r.view()),
         Card::File => ui.file_requester.as_ref().map(FileRequester::view),
         Card::Import => ui.import_requester.as_ref().map(ImportRequester::view),
+        Card::Generate => ui.generate_requester.as_ref().map(GenerateRequester::view),
+        Card::Setup => ui.imagegen_setup.as_ref().map(|r| r.view()),
     }
 }
 
 /// A requester of the shared interface state that is still shown in the Classic look is
 /// open (the picture quad hosts it).
 pub(crate) fn classic_look_open(ui: &UiState) -> bool {
-    ui.palette_requester.is_some()
-        || ui.generate_requester.is_some()
-        || ui.imagegen_setup.is_some()
-        || ui.mcp_requester.is_some()
+    ui.palette_requester.is_some() || ui.mcp_requester.is_some()
 }
 
 /// `ui` without the requesters the Modern skin draws itself: what the picture quad is
@@ -150,6 +158,8 @@ pub(crate) struct Cards {
     anim_control: Option<AnimControlRequester>,
     file: Option<FileRequester>,
     import: Option<ImportRequester>,
+    generate: Option<GenerateRequester>,
+    setup: Option<dpx_ui::ImageGenSetupRequester>,
 }
 
 impl Cards {
@@ -165,6 +175,8 @@ impl Cards {
             anim_control: ui.anim_control.take(),
             file: ui.file_requester.take(),
             import: ui.import_requester.take(),
+            generate: ui.generate_requester.take(),
+            setup: ui.imagegen_setup.take(),
         }
     }
 
@@ -179,6 +191,8 @@ impl Cards {
         ui.anim_control = self.anim_control;
         ui.file_requester = self.file;
         ui.import_requester = self.import;
+        ui.generate_requester = self.generate;
+        ui.imagegen_setup = self.setup;
     }
 }
 

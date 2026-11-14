@@ -1073,6 +1073,9 @@ impl Draw<'_> {
                 Part::Icon(b) => self.icon(b, rect),
                 Part::Text(t, tone) => {
                     let ink = self.ink(*tone);
+                    // A text that would leave the line ends in an ellipsis.
+                    let t = &font::fit(t, (x + w - rect.x).max(0.0), SIZE, Weight::Regular);
+                    let rect = Rect::new(rect.x, rect.y, rect.w.min(x + w - rect.x), rect.h);
                     self.text(
                         rect.x,
                         mid,
@@ -1953,8 +1956,136 @@ mod tests {
         out.push(("screen format, chipset ghosted", hires.view()));
         files(&mut out);
         imports(&mut out);
+        generators(&mut out);
         out
     }
+
+    fn generate_requester(prompt: &str, screen: (i32, i32)) -> dpx_ui::GenerateRequester {
+        dpx_ui::GenerateRequester::new(
+            dpx_ui::GenerateOptions::default(),
+            prompt,
+            32,
+            screen,
+            dpx_ui::ProviderInfo {
+                ready: true,
+                summary: "OpenAI Images: billed per picture".into(),
+                // The app's longest note.
+                note: "Your description goes over the internet to OpenAI. Every picture is \
+                       billed to your OpenAI account, also a cancelled one. No free tier; \
+                       the price depends on model, quality and size (see OpenAI's pricing \
+                       page). Low quality is the cheapest. Model: gpt-image-2.6-flare."
+                    .into(),
+            },
+        )
+    }
+
+    fn setup_requester(provider: dpx_ui::SetupProvider) -> dpx_ui::ImageGenSetupRequester {
+        dpx_ui::ImageGenSetupRequester::new(
+            provider,
+            "gpt-image-2.6-flare",
+            dpx_ui::SetupInfo {
+                key_status: "API key saved in the system keychain".into(),
+                has_key: true,
+                removable: true,
+                model_hint: "Default gpt-image-2.6-flare".into(),
+                note: "OpenAI bills each picture to your API account, also a cancelled one; \
+                       no free models. Default model checked 2026-11-12. The key goes to \
+                       the system keychain, never to a file."
+                    .into(),
+            },
+            (320, 256),
+        )
+    }
+
+    /// Generate Picture and the Image Generator setup (slice 4c) in the states that change
+    /// what they show.
+    fn generators(out: &mut Vec<(&'static str, Dialog)>) {
+        use dpx_ui::GenPhase;
+        let ask = generate_requester(
+            "a castle on a hill at sunset, seen from the lake",
+            (320, 256),
+        );
+        out.push(("generate", ask.view()));
+        let mut more = ask.clone();
+        more.set_more(true);
+        out.push(("generate, more", more.view()));
+        let mut working = more.clone();
+        working.set_phase(GenPhase::Working { seconds: 1234 });
+        out.push(("generate, working", working.view()));
+        for (name, more, screen) in [
+            ("generate, result", false, (320, 256)),
+            ("generate, more, result", true, (320, 256)),
+            ("generate, result on the smallest screen", true, (320, 200)),
+            ("generate, result on a large screen", false, (736, 566)),
+        ] {
+            let mut done = generate_requester("a castle", screen);
+            done.set_more(more);
+            done.set_phase(GenPhase::Result);
+            let (w, h) = done.thumb_size();
+            let fill = dpx_core::Rgba8::new(40, 160, 90, 255);
+            done.set_thumbnail(Some(dpx_core::RgbaImage::new(w, h, fill)));
+            done.set_message(Some(
+                "Apply makes it the spare page (320x240, 32 colours).".into(),
+            ));
+            out.push((name, done.view()));
+            if more {
+                done.set_error(Some(
+                    "The generator did not answer in time. The picture shown is the one \
+                     from before."
+                        .into(),
+                ));
+                out.push(("generate, a result and an error", done.view()));
+            }
+        }
+        // No generator; a problem that keeps Generate ghosted; an empty description.
+        let mut none = dpx_ui::GenerateRequester::new(
+            dpx_ui::GenerateOptions::default(),
+            "",
+            32,
+            (320, 256),
+            dpx_ui::ProviderInfo {
+                ready: false,
+                summary: "No image generator is set up.".into(),
+                note: "No image generator is set up. Set up.. chooses a generator and its \
+                       API key."
+                    .into(),
+            },
+        );
+        out.push(("generate, no generator", none.view()));
+        none.set_error(Some("No image generator is set up.".into()));
+        none.set_more(true);
+        out.push(("generate, more, an error", none.view()));
+        let mut layer = more.clone();
+        layer.set_options(dpx_ui::GenerateOptions {
+            target: dpx_ui::GenTarget::NewLayer,
+            ..dpx_ui::GenerateOptions::default()
+        });
+        layer.set_document(
+            Target::new(dpx_core::Chipset::Aga, dpx_core::DisplayMode::PAL_LORES),
+            (1024, 1024),
+        );
+        layer.set_doc_layers(dpx_core::layer::MAX_LAYERS);
+        out.push(("generate, a new layer that has no room", layer.view()));
+        // The setup.
+        out.push((
+            "setup, none",
+            setup_requester(dpx_ui::SetupProvider::None).view(),
+        ));
+        let mut openai = setup_requester(dpx_ui::SetupProvider::OpenAi);
+        out.push(("setup, openai", openai.view()));
+        for k in dpx_ui::paste_keys(SECRET) {
+            openai.handle(ReqEvent::Key(k));
+        }
+        out.push(("setup, a key typed", openai.view()));
+        openai.set_test(Some(
+            "The key works: OpenAI lists the model gpt-image-2.6-flare for this account.".into(),
+        ));
+        openai.handle(ReqEvent::Key(ReqKey::Tab));
+        out.push(("setup, tested, the model has the keys", openai.view()));
+    }
+
+    /// A key as a test types it into the setup; it must show nowhere.
+    const SECRET: &str = "sk-kit-Secret_0123456789abcdefghijklmnopqrstuvwxyz";
 
     fn import_requester(name: &str, screen: (i32, i32)) -> dpx_ui::ImportRequester {
         dpx_ui::ImportRequester::new(
@@ -3738,5 +3869,112 @@ mod tests {
             })
             .unwrap();
         assert!(b.card.encloses(&rect) && rect.w > 400.0);
+    }
+    /// The Image Generator setup (slice 4c): the key field shows one star per character and
+    /// the caret; the key is in no text, no drawing and no dump of the card.
+    #[test]
+    fn the_setup_shows_stars_and_never_the_key() {
+        use dpx_ui::imagegen_setup::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = setup_requester(dpx_ui::SetupProvider::OpenAi);
+        for k in dpx_ui::paste_keys("sk-short-Key1") {
+            req.handle(ReqEvent::Key(k));
+        }
+        let b = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        let stars = "*".repeat("sk-short-Key1".len());
+        assert_eq!(text_color(&b, &stars), theme.text, "the stars are shown");
+        // The field with the keys has the accent around it and a caret after the stars.
+        let key = b.spot(ctl::KEY).expect("the key field").rect;
+        assert!(rings(&b.list, key).contains(&(theme.accent, 1.5)));
+        let model = b.spot(ctl::MODEL).expect("the model field").rect;
+        assert_eq!((key.x, key.w), (model.x, model.w));
+        // A long key: still stars only, in the field, with nothing of the key anywhere.
+        for k in dpx_ui::paste_keys(SECRET) {
+            req.handle(ReqEvent::Key(k));
+        }
+        for (name, dialog) in dialogs().into_iter().chain([("typed twice", req.view())]) {
+            if !name.starts_with("setup") && name != "typed twice" {
+                continue;
+            }
+            for scale in SCALES {
+                let b = build(&dialog, window, scale, &theme, &Pointer::default());
+                let dump = format!("{:?} {:?} {:?} {dialog:?}", b.list, b.texts, b.spots);
+                for part in ["sk-", "Secret", "Key1", "0123456789", "abcdefgh", "short"] {
+                    assert!(!dump.contains(part), "{name}: '{part}' is in the dump");
+                }
+                for t in &b.texts {
+                    assert!(t.within.inset(-0.5).encloses(&t.ink), "{name}: {}", t.text);
+                }
+            }
+        }
+        // None: the fields are faint and empty and take no pointer; their buttons too.
+        let none = setup_requester(dpx_ui::SetupProvider::None);
+        let b = build(&none.view(), window, 1.0, &theme, &Pointer::default());
+        assert!(b.spot(ctl::KEY).is_none() && b.spot(ctl::MODEL).is_none());
+        assert!(b.spot(ctl::TEST).is_none() && b.spot(ctl::GET_KEY).is_none());
+        assert_eq!(text_color(&b, "API key"), theme.disabled);
+        assert_eq!(text_color(&b, "Test"), theme.disabled);
+        // The model id is still named by the hint under the ghosted field, nowhere else.
+        let named = b
+            .texts
+            .iter()
+            .filter(|t| t.text.contains("gpt-image-2.6-flare"))
+            .count();
+        assert_eq!(named, 1);
+    }
+
+    /// Generate Picture (slice 4c): the arrows of an option stand side by side before its
+    /// value, a ghosted arrow takes no pointer, and "More.." puts four options into the
+    /// right column over the note.
+    #[test]
+    fn generate_rows_have_arrows_and_more_fills_the_right_column() {
+        use dpx_ui::GenRow;
+        use dpx_ui::generate_requester::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = generate_requester("a castle", (320, 256));
+        let b = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        let prompt = b.spot(ctl::PROMPT).expect("the description").rect;
+        let next = b.spot(ctl::next(GenRow::Resolution)).unwrap().rect;
+        let prev = b.spot(ctl::prev(GenRow::Resolution)).unwrap().rect;
+        assert_eq!(prev.right() + GROUP_GAP, next.x);
+        assert!(prompt.bottom() < prev.y);
+        assert_eq!(
+            prompt.x,
+            b.card.x + PAD,
+            "the description starts at the card's edge"
+        );
+        // OCS is the first chipset: its "previous" arrow is ghosted.
+        assert!(b.spot(ctl::prev(GenRow::Chipset)).is_none());
+        assert!(b.spot(ctl::next(GenRow::Chipset)).is_some());
+        assert!(
+            b.spot(ctl::next(GenRow::Target)).is_none(),
+            "not shown without More.."
+        );
+        req.set_more(true);
+        let m = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        let (dither, target) = (
+            m.spot(ctl::next(GenRow::Dither)).unwrap().rect,
+            m.spot(ctl::next(GenRow::Target)).unwrap().rect,
+        );
+        assert!(dither.x < prompt.right() && target.x > prompt.right());
+        // The default button is Generate; with a result it is Apply.
+        let default =
+            |b: &Built, id| fills(&b.list, b.spot(id).unwrap().rect).contains(&theme.accent);
+        assert!(default(&m, ctl::GENERATE));
+        req.set_phase(dpx_ui::GenPhase::Result);
+        let (w, h) = req.thumb_size();
+        let fill = dpx_core::Rgba8::new(1, 2, 3, 255);
+        req.set_thumbnail(Some(dpx_core::RgbaImage::new(w, h, fill)));
+        let r = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        assert!(default(&r, ctl::APPLY) && !default(&r, ctl::GENERATE));
+        assert_eq!(text_color(&r, "Again"), theme.text);
+        assert!(
+            r.list
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Pixels { .. }))
+        );
     }
 }

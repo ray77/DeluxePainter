@@ -304,6 +304,50 @@ fn index_of<T: PartialEq>(list: &[T], v: &T) -> usize {
     list.iter().position(|x| x == v).unwrap_or(0)
 }
 
+/// The controls of the requester's description for the Modern skin
+/// ([`GenerateRequester::view`]).
+pub mod ctl {
+    use super::{GenControl, GenRow};
+    use crate::dialog::ControlId;
+
+    /// The description field.
+    pub const PROMPT: ControlId = 0;
+    /// A row's "previous" button: `PREV + row`, rows in the order of [`GenRow`].
+    pub const PREV: ControlId = 10;
+    /// A row's "next" button: `NEXT + row`.
+    pub const NEXT: ControlId = 30;
+    pub const MORE: ControlId = 50;
+    pub const SET_UP: ControlId = 51;
+    pub const CANCEL: ControlId = 52;
+    /// Generate, or Again once there is a result.
+    pub const GENERATE: ControlId = 53;
+    /// Only with a result.
+    pub const APPLY: ControlId = 54;
+
+    /// The id of a control.
+    pub fn of(c: GenControl) -> ControlId {
+        match c {
+            GenControl::Prompt => PROMPT,
+            GenControl::Prev(row) => PREV + row as ControlId,
+            GenControl::Next(row) => NEXT + row as ControlId,
+            GenControl::More => MORE,
+            GenControl::SetUp => SET_UP,
+            GenControl::Cancel => CANCEL,
+            GenControl::Generate => GENERATE,
+            GenControl::Apply => APPLY,
+        }
+    }
+
+    /// `PREV + row` / `NEXT + row` for a row.
+    pub fn prev(row: GenRow) -> ControlId {
+        of(GenControl::Prev(row))
+    }
+
+    pub fn next(row: GenRow) -> ControlId {
+        of(GenControl::Next(row))
+    }
+}
+
 /// What the requester is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GenPhase {
@@ -999,6 +1043,138 @@ impl GenerateRequester {
         }
     }
 
+    /// The hint shown while a picture is generated.
+    const WORKING_HINT: &'static str =
+        "Cancel stops waiting. A request already sent may still be billed.";
+
+    /// What the requester shows, for the Modern skin (ADR-47): the description field and
+    /// the option rows at the left (with "More.." the last four at the right), and at the
+    /// right what the Classic box and the two lines under the options say: the note, a
+    /// problem or an error, the progress, or the result's true-colour thumbnail, then the
+    /// generator and the message.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, Dialog, Glyph, IconButton, Item, Kind, Part, Role, Size,
+            Thumbnail, Tone,
+        };
+        let controls = self.controls();
+        let rect = |c: GenControl| {
+            controls
+                .iter()
+                .find(|(k, _)| *k == c)
+                .map_or(Rect::new(0, 0, 1, 1), |(_, r)| *r)
+        };
+        let setting = |row: GenRow| {
+            let ghosted = (row == GenRow::Colors && !self.colors_enabled()) || self.row_fixed(row);
+            let arrow = |c: GenControl, glyph| {
+                Part::Icon(IconButton {
+                    control: Control::new(ctl::of(c), rect(c)),
+                    glyph,
+                    on: false,
+                    pressed: self.pressed(c),
+                    enabled: self.enabled(c),
+                })
+            };
+            Item::Setting {
+                label: row.label().trim_end_matches(':').into(),
+                focused: false,
+                enabled: !ghosted,
+                parts: vec![
+                    arrow(GenControl::Prev(row), Glyph::Backward),
+                    arrow(GenControl::Next(row), Glyph::Forward),
+                    Part::Text(
+                        self.value(row),
+                        if ghosted { Tone::Dim } else { Tone::Normal },
+                    ),
+                ],
+            }
+        };
+        let mut prompt = self
+            .prompt
+            .view(Control::new(ctl::PROMPT, self.prompt_rect()), true);
+        // A press in the description does not move the caret in the Classic skin either.
+        prompt.stops.clear();
+        let mut left = vec![
+            Item::Heading(ASK.into()),
+            // Across the column, not after the labels.
+            Item::Row(vec![Part::Field(prompt)]),
+            setting(GenRow::Resolution),
+        ];
+        let rows = self.rows();
+        // With "More.." the rows fill both columns.
+        let split = if self.more { 6 } else { rows.len() };
+        left.extend(rows.iter().take(split).map(|&r| setting(r)));
+        let mut right: Vec<Item> = rows.iter().skip(split).map(|&r| setting(r)).collect();
+        let text = |text: &str, tone| Item::Text {
+            text: text.into(),
+            tone,
+            bullet: false,
+        };
+        let showing_thumb = self.phase == GenPhase::Result && self.thumb.is_some();
+        match (self.phase, &self.thumb) {
+            (GenPhase::Result, Some(thumb)) => {
+                right.push(Item::Heading("Result".into()));
+                right.push(Item::Picture {
+                    width: thumb.width(),
+                    height: thumb.height(),
+                    picture: Some(Thumbnail::of(thumb)),
+                });
+            }
+            (GenPhase::Result, None) => {
+                if let Some(e) = &self.error {
+                    right.push(text(e, Tone::Alert));
+                }
+            }
+            (GenPhase::Ask, _) => match (self.problem(), &self.error) {
+                (Some(p), _) => right.push(text(&p, Tone::Alert)),
+                (None, Some(e)) => right.push(text(e, Tone::Alert)),
+                (None, None) => right.push(text(&self.provider.note, Tone::Normal)),
+            },
+            (GenPhase::Working { seconds }, _) => {
+                right.push(text(&format!("Generating.. {seconds} s"), Tone::Normal));
+                right.push(text(Self::WORKING_HINT, Tone::Dim));
+            }
+        }
+        // The two lines under the options.
+        match (&self.error, &self.message) {
+            (Some(e), _) if showing_thumb => right.push(text(e, Tone::Alert)),
+            (_, message) => {
+                if !self.provider.summary.is_empty() {
+                    right.push(text(&self.provider.summary, Tone::Dim));
+                }
+                if let Some(m) = message {
+                    right.push(text(m, Tone::Normal));
+                }
+            }
+        }
+        // A line the app left empty takes no room.
+        right.retain(|i| !matches!(i, Item::Text { text, .. } if text.trim().is_empty()));
+        let result = self.phase == GenPhase::Result;
+        let buttons = self
+            .buttons()
+            .into_iter()
+            .map(|(c, label, r)| {
+                let role = match c {
+                    GenControl::Cancel => Role::Cancel,
+                    GenControl::Apply => Role::Default,
+                    GenControl::Generate if !result => Role::Default,
+                    _ => Role::Plain,
+                };
+                let mut b =
+                    ViewButton::new(Control::new(ctl::of(c), r), label, role, self.pressed(c));
+                b.enabled = self.enabled(c);
+                b
+            })
+            .collect();
+        Dialog {
+            title: TITLE.into(),
+            kind: Kind::Plain,
+            size: Size::Large,
+            columns: vec![left, right],
+            buttons,
+        }
+    }
+
     /// Draws the requester centred on its UI screen.
     pub fn draw(&self, img: &mut IndexedImage, pens: &Pens) {
         let (x, y) = self.origin();
@@ -1079,10 +1255,7 @@ impl GenerateRequester {
             GenPhase::Working { seconds } => {
                 let mut lines = vec!["Generating..".to_string(), format!("{seconds} s")];
                 lines.push(String::new());
-                lines.extend(wrap(
-                    "Cancel stops waiting. A request already sent may still be billed.",
-                    inner.w - 2,
-                ));
+                lines.extend(wrap(Self::WORKING_HINT, inner.w - 2));
                 lines
             }
         };
@@ -1795,5 +1968,197 @@ mod tests {
                 b.h
             );
         }
+    }
+    #[test]
+    fn the_view_names_every_control_where_the_requester_takes_it() {
+        use crate::dialog::{Item, Part, Role, Tone};
+        let settings = |r: &GenerateRequester| -> Vec<(usize, String, bool, String)> {
+            r.view()
+                .columns
+                .iter()
+                .enumerate()
+                .flat_map(|(col, items)| {
+                    items.iter().filter_map(move |i| match i {
+                        Item::Setting {
+                            label,
+                            enabled,
+                            parts,
+                            ..
+                        } => match &parts[2] {
+                            Part::Text(value, _) => {
+                                Some((col, label.clone(), *enabled, value.clone()))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                })
+                .collect()
+        };
+        for more in [false, true] {
+            for phase in [
+                GenPhase::Ask,
+                GenPhase::Working { seconds: 3 },
+                GenPhase::Result,
+            ] {
+                let mut r = requester((320, 256));
+                typed(&mut r, "a castle");
+                r.set_more(more);
+                r.set_phase(phase);
+                if phase == GenPhase::Result {
+                    let (w, h) = r.thumb_size();
+                    r.set_thumbnail(Some(RgbaImage::new(w, h, Rgba8::new(9, 9, 9, 255))));
+                }
+                // Every control of the requester is described once, with its rectangle;
+                // a press in its middle is that control's.
+                let view = r.view();
+                let described = view.controls();
+                let controls = r.controls();
+                assert_eq!(described.len(), controls.len(), "more={more} {phase:?}");
+                for (c, rect) in controls {
+                    let d = view.control(ctl::of(c)).unwrap_or_else(|| panic!("{c:?}"));
+                    assert_eq!(d.area, rect, "{c:?}");
+                    let (x, y) = (rect.x + rect.w / 2, rect.y + rect.h / 2);
+                    let hit = r.control_at(x, y);
+                    assert_eq!(hit, r.enabled(c).then_some(c), "{c:?}");
+                }
+                assert_eq!(settings(&r).len(), if more { 11 } else { 4 });
+                // With "More.." the last four options stand in the right column.
+                let right = settings(&r).iter().filter(|s| s.0 == 1).count();
+                assert_eq!(right, if more { 4 } else { 0 });
+                let labels: Vec<_> = view.buttons.iter().map(|b| b.label.as_str()).collect();
+                let default: Vec<_> = view
+                    .buttons
+                    .iter()
+                    .filter(|b| b.role == Role::Default)
+                    .map(|b| b.label.as_str())
+                    .collect();
+                let words = |tone: Tone| -> Vec<String> {
+                    view.columns[1]
+                        .iter()
+                        .filter_map(|i| match i {
+                            Item::Text { text, tone: t, .. } if *t == tone => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let more_label = if more { "Less.." } else { "More.." };
+                match phase {
+                    GenPhase::Ask => {
+                        assert_eq!(labels, ["Cancel", more_label, "Set up..", "Generate"]);
+                        assert_eq!(default, ["Generate"]);
+                        assert!(view.buttons[3].enabled);
+                        assert_eq!(words(Tone::Normal), [ready().note]);
+                        assert_eq!(words(Tone::Dim), [ready().summary]);
+                    }
+                    GenPhase::Working { .. } => {
+                        assert!(!view.buttons[3].enabled && !view.buttons[2].enabled);
+                        assert_eq!(words(Tone::Normal), ["Generating.. 3 s"]);
+                    }
+                    GenPhase::Result => {
+                        assert_eq!(labels, ["Cancel", more_label, "Set up..", "Again", "Apply"]);
+                        assert_eq!(default, ["Apply"]);
+                        let (w, h) = r.thumb_size();
+                        assert!(view.columns[1].iter().any(|i| matches!(i,
+                            Item::Picture { width, height, picture: Some(_) }
+                                if (*width, *height) == (w, h))));
+                    }
+                }
+            }
+        }
+        // The description field has the keys and shows what is typed.
+        let mut r = requester((320, 256));
+        typed(&mut r, "a castle");
+        let Item::Row(parts) = &r.view().columns[0][1] else {
+            panic!("the description");
+        };
+        assert!(matches!(&parts[0],
+            Part::Field(f) if f.text == "a castle" && f.caret == Some(8) && f.stops.is_empty()));
+        // The arrows change the value; at an end the arrow is ghosted.
+        assert_eq!(settings(&r)[1], (0, "Chipset".into(), true, "OCS".into()));
+        let press = |r: &mut GenerateRequester, id| {
+            let a = r.view().control(id).expect("the control").area;
+            r.handle(ReqEvent::Press(a.x + a.w / 2, a.y + a.h / 2));
+            r.handle(ReqEvent::Release)
+        };
+        assert_eq!(
+            press(&mut r, ctl::prev(GenRow::Chipset)),
+            GenerateResponse::Continue
+        );
+        assert_eq!(
+            press(&mut r, ctl::next(GenRow::Chipset)),
+            GenerateResponse::Changed
+        );
+        assert_eq!(settings(&r)[1].3, "AGA");
+        let arrows = |r: &GenerateRequester, row: GenRow| -> Vec<bool> {
+            r.view()
+                .columns
+                .concat()
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Setting { label, parts, .. }
+                        if *label == row.label().trim_end_matches(':') =>
+                    {
+                        Some(
+                            parts
+                                .iter()
+                                .filter_map(|p| match p {
+                                    Part::Icon(b) => Some(b.enabled),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+        assert_eq!(arrows(&r, GenRow::Chipset), [true, false]);
+        // The buttons answer.
+        assert_eq!(press(&mut r, ctl::SET_UP), GenerateResponse::SetUp);
+        assert_eq!(press(&mut r, ctl::GENERATE), GenerateResponse::Generate);
+        assert_eq!(press(&mut r, ctl::MORE), GenerateResponse::Continue);
+        assert!(r.more());
+        assert_eq!(press(&mut r, ctl::CANCEL), GenerateResponse::Cancel);
+        // A new layer ghosts the rows that show the picture's own values.
+        r.set_document(
+            Target::new(Chipset::Aga, DisplayMode::PAL_LORES),
+            (320, 256),
+        );
+        for _ in 0..3 {
+            press(&mut r, ctl::next(GenRow::Target));
+        }
+        let ghosted: Vec<String> = settings(&r)
+            .into_iter()
+            .filter(|s| !s.2)
+            .map(|s| s.1)
+            .collect();
+        assert_eq!(ghosted, ["Resolution", "Chipset", "Colours", "Palette"]);
+        assert_eq!(settings(&r)[0].3, "This page 320x256");
+        // A problem and an error stand out; an error beside a result takes the lines.
+        let alerts = |r: &GenerateRequester| -> Vec<String> {
+            r.view().columns[1]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Text {
+                        text,
+                        tone: Tone::Alert,
+                        ..
+                    } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        r.set_doc_layers(MAX_LAYERS);
+        assert!(alerts(&r)[0].contains("the most allowed"));
+        assert!(!r.view().buttons[3].enabled, "nothing to generate for");
+        let mut failed = requester((320, 256));
+        failed.set_error(Some("The generator did not answer.".into()));
+        assert_eq!(alerts(&failed), ["The generator did not answer."]);
+        failed.set_message(Some("Apply replaces the spare page.".into()));
+        assert!(failed.view().columns[1].iter().any(
+            |i| matches!(i, Item::Text { text, tone: Tone::Normal, .. } if text.starts_with("Apply"))
+        ));
     }
 }

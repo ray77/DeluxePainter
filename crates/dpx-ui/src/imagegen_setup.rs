@@ -47,6 +47,23 @@ mod geom {
     pub const NOTE_Y: i32 = 112;
 }
 
+/// The controls of the requester's description for the Modern skin
+/// ([`ImageGenSetupRequester::view`]): the ids are the places in
+/// [`ImageGenSetupRequester::controls`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// None, OpenAI Images: `PROVIDER + 0..2`.
+    pub const PROVIDER: ControlId = 0;
+    pub const KEY: ControlId = 2;
+    pub const MODEL: ControlId = 3;
+    pub const TEST: ControlId = 4;
+    pub const GET_KEY: ControlId = 5;
+    pub const REMOVE_KEY: ControlId = 6;
+    pub const CANCEL: ControlId = 7;
+    pub const OK: ControlId = 8;
+}
+
 /// The generator chosen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SetupProvider {
@@ -462,6 +479,115 @@ impl ImageGenSetupRequester {
         }
     }
 
+    /// What the requester shows, for the Modern skin (ADR-47). The key field is described
+    /// as the Classic skin draws it: one `*` per character and the caret, never the key.
+    pub fn view(&self) -> crate::dialog::Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Control, ControlId, Dialog, Item, Kind, Part, Push, Radio, Role,
+            Size, Tone,
+        };
+        let controls = self.controls();
+        let control = |id: ControlId| Control::new(id, controls[usize::from(id)].1);
+        let kind = |id: ControlId| controls[usize::from(id)].0;
+        let openai = self.provider == SetupProvider::OpenAi;
+        let radio = |id: ControlId, p: SetupProvider| {
+            Part::Radio(Radio {
+                control: control(id),
+                label: Self::provider_label(p).into(),
+                on: self.provider == p,
+                enabled: true,
+            })
+        };
+        let field = |id: ControlId, f: SetupField, label: &str| {
+            let shown = match f {
+                SetupField::Key => self.masked(),
+                SetupField::Model => self.model.clone(),
+            };
+            let mut field = shown.view(control(id), openai && self.active == Some(f));
+            // A press chooses the field; it does not move the caret (as in Classic).
+            field.stops.clear();
+            field.enabled = openai;
+            if !openai {
+                // Ghosted: nothing of the field is shown in Classic.
+                field.text.clear();
+            }
+            Item::Setting {
+                label: label.into(),
+                focused: false,
+                enabled: openai,
+                parts: vec![Part::Field(field)],
+            }
+        };
+        let push = |id: ControlId| {
+            let c = kind(id);
+            Part::Button(Push {
+                control: control(id),
+                label: Self::label(c).into(),
+                on: false,
+                pressed: self.pressed(c),
+                enabled: self.enabled(c),
+            })
+        };
+        let text = |text: &str, tone| Item::Text {
+            text: text.into(),
+            tone,
+            bullet: false,
+        };
+        // One line under a field, where the field starts (as in Classic, which shows the
+        // first line of it).
+        let under = |line: String| Item::Line {
+            label: String::new(),
+            key: None,
+            parts: vec![Part::Text(line, Tone::Dim)],
+        };
+        let mut items = vec![
+            Item::Line {
+                label: "Generator".into(),
+                key: None,
+                parts: vec![
+                    radio(ctl::PROVIDER, SetupProvider::None),
+                    radio(ctl::PROVIDER + 1, SetupProvider::OpenAi),
+                ],
+            },
+            field(ctl::KEY, SetupField::Key, "API key"),
+            under(self.key_line()),
+            field(ctl::MODEL, SetupField::Model, "Model"),
+            under(self.info.model_hint.clone()),
+            Item::Line {
+                label: String::new(),
+                key: None,
+                parts: vec![push(ctl::TEST), push(ctl::GET_KEY), push(ctl::REMOVE_KEY)],
+            },
+        ];
+        if let Some(t) = &self.test {
+            items.push(text(t, Tone::Normal));
+        }
+        items.push(Item::Rule);
+        items.push(text(&self.info.note, Tone::Dim));
+        // A line the app left empty takes no room.
+        items.retain(|i| match i {
+            Item::Text { text, .. } => !text.trim().is_empty(),
+            Item::Line { parts, .. } => {
+                !matches!(&parts[..], [Part::Text(text, _)] if text.trim().is_empty())
+            }
+            _ => true,
+        });
+        let button = |id: ControlId, role| {
+            let c = kind(id);
+            ViewButton::new(control(id), Self::label(c), role, self.pressed(c))
+        };
+        Dialog {
+            title: TITLE.into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![items],
+            buttons: vec![
+                button(ctl::CANCEL, Role::Cancel),
+                button(ctl::OK, Role::Default),
+            ],
+        }
+    }
+
     pub fn render(&self, pens: &Pens) -> IndexedImage {
         let font = Font::builtin();
         let (w, h) = self.size();
@@ -765,5 +891,134 @@ mod tests {
         assert_eq!(img.get(0, 0), Some(pens.dark), "square corner");
         r.set_test(Some("The key works.".into()));
         assert_ne!(r.render(&pens).pixels(), img.pixels());
+    }
+    #[test]
+    fn the_view_names_every_control_and_never_shows_the_key() {
+        use crate::dialog::{Item, Part, Role, Tone};
+        let mut r = requester(SetupProvider::OpenAi, true);
+        let view = r.view();
+        assert_eq!(view.title, "Image Generator");
+        // The ids are the places in `controls()`, with the same rectangles.
+        let controls = r.controls();
+        assert_eq!(view.controls().len(), controls.len());
+        for c in view.controls() {
+            assert_eq!(c.area, controls[usize::from(c.id)].1, "control {}", c.id);
+        }
+        assert_eq!(
+            view.buttons
+                .iter()
+                .map(|b| (b.label.as_str(), b.role))
+                .collect::<Vec<_>>(),
+            [("Cancel", Role::Cancel), ("Ok", Role::Default)]
+        );
+        let fields = |r: &ImageGenSetupRequester| -> Vec<(String, bool, crate::dialog::Field)> {
+            r.view().columns[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Setting {
+                        label,
+                        enabled,
+                        parts,
+                        ..
+                    } => match &parts[0] {
+                        Part::Field(f) => Some((label.clone(), *enabled, f.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        let buttons = |r: &ImageGenSetupRequester| -> Vec<(String, bool)> {
+            r.view().columns[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Line { parts, .. } => Some(parts),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|p| match p {
+                    Part::Button(b) => Some((b.label.clone(), b.enabled)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let texts = |r: &ImageGenSetupRequester| -> Vec<String> {
+            r.view().columns[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Text { text, .. } => Some(text.clone()),
+                    Item::Line { parts, .. } => match &parts[..] {
+                        [Part::Text(text, _)] => Some(text.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        // The key field has the keys; a typed or pasted key is shown as stars only.
+        let f = fields(&r);
+        assert_eq!((f[0].0.as_str(), f[0].2.caret), ("API key", Some(0)));
+        assert_eq!((f[1].0.as_str(), f[1].2.caret), ("Model", None));
+        assert_eq!(f[1].2.text, "gpt-image-2.6-flare");
+        let secret = "sk-secret-Key_0123456789";
+        for k in crate::paste_keys(secret) {
+            r.handle(ReqEvent::Key(k));
+        }
+        r.handle(ReqEvent::Key(ReqKey::Left));
+        let key = &fields(&r)[0].2;
+        assert_eq!(key.text, "*".repeat(secret.len()));
+        assert_eq!(key.caret, Some(secret.len() - 1));
+        assert!(key.stops.is_empty());
+        let dump = format!("{:?}", r.view());
+        assert!(!dump.contains(secret) && !dump.contains("sk-") && !dump.contains("Key_0"));
+        assert!(!format!("{r:?}").contains("secret"));
+        assert_eq!(texts(&r)[0], "The new key is saved at Ok.");
+        assert_eq!(
+            buttons(&r),
+            [
+                ("Test".to_string(), true),
+                ("Get key..".to_string(), true),
+                ("Remove key".to_string(), true)
+            ]
+        );
+        // A press in the middle of every control's rectangle reaches it.
+        let press = |r: &mut ImageGenSetupRequester, id| {
+            let a = r.view().control(id).expect("the control").area;
+            let first = r.handle(ReqEvent::Press(a.x + a.w / 2, a.y + a.h / 2));
+            let second = r.handle(ReqEvent::Release);
+            if first == SetupResponse::Continue {
+                second
+            } else {
+                first
+            }
+        };
+        assert_eq!(press(&mut r, ctl::TEST), SetupResponse::Test);
+        assert_eq!(press(&mut r, ctl::GET_KEY), SetupResponse::GetKey);
+        assert_eq!(press(&mut r, ctl::MODEL), SetupResponse::Continue);
+        assert_eq!(fields(&r)[1].2.caret, Some("gpt-image-2.6-flare".len()));
+        assert_eq!(press(&mut r, ctl::KEY), SetupResponse::Continue);
+        assert_eq!(r.active(), Some(SetupField::Key));
+        assert_eq!(press(&mut r, ctl::REMOVE_KEY), SetupResponse::Continue);
+        assert_eq!(fields(&r)[0].2.text, "");
+        assert_eq!(texts(&r)[0], "The API key is removed at Ok.");
+        assert_eq!(buttons(&r)[2], ("Remove key".to_string(), false));
+        assert_eq!(press(&mut r, ctl::CANCEL), SetupResponse::Cancel);
+        assert_eq!(press(&mut r, ctl::OK), SetupResponse::Ok);
+        // A test answer is shown; None ghosts the fields and their buttons.
+        r.set_test(Some("The key works.".into()));
+        assert!(texts(&r).contains(&"The key works.".to_string()));
+        assert_eq!(press(&mut r, ctl::PROVIDER), SetupResponse::Continue);
+        let f = fields(&r);
+        assert!(!f[0].1 && !f[0].2.enabled && f[0].2.caret.is_none());
+        assert!(
+            !f[1].1 && f[1].2.text.is_empty(),
+            "nothing of a ghosted field is shown"
+        );
+        assert!(buttons(&r).iter().all(|b| !b.1));
+        assert!(matches!(&r.view().columns[0][0],
+            Item::Line { parts, .. } if matches!(&parts[0], Part::Radio(n) if n.on)));
+        // The note is the last, quiet text.
+        assert!(matches!(r.view().columns[0].last(),
+            Some(Item::Text { text, tone: Tone::Dim, .. }) if text.starts_with("Sends your")));
     }
 }

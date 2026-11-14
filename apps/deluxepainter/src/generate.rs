@@ -1229,7 +1229,8 @@ impl PainterApp {
     /// Paints the thumbnail into the RGBA screen (`frame_w` pixels wide, one pixel per screen
     /// pixel) unless the setup or the quit question covers it.
     pub(crate) fn generate_overlay(&self, rgba: &mut [u8], frame_w: usize) {
-        if self.ui.choice_requester.is_some() {
+        // ADR-47: as a Modern card the requester shows its thumbnail itself.
+        if self.ui.choice_requester.is_some() || self.modern_card().is_some() {
             return;
         }
         let v = self.view();

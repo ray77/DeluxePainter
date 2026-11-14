@@ -34,6 +34,8 @@ fn dialog_state(rig: &mut Rig) -> String {
     let control = app.ui.anim_control.take();
     let file = app.ui.file_requester.take();
     let import = app.ui.import_requester.take();
+    let generate = app.ui.generate_requester.take();
+    let setup = app.ui.imagegen_setup.take();
     let percent = (
         app.menu_data.effects.percent,
         app.engine.document().fps(),
@@ -62,6 +64,24 @@ fn dialog_state(rig: &mut Rig) -> String {
             (
                 file.as_ref().map(|r| (r.view(), r.drawer().to_string())),
                 import.as_ref().map(|r| (r.view(), r.options(), r.focus())),
+                generate
+                    .as_ref()
+                    .map(|r| (r.view(), r.options(), r.prompt(), r.phase())),
+                // The setup by what it shows and by its entries, never by the key.
+                setup.as_ref().map(|r| {
+                    (
+                        r.view(),
+                        r.provider(),
+                        r.model(),
+                        r.typed_key().map(|k| k.chars().count()),
+                        r.remove_key(),
+                    )
+                }),
+                (
+                    app.imagegen.settings.provider,
+                    app.imagegen.settings.openai.model.clone(),
+                    app.imagegen.opened_url.clone(),
+                ),
             ),
             percent,
             (open, pending, confirmed),
@@ -84,6 +104,8 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.anim_control = control;
     app.ui.file_requester = file;
     app.ui.import_requester = import;
+    app.ui.generate_requester = generate;
+    app.ui.imagegen_setup = setup;
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -2528,12 +2550,385 @@ fn the_import_requester_does_the_same_in_both_skins() {
     both_at_every_scale(import_script);
 }
 
+/// The test pattern as the generator and a keychain stand-in in memory: nothing leaves
+/// the machine and no real key store is touched.
+fn offline_generator(rig: &mut Rig) {
+    use std::sync::Arc;
+    rig.app.imagegen.debug_provider = Some(Arc::new(dpx_imagegen::fixture::TestPattern));
+    rig.app.imagegen.keys = Arc::new(dpx_imagegen::ApiKeys::new(
+        Some(Box::new(dpx_imagegen::secret::MemoryStore::new())),
+        None,
+        Arc::new(|_: &str| None::<String>),
+    ));
+}
+
+/// Passes until the generation that runs has ended (its seconds are not compared).
+fn generation_ends(rig: &mut Rig) {
+    for _ in 0..2000 {
+        rig.pass(vec![]);
+        let working = rig
+            .app
+            .ui
+            .generate_requester
+            .as_ref()
+            .is_some_and(|r| matches!(r.phase(), dpx_ui::GenPhase::Working { .. }));
+        if !working {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("the generation did not end");
+}
+
+/// Picture ▸ Generate.. (slice 4c) with the test pattern: the description (typing, paste,
+/// editing keys), both arrows of every option to both ends, More.. and Less.., the rows a
+/// new layer ghosts, Generate, the result's thumbnail, an option changed after it, Again,
+/// Apply, Return, Cancel and Esc.
+fn generate_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::generate_requester::ctl;
+    use dpx_ui::{GenControl, GenPhase, GenRow};
+    const MID: (f32, f32) = (0.5, 0.5);
+    offline_generator(rig);
+    let open = |rig: &mut Rig, seen: Seen| {
+        rig.pick(Action::Command("picture.generate"));
+        assert!(rig.app.ui.generate_requester.is_some());
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Generate));
+        }
+        seen(rig, "Generate..".into());
+    };
+    let req = |rig: &Rig| rig.app.ui.generate_requester.clone().expect("open");
+    let is_open = |rig: &Rig| rig.app.ui.generate_requester.is_some();
+    let has_thumbnail = |rig: &Rig| {
+        rig.dialog().columns[1].iter().any(|i| {
+            matches!(
+                i,
+                dpx_ui::dialog::Item::Picture {
+                    picture: Some(_),
+                    ..
+                }
+            )
+        })
+    };
+    open(rig, seen);
+    // The description.
+    rig.type_text("a castle");
+    rig.pass(vec![egui::Event::Paste(" on a\nhill".into())]);
+    for key in [
+        egui::Key::ArrowLeft,
+        egui::Key::Backspace,
+        egui::Key::Home,
+        egui::Key::Delete,
+        egui::Key::ArrowRight,
+        egui::Key::End,
+    ] {
+        rig.tap(key);
+    }
+    rig.type_text("!");
+    assert_eq!(req(rig).prompt(), " castle on a hil!");
+    seen(rig, "the description typed, pasted and edited".into());
+    rig.click_control(ctl::PROMPT, (0.2, 0.5));
+    rig.type_text("?");
+    assert!(req(rig).prompt().ends_with("!?"), "a press keeps the caret");
+    rig.tap(egui::Key::Tab);
+    rig.tap(egui::Key::ArrowDown);
+    rig.wheel(-2.0);
+    rig.click_beside();
+    seen(
+        rig,
+        "a press in the description, Tab, an arrow, the wheel".into(),
+    );
+    // Every option to its last value and back to its first; a ghosted arrow has no place.
+    let walk = |rig: &mut Rig, seen: Seen, rows: &[GenRow]| {
+        for &row in rows {
+            let mut steps = 0;
+            while req(rig).enabled(GenControl::Next(row)) {
+                let at = [(0.05, 0.1), MID, (0.95, 0.9)][steps % 3];
+                rig.click_control(ctl::next(row), at);
+                steps += 1;
+                seen(rig, format!("{row:?} next ({steps})"));
+            }
+            while req(rig).enabled(GenControl::Prev(row)) {
+                let at = [(0.95, 0.9), MID, (0.05, 0.1)][steps % 3];
+                rig.click_control(ctl::prev(row), at);
+                steps += 1;
+                seen(rig, format!("{row:?} previous ({steps})"));
+            }
+            if req(rig).enabled(GenControl::Next(row)) {
+                rig.press_and_leave(ctl::next(row));
+                seen(rig, format!("{row:?} next pressed and left"));
+            }
+        }
+    };
+    walk(
+        rig,
+        seen,
+        &[
+            GenRow::Resolution,
+            GenRow::Chipset,
+            GenRow::Colors,
+            GenRow::Style,
+        ],
+    );
+    rig.click_control(ctl::MORE, (0.02, 0.05));
+    assert!(req(rig).more());
+    seen(rig, "More..".into());
+    walk(
+        rig,
+        seen,
+        &[
+            GenRow::Palette,
+            GenRow::Dither,
+            GenRow::Fit,
+            GenRow::Scaler,
+            GenRow::Background,
+            GenRow::Quality,
+        ],
+    );
+    // The target: a new layer ghosts the rows that show the picture's own values.
+    for step in 0..3 {
+        rig.click_control(ctl::next(GenRow::Target), MID);
+        seen(rig, format!("Target next ({step})"));
+    }
+    assert!(req(rig).row_fixed(GenRow::Resolution), "a new layer");
+    for step in 0..3 {
+        rig.click_control(ctl::prev(GenRow::Target), MID);
+        seen(rig, format!("Target previous ({step})"));
+    }
+    rig.click_control(ctl::MORE, (0.98, 0.95));
+    assert!(!req(rig).more());
+    seen(rig, "Less..".into());
+    for id in [ctl::CANCEL, ctl::MORE, ctl::SET_UP, ctl::GENERATE] {
+        rig.press_and_leave(id);
+        rig.press_beside_and_enter(id);
+        assert!(is_open(rig) && rig.app.ui.imagegen_setup.is_none());
+        seen(rig, format!("button {id} pressed and left"));
+    }
+    // Generate: the result's thumbnail is part of what is shown.
+    rig.click_control(ctl::GENERATE, MID);
+    generation_ends(rig);
+    assert_eq!(req(rig).phase(), GenPhase::Result);
+    assert!(has_thumbnail(rig));
+    seen(rig, "Generate".into());
+    // An option changed after the result converts it again; More.. makes it again too.
+    rig.click_control(ctl::next(GenRow::Colors), MID);
+    rig.click_control(ctl::next(GenRow::Colors), MID);
+    rig.click_control(ctl::prev(GenRow::Colors), MID);
+    assert!(has_thumbnail(rig));
+    seen(rig, "other colour counts after the result".into());
+    rig.click_control(ctl::MORE, MID);
+    rig.click_control(ctl::next(GenRow::Dither), MID);
+    assert!(has_thumbnail(rig));
+    seen(rig, "More.. and a dither after the result".into());
+    rig.click_control(ctl::MORE, MID);
+    seen(rig, "Less.. after the result".into());
+    rig.press_and_leave(ctl::APPLY);
+    assert!(is_open(rig));
+    // Again makes a new one; Apply takes it over.
+    rig.click_control(ctl::GENERATE, (0.05, 0.1));
+    generation_ends(rig);
+    assert_eq!(req(rig).phase(), GenPhase::Result);
+    seen(rig, "Again".into());
+    rig.click_control(ctl::APPLY, (0.98, 0.95));
+    assert!(!is_open(rig), "Apply closes it");
+    seen(rig, "Apply".into());
+    while rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+        seen(rig, "the note closed".into());
+    }
+    // Return generates, and applies once there is a result.
+    open(rig, seen);
+    rig.tap(egui::Key::Enter);
+    generation_ends(rig);
+    assert_eq!(req(rig).phase(), GenPhase::Result);
+    seen(rig, "Return generates".into());
+    rig.tap(egui::Key::Enter);
+    assert!(!is_open(rig), "Return applies");
+    seen(rig, "Return applies".into());
+    while rig.app.ui.note_requester.is_some() {
+        rig.tap(egui::Key::Enter);
+        seen(rig, "the note closed".into());
+    }
+    // Cancel and Esc.
+    open(rig, seen);
+    rig.click_control(ctl::CANCEL, (0.02, 0.05));
+    assert!(!is_open(rig), "Cancel closes it");
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig), "Esc closes it");
+    seen(rig, "Esc".into());
+    assert!(!rig.app.modal_open());
+}
+
+#[test]
+fn the_generate_requester_does_the_same_in_both_skins() {
+    both_at_every_scale(generate_script);
+}
+
+/// The Image Generator setup (slice 4c), opened from Generate: the generator, a pasted and
+/// a typed key (shown as stars, never in what is compared or drawn), the model, Tab, Get
+/// key.., Remove key, Cancel, Esc, Ok and Return with the key going to the stand-in
+/// keychain, a refused model id. Test is only pressed and left: it would ask the network.
+fn setup_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::generate_requester::ctl as generate;
+    use dpx_ui::imagegen_setup::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    const KEY: &str = "sk-parity-Key_0123456789";
+    offline_generator(rig);
+    let open = |rig: &mut Rig, seen: Seen| {
+        if rig.app.ui.generate_requester.is_none() {
+            rig.pick(Action::Command("picture.generate"));
+        }
+        rig.click_control(generate::SET_UP, MID);
+        assert!(rig.app.ui.imagegen_setup.is_some(), "Set up.. opens it");
+        if rig.app.is_modern() {
+            assert_eq!(rig.card(), Some(Card::Setup));
+        }
+        seen(rig, "Set up..".into());
+    };
+    let is_open = |rig: &Rig| rig.app.ui.imagegen_setup.is_some();
+    // Nothing of the key is in what the card shows or in its drawing.
+    let no_key = |rig: &Rig| {
+        let dialog = rig.dialog();
+        let shown = format!("{dialog:?}");
+        let window = dpx_ui_modern::paint::Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let built =
+            dpx_ui_modern::dialog::build(&dialog, window, 1.0, &Theme::dark(), &Default::default());
+        let drawn = format!("{:?} {:?}", built.list, built.texts);
+        for part in ["sk-", "parity", "Key_0", "0123456789"] {
+            assert!(!shown.contains(part) && !drawn.contains(part), "{part}");
+        }
+    };
+    open(rig, seen);
+    // The generator, by both radio buttons and their corners.
+    for (id, at) in [
+        (ctl::PROVIDER + 1, (0.02, 0.1)),
+        (ctl::PROVIDER, (0.98, 0.9)),
+        (ctl::PROVIDER + 1, MID),
+    ] {
+        rig.click_control(id, at);
+        seen(rig, format!("generator {id}"));
+    }
+    // A pasted key and typed characters: stars.
+    rig.pass(vec![egui::Event::Paste(format!("  {KEY}\n"))]);
+    no_key(rig);
+    seen(rig, "a key pasted".into());
+    rig.tap(egui::Key::ArrowLeft);
+    rig.tap(egui::Key::Backspace);
+    rig.type_text("9");
+    rig.tap(egui::Key::End);
+    no_key(rig);
+    seen(rig, "the key edited".into());
+    // Tab to the model and back; a press chooses a field.
+    rig.tap(egui::Key::Tab);
+    rig.type_text("x");
+    seen(rig, "Tab, a letter in the model".into());
+    rig.tap(egui::Key::Backspace);
+    rig.tap(egui::Key::Tab);
+    rig.type_text("0");
+    seen(rig, "Tab back, a character in the key".into());
+    rig.click_control(ctl::MODEL, (0.9, 0.5));
+    rig.type_text("y");
+    rig.tap(egui::Key::Backspace);
+    rig.click_control(ctl::KEY, (0.1, 0.5));
+    rig.tap(egui::Key::Backspace);
+    no_key(rig);
+    seen(rig, "the fields chosen by a press".into());
+    for id in [
+        ctl::TEST,
+        ctl::GET_KEY,
+        ctl::REMOVE_KEY,
+        ctl::CANCEL,
+        ctl::OK,
+    ] {
+        rig.press_and_leave(id);
+        rig.press_beside_and_enter(id);
+        assert!(is_open(rig));
+        seen(rig, format!("button {id} pressed and left"));
+    }
+    rig.click_beside();
+    rig.wheel(-2.0);
+    rig.click_control(ctl::GET_KEY, MID);
+    assert!(
+        rig.app.imagegen.opened_url.is_some(),
+        "Get key.. asks for the page"
+    );
+    seen(rig, "Get key..".into());
+    rig.click_control(ctl::REMOVE_KEY, MID);
+    seen(rig, "Remove key empties the field".into());
+    // Cancel and Esc change nothing and return to Generate.
+    rig.click_control(ctl::CANCEL, (0.02, 0.05));
+    assert!(!is_open(rig) && rig.app.ui.generate_requester.is_some());
+    seen(rig, "Cancel".into());
+    open(rig, seen);
+    rig.click_control(ctl::PROVIDER + 1, MID);
+    rig.type_text("abc");
+    rig.tap(egui::Key::Escape);
+    assert!(!is_open(rig), "Esc closes it");
+    seen(rig, "Esc".into());
+    // Ok stores the key in the stand-in keychain; Return too.
+    open(rig, seen);
+    rig.click_control(ctl::PROVIDER + 1, MID);
+    rig.pass(vec![egui::Event::Paste(KEY.into())]);
+    rig.click_control(ctl::OK, (0.98, 0.95));
+    seen(rig, "Ok with a key".into());
+    if is_open(rig) {
+        rig.click_control(ctl::OK, MID);
+        seen(rig, "Ok again".into());
+    }
+    assert!(!is_open(rig), "Ok closes it");
+    let stored = rig
+        .app
+        .imagegen
+        .keys
+        .key(
+            dpx_imagegen::openai::KEY_ACCOUNT,
+            dpx_imagegen::openai::ENV_KEY,
+        )
+        .is_some();
+    assert!(stored, "the key is in the stand-in keychain");
+    // The stored key is not read into the field; Remove key forgets it at Ok (Return).
+    open(rig, seen);
+    no_key(rig);
+    rig.click_control(ctl::REMOVE_KEY, MID);
+    seen(rig, "Remove key".into());
+    rig.tap(egui::Key::Enter);
+    assert!(!is_open(rig), "Return is Ok");
+    seen(rig, "Return".into());
+    // A model id that cannot be used keeps it open and says why.
+    open(rig, seen);
+    rig.click_control(ctl::MODEL, MID);
+    rig.type_text(" two words");
+    rig.click_control(ctl::OK, MID);
+    assert!(is_open(rig), "refused");
+    seen(rig, "a refused model id".into());
+    rig.tap(egui::Key::Escape);
+    rig.tap(egui::Key::Escape);
+    assert!(!rig.app.modal_open());
+    seen(rig, "closed".into());
+}
+
+#[test]
+fn the_image_generator_setup_does_the_same_in_both_skins() {
+    both_at_every_scale(setup_script);
+}
+
 /// Every converted requester fits the smallest window and is drawn there, in both themes
 /// and at device scale 1 and 2 (the images go to `DPX_MODERN_SHOTS` for a look).
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 27] = [
+    let open: [(&str, Card, Open); 29] = [
+        ("generate", Card::Generate, |rig| {
+            rig.pick(Action::Command("picture.generate"))
+        }),
+        ("generate-more", Card::Generate, |rig| {
+            rig.pick(Action::Command("picture.generate"));
+            let req = rig.app.ui.generate_requester.as_mut().expect("Generate");
+            req.set_more(true);
+            rig.pass(vec![]);
+        }),
         ("import", Card::Import, |rig| {
             rig.app
                 .open_import_image("probe.png".into(), import_picture(), None, Vec::new());
@@ -2722,11 +3117,8 @@ fn only_the_converted_requesters_are_cards() {
             .is_none()
     );
     type Open = fn(&mut Rig);
-    let others: [(&str, Open); 3] = [
+    let others: [(&str, Open); 2] = [
         ("Color Mixer", |rig| rig.key('p')),
-        ("Generate", |rig| {
-            rig.pick(Action::Command("picture.generate"))
-        }),
         ("AI & MCP", |rig| rig.pick(Action::Command("app.ai_mcp"))),
     ];
     for (name, open) in others {
