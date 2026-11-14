@@ -2222,7 +2222,7 @@ impl PainterApp {
                 Some(dpx_ui_modern::Spot::Ui(hit)) => Some(hit),
                 Some(dpx_ui_modern::Spot::Canvas) => None,
                 // The screen: in Modern without the classic chrome (see `ui()`), so only
-                // the page and what is still shown in the Classic look inside the quad.
+                // the page and what is shown in the Classic look inside the quad.
                 _ => match ui_screen.hit_test(self.palette().len(), &self.ui, ux, uy) {
                     Hit::Page { .. } => inside.map(|(x, y)| Hit::Page { x, y }),
                     h => Some(h),
@@ -2839,20 +2839,34 @@ impl PainterApp {
         }
     }
 
-    /// While the Color Mixer is open, uploads the screen in the palette being edited, so
-    /// every change shows at once (the document palette changes only on Ok).
-    fn palette_upload(&mut self, ctx: &egui::Context) {
-        let Some(req) = &self.ui.palette_requester else {
-            return;
-        };
-        if !self.dirty && self.texture.is_some() {
-            return;
-        }
-        let palette = req.palette();
+    /// The screen while the Color Mixer is open, in the palette being edited (the document
+    /// palette changes only on Ok): the image and its RGBA8 pixels. `None` while the Mixer
+    /// is closed.
+    pub(crate) fn mixer_screen(&mut self) -> Option<(IndexedImage, Vec<u8>)> {
+        let palette = self.ui.palette_requester.as_ref()?.palette();
+        // ADR-47: in the Modern skin the Mixer is a card beside the picture, not part of
+        // the screen.
+        let cards = (self.modern_card() == Some(modern_dialog::Card::Palette))
+            .then(|| modern_dialog::Cards::take(&mut self.ui));
         let screen = self
             .view()
             .compose(&self.page(), self.scroll, &palette, &self.ui);
+        if let Some(cards) = cards {
+            cards.put_back(&mut self.ui);
+        }
         let rgba = to_rgba(&screen, &palette, 1, 1);
+        Some((screen, rgba))
+    }
+
+    /// While the Color Mixer is open, uploads the screen in the palette being edited, so
+    /// every change shows at once.
+    fn palette_upload(&mut self, ctx: &egui::Context) {
+        if self.ui.palette_requester.is_none() || (!self.dirty && self.texture.is_some()) {
+            return;
+        }
+        let Some((screen, rgba)) = self.mixer_screen() else {
+            return;
+        };
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [screen.width() as usize, screen.height() as usize],
             &rgba,

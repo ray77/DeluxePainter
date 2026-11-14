@@ -8,15 +8,15 @@
 //! (`modal_events`, the `*_event` functions), so both skins answer alike.
 //!
 //! Only the requester that has the pointer and the keys (the first one `pass()` asks) is
-//! shown as a card. Every requester that is not converted yet is shown in the Classic look
-//! inside the picture quad, as before.
+//! shown as a card. Since slice 4c every requester is one; Show Page and the Animation
+//! Control Panel are not requesters and stay in the picture quad.
 
 use dpx_core::Palette;
 use dpx_ui::dialog::Dialog;
 use dpx_ui::{
     AnimControlRequester, AnimRequester, ChoiceRequester, FileRequester, GenerateRequester,
-    ImportRequester, McpRequester, NoteRequester, PageSizeRequester, RangeRequester,
-    ScreenFormatRequester, ToolRequester, UiState,
+    ImportRequester, McpRequester, NoteRequester, PageSizeRequester, PaletteRequester,
+    RangeRequester, ScreenFormatRequester, ToolRequester, UiState,
 };
 use dpx_ui_modern::Theme;
 use dpx_ui_modern::dialog as kit;
@@ -54,6 +54,8 @@ pub(crate) enum Card {
     Setup,
     /// Prefs ▸ AI & MCP..
     Mcp,
+    /// Color ▸ Palette ▸ Mixer: the Color Mixer, docked beside the unveiled picture.
+    Palette,
 }
 
 /// The requester that has the pointer and the keys, if the Modern skin draws it: the
@@ -100,7 +102,7 @@ pub(crate) fn card(
         return Some(Card::Anim);
     }
     if ui.palette_requester.is_some() {
-        return None;
+        return Some(Card::Palette);
     }
     if ui.range_requester.is_some() {
         return Some(Card::Range);
@@ -135,13 +137,8 @@ pub(crate) fn view(
         Card::Generate => ui.generate_requester.as_ref().map(GenerateRequester::view),
         Card::Setup => ui.imagegen_setup.as_ref().map(|r| r.view()),
         Card::Mcp => ui.mcp_requester.as_ref().map(McpRequester::dialog),
+        Card::Palette => ui.palette_requester.as_ref().map(PaletteRequester::view),
     }
-}
-
-/// A requester of the shared interface state that is still shown in the Classic look is
-/// open (the picture quad hosts it).
-pub(crate) fn classic_look_open(ui: &UiState) -> bool {
-    ui.palette_requester.is_some()
 }
 
 /// `ui` without the requesters the Modern skin draws itself: what the picture quad is
@@ -164,6 +161,7 @@ pub(crate) struct Cards {
     generate: Option<GenerateRequester>,
     setup: Option<dpx_ui::ImageGenSetupRequester>,
     mcp: Option<McpRequester>,
+    palette: Option<PaletteRequester>,
 }
 
 impl Cards {
@@ -182,6 +180,7 @@ impl Cards {
             generate: ui.generate_requester.take(),
             setup: ui.imagegen_setup.take(),
             mcp: ui.mcp_requester.take(),
+            palette: ui.palette_requester.take(),
         }
     }
 
@@ -199,12 +198,13 @@ impl Cards {
         ui.generate_requester = self.generate;
         ui.imagegen_setup = self.setup;
         ui.mcp_requester = self.mcp;
+        ui.palette_requester = self.palette;
     }
 }
 
 impl PainterApp {
     /// The requester the Modern skin shows as a card now; `None` in the Classic skin, with
-    /// no requester open, and while the one on top is not converted yet.
+    /// no requester open, and while playback or the Move preview runs.
     pub(crate) fn modern_card(&self) -> Option<Card> {
         if !self.is_modern() {
             return None;
@@ -235,7 +235,7 @@ impl PainterApp {
 
     /// A card is all that is open: the picture's image holds no requester.
     pub(crate) fn modern_plain_picture(&self) -> bool {
-        self.modern_card().is_some() && !classic_look_open(&self.ui) && self.show_page.is_none()
+        self.modern_card().is_some() && self.show_page.is_none()
     }
 
     /// While a card is shown: the pointer of this pass in the coordinates of the requester's
@@ -260,9 +260,11 @@ impl PainterApp {
         pointer.at = hover.map(|p| (p.x - area.min.x, p.y - area.min.y));
         pointer.down = down;
         // Where the controls are does not depend on the theme.
-        let built = kit::build(
+        let built = kit::build_in(
             &dialog,
             layout.window,
+            layout.viewport,
+            layout.picture,
             layout.scale,
             &Theme::dark(),
             &pointer,

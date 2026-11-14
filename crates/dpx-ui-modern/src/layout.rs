@@ -213,7 +213,8 @@ pub struct Picture {
     pub per_ui_pixel: u32,
     /// Prefs ▸ Pixel Size: the wanted size of an interface pixel, in half points.
     pub pixel_size: PixelSize,
-    /// The image shows a requester, a note or Show Page in the Classic look. The chrome is
+    /// The image shows a view in the Classic look that has the pointer and the keys (Show
+    /// Page; before slice 4c also the requesters that were not cards yet). The chrome is
     /// veiled and takes no input then, so the quad may use the whole window when the
     /// viewport alone would show it smaller than wanted.
     pub hosts_requester: bool,

@@ -37,6 +37,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     let generate = app.ui.generate_requester.take();
     let setup = app.ui.imagegen_setup.take();
     let mcp = app.ui.mcp_requester.take();
+    let mixer = app.ui.palette_requester.take();
     // The server listens on any free port: the number is not compared.
     let port = match app.mcp.status() {
         crate::mcp::Status::Running { port, .. } => Some(port.to_string()),
@@ -106,6 +107,10 @@ fn dialog_state(rig: &mut Rig) -> String {
                     app.imagegen.opened_url.clone(),
                 ),
                 (mcp_shown, mcp_settings),
+                // The Color Mixer by what it shows and by the colours it would set.
+                mixer
+                    .as_ref()
+                    .map(|r| (r.view(), r.colors().to_vec(), r.selected())),
             ),
             percent,
             (open, pending, confirmed),
@@ -131,6 +136,7 @@ fn dialog_state(rig: &mut Rig) -> String {
     app.ui.generate_requester = generate;
     app.ui.imagegen_setup = setup;
     app.ui.mcp_requester = mcp;
+    app.ui.palette_requester = mixer;
     format!("{shown} closes: {closes} {rest}")
 }
 
@@ -3127,12 +3133,394 @@ fn the_ai_and_mcp_requester_does_the_same_in_both_skins() {
     both_at_every_scale(mcp_script);
 }
 
+/// Slider `id` of the card on top as it is described: its Classic area and its knob.
+fn slider_of(rig: &Rig, id: ControlId) -> (dpx_core::Rect, dpx_core::Rect) {
+    use dpx_ui::dialog::{Item, Part};
+    for item in rig.dialog().columns.iter().flatten() {
+        let Item::Line { parts, .. } = item else {
+            continue;
+        };
+        for part in parts {
+            match part {
+                Part::Slider(s) if s.control.id == id => return (s.control.area, s.knob),
+                _ => {}
+            }
+        }
+    }
+    panic!("slider {id}");
+}
+
+impl Rig {
+    /// The window point that stands for the Classic x `cx` on slider `id`: in the Classic
+    /// window that pixel of the track, in the Modern window the point of the track whose
+    /// knob position is the same.
+    fn slider_point(&self, id: ControlId, cx: i32) -> egui::Pos2 {
+        let (area, knob) = slider_of(self, id);
+        if self.app.is_modern() {
+            let (from, to) = (
+                self.control_point(id, (0.0, 0.5)),
+                self.control_point(id, (1.0, 0.5)),
+            );
+            let r = dpx_ui_modern::dialog::KNOB_R;
+            let t = (cx - area.x - knob.w / 2) as f32 / (area.w - knob.w) as f32;
+            egui::pos2(from.x + r + t * (to.x - from.x - 2.0 * r), from.y)
+        } else {
+            let frac = ((cx - area.x) as f32 + 0.5) / area.w as f32;
+            self.control_point(id, (frac, 0.5))
+        }
+    }
+
+    /// Press on slider `id` at the Classic x `from`, move to `to`, let go.
+    fn drag_slider(&mut self, id: ControlId, from: i32, to: i32, seen: Seen, what: &str) {
+        let pos = self.slider_point(id, from);
+        self.pass(vec![
+            egui::Event::PointerMoved(pos),
+            pointer_button(pos, Primary, true),
+        ]);
+        seen(self, format!("{what}: pressed"));
+        let pos = self.slider_point(id, to);
+        self.pass(vec![egui::Event::PointerMoved(pos)]);
+        seen(self, format!("{what}: moved"));
+        self.pass(vec![pointer_button(pos, Primary, false)]);
+        seen(self, format!("{what}: let go"));
+    }
+
+    /// A click on slider `id` at the Classic x `cx`.
+    fn click_slider(&mut self, id: ControlId, cx: i32) {
+        let pos = self.slider_point(id, cx);
+        self.pass(vec![
+            egui::Event::PointerMoved(pos),
+            pointer_button(pos, Primary, true),
+        ]);
+        self.pass(vec![pointer_button(pos, Primary, false)]);
+    }
+}
+
+/// The Color Mixer (slice 4c): opened by `p` and by the menu; every cell of the grid by
+/// its middle and its corners; each slider dragged by its knob to both ends and to the
+/// middle and stepped by clicks beside the knob, in RGB and in HSV; Spread, Copy and Ex
+/// with their second colour, switched, taken back by a second press and by Esc; Undo by
+/// its button and by `u`; buttons pressed and left; Ok, Cancel, Return, Esc and `p`.
+fn mixer_script(rig: &mut Rig, seen: Seen) {
+    use dpx_ui::palette_requester::ctl;
+    const MID: (f32, f32) = (0.5, 0.5);
+    let req = |rig: &Rig| rig.app.ui.palette_requester.clone().expect("open");
+    let cell = |c: u16| swatch(c, 2, MID);
+    let colors = |rig: &Rig| rig.app.engine.document().palette().colors().to_vec();
+    let start = colors(rig);
+    assert_eq!(start.len(), 32, "a grid of 16 x 2");
+    rig.key('p');
+    assert!(rig.app.ui.palette_requester.is_some());
+    if rig.app.is_modern() {
+        assert_eq!(rig.card(), Some(Card::Palette));
+    }
+    seen(rig, "p opens the Color Mixer".into());
+    // The grid.
+    for (c, at) in [
+        (7u16, MID),
+        (0, (0.05, 0.1)),
+        (31, (0.95, 0.9)),
+        (15, (0.95, 0.1)),
+        (16, (0.05, 0.9)),
+        (5, MID),
+    ] {
+        rig.click_control(ctl::GRID, swatch(c, 2, at));
+        assert_eq!(u16::from(req(rig).selected()), c);
+        seen(rig, format!("colour {c}"));
+    }
+    // The sliders, first R, G and B, then H, S and V.
+    for system in ["RGB", "HSV"] {
+        for ch in 0..3u16 {
+            let id = ctl::SLIDER + ch;
+            let what = format!("{system} slider {ch}");
+            let (area, knob) = slider_of(rig, id);
+            let free = area.w - knob.w;
+            let before = req(rig).colors().to_vec();
+            rig.drag_slider(
+                id,
+                knob.x + knob.w / 2,
+                area.x + area.w + 40,
+                seen,
+                &format!("{what} to the right end"),
+            );
+            let (_, knob) = slider_of(rig, id);
+            assert_eq!(knob.x, area.x + free, "{what}: at the end");
+            rig.drag_slider(
+                id,
+                knob.x + knob.w / 2,
+                area.x - 30,
+                seen,
+                &format!("{what} to the left end"),
+            );
+            let (_, knob) = slider_of(rig, id);
+            assert_eq!(knob.x, area.x, "{what}: at the start");
+            rig.drag_slider(
+                id,
+                knob.x + knob.w / 2,
+                area.x + knob.w / 2 + free / 2,
+                seen,
+                &format!("{what} to the middle"),
+            );
+            let (_, knob) = slider_of(rig, id);
+            assert!((knob.x - area.x - free / 2).abs() <= 1, "{what}: {knob:?}");
+            // Beside the knob: one step each.
+            rig.click_slider(id, area.x + area.w - 3);
+            seen(rig, format!("{what}: a step up"));
+            rig.click_slider(id, area.x + 2);
+            rig.click_slider(id, area.x + 2);
+            seen(rig, format!("{what}: two steps down"));
+            assert_ne!(req(rig).colors(), before, "{what} changed the colour");
+        }
+        rig.click_control(ctl::SYSTEM, MID);
+        seen(rig, format!("after {system}: the other sliders"));
+    }
+    // Undo by its button and by its key.
+    for _ in 0..3 {
+        rig.click_control(ctl::UNDO, MID);
+        seen(rig, "Undo".into());
+    }
+    rig.key('u');
+    rig.key('u');
+    seen(rig, "u twice".into());
+    // Spread, Copy and Ex wait for their second colour.
+    rig.click_control(ctl::GRID, cell(4));
+    rig.click_control(ctl::SPREAD, MID);
+    seen(rig, "Spread waits".into());
+    rig.click_control(ctl::GRID, cell(12));
+    let now = req(rig);
+    assert_eq!(now.selected(), 12);
+    assert_ne!(now.colors()[8], start[8], "a gradient from 4 to 12");
+    seen(rig, "Spread 4 to 12".into());
+    rig.click_control(ctl::COPY, (0.1, 0.2));
+    seen(rig, "Copy waits".into());
+    rig.click_control(ctl::GRID, cell(20));
+    let now = req(rig);
+    assert_eq!(now.colors()[20], now.colors()[12]);
+    seen(rig, "Copy 12 to 20".into());
+    rig.click_control(ctl::EX, (0.9, 0.8));
+    seen(rig, "Ex waits".into());
+    rig.click_control(ctl::GRID, cell(1));
+    let after = req(rig);
+    assert_eq!(after.colors()[1], now.colors()[20]);
+    seen(rig, "Exchange 20 with 1".into());
+    // A second press takes it back; another one takes over; Esc ends the waiting only.
+    rig.click_control(ctl::SPREAD, MID);
+    seen(rig, "Spread".into());
+    rig.click_control(ctl::SPREAD, MID);
+    seen(rig, "Spread again: off".into());
+    rig.click_control(ctl::COPY, MID);
+    rig.click_control(ctl::EX, MID);
+    seen(rig, "Copy, then Ex".into());
+    rig.tap(egui::Key::Escape);
+    assert!(
+        rig.app.ui.palette_requester.is_some(),
+        "Esc ends the waiting"
+    );
+    seen(rig, "Esc".into());
+    rig.click_control(ctl::SPREAD, MID);
+    rig.click_control(ctl::UNDO, MID);
+    seen(rig, "Spread, then Undo".into());
+    // Pressed and left, entered with the button held, beside, Tab and the wheel.
+    for id in [ctl::OK, ctl::CANCEL, ctl::SPREAD, ctl::UNDO] {
+        rig.press_and_leave(id);
+        assert!(rig.app.ui.palette_requester.is_some());
+        seen(rig, format!("control {id} pressed and left"));
+        rig.press_beside_and_enter(id);
+        assert!(rig.app.ui.palette_requester.is_some());
+        seen(rig, format!("control {id} entered with the button held"));
+    }
+    rig.click_beside();
+    rig.tap(egui::Key::Tab);
+    rig.wheel(-3.0);
+    assert!(rig.app.ui.palette_requester.is_some());
+    seen(rig, "a click beside, Tab, the wheel".into());
+    assert_eq!(
+        colors(rig),
+        start,
+        "the picture's palette is not touched yet"
+    );
+    // Ok sets the palette and the foreground colour.
+    let edited = req(rig);
+    rig.click_control(ctl::OK, MID);
+    assert!(rig.app.ui.palette_requester.is_none());
+    assert_eq!(colors(rig), edited.colors());
+    assert_eq!(rig.app.ui.fg, edited.selected());
+    seen(rig, "Ok".into());
+    // By the menu; Cancel forgets the changes.
+    let kept = colors(rig);
+    let change = |rig: &mut Rig, seen: Seen| {
+        rig.click_control(ctl::GRID, cell(9));
+        let (area, knob) = slider_of(rig, ctl::SLIDER);
+        let to = if knob.x > area.x + 20 {
+            area.x - 30
+        } else {
+            area.x + area.w + 40
+        };
+        rig.drag_slider(ctl::SLIDER, knob.x + knob.w / 2, to, seen, "a change");
+    };
+    rig.pick(Action::Command("palette.mixer"));
+    assert!(rig.app.ui.palette_requester.is_some());
+    seen(rig, "Mixer by the menu".into());
+    change(rig, seen);
+    rig.click_control(ctl::CANCEL, MID);
+    assert!(rig.app.ui.palette_requester.is_none());
+    assert_eq!(colors(rig), kept);
+    seen(rig, "Cancel".into());
+    // Return keeps them, Esc forgets them, p keeps them.
+    for (key, keeps) in [("Return", true), ("Esc", false), ("p", true)] {
+        let kept = colors(rig);
+        rig.key('p');
+        seen(rig, "p".into());
+        change(rig, seen);
+        match key {
+            "Return" => rig.tap(egui::Key::Enter),
+            "Esc" => rig.tap(egui::Key::Escape),
+            _ => rig.key('p'),
+        }
+        assert!(rig.app.ui.palette_requester.is_none(), "{key} closes");
+        assert_eq!(colors(rig) != kept, keeps, "{key}");
+        seen(rig, key.to_string());
+    }
+    // One undo step per Ok.
+    rig.key('u');
+    seen(rig, "u undoes the last palette".into());
+}
+
+#[test]
+fn the_color_mixer_does_the_same_in_both_skins() {
+    both_at_every_scale(mixer_script);
+}
+
+/// The Color Mixer in the Modern skin: its card is docked at the bottom left of the
+/// picture's area, the picture keeps its place and is not veiled, and it shows every
+/// change at once, before Ok (the document's palette changes only then).
+#[test]
+fn the_color_mixer_recolours_the_unveiled_picture_beside_its_card() {
+    use dpx_ui::palette_requester::ctl;
+    use dpx_ui_modern::dialog::DOCK_MARGIN;
+    for (kind, size, ppp) in [
+        (ThemeKind::Dark, (1280.0, 800.0), 1.0),
+        (ThemeKind::Light, (1280.0, 800.0), 2.0),
+        (ThemeKind::Dark, (1001.0, 700.0), 1.5),
+    ] {
+        let what = format!("{kind:?} {size:?} {ppp}");
+        let theme = Theme::of(kind);
+        let mut rig = Rig::new(UiStyle::Modern, size, ppp);
+        rig.app.run(Command::Clear { color: 5 });
+        rig.app.ui.fg = 5;
+        rig.pass(vec![]);
+        let plain = rig.app.modern_layout().expect("layout");
+        let lit = shot(&mut rig, kind, "live-mixer-before");
+        let far = modern_point(&rig.app, Place::Page(318, 1));
+        let was = rig.app.engine.document().palette().colors()[5];
+        assert_eq!(probe(&lit, &plain, far.x, far.y), [was.r, was.g, was.b]);
+        rig.key('p');
+        rig.pass(vec![]);
+        assert_eq!(rig.card(), Some(Card::Palette), "{what}");
+        let l = rig.app.modern_layout().expect("layout");
+        assert_eq!(l, plain, "{what}: the picture keeps its place");
+        assert!(rig.app.modern_plain_picture(), "{what}");
+        let dialog = rig.app.modern_dialog().expect("the card");
+        let built = dpx_ui_modern::dialog::build_in(
+            &dialog,
+            l.window,
+            l.viewport,
+            l.picture,
+            l.scale,
+            &theme,
+            &Default::default(),
+        );
+        // In a bottom corner of the picture's area: the left one, or the right one where
+        // that covers less of the picture.
+        let (card, area) = (built.card, l.viewport);
+        let left = (card.x - (area.x + DOCK_MARGIN)).abs() < 1.0;
+        let right = (card.right() - (area.right() - DOCK_MARGIN)).abs() < 1.0;
+        assert!(left || right, "{what}: {card:?}");
+        assert!(
+            left || ppp == 1.5,
+            "{what}: bottom left in the default window"
+        );
+        assert!(
+            (card.bottom() - (area.bottom() - DOCK_MARGIN)).abs() < 1.0,
+            "{what}: {card:?}"
+        );
+        assert!(l.window.encloses(&built.card), "{what}");
+        // The quad holds no requester.
+        let screen = rig.app.compose_for_skin();
+        let mut bare = rig.app.ui.clone();
+        bare.palette_requester = None;
+        assert_eq!(
+            screen,
+            rig.app
+                .view()
+                .compose(&rig.app.page(), rig.app.scroll, rig.app.palette(), &bare)
+        );
+        let open = shot(
+            &mut rig,
+            kind,
+            &format!("live-mixer-{kind:?}-{ppp}").to_lowercase(),
+        );
+        assert_eq!(
+            probe(&open, &l, far.x, far.y),
+            [was.r, was.g, was.b],
+            "{what}: the picture is not veiled"
+        );
+        assert_eq!(
+            probe(&open, &l, built.card.x + 8.0, built.card.y + 8.0),
+            rgb(theme.raised),
+            "{what}: the card"
+        );
+        let bar = l.bar.expect("bar");
+        assert_ne!(
+            probe(&open, &l, bar.right() - 3.0, bar.y + 3.0),
+            rgb(theme.panel),
+            "{what}: the chrome takes no input and is veiled"
+        );
+        // A slider moved: the picture follows at once, the document does not.
+        let (area, knob) = slider_of(&rig, ctl::SLIDER + 2);
+        let to = if knob.x > area.x + 20 {
+            area.x - 30
+        } else {
+            area.x + area.w + 40
+        };
+        rig.drag_slider(
+            ctl::SLIDER + 2,
+            knob.x + knob.w / 2,
+            to,
+            &mut |_, _| {},
+            "B",
+        );
+        let mixed = rig
+            .app
+            .ui
+            .palette_requester
+            .as_ref()
+            .expect("open")
+            .colors()[5];
+        assert_ne!(mixed, was, "{what}");
+        assert_eq!(rig.app.engine.document().palette().colors()[5], was);
+        let live = shot(&mut rig, kind, "live-mixer-changed");
+        assert_eq!(
+            probe(&live, &l, far.x, far.y),
+            [mixed.r, mixed.g, mixed.b],
+            "{what}: the picture shows the colour being mixed"
+        );
+        // Cancel: the picture is as it was.
+        rig.click_control(ctl::CANCEL, (0.5, 0.5));
+        rig.pass(vec![]);
+        assert!(rig.app.ui.palette_requester.is_none(), "{what}");
+        let again = shot(&mut rig, kind, "live-mixer-cancelled");
+        assert_eq!(probe(&again, &l, far.x, far.y), [was.r, was.g, was.b]);
+    }
+}
+
 /// Every converted requester fits the smallest window and is drawn there, in both themes
 /// and at device scale 1 and 2 (the images go to `DPX_MODERN_SHOTS` for a look).
 #[test]
 fn every_card_fits_the_smallest_window() {
     type Open = fn(&mut Rig);
-    let open: [(&str, Card, Open); 31] = [
+    let open: [(&str, Card, Open); 32] = [
+        ("color-mixer", Card::Palette, |rig| rig.key('p')),
         ("ai-mcp", Card::Mcp, |rig| {
             rig.pick(Action::Command("app.ai_mcp"))
         }),
@@ -3251,9 +3639,11 @@ fn every_card_fits_the_smallest_window() {
             let l = rig.app.modern_layout().expect("layout");
             assert_eq!(l, main, "{name}: the window stays as it is");
             let dialog = rig.app.modern_dialog().expect("the card");
-            let built = dpx_ui_modern::dialog::build(
+            let built = dpx_ui_modern::dialog::build_in(
                 &dialog,
                 l.window,
+                l.viewport,
+                l.picture,
                 l.scale,
                 &theme,
                 &Default::default(),
@@ -3322,10 +3712,11 @@ fn a_question_over_another_card_is_the_only_card() {
     assert!(!rig.app.modal_open());
 }
 
-/// The requesters that are not converted stay in the Classic look: none of them is a card,
-/// and the Classic skin never has one.
+/// Every requester is a card since slice 4c. What is not a requester stays in the picture
+/// quad and is no card: Show Page and the Animation Control Panel. The Classic skin never
+/// has a card.
 #[test]
-fn only_the_converted_requesters_are_cards() {
+fn what_is_not_a_requester_is_not_a_card() {
     let mut classic = Rig::classic();
     classic.pick(Action::Command("picture.page_size"));
     assert!(classic.app.ui.page_size_requester.is_some());
@@ -3336,17 +3727,26 @@ fn only_the_converted_requesters_are_cards() {
             .modern_dialog_pos(&classic.ctx.clone())
             .is_none()
     );
-    type Open = fn(&mut Rig);
-    let others: [(&str, Open); 1] = [("Color Mixer", |rig| rig.key('p'))];
-    for (name, open) in others {
-        let mut rig = Rig::modern();
-        open(&mut rig);
-        rig.pass(vec![]);
-        assert!(rig.app.modal_open(), "{name} is open");
-        assert_eq!(rig.card(), None, "{name} keeps the Classic look");
-        assert!(rig.app.modern_dialog().is_none());
-        // A converted requester under it does not become a card either.
-        rig.show_note();
-        assert_eq!(rig.card(), None, "{name}");
-    }
+    let mut rig = Rig::modern();
+    rig.pick(Action::Command("picture.show_page"));
+    rig.pass(vec![]);
+    assert!(rig.app.show_page.is_some() && rig.app.modal_open());
+    assert_eq!(rig.card(), None, "Show Page is a view");
+    assert!(rig.app.modern_dialog().is_none());
+    rig.tap(egui::Key::Escape);
+    assert!(!rig.app.modal_open());
+    rig.pick(Action::Command("anim.panel"));
+    rig.pass(vec![]);
+    assert!(rig.app.anim_control.panel, "the Control Panel is shown");
+    assert_eq!(rig.card(), None, "the Control Panel is a panel");
+    assert!(rig.app.modern_dialog().is_none());
+    // Every requester of the shared state is one the Modern skin takes out of the quad.
+    let mut ui = rig.app.ui.clone();
+    ui.palette_requester = Some(dpx_ui::PaletteRequester::new(
+        rig.app.palette(),
+        1,
+        dpx_core::Chipset::Aga,
+    ));
+    crate::modern_dialog::without_cards(&mut ui);
+    assert!(ui.palette_requester.is_none());
 }

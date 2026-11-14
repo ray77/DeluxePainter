@@ -7,9 +7,10 @@
 //! the dock and the layer column (Prefs ▸ Layers) are drawn by `dpx-ui-modern` on the CPU,
 //! each into its own image that is redone only when its display list changes; dock and layer
 //! column answer a click with the Classic skin's [`Hit`] values, so `handle_press` does not
-//! know which skin it came from. A requester, a note, Show Page and playback are shown in
-//! the Classic look inside the quad; the chrome around lies under a scrim then and takes no
-//! input. The Screen Format requester, which has a screen of its own, gets the whole window. The pull-down
+//! know which skin it came from. Every requester is a card the Modern skin draws itself
+//! (`modern_dialog`, slices 4a to 4c); Show Page, playback and the Animation Control Panel
+//! are shown in the Classic look inside the quad. While a requester or Show Page is open
+//! the chrome around lies under a scrim and takes no input. The pull-down
 //! menus (held with the right button on the bar, as in Classic) and the tooltips of the dock
 //! buttons are one more image over everything; they write and read the same `MenuState`
 //! and `Tooltip` as the Classic skin.
@@ -351,8 +352,8 @@ impl PainterApp {
         }
         let win = self.window?;
         let view = self.view();
-        // A requester in the Classic look may use the whole window; a Modern card leaves
-        // the picture where it is.
+        // Show Page (in the Classic look inside the quad) may use the whole window; a
+        // Modern card leaves the picture where it is.
         let hosts = self.modern_dimmed() && !self.modern_plain_picture();
         // A held mouse button keeps the layout it went down in (see `State::frozen`); a
         // requester that opened meanwhile has the pointer and is laid out as it is.
@@ -814,6 +815,10 @@ impl PainterApp {
                 let rgba = dpx_ui::to_rgba(&screen, self.palette(), 1, 1);
                 (screen, rgba)
             }
+            // As `palette_upload`: the screen in the palette the Color Mixer edits.
+            (None, None) if self.ui.palette_requester.is_some() => {
+                self.mixer_screen().expect("the Color Mixer is open")
+            }
             (None, None) => {
                 let screen = self.compose_for_skin();
                 let mut rgba = dpx_ui::to_rgba(&screen, self.palette(), 1, 1);
@@ -1021,8 +1026,9 @@ pub(crate) fn snapshot_options(args: &[String]) -> Result<Option<SnapshotOptions
 }
 
 /// The interface state the picture quad is composed with: the shared state without the
-/// classic chrome, which the Modern skin draws itself. Requesters and the Animation Control
-/// Panel stay: they are shown in the Classic look inside the quad until they are converted.
+/// classic chrome, which the Modern skin draws itself. The Animation Control Panel stays: it
+/// is shown in the Classic look inside the quad (the requesters are taken out where a card
+/// is shown, see `modern_dialog::without_cards`).
 fn quad_ui(ui: &UiState) -> UiState {
     let mut bare = ui.clone();
     bare.title_visible = false;
@@ -1061,7 +1067,7 @@ pub(crate) fn snapshot_image(
     // A Classic tooltip (the Control Panel's, inside the quad) is not the chrome's.
     shown.tooltip = None;
     let dimmed = has_requester(ui) || screen_format.is_some();
-    let plain_picture = card.is_some() && !modern_dialog::classic_look_open(ui);
+    let plain_picture = card.is_some();
     let layout = Frame {
         size: options.size,
         scale: options.device_scale,
@@ -1516,9 +1522,11 @@ mod tests {
             let dialog = self.dialog();
             if self.app.is_modern() {
                 let l = self.app.modern_layout().expect("layout");
-                let built = dpx_ui_modern::dialog::build(
+                let built = dpx_ui_modern::dialog::build_in(
                     &dialog,
                     l.window,
+                    l.viewport,
+                    l.picture,
                     l.scale,
                     &Theme::dark(),
                     &Default::default(),
@@ -1562,6 +1570,8 @@ mod tests {
                 r.origin(w, h)
             } else if let Some(r) = &app.ui.anim_requester {
                 r.origin(w, h)
+            } else if app.ui.palette_requester.is_some() {
+                dpx_ui::PaletteRequester::origin(w, h)
             } else if app.ui.range_requester.is_some() {
                 dpx_ui::RangeRequester::origin(w, h)
             } else if let Some(r) = &app.ui.note_requester {
@@ -3585,49 +3595,14 @@ mod tests {
         seen(rig, "the screen-sized page again".into());
     }
 
-    /// The Color Mixer: a click on a colour selects it, a click in a slider changes it.
-    fn color_mixer_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
-        use dpx_ui::PaletteRequester as Req;
-        rig.key('p');
-        let (w, h) = rig.app.view().ui_size();
-        let (ox, oy) = Req::origin(w, h);
-        let cell = rig
-            .app
-            .ui
-            .palette_requester
-            .as_ref()
-            .expect("the Color Mixer")
-            .cell_rect(7);
-        seen(rig, "the Color Mixer".into());
-        // The cell's last pixel, at its far corner.
-        let last = (ox + cell.x + cell.w - 1, oy + cell.y + cell.h - 1);
-        rig.click_at(ui_pixel(rig, last), FAR, Primary);
-        let mixer = |rig: &Rig| {
-            let req = rig.app.ui.palette_requester.as_ref().expect("the Mixer");
-            (req.selected(), req.colors()[7])
-        };
-        assert_eq!(mixer(rig).0, 7, "the colour under the pointer");
-        seen(rig, "colour 7".into());
-        let before = mixer(rig).1;
-        let slider = Req::slider_rect(1);
-        let at = (ox + slider.x + slider.w / 3, oy + slider.y + slider.h / 2);
-        rig.click(ui_pixel(rig, at), Primary);
-        assert_ne!(mixer(rig).1, before, "the slider took the click");
-        seen(rig, "the G slider".into());
-        rig.tap(egui::Key::Escape);
-        assert!(rig.app.ui.palette_requester.is_none());
-        seen(rig, "Esc".into());
-    }
-
     type Script = fn(&mut Rig, &mut dyn FnMut(&mut Rig, String));
 
     /// One requester of each kind, with the layer column shown: each opens in the Modern
     /// window, takes clicks on the first and last pixels of its buttons through the
     /// unchanged mapping, closes, and leaves the same state as in the Classic window.
-    const MODAL_SCRIPTS: [(&str, Script); 3] = [
+    const MODAL_SCRIPTS: [(&str, Script); 2] = [
         ("Screen Format", screen_format_script),
         ("Show Page", show_page_script),
-        ("Color Mixer", color_mixer_script),
     ];
 
     fn modal_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
@@ -3704,9 +3679,9 @@ mod tests {
                     assert_ne!(c, rgb(theme.panel), "{name}: veiled at ({x}, {y})");
                     assert!(c.iter().zip(rgb(theme.panel)).all(|(a, b)| *a <= b));
                 }
-                // The requester is in the picture, which is not veiled: its middle differs
-                // from the page, and the page's corner is the page.
-                let corner = modern_point(&rig.app, Place::Page(1, 254));
+                // The Color Mixer's card lies beside the picture, which is not veiled: the
+                // page's far corner is the page.
+                let corner = modern_point(&rig.app, Place::Page(318, 1));
                 assert_eq!(
                     probe(&image, &l, corner.x, corner.y),
                     probe(&lit, &l, corner.x, corner.y),
@@ -3942,42 +3917,41 @@ mod tests {
         }
     }
 
-    /// A requester on a screen that the viewport would cut or show small lies in the middle
-    /// of the window, over the veiled chrome, and is clicked where it is drawn.
+    /// Show Page (a view, not a requester: it stays in the picture quad) on a screen that
+    /// the viewport would show small lies in the middle of the window, over the veiled
+    /// chrome. The Color Mixer, a card since slice 4c, leaves the picture where it is.
     #[test]
-    fn a_requester_is_whole_and_readable_in_a_small_window() {
-        // The Color Mixer on a LoRes picture in an 800 x 600 window with the column: two
-        // physical pixels per pixel instead of one, and its cells and sliders answer.
+    fn show_page_is_whole_in_a_small_window_and_the_mixer_moves_nothing() {
         for (size, ppp) in [
             ((800.0, 600.0), 1.0),
             ((720.0, 520.0), 1.0),
             ((720.0, 520.0), 1.5),
         ] {
+            let what = format!("{size:?} {ppp}");
             let mut rig = Rig::new(UiStyle::Modern, size, ppp);
             rig.key('L');
             rig.pass(vec![]);
             let plain = rig.app.modern_layout().expect("layout");
-            color_mixer_script(&mut rig, &mut |rig, step| {
-                rig.pass(vec![]);
-                let l = rig.app.modern_layout().expect("layout");
-                if rig.app.modal_open() {
-                    assert!(l.over_chrome, "{size:?} {ppp}: {step}");
-                    assert!(l.zoom > plain.zoom, "{size:?} {ppp}: {step}");
-                    assert!(l.window.encloses(&l.picture), "{size:?} {ppp}: {step}");
-                } else {
-                    assert_eq!(l, plain, "{size:?} {ppp}: {step}");
-                }
-            });
+            rig.pick(Action::Command("picture.show_page"));
+            rig.pass(vec![]);
+            assert!(rig.app.show_page.is_some(), "{what}");
+            let l = rig.app.modern_layout().expect("layout");
+            assert!(l.over_chrome, "{what}");
+            assert!(l.zoom > plain.zoom, "{what}");
+            assert!(l.window.encloses(&l.picture), "{what}");
+            rig.tap(egui::Key::Escape);
+            rig.pass(vec![]);
+            assert!(rig.app.show_page.is_none(), "{what}");
+            assert_eq!(rig.app.modern_layout().expect("layout"), plain, "{what}");
+            // The Color Mixer: a card, the picture keeps its place and size.
+            rig.key('p');
+            rig.pass(vec![]);
+            assert!(rig.app.ui.palette_requester.is_some(), "{what}");
+            assert_eq!(rig.app.modern_layout().expect("layout"), plain, "{what}");
+            rig.tap(egui::Key::Escape);
+            rig.pass(vec![]);
+            assert_eq!(rig.app.modern_layout().expect("layout"), plain, "{what}");
         }
-        // In a roomy window the requester is where the picture is: nothing moves.
-        let mut rig = Rig::modern();
-        rig.key('L');
-        rig.pass(vec![]);
-        let plain = rig.app.modern_layout().expect("layout");
-        rig.key('p');
-        rig.pass(vec![]);
-        assert!(rig.app.modal_open());
-        assert_eq!(rig.app.modern_layout().expect("layout"), plain);
     }
 
     /// A freehand stroke from (50, 50) to (60, 60) with `during` run while the button is

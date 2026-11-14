@@ -60,7 +60,8 @@ const PART_GAP: f32 = 8.0;
 const LABEL_GAP: f32 = 12.0;
 const COLUMN_GAP: f32 = 24.0;
 const CHECK: f32 = 18.0;
-const KNOB_R: f32 = 8.0;
+/// Radius of a slider's knob: its centre keeps this distance from the ends of the track.
+pub const KNOB_R: f32 = 8.0;
 const SCROLL_W: f32 = 14.0;
 const STEPPER_W: f32 = 116.0;
 /// Space between two buttons that stand side by side in a line.
@@ -71,6 +72,11 @@ const RADIO_MIN_W: f32 = 96.0;
 /// Width of an icon button, and the least width of a button in a line.
 const ICON_W: f32 = 38.0;
 const PUSH_MIN_W: f32 = 34.0;
+/// Width of a colour sample in a form line.
+const SAMPLE_W: f32 = 56.0;
+/// A card that works on the picture (`Kind::Panel`) keeps this distance from the edges of
+/// the picture's area.
+pub const DOCK_MARGIN: f32 = 12.0;
 /// The two inks of a mark on a swatch: together they show on every colour.
 const MARK_DARK: Color = Color::rgb(20, 20, 24);
 const MARK_LIGHT: Color = Color::rgb(255, 255, 255);
@@ -886,6 +892,7 @@ impl Draw<'_> {
         if g.strip {
             self.list.rect(frame, theme.panel);
         }
+        let mut picked = Vec::new();
         for (i, cell) in g.cells.iter().enumerate() {
             let (col, row) = ((i % cols) as f32, (i / cols) as f32);
             let (left, right) = (self.snap(x0 + col * cw), self.snap(x0 + (col + 1.0) * cw));
@@ -918,7 +925,10 @@ impl Draw<'_> {
                         icons::MARK_STROKE,
                     );
                 }
-                Mark::Picked => {
+                // In a strip the cells are small: the ring goes around the cell, over its
+                // neighbours, and is drawn after them.
+                Mark::Selected if g.strip => picked.push(outer),
+                Mark::Picked | Mark::Selected => {
                     self.list.ring(outer.inset(0.5), 4.0, theme.accent, 2.0);
                     self.list.fill(Path::new().circle(cx, cy, 4.0), MARK_DARK);
                     self.list.fill(Path::new().circle(cx, cy, 2.5), MARK_LIGHT);
@@ -931,6 +941,10 @@ impl Draw<'_> {
         }
         if g.strip {
             self.list.ring(frame, 0.0, theme.hairline, 1.0);
+        }
+        for outer in picked {
+            self.list.ring(outer.inset(-3.0), 3.0, MARK_DARK, 1.0);
+            self.list.ring(outer.inset(-2.0), 2.0, MARK_LIGHT, 2.0);
         }
         self.spot(g.control, frame);
         frame.h
@@ -999,6 +1013,7 @@ impl Draw<'_> {
             Part::Radio(r) => Some(Self::radio_width(r)),
             Part::Button(b) => Some(Self::push_width(b)),
             Part::Icon(_) => Some(ICON_W),
+            Part::Sample(_) => Some(SAMPLE_W),
         }
     }
 
@@ -1071,6 +1086,11 @@ impl Draw<'_> {
                 Part::Radio(r) => self.radio(r, rect),
                 Part::Button(b) => self.push(b, rect),
                 Part::Icon(b) => self.icon(b, rect),
+                Part::Sample([r, g, b]) => {
+                    self.list
+                        .round_rect(rect, CONTROL_RADIUS, Color::rgb(*r, *g, *b));
+                    self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+                }
                 Part::Text(t, tone) => {
                     let ink = self.ink(*tone);
                     // A text that would leave the line ends in an ellipsis.
@@ -1441,7 +1461,7 @@ impl Draw<'_> {
                     Item::Text { text, tone, bullet } => {
                         let (tone, centred) = match kind {
                             Kind::About => (Tone::Dim, true),
-                            Kind::Plain => (*tone, false),
+                            Kind::Plain | Kind::Panel => (*tone, false),
                         };
                         self.paragraph(x, top, w, text, tone, *bullet, centred)
                     }
@@ -1626,7 +1646,55 @@ fn lay_out(
 /// Lays out and draws `dialog` as a card in the middle of `window` (points; `scale`
 /// physical pixels per point). In a window too low for the roomy sizes the compact ones are
 /// used. The scrim over the window is not part of the drawing (see `build::overlay`).
+///
+/// A card that works on the picture (`Kind::Panel`) is put as [`build_in`] puts it, with
+/// the whole window as the picture's area.
 pub fn build(dialog: &Dialog, window: Rect, scale: f32, theme: &Theme, pointer: &Pointer) -> Built {
+    let nothing = Rect::new(window.x, window.y, 0.0, 0.0);
+    build_in(dialog, window, window, nothing, scale, theme, pointer)
+}
+
+/// The corner of `viewport` in which a card of this size covers the least of `picture`:
+/// bottom left, bottom right, top left, top right, the first of equals. The card keeps
+/// [`DOCK_MARGIN`] from the viewport's edges and stays inside `window`.
+fn docked(window: Rect, viewport: Rect, picture: Rect, (w, h): (f32, f32)) -> (f32, f32) {
+    let edge = MARGIN.min(4.0);
+    let fit =
+        |v: f32, from: f32, len: f32, size: f32| v.min(from + len - edge - size).max(from + edge);
+    let (left, right) = (viewport.x + DOCK_MARGIN, viewport.right() - DOCK_MARGIN - w);
+    let (top, bottom) = (
+        viewport.y + DOCK_MARGIN,
+        viewport.bottom() - DOCK_MARGIN - h,
+    );
+    let covered = |&(x, y): &(f32, f32)| {
+        let ox = (x + w).min(picture.right()) - x.max(picture.x);
+        let oy = (y + h).min(picture.bottom()) - y.max(picture.y);
+        ox.max(0.0) * oy.max(0.0)
+    };
+    let mut best: Option<((f32, f32), f32)> = None;
+    for (x, y) in [(left, bottom), (right, bottom), (left, top), (right, top)] {
+        let at = (fit(x, window.x, window.w, w), fit(y, window.y, window.h, h));
+        let area = covered(&at);
+        if best.is_none_or(|(_, least)| area < least) {
+            best = Some((at, area));
+        }
+    }
+    best.map_or((left, bottom), |(at, _)| at)
+}
+
+/// [`build`] in a window whose picture area is `viewport` with the picture at `picture`.
+/// A card that works on the picture (`Kind::Panel`: the Color Mixer) is not put in the
+/// middle: it is docked in the corner of the viewport where it covers the least of the
+/// picture (bottom left first). Every other card lies in the middle of the window.
+pub fn build_in(
+    dialog: &Dialog,
+    window: Rect,
+    viewport: Rect,
+    picture: Rect,
+    scale: f32,
+    theme: &Theme,
+    pointer: &Pointer,
+) -> Built {
     let snap = |v: f32| (v * scale).round() / scale;
     let width = snap(card_width(dialog.size).min(window.w - 2.0 * MARGIN));
     let room = window.h - 2.0 * MARGIN;
@@ -1641,8 +1709,15 @@ pub fn build(dialog: &Dialog, window: Rect, scale: f32, theme: &Theme, pointer: 
         (COMPACT, true)
     };
     let height = snap(measure(m));
-    let x = snap(window.x + (window.w - width) / 2.0);
-    let y = snap((window.y + (window.h - height) / 2.0).max(window.y + MARGIN.min(4.0)));
+    let (x, y) = if dialog.kind == Kind::Panel {
+        let (x, y) = docked(window, viewport, picture, (width, height));
+        (snap(x), snap(y))
+    } else {
+        (
+            snap(window.x + (window.w - width) / 2.0),
+            snap((window.y + (window.h - height) / 2.0).max(window.y + MARGIN.min(4.0))),
+        )
+    };
     let card = Rect::new(x, y, width, height);
     let mut list = List::new();
     // The shadow: many faint cards of falling size, lower than the card, so that it fades
@@ -1958,7 +2033,50 @@ mod tests {
         imports(&mut out);
         generators(&mut out);
         mcp(&mut out);
+        mixers(&mut out);
         out
+    }
+
+    /// A palette of `n` colours: a ramp through red, green and blue.
+    fn ramp(n: usize) -> dpx_core::Palette {
+        let colors = (0..n)
+            .map(|i| {
+                let v = (i * 255 / (n - 1).max(1)) as u8;
+                dpx_core::Rgb8::new(v, 255 - v, (i * 37 % 256) as u8)
+            })
+            .collect();
+        dpx_core::Palette::new(colors).expect("a palette")
+    }
+
+    fn mixer(colors: usize, selected: u8, chipset: dpx_core::Chipset) -> dpx_ui::PaletteRequester {
+        dpx_ui::PaletteRequester::new(&ramp(colors), selected, chipset)
+    }
+
+    /// One press and release on control `id` of the Color Mixer.
+    fn mixer_click(r: &mut dpx_ui::PaletteRequester, id: ControlId) {
+        let a = r.view().control(id).expect("the control").area;
+        r.handle(ReqEvent::Press(a.x + a.w / 2, a.y + a.h / 2));
+        r.handle(ReqEvent::Release);
+    }
+
+    /// The Color Mixer (slice 4c) with every size of grid, both slider systems and a
+    /// waiting Spread, Copy and Exchange.
+    fn mixers(out: &mut Vec<(&'static str, Dialog)>) {
+        use dpx_core::Chipset::{Aga, Ocs};
+        use dpx_ui::palette_requester::ctl;
+        out.push(("color mixer, 2 colours", mixer(2, 1, Ocs).view()));
+        out.push(("color mixer, 16 colours", mixer(16, 5, Ocs).view()));
+        out.push(("color mixer, 32 colours", mixer(32, 31, Ocs).view()));
+        let mut ehb = mixer(64, 40, Ocs);
+        mixer_click(&mut ehb, ctl::EX);
+        out.push(("color mixer, 64 colours, exchange", ehb.view()));
+        let mut hsv = mixer(256, 200, Aga);
+        mixer_click(&mut hsv, ctl::SYSTEM);
+        mixer_click(&mut hsv, ctl::SPREAD);
+        out.push(("color mixer, 256 colours, hsv, spread", hsv.view()));
+        let mut copy = mixer(128, 127, Aga);
+        mixer_click(&mut copy, ctl::COPY);
+        out.push(("color mixer, 128 colours, copy", copy.view()));
     }
 
     fn mcp_view() -> dpx_ui::McpView {
@@ -3379,6 +3497,170 @@ mod tests {
                 veiled(theme.panel)
             ));
         }
+    }
+
+    /// The Color Mixer (slice 4c) works on the picture: its card is docked in the corner of
+    /// the picture's area where it covers the least of the picture (bottom left first),
+    /// inside the window, and the picture is not veiled. The grid has the Classic columns
+    /// and marks the selected colour, the sample shows it, RGB | HSV names the sliders,
+    /// and a waiting Spread stays down.
+    #[test]
+    fn the_color_mixer_is_docked_beside_the_unveiled_picture() {
+        use crate::build::{self, Model};
+        use crate::layout::{Chrome, MainLayout};
+        use dpx_core::Chipset::Aga;
+        use dpx_ui::palette_requester::ctl;
+        let theme = Theme::dark();
+        let none = Pointer::default();
+        let mut req = mixer(32, 5, Aga);
+        let dialog = req.view();
+        assert_eq!(dialog.kind, Kind::Panel);
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let viewport = Rect::new(0.0, 30.0, 1188.0, 770.0);
+        let place =
+            |picture: Rect| build_in(&dialog, window, viewport, picture, 1.0, &theme, &none).card;
+        // A picture in the middle: bottom left, the margin from the viewport's edges.
+        let middle = Rect::new(274.0, 95.0, 640.0, 640.0);
+        let card = place(middle);
+        assert_eq!(card.x, viewport.x + DOCK_MARGIN);
+        assert_eq!(card.bottom(), viewport.bottom() - DOCK_MARGIN);
+        // The same card wherever it is put; a picture at the left or at the bottom sends
+        // it to the corner that covers less.
+        let right = place(Rect::new(0.0, 30.0, 700.0, 770.0));
+        assert_eq!(right.right(), viewport.right() - DOCK_MARGIN);
+        assert_eq!(
+            (right.bottom(), right.w, right.h),
+            (card.bottom(), card.w, card.h)
+        );
+        let top = place(Rect::new(0.0, 500.0, 1188.0, 300.0));
+        assert_eq!((top.x, top.y), (card.x, viewport.y + DOCK_MARGIN));
+        let top_right = place(Rect::new(0.0, 300.0, 1000.0, 500.0));
+        assert_eq!(top_right.right(), viewport.right() - DOCK_MARGIN);
+        assert_eq!(top_right.y, viewport.y + DOCK_MARGIN);
+        // A viewport smaller than the card: the card stays inside the window.
+        for (size, scale) in [
+            ((720.0, 520.0), 1.0),
+            ((720.0, 520.0), 1.5),
+            ((720.0, 520.0), 2.0),
+        ] {
+            let window = Rect::new(0.0, 0.0, size.0, size.1);
+            let narrow = Rect::new(0.0, 30.0, 300.0, 300.0);
+            let b = build_in(&dialog, window, narrow, narrow, scale, &theme, &none);
+            assert!(window.encloses(&b.card), "{scale}: {:?}", b.card);
+        }
+        // In the window: no veil over the picture, the card over it.
+        let palette = dpx_core::Palette::dpaint_default_32();
+        let ui = dpx_ui::UiState::default();
+        let l = MainLayout::new(
+            (1280.0, 800.0),
+            1.0,
+            Chrome::ALL,
+            32,
+            (320, 256),
+            dpx_ui::PixelSize::default(),
+        );
+        let model = Model {
+            dimmed: true,
+            dialog: Some(&dialog),
+            plain_picture: true,
+            ..Model::new(&ui, &palette)
+        };
+        let (bounds, list) = build::overlay(&l, &theme, &model).expect("the card");
+        let docked = build_in(&dialog, l.window, l.viewport, l.picture, 1.0, &theme, &none);
+        assert_eq!(list, docked.list, "the card alone: no veil");
+        assert!(bounds.encloses(&docked.bounds));
+        assert_eq!(docked.card.x, l.viewport.x + DOCK_MARGIN);
+        let veils = list
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::RoundRect { fill: Some(c), .. } if *c == theme.scrim))
+            .count();
+        assert_eq!(veils, 0);
+        // Another requester veils the picture.
+        let other = page_size().view();
+        let model = Model {
+            dialog: Some(&other),
+            ..model
+        };
+        let (_, list) = build::overlay(&l, &theme, &model).expect("the card");
+        assert!(matches!(
+            list.ops()[0],
+            Op::RoundRect { rect, fill: Some(c), .. } if rect == l.picture && c == theme.scrim
+        ));
+        // The parts.
+        let b = docked;
+        let Item::Swatches(grid) = &dialog.columns[0][0] else {
+            panic!("the grid comes first");
+        };
+        assert_eq!((grid.cols, grid.cells.len(), grid.strip), (16, 32, false));
+        assert_eq!(grid.cells[5].mark, Mark::Selected);
+        assert_eq!(
+            grid.cells.iter().filter(|c| c.mark != Mark::None).count(),
+            1
+        );
+        let cell = b.spot(ctl::GRID).expect("the grid").rect;
+        let (cw, ch) = (cell.w / 16.0, cell.h / 2.0);
+        let (id, at) = b.press(cell.x + cw * 9.5, cell.y + ch * 1.5);
+        assert_eq!(id, Some(ctl::GRID));
+        req.handle(ReqEvent::Press(at.0, at.1));
+        req.handle(ReqEvent::Release);
+        assert_eq!(req.selected(), 25);
+        // The sample shows the selected colour.
+        let now = req.colors()[25];
+        let sample = Color::rgb(now.r, now.g, now.b);
+        let b = built(&req.view(), (1280.0, 800.0), 1.0, ThemeKind::Dark);
+        let samples = b
+            .list
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(op, Op::RoundRect { rect, fill: Some(c), .. }
+                    if *c == sample && rect.w == SAMPLE_W)
+            })
+            .count();
+        assert_eq!(samples, 1);
+        assert_eq!(text_color(&b, "Color 25"), theme.text);
+        for label in ["R", "G", "B"] {
+            assert_eq!(text_color(&b, label), theme.text_dim);
+        }
+        assert_eq!(text_color(&b, "RGB"), theme.on_accent);
+        // HSV: the other segment; the sliders are named H, S and V.
+        let other = b.spot(ctl::SYSTEM).expect("HSV").rect;
+        let (_, at) = b.press(other.x + 4.0, other.y + 4.0);
+        req.handle(ReqEvent::Press(at.0, at.1));
+        req.handle(ReqEvent::Release);
+        let b = built(&req.view(), (1280.0, 800.0), 1.0, ThemeKind::Dark);
+        assert_eq!(text_color(&b, "HSV"), theme.on_accent);
+        for label in ["H", "S", "V"] {
+            assert_eq!(text_color(&b, label), theme.text_dim);
+        }
+        // A press on a knob takes the knob: dragging it to the right end gives the
+        // highest value.
+        let slider = *b.spot(ctl::SLIDER + 2).expect("V");
+        let Item::Line { parts, .. } = &req.view().columns[0][4] else {
+            panic!("the third slider");
+        };
+        let Part::Slider(s) = &parts[0] else {
+            panic!("a slider");
+        };
+        let free = (s.control.area.w - s.knob.w) as f32;
+        let t = (s.knob.x - s.control.area.x) as f32 / free;
+        let knob_x = slider.rect.x + KNOB_R + t * (slider.rect.w - 2.0 * KNOB_R);
+        let mid = slider.rect.y + slider.rect.h / 2.0;
+        let (id, at) = b.press(knob_x, mid);
+        assert_eq!(id, Some(ctl::SLIDER + 2));
+        req.handle(ReqEvent::Press(at.0, at.1));
+        let at = b.drag(id, slider.rect.right() + 50.0, mid);
+        req.handle(ReqEvent::Drag(at.0, at.1));
+        req.handle(ReqEvent::Release);
+        let b = built(&req.view(), (1280.0, 800.0), 1.0, ThemeKind::Dark);
+        assert_eq!(text_color(&b, "100"), theme.text, "V is 100");
+        // Spread waits for its second colour: it stays down and the line asks.
+        mixer_click(&mut req, ctl::SPREAD);
+        let b = built(&req.view(), (1280.0, 800.0), 1.0, ThemeKind::Dark);
+        assert_eq!(text_color(&b, "Spread"), theme.on_accent);
+        assert_eq!(text_color(&b, "Copy"), theme.text);
+        assert_eq!(text_color(&b, "Spread 25 to?"), theme.text);
     }
 
     /// A form (slice 4b): the first radio button or check box of a row stands where the

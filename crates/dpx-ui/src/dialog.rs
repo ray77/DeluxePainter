@@ -204,6 +204,8 @@ pub enum Mark {
     Picked,
     /// Where a dragged swatch would land.
     Target,
+    /// The colour that is worked on (the Color Mixer's selected colour).
+    Selected,
 }
 
 /// One colour of a swatch grid.
@@ -246,6 +248,8 @@ pub enum Part {
     Radio(Radio),
     Button(Push),
     Icon(IconButton),
+    /// A sample of one colour (the colour that is being mixed); takes no pointer.
+    Sample([u8; 3]),
 }
 
 /// One of a few rows of which one is chosen (radio rows).
@@ -398,6 +402,10 @@ pub enum Kind {
     Plain,
     /// The program's own "About" text: its first paragraph names the program.
     About,
+    /// A requester that works on the picture while it is open (the Color Mixer recolours
+    /// it with every change): the Modern skin puts its card in a corner of the picture's
+    /// area and leaves the picture unveiled.
+    Panel,
 }
 
 /// A requester as the Modern skin shows it.
@@ -428,7 +436,7 @@ impl Dialog {
                             Part::Radio(r) => out.push(r.control),
                             Part::Button(b) => out.push(b.control),
                             Part::Icon(b) => out.push(b.control),
-                            Part::Text(..) => {}
+                            Part::Text(..) | Part::Sample(_) => {}
                         }
                     }
                 }

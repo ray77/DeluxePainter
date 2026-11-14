@@ -9,6 +9,7 @@
 
 use dpx_core::{Chipset, IndexedImage, Palette, Rect, Rgb8};
 
+use crate::dialog::{self, Control, Dialog, Item, Part};
 use crate::font::Font;
 use crate::pens::Pens;
 use crate::requester::{ReqEvent, ReqKey};
@@ -43,6 +44,24 @@ mod geom {
     pub const INFO_Y: i32 = 90;
     pub const BUTTONS_Y: i32 = 104;
     pub const BUTTON_H: i32 = 13;
+}
+
+/// The controls of the Color Mixer as the Modern skin names them (ADR-47, slice 4c).
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// The palette grid (one control: every cell is alike).
+    pub const GRID: ControlId = 0;
+    /// The first of the three sliders (R or H); G/S and B/V follow.
+    pub const SLIDER: ControlId = 1;
+    /// RGB or HSV sliders.
+    pub const SYSTEM: ControlId = 4;
+    pub const SPREAD: ControlId = 5;
+    pub const COPY: ControlId = 6;
+    pub const EX: ControlId = 7;
+    pub const UNDO: ControlId = 8;
+    pub const CANCEL: ControlId = 9;
+    pub const OK: ControlId = 10;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +125,30 @@ impl Button {
             Button::Undo => at(137, 40),
             Button::Cancel => at(186, 52),
             Button::Ok => at(242, 38),
+        }
+    }
+
+    fn id(self) -> dialog::ControlId {
+        match self {
+            Button::System => ctl::SYSTEM,
+            Button::Spread => ctl::SPREAD,
+            Button::Copy => ctl::COPY,
+            Button::Ex => ctl::EX,
+            Button::Undo => ctl::UNDO,
+            Button::Cancel => ctl::CANCEL,
+            Button::Ok => ctl::OK,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Button::System => "RGB",
+            Button::Spread => "Spread",
+            Button::Copy => "Copy",
+            Button::Ex => "Ex",
+            Button::Undo => "Undo",
+            Button::Cancel => "Cancel",
+            Button::Ok => "Ok",
         }
     }
 
@@ -532,6 +575,125 @@ impl PaletteRequester {
         PaletteResponse::Continue
     }
 
+    /// The names of the three sliders.
+    fn labels(&self) -> [&'static str; 3] {
+        match self.system {
+            System::Rgb => ["R", "G", "B"],
+            System::Hsv => ["H", "S", "V"],
+        }
+    }
+
+    /// The line under the sliders: the selected colour, or what a waiting Spread, Copy or
+    /// Ex asks for.
+    fn info(&self) -> String {
+        match self.pending {
+            None => format!("Color {}", self.selected),
+            Some(Op::Spread) => format!("Spread {} to?", self.selected),
+            Some(Op::Copy) => format!("Copy {} to?", self.selected),
+            Some(Op::Ex) => format!("Exchange {} with?", self.selected),
+        }
+    }
+
+    /// What the requester shows, for the Modern skin (ADR-47, slice 4c): the palette as
+    /// one grid, the sample with RGB | HSV and the line that names the colour, the three
+    /// sliders and Spread, Copy, Ex, Undo as buttons that stay down while they wait for
+    /// their second colour.
+    pub fn view(&self) -> Dialog {
+        let (cols, rows, cw, ch) = self.grid();
+        let cells = self
+            .colors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| dialog::Swatch {
+                rgb: [c.r, c.g, c.b],
+                mark: if i == usize::from(self.selected) {
+                    dialog::Mark::Selected
+                } else {
+                    dialog::Mark::None
+                },
+            })
+            .collect();
+        let grid = dialog::Swatches {
+            control: Control::new(
+                ctl::GRID,
+                Rect::new(geom::GRID_X, geom::GRID_Y, cols * cw, rows * ch),
+            ),
+            cols: cols as usize,
+            cells,
+            strip: self.colors.len() > 64,
+        };
+        let now = self.current();
+        let mut items = vec![
+            Item::Swatches(grid),
+            Item::Row(vec![
+                Part::Sample([now.r, now.g, now.b]),
+                Part::Cycle(dialog::Cycle {
+                    control: Control::new(ctl::SYSTEM, Button::System.rect()),
+                    options: vec!["RGB".to_string(), "HSV".to_string()],
+                    selected: match self.system {
+                        System::Rgb => 0,
+                        System::Hsv => 1,
+                    },
+                    enabled: true,
+                }),
+                Part::Text(self.info(), dialog::Tone::Normal),
+            ]),
+        ];
+        for (ch, label) in self.labels().into_iter().enumerate() {
+            let t = Self::slider_rect(ch);
+            items.push(Item::Line {
+                label: label.to_string(),
+                key: None,
+                parts: vec![Part::Slider(dialog::Slider {
+                    // The knob runs inside the bevel of the track.
+                    control: Control::new(
+                        ctl::SLIDER + ch as dialog::ControlId,
+                        Rect::new(t.x + 1, t.y, t.w - 2, t.h),
+                    ),
+                    knob: Rect::new(self.knob_x(ch), t.y + 1, geom::KNOB_W, t.h - 2),
+                    value: self.value(ch).to_string(),
+                    enabled: true,
+                })],
+            });
+        }
+        let push = |b: Button| {
+            let held = self.held == Some(Held::Button(b))
+                && b.rect().contains(self.pointer.0, self.pointer.1);
+            Part::Button(dialog::Push {
+                control: Control::new(b.id(), b.rect()),
+                label: b.label().to_string(),
+                on: b.op().is_some() && b.op() == self.pending,
+                pressed: held,
+                enabled: true,
+            })
+        };
+        items.push(Item::Line {
+            label: String::new(),
+            key: None,
+            parts: [Button::Spread, Button::Copy, Button::Ex, Button::Undo]
+                .map(push)
+                .to_vec(),
+        });
+        let button = |b: Button, role| {
+            dialog::Button::new(
+                Control::new(b.id(), b.rect()),
+                b.label(),
+                role,
+                self.pressed(b),
+            )
+        };
+        Dialog {
+            title: "Color Mixer".to_string(),
+            kind: dialog::Kind::Panel,
+            size: dialog::Size::Small,
+            columns: vec![items],
+            buttons: vec![
+                button(Button::Cancel, dialog::Role::Cancel),
+                button(Button::Ok, dialog::Role::Default),
+            ],
+        }
+    }
+
     /// Draws the requester onto a UI screen at [`PaletteRequester::origin`].
     pub fn draw(&self, img: &mut IndexedImage, pens: &Pens) {
         let (x, y) = Self::origin(img.width() as i32, img.height() as i32);
@@ -581,10 +743,7 @@ impl PaletteRequester {
         img.fill_rect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, self.selected);
 
         // Sliders.
-        let labels = match self.system {
-            System::Rgb => ["R", "G", "B"],
-            System::Hsv => ["H", "S", "V"],
-        };
+        let labels = self.labels();
         for (ch, label) in labels.iter().enumerate() {
             let t = Self::slider_rect(ch);
             font.draw(&mut img, geom::LABEL_X, t.y + 1, label, pens.dark);
@@ -601,26 +760,13 @@ impl PaletteRequester {
                 pens.dark,
             );
         }
-        let info = match self.pending {
-            None => format!("Color {}", self.selected),
-            Some(Op::Spread) => format!("Spread {} to?", self.selected),
-            Some(Op::Copy) => format!("Copy {} to?", self.selected),
-            Some(Op::Ex) => format!("Exchange {} with?", self.selected),
-        };
+        let info = self.info();
         font.draw(&mut img, geom::LABEL_X, geom::INFO_Y, &info, pens.dark);
 
         for b in Button::ALL {
-            let label = match b {
-                Button::System => match self.system {
-                    System::Rgb => "RGB",
-                    System::Hsv => "HSV",
-                },
-                Button::Spread => "Spread",
-                Button::Copy => "Copy",
-                Button::Ex => "Ex",
-                Button::Undo => "Undo",
-                Button::Cancel => "Cancel",
-                Button::Ok => "Ok",
+            let label = match (b, self.system) {
+                (Button::System, System::Hsv) => "HSV",
+                _ => b.label(),
             };
             draw_button(&mut img, b.rect(), label, self.pressed(b), pens);
         }
@@ -1033,6 +1179,145 @@ mod tests {
         button(&mut r, Button::Spread);
         assert!(r.pressed(Button::Spread) && !r.pressed(Button::Copy));
         assert_ne!(r.render(&p), aga().render(&p));
+    }
+
+    /// The description for the Modern skin (ADR-47, slice 4c): every control once, each
+    /// with the rectangle in which the requester takes its press; the grid is one control
+    /// with the Classic cells; the description follows the state.
+    #[test]
+    fn the_view_names_every_control_with_its_classic_rectangle() {
+        for n in [2usize, 4, 8, 16, 32, 64, 128, 256] {
+            let colors = (0..n).map(|i| Rgb8::new(i as u8, 0, 0)).collect();
+            let palette = Palette::new(colors).unwrap();
+            let mut r = PaletteRequester::new(&palette, 0, Chipset::Aga);
+            let view = r.view();
+            assert_eq!(
+                (view.title.as_str(), view.kind),
+                ("Color Mixer", dialog::Kind::Panel)
+            );
+            let mut ids: Vec<_> = view.controls().iter().map(|c| c.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, (0..=10).collect::<Vec<_>>(), "{n}");
+            let Item::Swatches(grid) = &view.columns[0][0] else {
+                panic!("the grid");
+            };
+            assert_eq!(grid.cells.len(), n);
+            assert_eq!(grid.strip, n > 64);
+            // The grid's area is the cells: a point in cell i of the area is cell i.
+            let a = grid.control.area;
+            let (cw, ch) = (a.w / grid.cols as i32, a.h / grid.rows() as i32);
+            assert_eq!((a.w % grid.cols as i32, a.h % grid.rows() as i32), (0, 0));
+            for i in 0..n {
+                let (col, row) = ((i % grid.cols) as i32, (i / grid.cols) as i32);
+                for (dx, dy) in [(0, 0), (cw - 1, ch - 1)] {
+                    r.handle(ReqEvent::Press(a.x + col * cw + dx, a.y + row * ch + dy));
+                    r.handle(ReqEvent::Release);
+                    assert_eq!(usize::from(r.selected()), i, "{n}");
+                }
+            }
+            let view = r.view();
+            let Item::Swatches(grid) = &view.columns[0][0] else {
+                panic!("the grid");
+            };
+            let marked: Vec<usize> = (0..n)
+                .filter(|&i| grid.cells[i].mark != dialog::Mark::None)
+                .collect();
+            assert_eq!(marked, [n - 1]);
+        }
+        // Buttons: a press in the middle of each control's area is that button.
+        let mut r = aga();
+        for (id, b) in Button::ALL.map(|b| (b.id(), b)) {
+            let area = r.view().control(id).expect("the control").area;
+            assert_eq!(area, b.rect());
+        }
+        // The sliders: the knob lies inside the control, and a press on it takes it.
+        for ch in 0..3 {
+            let view = r.view();
+            let Item::Line { label, parts, .. } = &view.columns[0][2 + ch] else {
+                panic!("a slider line");
+            };
+            assert_eq!(label, ["R", "G", "B"][ch]);
+            let Part::Slider(s) = &parts[0] else {
+                panic!("a slider");
+            };
+            assert_eq!(s.control.id, ctl::SLIDER + ch as u16);
+            assert!(s.knob.x >= s.control.area.x);
+            assert!(s.knob.x + s.knob.w <= s.control.area.x + s.control.area.w);
+            assert_eq!(s.value, r.value(ch).to_string());
+            // Both ends of the knob's way lie in the control.
+            let free = s.control.area.w - s.knob.w;
+            assert_eq!(free, PaletteRequester::free());
+            r.handle(ReqEvent::Press(s.knob.x + s.knob.w / 2, s.knob.y + 2));
+            assert_eq!(
+                r.held,
+                Some(Held::Knob {
+                    channel: ch,
+                    grab: s.knob.w / 2
+                })
+            );
+            r.handle(ReqEvent::Drag(
+                s.control.area.x + s.knob.w / 2 + free,
+                s.knob.y + 2,
+            ));
+            r.handle(ReqEvent::Release);
+            assert_eq!(r.value(ch), 255);
+            r.handle(ReqEvent::Press(r.knob_x(ch) + s.knob.w / 2, s.knob.y + 2));
+            r.handle(ReqEvent::Drag(
+                s.control.area.x + s.knob.w / 2,
+                s.knob.y + 2,
+            ));
+            r.handle(ReqEvent::Release);
+            assert_eq!(r.value(ch), 0);
+        }
+        // The state shows: the sample, the line, HSV, a waiting operation, a held button.
+        let text = |r: &PaletteRequester| format!("{:?}", r.view());
+        assert!(text(&r).contains("Sample([0, 0, 0])"));
+        assert!(text(&r).contains("\"Color 1\""));
+        button(&mut r, Button::System);
+        let view = r.view();
+        let Item::Row(parts) = &view.columns[0][1] else {
+            panic!("the sample row");
+        };
+        assert!(
+            matches!(&parts[1], Part::Cycle(c) if c.selected == 1 && c.options == ["RGB", "HSV"])
+        );
+        assert!(matches!(&view.columns[0][2], Item::Line { label, .. } if label == "H"));
+        button(&mut r, Button::Ex);
+        assert!(text(&r).contains("\"Exchange 1 with?\""));
+        let on = |r: &PaletteRequester| -> Vec<String> {
+            let view = r.view();
+            let Some(Item::Line { parts, .. }) = view.columns[0].last() else {
+                panic!("the buttons");
+            };
+            parts
+                .iter()
+                .filter_map(|p| match p {
+                    Part::Button(b) if b.on => Some(b.label.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(on(&r), ["Ex"]);
+        r.handle(ReqEvent::Key(ReqKey::Escape));
+        assert!(on(&r).is_empty());
+        let ok = Button::Ok.rect();
+        r.handle(ReqEvent::Press(ok.x + 2, ok.y + 2));
+        assert!(r.view().buttons[1].pressed && !r.view().buttons[0].pressed);
+        r.handle(ReqEvent::Drag(0, 0));
+        assert!(!r.view().buttons[1].pressed);
+        let roles: Vec<_> = r
+            .view()
+            .buttons
+            .iter()
+            .map(|b| (b.label.clone(), b.role))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("Cancel".to_string(), dialog::Role::Cancel),
+                ("Ok".to_string(), dialog::Role::Default)
+            ]
+        );
     }
 
     #[test]

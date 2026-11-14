@@ -68,7 +68,7 @@ The owner was not asked again about these visible points; each is a small, local
 28. (Slice 4a.) The buttons keep the Classic order from left to right, so a requester's keys, its default and the place of "Cancel" are the same in both skins. The button Return presses is filled with the accent, the others are quiet; a letter that is a button's key is underlined.
 29. (Slice 4a.) A cycle gadget with exactly two values is shown as two segments side by side (the selected one filled with the accent); a press on the other segment is the press on the Classic gadget. A gadget with more values is a stepper that shows the value with a chevron and moves on with every press, as in Classic. No drop-down lists: they would need behaviour the Classic requester does not have.
 30. (Slice 4a.) A refused value is shown as a line in the alert colour with a bar at its left, inside the panel of facts where the dialog has one. About has a head with the program's name; its text is the Classic text, re-flowed.
-31. (Slice 4a.) One card at a time: the requester that has the pointer and the keys. A converted requester that lies under another one is not drawn until it is on top (in Classic it is visible underneath but takes no input either). A card over an unconverted requester (a question over the file requester) lies over the veiled picture that still shows that requester in the Classic look. Text fields have a caret and a focus ring and no selection: the Classic fields have none.
+31. (Slice 4a.) One card at a time: the requester that has the pointer and the keys. A converted requester that lies under another one is not drawn until it is on top (in Classic it is visible underneath but takes no input either). A card over an unconverted requester (a question over the file requester) lies over the veiled picture that still shows that requester in the Classic look. Text fields have a caret and a focus ring and no selection: the Classic fields have none. (Since slice 4c no requester is unconverted: nothing is hosted under a card any more.)
 
 32. (Slice 4b.) A requester built on the shared form is one column: what stands at one height in the Classic requester is one line; a radio button or check box that begins a line stands where the labels of the other lines stand, and what follows it starts at one place in every line (so the fields of Spacing or Copy Frames stand under each other). A text over radio buttons is a small heading, an explanation at the end is one subdued paragraph, the captions X / Y / Z over the Perspective fields stand before their fields. Labels lose their colon.
 33. (Slice 4b.) A refused number is shown as the last line of the form, in the alert look; the card grows by that line while it is shown (the Classic requester has a reserved line; a reserved empty line in every card would be the worse look).
@@ -76,6 +76,11 @@ The owner was not asked again about these visible points; each is a small, local
 35. (Slice 4b.) Buttons that are a mode or belong to a line stand in that line, not at the bottom: Move / Ex in Arrange Palette (the chosen one filled with the accent; the count of moved colours beside them), the range numbers 1 to 8, Active and Clear in Range, From Brush in Perspective, Clear / Go Back and Preview / Trails / Fill in Move. Read line by line and then along the bottom row, the buttons are in the Classic order (decision 28). In Move the bottom row is Draw (the button Return presses, filled with the accent), Cancel, Load, Save, Exit; in Make Stencil it is Make, Clear, Invert, Cancel.
 36. (Slice 4b.) Range's Forward / Reverse button is shown as two segments (decision 29); `r` is underlined in its label "Direction". Its span text and its info line are one line under the controls ("Colors 20-27: 8 colors, 15/s, off"). The rate slider is ghosted while the range has no span.
 37. (Slice 4b.) Icon buttons (the three AnimBrush directions, Move's Go from / Come to and the three Record choices) show our own pictograms: triangles, an arrow with a dot, double chevrons, two bars. None is traced from the Classic bitmaps.
+38. (Slice 4c.) The file requester is one column: Drawer, Pattern, the list, File (and "# of Frames" where Classic has it), then a line "Go to" with Disks, Assigns and Parent. A place in the list says what it is at the right ("Drawer", "Disk", "Assign"). The list has its scroll bar and the wheel; the two Classic arrow gadgets are not shown. The Replace / Delete question is a small card of its own with Yes and No.
+39. (Slice 4c.) Import is two columns: the facts and the four option rows at the left, "Preview" with the true-colour thumbnail at the right. The option the arrow keys change (Tab moves on) has its label on a quiet bar with the accent around it.
+40. (Slice 4c.) Generate: the prompt field takes the card's width; every option row has a triangle to step back and one to step on (a ghosted one takes no pointer); with More.. the rows are split between the two columns; status, reasons, the result's thumbnail and its summary stand at the right. The Image Generator setup shows the hints under their fields; the API key is shown as the same stars as in Classic and is never part of a description.
+41. (Slice 4c.) AI & MCP is two columns with the headings "Permissions" and "Folder"; an empty activity list says "None yet"; Close is the button Return presses, as in Classic.
+42. (Slice 4c.) **The Color Mixer is an un-veiled card docked at the bottom left of the picture's area.** It recolours the picture with every change, so the picture must stay visible: its card is not put in the middle and the picture gets no veil. It stands in the corner of the viewport where it covers the least of the picture (bottom left, bottom right, top left, top right; the first of equals), 12 pt from the viewport's edges, and it is the narrow card (400 pt). The Mixer is still modal, as in Classic: bar, dock, layer column and the canvas around the picture are veiled and take no input (the dock's palette therefore does not follow the colours being mixed; the picture and the card's own swatches do). On the card: the palette grid (squares up to 64 colours, a strip of 32 columns above), the sample with RGB | HSV beside it and the line that names the colour ("Color 5", "Spread 5 to?"), the three sliders with their values, Spread / Copy / Ex / Undo in one line (the waiting one filled with the accent), Cancel and Ok at the bottom. A slider is dragged by its knob and a click beside the knob is one step, exactly as in Classic. Decided by the lead, easy to change: the corner, the margin and the veil are one function (`dpx_ui_modern::dialog::docked`) and one `if` (`build::overlay`).
 
 ## Options considered
 
@@ -326,7 +331,7 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 
 1. In the requester's file in `dpx-ui`, give every control a `ControlId` (a `pub mod ctl` or constants) and add `pub fn view(&self) -> Dialog`. Each `Control.area` is the rectangle the existing `handle`/`hit` code already uses for that control; take it from the same function or constant the Classic code uses, never a copy of the numbers. Do not change `render` or `handle`. Add a unit test: the centre of every `area` sent as a press reaches that control.
 2. If the requester needs a part the kit lacks (see the table), add it to `dpx_ui::dialog` as data and to `dpx_ui_modern::dialog` as drawing plus spots, with a list test, and add the requester to the kit's `dialogs()` test table (fit at 720 × 520 and scales 1 and 2, contrast, mapping).
-3. In `modern_dialog.rs`: a `Card` variant, its place in `card()` (the same place as in `pass()`), its arm in `view()`; remove it from `classic_look_open` and add it to `without_cards`. If its input branch in `main.rs` does not go through `requester_input` or `modal_events_with`, use `self.modern_dialog_pos(ctx).unwrap_or(pos)` there.
+3. In `modern_dialog.rs`: a `Card` variant, its place in `card()` (the same place as in `pass()`), its arm in `view()`; add it to `Cards` (what `without_cards` takes out of the quad; `classic_look_open` is gone since slice 4c: nothing is hosted any more). If its input branch in `main.rs` does not go through `requester_input` or `modal_events_with`, use `self.modern_dialog_pos(ctx).unwrap_or(pos)` there.
 4. A parity test in `apps/deluxepainter/src/modern/tests/dialogs.rs` with `both_at_every_scale`: every button on its first and last pixel, typing in every field, Return, Esc, Tab, its hotkeys and arrows, a press that leaves the control before the release, a click beside the card.
 5. Snapshots in dark and light (`--ui modern` with the requester's flag), looked at; the row in the table below; README/FEATURES/ROADMAP.
 
@@ -345,12 +350,12 @@ Both themes use the existing tokens of `theme.rs`; no new colour was added. The 
 | Anim requesters: Set Frame Count, Add, Copy and Delete Frames, Go to Frame, Set Rate | `anim_requester.rs` (forms) | **modern** (slice 4b) | |
 | Set Range | `anim_control.rs` (`PlayRangeRequester`, a form) | **modern** (slice 4b) | |
 | Move | `anim_control.rs` (`MoveRequester`, own code) | **modern** (slice 4b) | its preview plays in the picture, without the card |
-| File requester (Load, Save, Export, brushes, anims) | `file_requester.rs` | classic look | the list part with scroll bar and the fields exist; needs Drawer / Pattern / File fields in one view, Disks / Assigns / Parent, "# of Frames", long names |
-| Color Mixer | `palette_requester.rs` | classic look | swatch grid, sample box, RGB/HSV sliders, SPREAD / COPY / EX / UNDO; it changes the palette of the whole screen live, so where the card stands over the picture is a visible decision |
+| File requester (Load, Save, Export, Delete, palettes, brushes, stencils, anims) | `file_requester.rs` | **modern** (slice 4c) | its Replace / Delete question is a card of its own |
+| Color Mixer | `palette_requester.rs` | **modern** (slice 4c): an un-veiled card docked in a corner of the picture's area (lead decision 42) | |
 | Range | `range_requester.rs` | **modern** (slice 4b) | |
-| Import | `import_requester.rs` | classic look | a true-colour thumbnail part (the app paints it over the frame today), option rows with a Tab focus |
-| Generate, Image Generator setup | `generate_requester.rs`, `imagegen_setup.rs` | classic look | a text field with paste, option rows, "More..", a status/thumbnail box |
-| AI & MCP | `mcp_requester.rs` | classic look | status lines, permissions, connect buttons, the list of last calls |
+| Import | `import_requester.rs` | **modern** (slice 4c) | |
+| Generate, Image Generator setup | `generate_requester.rs`, `imagegen_setup.rs` | **modern** (slice 4c) | |
+| AI & MCP | `mcp_requester.rs` | **modern** (slice 4c) | |
 | Show Page | `show_page.rs` | classic look | not a dialog: a view of the whole page; belongs to slice 3 |
 | Animation Control Panel | `anim_control.rs`, `anim_panel.rs` | classic look | not a dialog: slice 2 (a Modern strip) |
 
@@ -418,13 +423,69 @@ All with `--snapshot --ui modern --no-settings --commands docs/design/screenshot
 
 The four pin scenes pass unchanged. A binary built from the commit before this slice (629b52c) and the new one wrote byte-identical `--snapshot` images for 25 Classic scenes with `--commands wave8-layer-panel.json` (plain; every requester converted here by its flag, 20 of them; `--palette-requester`, `--page-size-requester`, `--menu 2:3`, `--layers-panel`) and for 4 Modern scenes without a card (dark, light at 2x, `--layers-panel --palette-requester`, `--menu 2:3`).
 
+## Slice 4c: the remaining requesters
+
+Batch 2, by the same recipe: the file requester, Import, Generate with the Image Generator setup, AI & MCP and the Color Mixer. **After this slice no requester is shown in the Classic look in the Modern skin.** Show Page and the Animation Control Panel are not dialogs and stay in the picture quad (slices 3 and 2). Nothing has to stay hosted.
+
+### What was converted
+
+| Requester | How it describes itself | Card |
+|---|---|---|
+| File requester | `FileRequester::view()`, ids in `file_requester::ctl` (list rows, scroll bar, Drawer, Pattern, File, Disks, Assigns, Parent, the action, Cancel, "# of Frames", Yes, No); `question()` for the Replace / Delete state | `Card::File` |
+| Import | `ImportRequester::view()`, ids in `import_requester::ctl` | `Card::Import` |
+| Generate | `GenerateRequester::view()`, ids in `generate_requester::ctl` (the prompt, an arrow pair per option row, More.., Set up.., Cancel, Generate, Apply) | `Card::Generate` |
+| Image Generator setup | `ImageGenSetupRequester::view()`, ids in `imagegen_setup::ctl` | `Card::Setup` |
+| AI & MCP | `McpRequester::dialog()`, ids in `mcp_requester::ctl` | `Card::Mcp` |
+| Color Mixer | `PaletteRequester::view()`, ids in `palette_requester::ctl` (the grid, three sliders, RGB / HSV, Spread, Copy, Ex, Undo, Cancel, Ok) | `Card::Palette`, docked and un-veiled (decision 42) |
+
+### Kit parts added
+
+- `Field::stops`: for a text field, the caret positions with the Classic x that puts the caret there. The Modern skin sends a press at the stop nearest to the pointer, so the caret lands under the pointer in both skins although the fonts differ. A text field for more than 32 characters takes the width its line has left.
+- `Item::Setting`: an option row the keyboard moves between (focus bar, ghosted when it cannot be set).
+- `Item::Picture` with `Thumbnail` (straight RGBA8; its `Debug` is the size and a fingerprint, never the pixels) and, in the display list, `Op::Pixels`: a list carries its own small picture, drawn with nearest-neighbour sampling at a whole factor where it fits. Import and Generate no longer paint their thumbnail over the screen in the Modern skin (`import_overlay` and `generate_overlay` return early for a card).
+- `Part::Text` is cut with an ellipsis where it would leave its line; radio buttons give up their common width in a line too narrow for it.
+- `Part::Sample`: a sample of one colour in a form line (the Color Mixer's sample box).
+- `Mark::Selected`: the colour that is worked on; in a strip a ring around the cell, drawn over its neighbours.
+- `Kind::Panel` and `dialog::build_in(dialog, window, viewport, picture, ..)`: a card that works on the picture is docked in the corner of the viewport where it covers the least of the picture (`docked`, `DOCK_MARGIN`); `build::overlay` draws no veil over the picture for it. `build` is `build_in` with the window as the viewport.
+
+### Deviations from the recipe, each small
+
+- `McpRequester::dialog()` instead of `view()`: `view()` already returns its `McpView` there.
+- Texts shared by both skins moved into functions the Classic `render` and the description both call (`GenerateRequester`'s working hint, `PaletteRequester::info()`, `labels()` and `Button::label()`); the Classic images are the same (compared, see below).
+- `PainterApp::mixer_screen()` makes the screen in the palette being edited for `palette_upload` and for the test image of the Modern window; in the Modern skin it is composed without the requester.
+- New snapshot flags: `--file-question` (the Replace / Delete question of `--file-requester` about `--file NAME`) and the kind `delete` of `--file-requester`.
+- Tests of the older slices that used these requesters as "a requester in the Classic look" were removed or rewritten: the file, Import, Generate, AI & MCP and Color Mixer entries of the hosted scripts are gone (their parity scripts cover them; the hosted script keeps Screen Format and Show Page); the veil test now opens the Color Mixer as a card and checks that the chrome is veiled and the picture is not; the small-window test is now about Show Page (`show_page_is_whole_in_a_small_window_and_the_mixer_moves_nothing`); `only_the_converted_requesters_are_cards` became `what_is_not_a_requester_is_not_a_card`.
+
+### Tests
+
+- `dpx-ui`: a view test per requester (every control's rectangle reaches that control; the description follows the state). The setup's test asserts that the typed key is in no description.
+- Kit: the `dialogs()` table got the file requester, Import, Generate, the setup, AI & MCP and six Color Mixer descriptions (2, 16, 32, 64, 128 and 256 colours; HSV; a waiting Spread, Copy and Exchange); fit, contrast and mapping run over all of them as before (720 × 520, scales 1, 1.5 and 2, both themes). New list tests: the text field and its caret stops, the file list, option rows and the thumbnail, the setup's stars, Generate's rows, AI & MCP, and `the_color_mixer_is_docked_beside_the_unveiled_picture` (the four corners, a viewport smaller than the card, no veil, the parts).
+- App, each with `both_at_every_scale`: `file_script`, `import_script`, `generate_script` (an offline test-pattern generator and in-memory key stores; no network), `setup_script`, `mcp_script` and `mixer_script` (`p` and the menu; cells by middle and corners; every slider in RGB and HSV dragged by its knob to both ends and to the middle and stepped beside the knob; Spread, Copy and Ex with their second colour, switched, taken back by a second press and by Esc; Undo by button and by `u`; buttons pressed and left; a click beside, Tab, the wheel; Ok, Cancel, Return, Esc, `p`; the document's undo). `the_color_mixer_recolours_the_unveiled_picture_beside_its_card` (Modern, three windows): the card is in a bottom corner of the viewport, the layout does not move, the quad holds no requester, a page pixel is exactly its colour (no veil), a dragged slider changes that pixel at once while the document's palette stays, Cancel restores it. `every_card_fits_the_smallest_window` now has 32 entries.
+
+### Screenshots
+
+Flags as in slice 4b, all `--no-settings` with a scratch `HOME` and `DPX_CONFIG_DIR`.
+
+- `modern-dialog-file-{load,save,replace}-{dark,light}` (`--file-requester load|save --drawer DIR --drawer-as Work:Pictures [--file NAME] [--file-question]`);
+- `modern-dialog-import-{dark,light}`, `-import-compact-2x` (`--import-requester FILE`);
+- `modern-dialog-generate-{dark,light}`, `-generate-more-*`, `-generate-result-*`, `-generate-compact-2x` (`--generate-requester --generate 'prompt=..;provider=openai;key=placeholder[;more]'`; the result with `provider=test_pattern;more --generate-run`), `modern-dialog-imagegen-setup-*` (`.. ;keychain=stand_in' --imagegen-setup`); the key in these is the word "placeholder", shown as stars;
+- `modern-dialog-ai-mcp-{dark,light}`, `-ai-mcp-off-*`, `-ai-mcp-question-*`, `-ai-mcp-compact-2x` (`--mcp-prefs ready|off|code-confirm`);
+- `modern-dialog-color-mixer-{dark,light}` (`--palette-requester`), `-color-mixer-compact-2x` (`--theme light --size 720x520 --device-scale 2 --layers-panel`), `-color-mixer-256-dark` (a 256-colour AGA picture made with a `set_format` command file, `--size 720x520 --device-scale 2`);
+- Replaced, they showed the hosted Color Mixer: `modern-requester-dark.png`, `modern-requester-light.png`, `modern-requester-compact.png` (same flags as before) and `modern-live-requester.png` (written by the veil test).
+
+Looked at: all four Color Mixer images, `modern-requester-compact.png` and `modern-live-requester.png`; of the others one or more per requester (file load dark, save light, replace light; import dark and compact; generate more dark and result light; the setup in both themes; AI & MCP dark), not every light and compact variant.
+
+### Classic identity
+
+The pin scenes pass unchanged. After the last requester, a binary built from the commit before this slice (791d42e) and the new one wrote byte-identical `--snapshot` images for 26 Classic scenes (the start screen; with `wave8-layer-panel.json`: plain, the Color Mixer at scale 2 and 3, Screen Format, Page Size, Range, the file requester as load, save and export, Import, Generate, the setup, AI & MCP ready and off, Show Page, two menus, the layer panel, the Control Panel, Move, Set Range, Set Frame Count, AnimBrush Settings, a tooltip; the Color Mixer on the gold palette) and for 5 Modern scenes without a card (dark, light at 2x with the layer column, a menu, the Control Panel, the smallest window).
+
 ## Consequences
 
 - Two renderers for the main window, one state: every new main-window feature needs a drawing in both skins and a parity test. Requesters stay single until converted.
 - Two new direct dependencies and one bundled font; tiny-skia now builds on macOS and Windows too. tiny-skia contains `unsafe` internally (the workspace's `forbid(unsafe_code)` covers our crates only).
 - The classic Prefs menu is two rows taller. Nothing else in Classic changes.
 - In Modern the window no longer snaps to the screen size and Pixel Size means picture zoom.
-- Mixed looks until later slices (since slice 4a five requesters are cards, the others are not): classic requesters over the modern window, and in slice 1 the anim panel in pixel look inside the picture.
+- Mixed looks until later slices: since slice 4c every requester is a card; Show Page, the Animation Control Panel and the Magnify divider are still in the pixel look inside the picture.
 - Chrome is rasterised on the CPU; the region cache keeps it off the painting path. A change of a region's list redraws that region: opening or closing a requester redraws all of them, F9, F10, Prefs ▸ Layers, a zoom step and every frame of a window resize at least the viewport. Measured for the viewport region alone (2376 × 1540 physical pixels: a 1280 × 800 point window at device scale 2; release build, one Apple-silicon Mac, CPU time over 20 runs): about 2.5 ms plain and 9.5 ms under the scrim. The first version of slice 1 took about 48 and 68 ms there, because the canvas list began with a clip (a mask as large as the region, and every fill through it) and its shadow was three filled cards under the picture; the list has no clip now and the shadow is three rings. The prototype's 1.5 ms for the whole chrome was never a number of this renderer. Dock, bar and layer column were not timed.
 - Text is unhinted and blended without gamma correction; at 1x it is slightly softer than native text.
 
@@ -464,3 +525,8 @@ The four pin scenes pass unchanged. A binary built from the commit before this s
 - A drag that leaves a swatch grid goes on outside it in the direction of the pointer, scaled like the grid; the parity scripts compare such a drag only for end points given relative to the grid. A drag to an arbitrary window point may cross other swatches on its way in the two skins, because the grids differ in size and place.
 - While the Range card is open, the swatches follow the palette as shown (cycling); that the card is redrawn for every cycle step was not measured or looked at.
 - The Classic comparison of slice 4b covers the 29 scenes listed there; the start screen and the other committed Classic screenshots were not regenerated.
+- Slice 4c was built and run on one Apple-silicon Mac only, through tests and `--snapshot`. No card of it was seen or used in a real window (no remote control of the app): typing and pasting into the file and prompt fields, the wheel over the file list, dragging the Mixer's knobs and how the docked card feels beside the picture are not verified on a screen. Windows and Linux: not built, not run.
+- The Color Mixer's live recolouring in the Modern skin was checked on the test image of the window (made by the same function that uploads the screen), not on the GPU texture. The Mixer was run in the live-window tests with the 32-colour palette only; 2 to 256 colours were laid out, mapped and rendered in the kit's tests and one 256-colour snapshot was looked at. With a small viewport (the smallest window with the layer column) the card covers most of the picture in every corner; nothing moves the picture aside.
+- Generate and the setup were run with an offline test-pattern generator and in-memory key stores: no request was sent to any image provider, the OS keychain was not touched, and the setup's Test button was only pressed and left in the parity script (a release on it would ask the network).
+- A press in a text field that has no caret stops is mapped proportionally; the file requester's and the prompt's fields have stops.
+- The Classic comparison of slice 4c covers the 31 scenes listed there; `--file-question` and the `delete` kind did not exist in the older binary and were not compared; a generated result (`--generate-run`) was not compared either.

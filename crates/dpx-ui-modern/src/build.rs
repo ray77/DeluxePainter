@@ -1,8 +1,9 @@
 //! Builds the display lists of the Modern main window from the shared interface state
 //! (ADR-47): the canvas with the picture, the bar, the dock, the layer column and what lies
 //! over them (the menu that is held open, a tooltip). What the lists show is the same state
-//! the Classic skin draws; only the look differs. While a requester is open (it is shown in
-//! the Classic look inside the picture), bar, dock and layer column lie under a scrim.
+//! the Classic skin draws; only the look differs. While a requester is open (a card over the
+//! window, see [`overlay`]) or Show Page is shown, bar, dock and layer column lie under a
+//! scrim.
 
 use dpx_core::Palette;
 use dpx_ui::layer_panel::BUTTONS;
@@ -10,7 +11,7 @@ use dpx_ui::screen::APP_TITLE;
 use dpx_ui::toolbox::TOOL_ROWS;
 use dpx_ui::{Hit, LayerHit, LayerPanel, Pref, Tool, Tooltip, TooltipTarget, UiState};
 
-use dpx_ui::dialog::Dialog;
+use dpx_ui::dialog::{Dialog, Kind};
 
 use crate::dialog::{self, Pointer};
 use crate::font;
@@ -53,8 +54,9 @@ pub struct Model<'a> {
     /// A requester, a note, Show Page or playback has the pointer and the keys: the chrome
     /// lies under a scrim.
     pub dimmed: bool,
-    /// The requester on top, when the Modern skin draws it itself (ADR-47, slice 4a): a card
-    /// over the veiled window, picture included.
+    /// The requester on top, which the Modern skin draws itself (ADR-47, slice 4a): a card
+    /// over the veiled window, picture included. The Color Mixer (`Kind::Panel`) is docked
+    /// in a corner of the picture's area instead and leaves the picture unveiled.
     pub dialog: Option<&'a Dialog>,
     /// The pointer over that card.
     pub pointer: Pointer,
@@ -130,8 +132,19 @@ pub fn overlay(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> Option<
         if layout.over_chrome {
             picture_rim(&mut list, layout, theme);
         }
-        list.rect(layout.picture, theme.scrim);
-        let built = dialog::build(shown, layout.window, layout.scale, theme, &model.pointer);
+        // A requester that works on the picture (the Color Mixer) leaves it as it is.
+        if shown.kind != Kind::Panel {
+            list.rect(layout.picture, theme.scrim);
+        }
+        let built = dialog::build_in(
+            shown,
+            layout.window,
+            layout.viewport,
+            layout.picture,
+            layout.scale,
+            theme,
+            &model.pointer,
+        );
         list.append(built.list);
         let around = menu::union(&layout.picture.inset(-1.0 / layout.scale), &built.bounds);
         return whole_pixels(around, layout).map(|bounds| (bounds, list));
