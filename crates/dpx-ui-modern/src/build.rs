@@ -10,6 +10,9 @@ use dpx_ui::screen::APP_TITLE;
 use dpx_ui::toolbox::TOOL_ROWS;
 use dpx_ui::{Hit, LayerHit, LayerPanel, Pref, Tool, Tooltip, TooltipTarget, UiState};
 
+use dpx_ui::dialog::Dialog;
+
+use crate::dialog::{self, Pointer};
 use crate::font;
 use crate::icons::{self, Ink};
 use crate::layout::{Dock, LayerColumn, MainLayout};
@@ -50,6 +53,14 @@ pub struct Model<'a> {
     /// A requester, a note, Show Page or playback has the pointer and the keys: the chrome
     /// lies under a scrim.
     pub dimmed: bool,
+    /// The requester on top, when the Modern skin draws it itself (ADR-47, slice 4a): a card
+    /// over the veiled window, picture included.
+    pub dialog: Option<&'a Dialog>,
+    /// The pointer over that card.
+    pub pointer: Pointer,
+    /// The chrome is dimmed, but the picture's image holds no requester in the Classic look
+    /// (the Modern card is all that is open), so the picture keeps its place and size.
+    pub plain_picture: bool,
 }
 
 impl<'a> Model<'a> {
@@ -62,6 +73,13 @@ impl<'a> Model<'a> {
             toggles: Toggles::default(),
             hover: None,
             dimmed: false,
+            dialog: None,
+            pointer: Pointer {
+                at: None,
+                down: false,
+                captured: None,
+            },
+            plain_picture: false,
         }
     }
 }
@@ -106,6 +124,18 @@ pub fn window(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> List {
 pub fn overlay(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> Option<(Rect, List)> {
     let ui = model.ui;
     let mut list = List::new();
+    if let Some(shown) = model.dialog {
+        // A requester in the Modern look: the picture is veiled like the chrome around it
+        // (whose regions carry their own scrim), and the card lies over everything.
+        if layout.over_chrome {
+            picture_rim(&mut list, layout, theme);
+        }
+        list.rect(layout.picture, theme.scrim);
+        let built = dialog::build(shown, layout.window, layout.scale, theme, &model.pointer);
+        list.append(built.list);
+        let around = menu::union(&layout.picture.inset(-1.0 / layout.scale), &built.bounds);
+        return whole_pixels(around, layout).map(|bounds| (bounds, list));
+    }
     if layout.over_chrome {
         // A hosted requester over the veiled chrome (which takes no input: no menu, no
         // tooltip): the fine rim around its screen, which no region can draw whole.
@@ -126,7 +156,12 @@ pub fn overlay(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> Option<
             .as_ref()
             .and_then(|tip| tooltip(&mut list, layout, theme, tip))
     }?;
-    // Whole physical pixels, inside the window.
+    whole_pixels(bounds, layout).map(|bounds| (bounds, list))
+}
+
+/// `bounds` grown to whole physical pixels and cut to the window; `None` when nothing of it
+/// lies in the window.
+fn whole_pixels(bounds: Rect, layout: &MainLayout) -> Option<Rect> {
     let scale = layout.scale;
     let (x0, y0) = (
         ((bounds.x * scale).floor() / scale).max(0.0),
@@ -136,7 +171,7 @@ pub fn overlay(layout: &MainLayout, theme: &Theme, model: &Model<'_>) -> Option<
         ((bounds.right() * scale).ceil() / scale).min(layout.window.right()),
         ((bounds.bottom() * scale).ceil() / scale).min(layout.window.bottom()),
     );
-    (x1 > x0 && y1 > y0).then(|| (Rect::new(x0, y0, x1 - x0, y1 - y0), list))
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 /// Height of a tooltip and the space it keeps to the dock.

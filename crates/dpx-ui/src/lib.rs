@@ -11,6 +11,8 @@ pub mod animbrush_requester;
 pub mod arrange_requester;
 pub mod bitmap;
 pub mod choice_requester;
+// What a requester shows, as data for the Modern skin (ADR-47).
+pub mod dialog;
 pub mod file_requester;
 pub mod font;
 pub(crate) mod form;

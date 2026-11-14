@@ -1,6 +1,6 @@
 # ADR-47: Modern UI skin
 
-- Status: accepted (2026-11-13). Written from three design proposals and three code maps at HEAD f4d9512. Slice 0 (groundwork, no visible change), slice 1a (the renderer crate `dpx-ui-modern`, the bundled font and headless snapshots of bar, dock and picture) slice 1b (the live window: bar, dock and picture with pointer, keys, zoom, HiDPI and the region cache) slice 1c (the Modern pull-down menus and tooltips, the switch by Prefs ▸ Modern UI, F12 and Cmd/Ctrl+Shift+U, Prefs ▸ Theme) and slice 1d (the layer column, the scrim over the chrome under a requester, Screen Format on the whole window) are implemented: slice 1 of the owner's decision 3 is complete. After slice 1 the owner changed decision 2: the Modern menus also open with the left button like a normal menu bar (implemented, see owner decision 2a and lead decision 25). Slices 2 and later are the plan, not the program.
+- Status: accepted (2026-11-13). Written from three design proposals and three code maps at HEAD f4d9512. Slice 0 (groundwork, no visible change), slice 1a (the renderer crate `dpx-ui-modern`, the bundled font and headless snapshots of bar, dock and picture) slice 1b (the live window: bar, dock and picture with pointer, keys, zoom, HiDPI and the region cache) slice 1c (the Modern pull-down menus and tooltips, the switch by Prefs ▸ Modern UI, F12 and Cmd/Ctrl+Shift+U, Prefs ▸ Theme) and slice 1d (the layer column, the scrim over the chrome under a requester, Screen Format on the whole window) are implemented: slice 1 of the owner's decision 3 is complete. After slice 1 the owner changed decision 2: the Modern menus also open with the left button like a normal menu bar (implemented, see owner decision 2a and lead decision 25). Slice 4a (2026-11-14: the dialog kit, and the first requesters in the Modern look: notes, questions, About, Page Size, Screen Format) is implemented; see "Slice 4a" and lead decisions 26 to 31, which change decisions 17 and 18 for those requesters. Slices 2, 3 and the rest of slice 4 are the plan, not the program.
 - Amends: ADR-3 (whole UI software-rendered into a low-res framebuffer), ADR-13 (the screen fills the window), ADR-33 (settings file: two new keys), and the first non-negotiable of `CLAUDE.md`.
 
 ## Context
@@ -62,6 +62,13 @@ The owner was not asked again about these visible points; each is a small, local
     - The right button pressed on the bar takes the open menu over as a held menu (the DeluxePaint protocol with left-button multi-select, until the right button is up); pressed elsewhere it closes the menu. In a menu that stays open there is no multi-select: one click, one pick.
     - **Hotkeys:** any key closes the menu. Esc does only that. Every other key is then handled in the same pass as with no menu open, so a hotkey (F1–F10, tool keys, `u`, Cmd/Ctrl +/−) works at once and F12 or Cmd/Ctrl+Shift+U close the menu and switch the skin. A modifier alone is no key. (A menu held with the right button still ignores all keys, as in Classic.)
     - The look is the one of the held menus; a title is not raised under the resting pointer while no menu is open.
+
+26. (Slice 4a.) A converted requester is a **card** in the middle of the window: 12 pt corner radius, a soft shadow, the title at the top left in the medium weight, the buttons at the bottom right. Under it the whole window is veiled, the picture too (this changes decision 17 for converted requesters: there the picture held the requester and stayed lit). A card is 400, 480 or 680 pt wide (message, form, two columns) and as high as its content; in a window too low for it the rows move closer together (the compact metrics), so every converted card fits 720 × 520 points.
+27. (Slice 4a.) Screen Format is a card over the main window in Modern (this changes decision 18: no screen of its own, the bar, dock and picture stay visible under the veil). In Classic it keeps its own HiRes screen.
+28. (Slice 4a.) The buttons keep the Classic order from left to right, so a requester's keys, its default and the place of "Cancel" are the same in both skins. The button Return presses is filled with the accent, the others are quiet; a letter that is a button's key is underlined.
+29. (Slice 4a.) A cycle gadget with exactly two values is shown as two segments side by side (the selected one filled with the accent); a press on the other segment is the press on the Classic gadget. A gadget with more values is a stepper that shows the value with a chevron and moves on with every press, as in Classic. No drop-down lists: they would need behaviour the Classic requester does not have.
+30. (Slice 4a.) A refused value is shown as a line in the alert colour with a bar at its left, inside the panel of facts where the dialog has one. About has a head with the program's name; its text is the Classic text, re-flowed.
+31. (Slice 4a.) One card at a time: the requester that has the pointer and the keys. A converted requester that lies under another one is not drawn until it is on top (in Classic it is visible underneath but takes no input either). A card over an unconverted requester (a question over the file requester) lies over the veiled picture that still shows that requester in the Classic look. Text fields have a caret and a focus ring and no selection: the Classic fields have none.
 
 ## Options considered
 
@@ -261,7 +268,9 @@ Slice 1 of the owner's decision 3 is slices 1a–1d here. Each slice ends with t
 
 **Slice 3 – free picture viewport.** Visible size parametrised in `max_scroll`, `clamp_scroll`, `centre_on`, `magnify_layout`, `page_scroll_input`, Show Page; optional vector pixel grid from factor 8, drawn by the chrome, never into the picture. Acceptance: classic pin tests unchanged; a 640×512 page fills a large window; scroll and Magnify tests in both skins.
 
-**Slice 4 and later – requesters,** one family per slice, each shippable because an unconverted requester falls back to the classic host: a widget kit in `dpx-ui-modern` (panel, button, toggle, radio, slider, text field, list, swatch grid: list builder + hit function), then tool settings (Spacing, Fill, Grid, Symmetry), choice and note, file and Page Size, Color Mixer and Range, the anim requesters, Import/Generate/AI & MCP, Screen Format and Show Page last. A requester keeps its state struct and its `ReqEvent` input; it gains a second layout in points returning the same hit values. Classic drawing is not rewritten onto a shared trait (that would put classic byte-identity at risk for no visible gain). Acceptance per family: dark and light snapshots, parity tests against the classic requester, classic tests unchanged.
+**Slice 4a – dialog kit and the first five requesters (done).** See the section "Slice 4a" below.
+
+**Slice 4b and later – the remaining requesters,** one family per slice, each shippable because an unconverted requester falls back to the classic host: a widget kit in `dpx-ui-modern` (panel, button, toggle, radio, slider, text field, list, swatch grid: list builder + hit function), then tool settings (Spacing, Fill, Grid, Symmetry), choice and note, file and Page Size, Color Mixer and Range, the anim requesters, Import/Generate/AI & MCP, Screen Format and Show Page last. A requester keeps its state struct and its `ReqEvent` input; it gains a second layout in points returning the same hit values. Classic drawing is not rewritten onto a shared trait (that would put classic byte-identity at risk for no visible gain). Acceptance per family: dark and light snapshots, parity tests against the classic requester, classic tests unchanged.
 
 ## What `CLAUDE.md` says since slice 0
 
@@ -280,13 +289,79 @@ Added to the licence line:
 
 > Bundled fonts fall under the same list (no OFL, no Ubuntu Font Licence).
 
+## Slice 4a: the dialog kit and the first Modern requesters
+
+The owner's decision 3 says the requesters become modern step by step. Slice 4a builds the kit they are drawn with and converts five of them: the note requester (messages), the question requester (Quit, Recover, Replace, the AI & MCP questions), About, Page Size and Screen Format. Every other requester is shown in the Classic look inside the picture as before (decisions 17 and 21).
+
+### Design: the requester stays the single source, the Modern skin is a second view
+
+A requester keeps its state struct, its `handle(ReqEvent)` function, its keys and its results. Nothing of that exists twice. Three parts make the Modern view:
+
+1. **`dpx_ui::dialog` (data, no drawing).** A requester describes what it shows as a `Dialog`: `title`, `kind` (`Plain`, `About`), `size` (`Small`, `Medium`, `Large`), one or two `columns` of `Item`s and the `buttons`. Items: `Heading`, `Text { text, tone, bullet }` (wrapped), `Line { label, key, parts }` (a form line of `Part::Field`, `Cycle`, `Check`, `Slider`, `Text`), `Choices` (radio rows), `List` (rows, capacity, scroll bar), `Facts { rows, message }`, `Credits`, `Rule`. Every part that takes the pointer carries a `Control { id, area }`: an id that is unique in the dialog and the rectangle in which the **Classic** requester takes that part's press, in the coordinates of its `handle` function. The description is made from the requester's state on every pass (`view()`); the Classic skin does not use it.
+2. **`dpx_ui_modern::dialog` (the kit: geometry, drawing, hit testing).** `build(dialog, window, scale, theme, pointer)` lays the description out in points (edges on physical pixels), draws it into a display list and returns a `Built`: the list, the card's rectangle, the rectangle its shadow reaches, a `Spot { control, rect, slider }` for every control, and a `TextBox` for every text (what the fit and contrast tests read). `Built::press(x, y)` and `Built::drag(captured, x, y)` turn a pointer position into a position **inside the control's Classic rectangle** (`Spot::to_classic`: proportional, the last pixel included; a slider or scroll bar maps along its run so that every position is reached), or `NOWHERE` (-1, -1) over no control. The kit holds no dialog logic: it never changes a value.
+3. **The app (`apps/deluxepainter/src/modern_dialog.rs`).** `card()` names the requester that has the pointer and the keys, in the order `pass()` asks them, if it is converted. `modern_dialog_pos` replaces the pointer position of the pass by the mapped one; the events then go the Classic way (`modal_events`, the `*_event` functions). A press is taken by the control under it and stays with it until the button is up, as the Classic requesters expect. Keys are not touched at all. While a card is shown the converted requesters are left out of the classic screen the picture quad is composed from, the picture is veiled and the card is drawn in the overlay.
+
+So both skins send the same `ReqEvent`s with positions inside the same rectangles, and get the same answers. The parity tests compare, after every step of a script, the requester's `view()`, the command log and the rest of the app state between a Classic and a Modern window.
+
+### What the kit offers
+
+- The card: centred, 12 pt radius, hairline edge, a shadow of ten faint layers, the title; roomy and compact metrics (chosen by the window's height); widths 400 / 480 / 680 pt, narrower in a narrower window.
+- Buttons: default (accent fill), cancel and plain (quiet fill with an edge); under the pointer, held, ghosted; an underlined key letter; too many or too long for the card, they share its width and labels end in an ellipsis.
+- Text and number fields: text, caret at a character position, focus ring in the accent, ghosted; the width follows `max_chars`. No selection (the Classic fields have none).
+- Cycle gadgets: two segments for two values, otherwise a stepper with a chevron; ghosted.
+- Check boxes with a label and key letter; sliders with a knob and the value in words; radio rows with a detail text; a list with selected row, right-aligned detail and a scroll bar.
+- Labels, headings, wrapped paragraphs in three tones (normal, dim, alert) with bullets, a panel of facts with an alert message, centred credits, rules, the About head.
+- Hover and pressed looks come from `Pointer { at, down, captured }`; the layout does not depend on the pointer or the theme.
+
+Both themes use the existing tokens of `theme.rs`; no new colour was added. The kit's contrast test checks every text against the ground it is drawn on (4.5:1 for text, 3:1 for ghosted text), in both themes.
+
+### Conversion recipe for a remaining requester
+
+1. In the requester's file in `dpx-ui`, give every control a `ControlId` (a `pub mod ctl` or constants) and add `pub fn view(&self) -> Dialog`. Each `Control.area` is the rectangle the existing `handle`/`hit` code already uses for that control; take it from the same function or constant the Classic code uses, never a copy of the numbers. Do not change `render` or `handle`. Add a unit test: the centre of every `area` sent as a press reaches that control.
+2. If the requester needs a part the kit lacks (see the table), add it to `dpx_ui::dialog` as data and to `dpx_ui_modern::dialog` as drawing plus spots, with a list test, and add the requester to the kit's `dialogs()` test table (fit at 720 × 520 and scales 1 and 2, contrast, mapping).
+3. In `modern_dialog.rs`: a `Card` variant, its place in `card()` (the same place as in `pass()`), its arm in `view()`; remove it from `classic_look_open` and add it to `without_cards`. If its input branch in `main.rs` does not go through `requester_input` or `modal_events_with`, use `self.modern_dialog_pos(ctx).unwrap_or(pos)` there.
+4. A parity test in `apps/deluxepainter/src/modern/tests/dialogs.rs` with `both_at_every_scale`: every button on its first and last pixel, typing in every field, Return, Esc, Tab, its hotkeys and arrows, a press that leaves the control before the release, a click beside the card.
+5. Snapshots in dark and light (`--ui modern` with the requester's flag), looked at; the row in the table below; README/FEATURES/ROADMAP.
+
+### All requesters and their state
+
+| Requester | Where | Modern skin | What a conversion needs |
+|---|---|---|---|
+| Notes (export notes, errors, messages) | `note_requester.rs` | **modern** | |
+| About | `note_requester.rs` (`NoteRequester::about`) | **modern** | |
+| Questions: Quit, Recover, Replace File?, AI & MCP questions | `choice_requester.rs` | **modern** | |
+| Page Size | `page_size_requester.rs` | **modern** | |
+| Screen Format | `requester.rs` | **modern** (a card, lead decision 27) | |
+| Grid, Symmetry, Spacing, Fill, Translucency | `tool_requesters.rs` on `form.rs` | classic look | one `Form::view()`: the form's radios, checks, fields and texts are placed by absolute pixel positions and have to be grouped into lines; after that each requester is a few lines |
+| Stencil, Arrange | `stencil_requester.rs`, `arrange_requester.rs` (own code, no form) | classic look | a swatch grid part; Stencil toggles by click and drag-paint, Arrange drags a swatch to another place |
+| AnimBrush, Perspective | `animbrush_requester.rs`, `perspective_requester.rs` (forms with extras) | classic look | the form family plus icon buttons (AnimBrush direction) and one extra button (Perspective) |
+| Anim requesters | `anim_requester.rs` (forms) | classic look | the form family; the Move preview and playback keep the picture |
+| File requester (Load, Save, Export, brushes, anims) | `file_requester.rs` | classic look | the list part with scroll bar and the fields exist; needs Drawer / Pattern / File fields in one view, Disks / Assigns / Parent, "# of Frames", long names |
+| Color Mixer | `palette_requester.rs` | classic look | swatch grid, sample box, RGB/HSV sliders, SPREAD / COPY / EX / UNDO; it changes the palette of the whole screen live, so where the card stands over the picture is a visible decision |
+| Range | `range_requester.rs` | classic look | a palette strip that marks the range's span, range, speed, direction and active controls |
+| Import | `import_requester.rs` | classic look | a true-colour thumbnail part (the app paints it over the frame today), option rows with a Tab focus |
+| Generate, Image Generator setup | `generate_requester.rs`, `imagegen_setup.rs` | classic look | a text field with paste, option rows, "More..", a status/thumbnail box |
+| AI & MCP | `mcp_requester.rs` | classic look | status lines, permissions, connect buttons, the list of last calls |
+| Show Page | `show_page.rs` | classic look | not a dialog: a view of the whole page; belongs to slice 3 |
+| Animation Control Panel | `anim_control.rs`, `anim_panel.rs` | classic look | not a dialog: slice 2 (a Modern strip) |
+
+### Files, tests, screenshots
+
+- `dpx-ui`: `dialog.rs` (new), `view()` and control ids in `note_requester.rs`, `choice_requester.rs`, `page_size_requester.rs`, `requester.rs`; `NoteRequester::about`. `requester.rs` got `info_rows()`, used by its Classic `render` too (same output: the pin scenes and the requester's tests pass, and the classic snapshots were compared, see "Not verified").
+- `dpx-ui-modern`: `dialog.rs` (new); `build::Model` got `dialog`, `pointer` and `plain_picture`, `build::overlay` draws veil and card.
+- App: `modern_dialog.rs` (new), branches in `modern.rs` and `main.rs`; `--snapshot --ui modern` now takes `--requester` (Screen Format as a card) and the new flags `--about` and `--quit-question` (both also work in a Classic snapshot).
+- Tests: kit tests in `dpx-ui-modern/src/dialog.rs` (every dialog fits its card and every text its box at 720 × 520 and larger, scales 1, 1.5 and 2, both themes; contrast; a point on a control is a point in its Classic rectangle; every slider and scroll position is reached; card, buttons, fields, cycles, checks, sliders, rows, list, text; raster probes); parity tests in `apps/deluxepainter/src/modern/tests/dialogs.rs` (note, About, the questions, Page Size, Screen Format at device scales 1, 2 and 1.5; stacked requesters; the veil, hover and held looks; every card in the smallest window; a card over a classic-look requester; only converted requesters are cards). The older tests that expected Screen Format on its own screen in Modern were rewritten for the card.
+- Screenshots (`--snapshot --ui modern --no-settings --commands docs/design/screenshots/wave8-layer-panel.json --tool rectangle:filled --fg 5 --theme dark|light` plus the flag): `modern-dialog-about-*.png` (`--about`), `modern-dialog-question-*.png` (`--quit-question`), `modern-dialog-recover-*.png` (`--recover-requester`), `modern-dialog-replace-*.png` (`--mcp-question castle.iff`), `modern-dialog-note-*.png` (`--export-note castle.png`), `modern-dialog-page-size-*.png` (`--page-size-requester --layers-panel`), `modern-dialog-screen-format-*.png` (`--requester`), each as `-dark` and `-light`; `modern-dialog-screen-format-compact-2x.png` (`--theme dark --requester --size 720x520 --device-scale 2`), `modern-dialog-page-size-compact.png` (`--theme light --page-size-requester --size 720x520`). All were looked at. The two `recover` images show the time of the run in their text and do not regenerate byte-identically.
+- Replaced: `modern-requester-light.png` showed Page Size in the Classic look; it now shows the Range requester (`--theme light --layers-panel --range-requester`), which is still hosted. `modern-live-screen-format.png` was written again by the live-window test (`DPX_MODERN_SHOTS`): Screen Format as a card.
+- Classic identity: the four pin scenes pass unchanged. A binary built from the commit before this slice (1d5d381) and the new one wrote byte-identical `--snapshot` images for ten Classic scenes (the start screen; with `--commands wave8-layer-panel.json`: plain, `--page-size-requester`, `--requester`, `--mcp-question castle.iff`, `--export-note castle.png`, `--menu 2:3`, `--palette-requester`, `--layers-panel`, `--range-requester`) and for seven Modern scenes without a card (dark, light at 2x, `--layers-panel --palette-requester` at 1280x800 and 800x600, `--menu 2:3`, `--frames 4 --anim-panel`, `--layers-panel --range-requester`).
+
 ## Consequences
 
 - Two renderers for the main window, one state: every new main-window feature needs a drawing in both skins and a parity test. Requesters stay single until converted.
 - Two new direct dependencies and one bundled font; tiny-skia now builds on macOS and Windows too. tiny-skia contains `unsafe` internally (the workspace's `forbid(unsafe_code)` covers our crates only).
 - The classic Prefs menu is two rows taller. Nothing else in Classic changes.
 - In Modern the window no longer snaps to the screen size and Pixel Size means picture zoom.
-- Mixed looks until later slices: classic requesters over the modern window, and in slice 1 the anim panel in pixel look inside the picture.
+- Mixed looks until later slices (since slice 4a five requesters are cards, the others are not): classic requesters over the modern window, and in slice 1 the anim panel in pixel look inside the picture.
 - Chrome is rasterised on the CPU; the region cache keeps it off the painting path. A change of a region's list redraws that region: opening or closing a requester redraws all of them, F9, F10, Prefs ▸ Layers, a zoom step and every frame of a window resize at least the viewport. Measured for the viewport region alone (2376 × 1540 physical pixels: a 1280 × 800 point window at device scale 2; release build, one Apple-silicon Mac, CPU time over 20 runs): about 2.5 ms plain and 9.5 ms under the scrim. The first version of slice 1 took about 48 and 68 ms there, because the canvas list began with a clip (a mask as large as the region, and every fill through it) and its shadow was three filled cards under the picture; the list has no clip now and the shadow is three rings. The prototype's 1.5 ms for the whole chrome was never a number of this renderer. Dock, bar and layer column were not timed.
 - Text is unhinted and blended without gamma correction; at 1x it is slightly softer than native text.
 
@@ -313,4 +388,10 @@ Added to the licence line:
 - Whether any requester positions itself relative to the classic toolbox or title bar in a way that the chrome-less compose shifts: the eight kinds of slice 1d are centred on the screen and were hit where they are drawn; the others were not checked.
 - The left-button menus were built and run on one Apple-silicon Mac only, through ui-loop tests with injected events; they were never used on a screen. Not exercised: a menu that stays open while the pointer leaves the window or the window loses focus (it stays open), while the window is resized, over a HiRes or interlaced picture, and items that open requesters other than the Color Mixer, Page Size and Set Rate.
 - `RawInput.system_theme` at runtime on each OS; F12 availability on each OS.
-- How uniformly the requesters draw through shared widget helpers (decides how mechanical slice 4 is).
+- How uniformly the requesters draw through shared widget helpers (decides how mechanical slice 4 is). (Slice 4a looked: nine requesters sit on `form.rs`, the others have their own layout code; see the table in "Slice 4a".)
+- Slice 4a was built and run on one Apple-silicon Mac only, through tests and `--snapshot`. No card was ever seen or used in a real window: the overlay texture on the GPU, the feel of hover and press, and text sharpness on a real 1x or 2x display are not verified. Windows and Linux: not built, not run.
+- In slice 4a the questions were run as Quit (through the menu) and Recover (the requester set as at a start after a crash; no recovery folder in the test). The Replace File? question of MCP and the AI & MCP questions were not triggered through their real flows in both skins: they are the same question requester with other texts (one Replace question was set by hand over the file requester in Modern, and the MCP one was rendered for a screenshot).
+- Cards were run on PAL LoRes pictures only; not over a HiRes, interlaced or SuperHiRes picture, and not during playback or with Show Page open.
+- A card over an unconverted requester was run for one pair (a question over the file requester).
+- The classic comparison of slice 4a covers the scenes listed there, not every committed classic screenshot.
+- The effort notes in the table of requesters are estimates from reading the code, not from a trial conversion.

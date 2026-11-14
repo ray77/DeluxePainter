@@ -8,6 +8,10 @@
 
 use dpx_core::{IndexedImage, Rect};
 
+use crate::dialog::{
+    self, Button as ViewButton, Choice, Control, Dialog, Field as ViewField, Item, Kind, Part,
+    Role, Size, Tone,
+};
 use crate::font::Font;
 use crate::pens::Pens;
 use crate::requester::{ReqEvent, ReqKey};
@@ -127,7 +131,101 @@ pub struct PageSizeRequester {
     pointer: (i32, i32),
 }
 
+/// Ids of the controls in [`PageSizeRequester::view`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    pub const WIDTH: ControlId = 0;
+    pub const HEIGHT: ControlId = 1;
+    /// The three presets: `PRESET + 0..3`.
+    pub const PRESET: ControlId = 2;
+    pub const CANCEL: ControlId = 5;
+    pub const OK: ControlId = 6;
+}
+
 impl PageSizeRequester {
+    /// The requester as the Modern skin shows it (ADR-47).
+    pub fn view(&self) -> Dialog {
+        let field = |f: Field, id: dialog::ControlId, text: &TextField| {
+            Part::Field(ViewField {
+                control: Control::new(id, f.rect()),
+                text: text.text(),
+                caret: (self.active == f).then_some(text.cursor),
+                enabled: true,
+                numeric: true,
+                max_chars: MAX_DIGITS,
+            })
+        };
+        let prompt = match &self.message {
+            Some(m) => Item::Text {
+                text: m.clone(),
+                tone: Tone::Alert,
+                bullet: false,
+            },
+            None => Item::Text {
+                text: "Type in size:".into(),
+                tone: Tone::Normal,
+                bullet: false,
+            },
+        };
+        let parsed = self.parsed();
+        let presets = self
+            .presets
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let b = Button::Preset(i);
+                Choice {
+                    control: Control::new(ctl::PRESET + i as dialog::ControlId, b.rect()),
+                    label: p.label.to_string(),
+                    detail: format!("{} x {}", p.size.0, p.size.1),
+                    selected: parsed == Some(p.size),
+                    pressed: self.pressed(b),
+                    enabled: true,
+                }
+            })
+            .collect();
+        Dialog {
+            title: "Set Page Size".into(),
+            kind: Kind::Plain,
+            size: Size::Small,
+            columns: vec![vec![
+                prompt,
+                Item::Line {
+                    label: "Width".into(),
+                    key: None,
+                    parts: vec![field(Field::Width, ctl::WIDTH, &self.width)],
+                },
+                Item::Line {
+                    label: "Height".into(),
+                    key: None,
+                    parts: vec![field(Field::Height, ctl::HEIGHT, &self.height)],
+                },
+                Item::Rule,
+                Item::Text {
+                    text: "Or select one:".into(),
+                    tone: Tone::Normal,
+                    bullet: false,
+                },
+                Item::Choices(presets),
+            ]],
+            buttons: vec![
+                ViewButton::new(
+                    Control::new(ctl::CANCEL, Button::Cancel.rect()),
+                    "Cancel",
+                    Role::Cancel,
+                    self.pressed(Button::Cancel),
+                ),
+                ViewButton::new(
+                    Control::new(ctl::OK, Button::Ok.rect()),
+                    "Ok",
+                    Role::Default,
+                    self.pressed(Button::Ok),
+                ),
+            ],
+        }
+    }
+
     /// `current` fills the fields; `presets` are Standard, Full Page, Overscan.
     pub fn new(current: (u32, u32), presets: [Preset; 3]) -> Self {
         let mut r = Self {
@@ -503,6 +601,72 @@ mod tests {
         r.handle(ReqEvent::Press(b.x + 3, b.y + 3));
         r.handle(ReqEvent::Drag(0, 0));
         assert_eq!(r.handle(ReqEvent::Release), PageSizeResponse::Continue);
+    }
+
+    #[test]
+    fn the_view_follows_the_state() {
+        let mut r = req();
+        let v = r.view();
+        assert_eq!((v.title.as_str(), v.size), ("Set Page Size", Size::Small));
+        let ids: Vec<dialog::ControlId> = v.controls().iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            [ctl::WIDTH, ctl::HEIGHT, 2, 3, 4, ctl::CANCEL, ctl::OK]
+        );
+        assert_eq!(v.control(ctl::OK).map(|c| c.area), Some(Button::Ok.rect()));
+        assert_eq!(
+            v.control(ctl::HEIGHT).map(|c| c.area),
+            Some(Field::Height.rect())
+        );
+        let fields = |v: &Dialog| -> Vec<(String, Option<usize>)> {
+            v.columns[0]
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Line { parts, .. } => match &parts[0] {
+                        Part::Field(f) => Some((f.text.clone(), f.caret)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(fields(&v), [("320".into(), Some(3)), ("200".into(), None)]);
+        let chosen = |v: &Dialog| -> Vec<bool> {
+            v.columns[0]
+                .iter()
+                .find_map(|i| match i {
+                    Item::Choices(rows) => Some(rows.iter().map(|r| r.selected).collect()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(chosen(&v), [true, false, false]);
+        r.handle(ReqEvent::Key(ReqKey::Tab));
+        r.handle(ReqEvent::Key(ReqKey::Left));
+        click(&mut r, Button::Preset(2));
+        r.handle(ReqEvent::Key(ReqKey::Left));
+        let v = r.view();
+        assert_eq!(fields(&v), [("368".into(), None), ("241".into(), Some(2))]);
+        assert_eq!(chosen(&v), [false, false, true]);
+        assert!(matches!(
+            &v.columns[0][0],
+            Item::Text {
+                tone: Tone::Normal,
+                ..
+            }
+        ));
+        r.set_message("Too big");
+        assert_eq!(
+            r.view().columns[0][0],
+            Item::Text {
+                text: "Too big".into(),
+                tone: Tone::Alert,
+                bullet: false
+            }
+        );
+        let b = Button::Cancel.rect();
+        r.handle(ReqEvent::Press(b.x + 1, b.y + 1));
+        assert!(r.view().buttons[0].pressed && !r.view().buttons[1].pressed);
     }
 
     #[test]

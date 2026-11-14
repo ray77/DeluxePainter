@@ -77,6 +77,17 @@ pub fn recover_requester(name: &str, when: String) -> ChoiceRequester {
     )
 }
 
+/// The question before quitting with unsaved changes: Yes / No, Return and Esc say No.
+pub fn quit_requester() -> ChoiceRequester {
+    ChoiceRequester::new(
+        QUIT_TITLE,
+        &["Quit without saving?".to_string()],
+        ["Yes", "No"],
+        1,
+        1,
+    )
+}
+
 impl PainterApp {
     /// The picture has changes that are in no saved file.
     pub fn unsaved(&self) -> bool {
@@ -185,13 +196,7 @@ impl PainterApp {
         }
         if self.unsaved() {
             self.finish_stroke();
-            self.ui.choice_requester = Some(ChoiceRequester::new(
-                QUIT_TITLE,
-                &["Quit without saving?".to_string()],
-                ["Yes", "No"],
-                1,
-                1,
-            ));
+            self.ui.choice_requester = Some(quit_requester());
             self.autosave.pending = Some(Pending::Quit);
             self.dirty = true;
         } else {

@@ -14,6 +14,7 @@ use dpx_core::mode::{PRESETS, Preset};
 use dpx_core::{Chipset, Command, DisplayMode, IndexedImage, Palette, Target};
 
 use crate::bitmap::{self, Bitmap};
+use crate::dialog::Dialog;
 use crate::font::{Font, glyph};
 use crate::pens::Pens;
 use crate::widgets::{TextField, draw_field};
@@ -32,6 +33,32 @@ pub fn palette() -> Palette {
 
 /// Version line in the credits panel.
 const VERSION: &str = concat!("Version ", env!("CARGO_PKG_VERSION"));
+
+/// The lines of the credits panel.
+const CREDITS: [&str; 5] = ["DeluxePainter", VERSION, "", "(c) 2026", "Dominik Schmidt"];
+
+/// Ids of the controls in [`ScreenFormatRequester::view`].
+pub mod ctl {
+    use crate::dialog::ControlId;
+
+    /// The scroll bar of the mode list.
+    pub const SCROLL: ControlId = 1;
+    /// The Screen Size cycle gadget and its two number boxes.
+    pub const SCREEN: ControlId = 2;
+    pub const SCREEN_W: ControlId = 3;
+    pub const SCREEN_H: ControlId = 4;
+    /// The Page Size cycle gadget.
+    pub const PAGE: ControlId = 5;
+    /// The Palette Size slider.
+    pub const COLORS: ControlId = 6;
+    pub const RETAIN: ControlId = 7;
+    pub const PRESET: ControlId = 8;
+    pub const CHIPSET: ControlId = 9;
+    pub const USE: ControlId = 10;
+    pub const CANCEL: ControlId = 11;
+    /// The visible rows of the mode list: `ROW + 0..5`.
+    pub const ROW: ControlId = 20;
+}
 
 /// Most lines of a message ("Use" refused) in the information panel.
 const MESSAGE_LINES: usize = 4;
@@ -701,6 +728,204 @@ impl ScreenFormatRequester {
         }
     }
 
+    /// The lines of the information panel: names and values.
+    fn info_rows(&self) -> [(&'static str, String); 6] {
+        let m = self.mode();
+        let (sw, sh) = self.screen_size();
+        let max = m.max_colors(self.chipset).unwrap_or(0);
+        let depth = match self.chipset {
+            Chipset::Ocs => "4096",
+            Chipset::Aga => "16777216",
+        };
+        let (ow, oh) = m.overscan_size();
+        let (ax, ay) = m.aspect();
+        let (fx, fy) = m.pixel_shape();
+        [
+            ("Chipset", chipset_name(self.chipset).to_string()),
+            ("Max Colors", format!("{max} of {depth}")),
+            ("Size", format!("{sw}x{sh}")),
+            ("Max Size", format!("{ow}x{oh}")),
+            ("Pixel Shape", format!("{fx}:{fy}")),
+            ("Aspect", format!("{ax}:{ay}")),
+        ]
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): the same gadgets in two columns.
+    /// The Classic requester has a screen of its own; the Modern one is a dialog over the
+    /// main window.
+    pub fn view(&self) -> Dialog {
+        use crate::dialog::{
+            Button as ViewButton, Check, Control, Cycle, Field, Item, Kind, ListRow, ListView,
+            Part, Role, ScrollBar, Size, Slider, Tone,
+        };
+        let list = list_rect();
+        let text_w = list.w - geom::SCROLL_W - 3;
+        let rows = (0..geom::ROWS as usize)
+            .filter_map(|row| {
+                let i = self.scroll + row;
+                let m = self.modes.get(i)?;
+                let (w, h) = m.size();
+                let y = list.y + 1 + row as i32 * geom::ROW_H;
+                Some(ListRow {
+                    control: Control::new(
+                        ctl::ROW + row as crate::dialog::ControlId,
+                        dpx_core::Rect::new(list.x + 1, y, text_w, geom::ROW_H),
+                    ),
+                    label: m.name(),
+                    detail: format!("{w}x{h}"),
+                    selected: i == self.selected,
+                })
+            })
+            .collect();
+        let track = scroll_track();
+        let (ky, kh) = self.knob();
+        let custom = self.screen_choice == ScreenChoice::Custom;
+        let (sw, sh) = self.screen_size();
+        let number = |id, x: i32, field: &TextField, index: usize, value: u32| {
+            Part::Field(Field {
+                control: Control::new(id, number_rect(x, geom::SCREEN_SIZE_Y).public()),
+                text: if custom {
+                    field.text()
+                } else {
+                    value.to_string()
+                },
+                caret: (custom && self.active == Some(index)).then_some(field.cursor),
+                enabled: custom,
+                numeric: true,
+                max_chars: 4,
+            })
+        };
+        let screen_label = match self.screen_choice {
+            ScreenChoice::Standard => "Standard",
+            ScreenChoice::Overscan => "Overscan",
+            ScreenChoice::Custom => "Custom",
+        };
+        let (pw, ph) = self.page_size();
+        let s = slider_rect();
+        let left = vec![
+            Item::Heading("Choose Display Mode".into()),
+            Item::List(ListView {
+                rows,
+                capacity: geom::ROWS as usize,
+                scroll: Some(ScrollBar {
+                    control: Control::new(ctl::SCROLL, track.public()),
+                    knob: dpx_core::Rect::new(track.x + 1, ky, track.w - 2, kh),
+                }),
+            }),
+            Item::Line {
+                label: "Screen Size".into(),
+                key: None,
+                parts: vec![
+                    Part::Cycle(Cycle {
+                        control: Control::new(
+                            ctl::SCREEN,
+                            cycle_rect(geom::SCREEN_SIZE_Y).public(),
+                        ),
+                        options: vec![screen_label.into()],
+                        selected: 0,
+                        enabled: true,
+                    }),
+                    number(ctl::SCREEN_W, geom::NUM_W_X, &self.field_w, 0, sw),
+                    Part::Text("x".into(), Tone::Dim),
+                    number(ctl::SCREEN_H, geom::NUM_H_X, &self.field_h, 1, sh),
+                ],
+            },
+            Item::Line {
+                label: "Page Size".into(),
+                key: None,
+                parts: vec![
+                    Part::Cycle(Cycle {
+                        control: Control::new(ctl::PAGE, cycle_rect(geom::PAGE_SIZE_Y).public()),
+                        options: vec!["Screen".into(), "Keep Same".into()],
+                        selected: usize::from(self.page == PageChoice::KeepSame),
+                        enabled: true,
+                    }),
+                    Part::Text(format!("{pw} x {ph}"), Tone::Dim),
+                ],
+            },
+            Item::Line {
+                label: "Palette Size".into(),
+                key: None,
+                parts: vec![Part::Slider(Slider {
+                    control: Control::new(ctl::COLORS, s.public()),
+                    knob: dpx_core::Rect::new(self.slider_knob_x(), s.y + 1, geom::KNOB_W, s.h - 2),
+                    value: self.colors().to_string(),
+                })],
+            },
+            Item::Line {
+                label: String::new(),
+                key: None,
+                parts: vec![Part::Check(Check {
+                    control: Control::new(ctl::RETAIN, check_rect().public()),
+                    label: "Retain Picture".into(),
+                    on: self.retain,
+                    enabled: true,
+                    key: Some('R'),
+                })],
+            },
+            Item::Line {
+                label: "Preset".into(),
+                key: Some('P'),
+                parts: vec![Part::Cycle(Cycle {
+                    control: Control::new(ctl::PRESET, preset_rect().public()),
+                    options: vec![self.preset().label.to_string()],
+                    selected: 0,
+                    enabled: true,
+                })],
+            },
+        ];
+        let right = vec![
+            Item::Heading("Display Information".into()),
+            Item::Facts {
+                rows: self
+                    .info_rows()
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value))
+                    .collect(),
+                message: self.message.clone(),
+            },
+            Item::Line {
+                label: "Chipset".into(),
+                key: Some('h'),
+                parts: vec![Part::Cycle(Cycle {
+                    control: Control::new(ctl::CHIPSET, chipset_rect().public()),
+                    options: vec!["OCS".into(), "AGA".into()],
+                    selected: usize::from(self.chipset == Chipset::Aga),
+                    enabled: self.chipset_switchable(),
+                })],
+            },
+            Item::Heading("Credits".into()),
+            Item::Credits(
+                CREDITS
+                    .iter()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.to_string())
+                    .collect(),
+            ),
+        ];
+        let button = |b: Button, id, label: &str, role, key| {
+            let pressed =
+                self.drag == Some(Drag::Button(b)) && button_rect(b).contains(self.pointer);
+            ViewButton::new(
+                Control::new(id, button_rect(b).public()),
+                label,
+                role,
+                pressed,
+            )
+            .key(key)
+        };
+        Dialog {
+            title: "Screen Format".into(),
+            kind: Kind::Plain,
+            size: Size::Large,
+            columns: vec![left, right],
+            buttons: vec![
+                button(Button::Use, ctl::USE, "Use", Role::Default, 'U'),
+                button(Button::Cancel, ctl::CANCEL, "Cancel", Role::Cancel, 'C'),
+            ],
+        }
+    }
+
     /// Draws the requester screen (use with [`palette`]).
     pub fn render(&self) -> IndexedImage {
         let pal = palette();
@@ -909,22 +1134,9 @@ impl ScreenFormatRequester {
             pens.shine,
         );
         recessed(&mut img, info, &pens);
-        let max = m.max_colors(self.chipset).unwrap_or(0);
-        let depth = match self.chipset {
-            Chipset::Ocs => "4096",
-            Chipset::Aga => "16777216",
-        };
-        let (ow, oh) = m.overscan_size();
-        let (ax, ay) = m.aspect();
-        let (fx, fy) = m.pixel_shape();
-        let lines = [
-            format!("Chipset = {}", chipset_name(self.chipset)),
-            format!("Max Colors = {max} of {depth}"),
-            format!("Size = {sw}x{sh}"),
-            format!("Max Size = {ow}x{oh}"),
-            format!("Pixel Shape = {fx}:{fy}"),
-            format!("Aspect = {ax}:{ay}"),
-        ];
+        let lines = self
+            .info_rows()
+            .map(|(name, value)| format!("{name} = {value}"));
         // A message ("Use" refused) is a bar at the panel's bottom (wrapped, up to
         // MESSAGE_LINES lines, so a long refusal such as ADR-46's colour rules stays inside);
         // the information lines it would cut into are left out, never shown in part.
@@ -972,10 +1184,7 @@ impl ScreenFormatRequester {
             pens.shine,
         );
         recessed(&mut img, credits, &pens);
-        for (i, line) in ["DeluxePainter", VERSION, "", "(c) 2026", "Dominik Schmidt"]
-            .iter()
-            .enumerate()
-        {
+        for (i, line) in CREDITS.iter().enumerate() {
             centred(
                 &mut img,
                 credits.x,
@@ -1246,6 +1455,95 @@ mod tests {
 
     fn row_y(row: i32) -> i32 {
         geom::LIST_Y + 1 + row * geom::ROW_H + 4
+    }
+
+    #[test]
+    fn the_view_describes_every_gadget_where_classic_takes_its_press() {
+        use crate::dialog::{Item, Part, Role};
+        let mut r = req();
+        let v = r.view();
+        assert_eq!(v.columns.len(), 2);
+        // A press in the middle of every control's area is taken by that gadget.
+        let ids: Vec<_> = v.controls().iter().map(|c| c.id).collect();
+        for id in [
+            ctl::SCROLL,
+            ctl::SCREEN,
+            ctl::SCREEN_W,
+            ctl::SCREEN_H,
+            ctl::PAGE,
+            ctl::COLORS,
+            ctl::RETAIN,
+            ctl::PRESET,
+            ctl::CHIPSET,
+            ctl::USE,
+            ctl::CANCEL,
+            ctl::ROW,
+            ctl::ROW + 4,
+        ] {
+            assert!(ids.contains(&id), "{id}");
+        }
+        let centre = |r: &ScreenFormatRequester, id| {
+            let a = r.view().control(id).expect("control").area;
+            (a.x + a.w / 2, a.y + a.h / 2)
+        };
+        let press = |r: &mut ScreenFormatRequester, id| {
+            let (x, y) = centre(r, id);
+            r.handle(ReqEvent::Press(x, y));
+            r.handle(ReqEvent::Release)
+        };
+        press(&mut r, ctl::ROW + 2);
+        assert_eq!(r.selected, r.scroll + 2);
+        assert!(matches!(&r.view().columns[0][1], Item::List(l) if l.rows[2].selected));
+        press(&mut r, ctl::RETAIN);
+        assert!(!r.retain);
+        press(&mut r, ctl::PAGE);
+        assert_eq!(r.page, PageChoice::KeepSame);
+        press(&mut r, ctl::SCREEN);
+        press(&mut r, ctl::SCREEN);
+        assert_eq!(r.screen_choice(), ScreenChoice::Custom);
+        press(&mut r, ctl::SCREEN_H);
+        assert_eq!(r.active, Some(1));
+        let fields: Vec<_> = r.view().columns[0]
+            .iter()
+            .flat_map(|i| match i {
+                Item::Line { parts, .. } => parts.clone(),
+                _ => Vec::new(),
+            })
+            .filter_map(|p| match p {
+                Part::Field(f) => Some((f.enabled, f.caret.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, [(true, false), (true, true)]);
+        let before = r.preset().id;
+        press(&mut r, ctl::PRESET);
+        assert_ne!(r.preset().id, before);
+        let chipset = r.chipset();
+        press(&mut r, ctl::CHIPSET);
+        assert_ne!(r.chipset(), chipset);
+        let (x, y) = centre(&r, ctl::COLORS);
+        r.handle(ReqEvent::Press(x, y));
+        r.handle(ReqEvent::Release);
+        assert!(r.colors() > 2 && r.colors() < 256, "{}", r.colors());
+        let a = r.view().control(ctl::SCROLL).unwrap().area;
+        r.handle(ReqEvent::Press(a.x + 2, a.y + a.h - 1));
+        r.handle(ReqEvent::Release);
+        assert!(r.scroll > 0, "a press below the knob pages down");
+        assert_eq!(press(&mut r, ctl::CANCEL), ReqResponse::Cancel);
+        assert!(matches!(press(&mut r, ctl::USE), ReqResponse::Use(_)));
+        let v = r.view();
+        assert_eq!(
+            v.buttons
+                .iter()
+                .map(|b| (b.role, b.key))
+                .collect::<Vec<_>>(),
+            [(Role::Default, Some('U')), (Role::Cancel, Some('C'))]
+        );
+        r.set_message("No");
+        assert!(matches!(
+            &r.view().columns[1][1],
+            Item::Facts { rows, message: Some(m) } if rows.len() == 6 && m == "No"
+        ));
     }
 
     #[test]

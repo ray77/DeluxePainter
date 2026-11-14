@@ -217,6 +217,26 @@ pub fn decode_palette(bytes: &[u8]) -> Result<(Vec<Rgb8>, Vec<ColorRange>), Stri
     Ok((colors, ranges))
 }
 
+/// Picture ▸ About..: our own short text about the program and the picture `doc`.
+pub(crate) fn about_requester(doc: &Document) -> NoteRequester {
+    let (w, h) = (doc.page().width(), doc.page().height());
+    let notes = [
+        format!(
+            "DeluxePainter {}: a pixel-art editor in the spirit of DeluxePaint IV AGA",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "Written in Rust; source-available under the PolyForm Noncommercial License 1.0.0"
+            .to_string(),
+        "Not affiliated with Electronic Arts".to_string(),
+        format!(
+            "Page {w}x{h}, {} colours, {}",
+            doc.palette().len(),
+            doc.target().mode.name()
+        ),
+    ];
+    NoteRequester::about("About DeluxePainter", &notes)
+}
+
 impl PainterApp {
     /// Keys of the ADR-15 menu items on the paint screen, and the colour-cycling clock: `j`
     /// Spare ▸ Swap, Ctrl+`j` Copy to Spare, `k` CLR, Tab Cycle, `?` About.
@@ -627,23 +647,7 @@ impl PainterApp {
 
     /// Picture ▸ About..: our own short text in the note requester.
     pub(crate) fn show_about(&mut self) {
-        let doc = self.engine.document();
-        let (w, h) = (doc.page().width(), doc.page().height());
-        let notes = [
-            format!(
-                "DeluxePainter {}: a pixel-art editor in the spirit of DeluxePaint IV AGA",
-                env!("CARGO_PKG_VERSION")
-            ),
-            "Written in Rust; source-available under the PolyForm Noncommercial License 1.0.0"
-                .to_string(),
-            "Not affiliated with Electronic Arts".to_string(),
-            format!(
-                "Page {w}x{h}, {} colours, {}",
-                doc.palette().len(),
-                doc.target().mode.name()
-            ),
-        ];
-        self.ui.note_requester = Some(NoteRequester::new("About DeluxePainter", &notes));
+        self.ui.note_requester = Some(about_requester(self.engine.document()));
         self.dirty = true;
     }
 

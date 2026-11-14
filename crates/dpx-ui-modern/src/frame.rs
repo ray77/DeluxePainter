@@ -44,7 +44,7 @@ impl Frame<'_> {
                 per_ui_pixel: self.per_ui_pixel,
                 pixel_size: ui.pixel_size,
                 // A requester in the picture's image may use the whole window.
-                hosts_requester: self.model.dimmed,
+                hosts_requester: self.model.dimmed && !self.model.plain_picture,
             },
         )
     }

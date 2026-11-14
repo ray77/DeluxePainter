@@ -32,14 +32,20 @@ DeluxePainter has two looks for the same program. **Classic** is the pixel inter
   <img src="docs/design/screenshots/modern-requester-dark.png" alt="Modern skin: the Color Mixer in the Classic look inside the picture, the interface around it dimmed" width="400">
 </p>
 
-What is Modern today (ADR-47, slice 1):
+What is Modern today (ADR-47, slices 1 and 4a):
 
 - the bar with the menu titles, status and coordinates, and the pull-down menus with submenus, check marks and shortcuts;
 - the dock at the right: built-in brushes, the 18 tools (split tools divided on the diagonal), colour indicator and palette, with tooltips;
 - the layer column left of the dock (Prefs ▸ Layers or `L`): eye, name, active layer, rename by double-click, New / Copy / Delete / Up / Down / Merge Down, wheel scrolling;
-- the picture, centred, zoomed with Cmd/Ctrl `+` / `−` / `0` or Prefs ▸ Pixel Size (the window keeps its size).
+- the picture, centred, zoomed with Cmd/Ctrl `+` / `−` / `0` or Prefs ▸ Pixel Size (the window keeps its size);
+- the first dialogs, as cards over the dimmed window: messages, questions (Quit, Recover, Replace ..), About, Page Size and Screen Format. They are the same requesters as in Classic (same keys, same buttons in the same order, same results) with a second look.
 
-What still has the Classic pixel look inside the Modern window: every requester (they open inside the picture, the interface around it is dimmed and takes no input until they close), Screen Format (it takes the whole window, as in Classic), Show Page, the Animation Control Panel and the Magnify divider. They work exactly as in Classic; they are converted in later slices.
+<p align="center">
+  <img src="docs/design/screenshots/modern-dialog-screen-format-dark.png" alt="Modern skin, dark theme: Screen Format as a card over the dimmed window" width="400">
+  <img src="docs/design/screenshots/modern-dialog-page-size-light.png" alt="Modern skin, light theme: Page Size as a card" width="400">
+</p>
+
+What still has the Classic pixel look inside the Modern window: every other requester (tool settings, the file requester, Color Mixer, Range, the anim requesters, Import, Generate, AI & MCP; they open inside the picture, the interface around it is dimmed and takes no input until they close), Show Page, the Animation Control Panel and the Magnify divider. They work exactly as in Classic; they are converted in later slices (the list and the recipe are in ADR-47).
 
 Not verified: the Modern skin has only been run through automated tests and headless renders on one Apple-silicon Mac. It has not been used by hand in a real window, and not been built or run on Windows or Linux. The picture area shows one Amiga screen; a screen larger than the free area of a small window is cut at its edges. Details and the full list: [ADR-47](docs/adr/0047-modern-ui-skin.md).
 

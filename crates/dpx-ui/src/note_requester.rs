@@ -7,6 +7,7 @@
 
 use dpx_core::{IndexedImage, Rect};
 
+use crate::dialog::{self, Button, Control, Dialog, Item, Kind, Role, Size, Tone};
 use crate::font::Font;
 use crate::pens::Pens;
 use crate::requester::{ReqEvent, ReqKey};
@@ -56,7 +57,16 @@ pub struct NoteRequester {
     /// Ok button held down, and the pointer position.
     held: bool,
     pointer: (i32, i32),
+    /// The notes that have text, first letter capitalised, unwrapped (for [`Self::view`]).
+    source: Vec<String>,
+    /// The last line is "...and N more".
+    more: bool,
+    /// The program's About text (the Modern skin sets it apart; Classic draws it as a note).
+    about: bool,
 }
+
+/// Id of the Ok button in [`NoteRequester::view`].
+pub const OK: dialog::ControlId = 0;
 
 /// Upper-cases the first letter.
 fn capitalise(s: &str) -> String {
@@ -123,6 +133,12 @@ impl NoteRequester {
                 ));
             }
         }
+        let source: Vec<String> = notes
+            .iter()
+            .map(|n| capitalise(n))
+            .filter(|n| !n.trim().is_empty())
+            .collect();
+        let more = all.len() > MAX_LINES;
         let lines = if all.len() > MAX_LINES {
             let shown = MAX_LINES - 1;
             // A note counts as shown only when its last line is among the shown ones.
@@ -147,6 +163,68 @@ impl NoteRequester {
             lines,
             held: false,
             pointer: (0, 0),
+            source,
+            more,
+            about: false,
+        }
+    }
+
+    /// The program's own About text: a note requester in the Classic skin; the Modern skin
+    /// shows the first note as the program's name line.
+    pub fn about(title: &str, notes: &[String]) -> Self {
+        Self {
+            about: true,
+            ..Self::new(title, notes)
+        }
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): the notes as running text (as
+    /// much of each as the lines above hold) and the Ok button.
+    pub fn view(&self) -> Dialog {
+        let body = &self.lines[..self.lines.len() - usize::from(self.more)];
+        let mut items = Vec::new();
+        let mut start = 0;
+        let mut note = 0;
+        while start < body.len() {
+            let end = (start + 1..body.len())
+                .find(|&i| body[i].bullet)
+                .unwrap_or(body.len());
+            let ink = dialog::ink_count(body[start..end].iter().map(|l| l.text.as_str()));
+            let (mut text, cut) = match self.source.get(note) {
+                Some(source) => dialog::shown_prefix(source, ink),
+                None => (String::new(), false),
+            };
+            if cut {
+                text.push('\u{2026}');
+            }
+            items.push(Item::Text {
+                text,
+                tone: Tone::Normal,
+                bullet: !self.about,
+            });
+            start = end;
+            note += 1;
+        }
+        if self.more
+            && let Some(last) = self.lines.last()
+        {
+            items.push(Item::Text {
+                text: last.text.replace("...", "\u{2026}"),
+                tone: Tone::Dim,
+                bullet: false,
+            });
+        }
+        Dialog {
+            title: self.title.clone(),
+            kind: if self.about { Kind::About } else { Kind::Plain },
+            size: Size::Small,
+            columns: vec![items],
+            buttons: vec![Button::new(
+                Control::new(OK, self.ok_rect()),
+                "Ok",
+                Role::Default,
+                self.pressed(),
+            )],
         }
     }
 
@@ -408,6 +486,92 @@ mod tests {
             .filter(|&(x, y)| img.get(x, y) == Some(p.dark))
             .count();
         assert!(title_dark > 0);
+    }
+
+    #[test]
+    fn the_view_gives_the_notes_back_as_running_text() {
+        let long = "mask plane not kept because the target has no room for a ninth bitplane";
+        let r = NoteRequester::new("Picture loaded", &notes(&[long, "", "two"]));
+        assert!(
+            wrap(long, geom::TEXT_W).len() > 1,
+            "the note wraps in Classic"
+        );
+        let v = r.view();
+        assert_eq!(
+            (v.title.as_str(), v.kind, v.size),
+            ("Picture loaded", Kind::Plain, Size::Small)
+        );
+        assert_eq!(
+            v.columns,
+            vec![vec![
+                Item::Text {
+                    text: capitalise(long),
+                    tone: Tone::Normal,
+                    bullet: true
+                },
+                Item::Text {
+                    text: "Two".into(),
+                    tone: Tone::Normal,
+                    bullet: true
+                },
+            ]]
+        );
+        assert_eq!(v.buttons.len(), 1);
+        assert_eq!(v.buttons[0].control, Control::new(OK, r.ok_rect()));
+        assert_eq!(v.buttons[0].role, Role::Default);
+        assert!(!v.buttons[0].pressed);
+        // Held down, the view says so.
+        let mut held = r.clone();
+        let b = held.ok_rect();
+        held.handle(ReqEvent::Press(b.x + 1, b.y + 1));
+        assert!(held.view().buttons[0].pressed);
+        // The About text has no bullets.
+        let about = NoteRequester::about("About", &notes(&["a", "b"]));
+        assert_eq!(about.view().kind, Kind::About);
+        assert!(
+            about.view().columns[0]
+                .iter()
+                .all(|i| matches!(i, Item::Text { bullet: false, .. }))
+        );
+        assert_eq!(
+            about.render(&pens()),
+            NoteRequester::new("About", &notes(&["a", "b"])).render(&pens())
+        );
+    }
+
+    #[test]
+    fn the_view_shows_as_much_as_the_lines_and_the_count_of_the_rest() {
+        let long = "word ".repeat(60);
+        let n: Vec<String> = (0..10).map(|_| long.trim().to_string()).collect();
+        let r = NoteRequester::new("T", &n);
+        let v = r.view();
+        let items = &v.columns[0];
+        let per = wrap(&n[0], geom::TEXT_W).len();
+        let whole = (MAX_LINES - 1) / per;
+        // The whole notes, one cut note (if a part of it is shown), then the count.
+        let cut = usize::from(!(MAX_LINES - 1).is_multiple_of(per));
+        assert_eq!(items.len(), whole + cut + 1);
+        let Item::Text { text, .. } = &items[0] else {
+            panic!("text");
+        };
+        assert_eq!(text, &capitalise(&n[0]));
+        if cut == 1 {
+            let Item::Text { text, .. } = &items[whole] else {
+                panic!("text");
+            };
+            assert!(
+                text.ends_with('\u{2026}') && text.len() < n[0].len(),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            items.last(),
+            Some(&Item::Text {
+                text: format!("\u{2026}and {} more", 10 - whole),
+                tone: Tone::Dim,
+                bullet: false
+            })
+        );
     }
 
     #[test]

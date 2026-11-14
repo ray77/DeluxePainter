@@ -6,6 +6,7 @@
 
 use dpx_core::{IndexedImage, Rect};
 
+use crate::dialog::{self, Button, Control, Dialog, Item, Kind, Role, Size, Tone};
 use crate::font::Font;
 use crate::note_requester::wrap;
 use crate::pens::Pens;
@@ -56,7 +57,13 @@ pub struct ChoiceRequester {
     /// Button held down, and the pointer position.
     held: Option<usize>,
     pointer: (i32, i32),
+    /// The paragraphs that have text, unwrapped, each with the number of lines it wraps to
+    /// (for [`Self::view`]).
+    source: Vec<(String, usize)>,
 }
+
+/// Ids of the two buttons in [`ChoiceRequester::view`]: the left and the right one.
+pub const BUTTONS: [dialog::ControlId; 2] = [0, 1];
 
 impl ChoiceRequester {
     /// `text` is word-wrapped (one paragraph per entry), at most [`MAX_LINES`] lines.
@@ -79,6 +86,11 @@ impl ChoiceRequester {
             .iter()
             .flat_map(|t| wrap(t, geom::TEXT_W).into_iter())
             .collect();
+        let source: Vec<(String, usize)> = text
+            .iter()
+            .map(|t| (t.clone(), wrap(t, geom::TEXT_W).len()))
+            .filter(|(_, n)| *n > 0)
+            .collect();
         let truncated = lines.len() > max_lines;
         if truncated {
             lines.truncate(max_lines - 1);
@@ -93,6 +105,67 @@ impl ChoiceRequester {
             esc: esc.min(1),
             held: None,
             pointer: (0, 0),
+            source,
+        }
+    }
+
+    /// The requester as the Modern skin shows it (ADR-47): the text as running paragraphs
+    /// (as much as the lines above hold) and the two buttons. Return's button is the
+    /// default one, Esc's the cancelling one.
+    pub fn view(&self) -> Dialog {
+        let mut left = self.lines.len() - usize::from(self.truncated);
+        let mut at = 0;
+        let mut items = Vec::new();
+        let mut cut_inside = false;
+        for (text, count) in &self.source {
+            if left == 0 {
+                break;
+            }
+            let take = (*count).min(left);
+            let ink = dialog::ink_count(self.lines[at..at + take].iter().map(String::as_str));
+            let (mut shown, cut) = dialog::shown_prefix(text, ink);
+            if cut {
+                shown.push('\u{2026}');
+                cut_inside = true;
+            }
+            items.push(Item::Text {
+                text: shown,
+                tone: Tone::Normal,
+                bullet: false,
+            });
+            at += take;
+            left -= take;
+        }
+        if self.truncated && !cut_inside {
+            items.push(Item::Text {
+                text: "\u{2026}".into(),
+                tone: Tone::Dim,
+                bullet: false,
+            });
+        }
+        let buttons = (0..2)
+            .map(|i| {
+                let role = if i == self.enter {
+                    Role::Default
+                } else if i == self.esc {
+                    Role::Cancel
+                } else {
+                    Role::Plain
+                };
+                Button::new(
+                    Control::new(BUTTONS[i], self.button_rect(i)),
+                    &self.labels[i],
+                    role,
+                    self.pressed(i),
+                )
+            })
+            .collect();
+        Dialog {
+            title: self.title.clone(),
+            kind: Kind::Plain,
+            size: Size::Small,
+            columns: vec![items],
+            buttons,
         }
     }
 
@@ -304,6 +377,62 @@ mod tests {
         assert!(a.w >= Font::builtin().text_width("Get Claude Code") + 8);
         assert_eq!(b.w, geom::BUTTON_W);
         assert!(a.x > 0 && a.x + a.w + geom::BUTTON_SPACE <= b.x && b.x + b.w < WIDTH);
+    }
+
+    #[test]
+    fn the_view_gives_the_paragraphs_and_the_buttons_with_their_roles() {
+        let long = "This picture has changes that were never saved and a very long explanation";
+        let text = vec![long.to_string(), String::new(), "Second".to_string()];
+        let mut r = ChoiceRequester::new("Quit", &text, ["Yes", "No"], 1, 1);
+        assert!(r.lines().len() > 2, "the first paragraph wraps in Classic");
+        let v = r.view();
+        assert_eq!(
+            (v.title.as_str(), v.kind, v.size),
+            ("Quit", Kind::Plain, Size::Small)
+        );
+        let texts: Vec<&str> = v.columns[0]
+            .iter()
+            .map(|i| match i {
+                Item::Text { text, .. } => text.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(texts, [long, "Second"]);
+        let roles: Vec<Role> = v.buttons.iter().map(|b| b.role).collect();
+        assert_eq!(roles, [Role::Plain, Role::Default]);
+        assert_eq!(
+            v.buttons[0].control,
+            Control::new(BUTTONS[0], r.button_rect(0))
+        );
+        assert_eq!(v.buttons[1].control.area, r.button_rect(1));
+        assert_eq!(
+            req()
+                .view()
+                .buttons
+                .iter()
+                .map(|b| b.role)
+                .collect::<Vec<_>>(),
+            [Role::Default, Role::Cancel]
+        );
+        let b = r.button_rect(0);
+        r.handle(ReqEvent::Press(b.x + 1, b.y + 1));
+        let held: Vec<bool> = r.view().buttons.iter().map(|b| b.pressed).collect();
+        assert_eq!(held, [true, false]);
+    }
+
+    #[test]
+    fn a_cut_text_ends_with_an_ellipsis_in_the_view() {
+        let long = vec!["word ".repeat(200)];
+        let r = ChoiceRequester::new("T", &long, ["A", "B"], 0, 1);
+        assert!(r.truncated());
+        let v = r.view();
+        let [Item::Text { text, .. }] = v.columns[0].as_slice() else {
+            panic!("{:?}", v.columns);
+        };
+        assert!(text.ends_with("word\u{2026}"), "{text}");
+        let shown = text.matches("word").count();
+        let classic: usize = r.lines().iter().map(|l| l.matches("word").count()).sum();
+        assert_eq!(shown, classic, "as much text as the Classic lines hold");
     }
 
     #[test]

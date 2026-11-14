@@ -29,7 +29,9 @@ use dpx_ui_modern::{
 };
 use eframe::egui;
 
-use crate::{CLASSIC_MIN_WINDOW, PainterApp, View, arg_value, snapshot_rgba, write_png};
+use crate::{
+    CLASSIC_MIN_WINDOW, PainterApp, View, arg_value, modern_dialog, snapshot_rgba, write_png,
+};
 
 /// The parts of the window that are rasterised on their own, in painting order.
 const REGIONS: usize = 4;
@@ -114,6 +116,9 @@ pub(crate) struct State {
     window_size: Option<(u16, u16)>,
     /// The window was checked against the monitor since the Modern skin was shown.
     fitted: bool,
+    /// The pointer over a requester that is shown as a Modern card (slice 4a): where it is,
+    /// whether the button is held and the control it went down on.
+    pub(crate) pointer: dpx_ui_modern::dialog::Pointer,
     /// The theme of the last painted pass.
     #[cfg(test)]
     theme: Option<ThemeKind>,
@@ -289,17 +294,9 @@ impl PainterApp {
     }
 
     /// Which parts of the Modern chrome are shown. The layer column is shown with the dock
-    /// while Prefs ▸ Layers is on (F10 hides both). The Screen Format requester has a screen
-    /// of its own, as in Classic: it gets the whole window, without any chrome.
+    /// while Prefs ▸ Layers is on (F10 hides both). (The Screen Format requester, which has
+    /// a screen of its own in Classic, is a card over the main window since slice 4a.)
     fn modern_chrome(&self) -> Chrome {
-        let none = Chrome {
-            bar: false,
-            dock: false,
-            layers: false,
-        };
-        if self.requester.is_some() {
-            return none;
-        }
         let flags = self.modern.held.unwrap_or(Chrome {
             bar: self.ui.title_visible,
             dock: self.ui.toolbox_visible,
@@ -328,12 +325,29 @@ impl PainterApp {
                 .tooltip
                 .as_ref()
                 .is_some_and(|tip| !matches!(tip.target, TooltipTarget::Panel(_)));
-        if !own {
+        // A requester the Modern skin draws as a card is not drawn into the quad (nor are
+        // the other converted ones under it: one card at a time).
+        let card = self.modern_card().is_some();
+        if !own && !card {
             return self.compose_screen();
         }
-        let tip = self.ui.tooltip.take();
+        let tip = if own { self.ui.tooltip.take() } else { None };
+        let cards = card.then(|| {
+            (
+                self.ui.note_requester.take(),
+                self.ui.choice_requester.take(),
+                self.ui.page_size_requester.take(),
+            )
+        });
         let screen = self.compose_screen();
-        self.ui.tooltip = tip;
+        if own {
+            self.ui.tooltip = tip;
+        }
+        if let Some((note, choice, page_size)) = cards {
+            self.ui.note_requester = note;
+            self.ui.choice_requester = choice;
+            self.ui.page_size_requester = page_size;
+        }
         screen
     }
 
@@ -345,7 +359,9 @@ impl PainterApp {
         }
         let win = self.window?;
         let view = self.view();
-        let hosts = self.modern_dimmed();
+        // A requester in the Classic look may use the whole window; a Modern card leaves
+        // the picture where it is.
+        let hosts = self.modern_dimmed() && !self.modern_plain_picture();
         // A held mouse button keeps the layout it went down in (see `State::frozen`); a
         // requester that opened meanwhile has the pointer and is laid out as it is.
         let (chrome, pixel_size) = match self.modern.frozen.filter(|_| !self.modal_open()) {
@@ -488,7 +504,7 @@ impl PainterApp {
     /// [`BAR`] and [`LAYERS`] (they do not overlap): the viewport is the canvas colour and
     /// the picture's shadow. A hidden region has no entry.
     fn modern_lists(&self, l: &MainLayout, theme: &Theme) -> [Option<(Rect, List)>; REGIONS] {
-        let model = self.modern_model();
+        let model = self.modern_model(None);
         [
             (l.viewport.w > 0.0 && l.viewport.h > 0.0)
                 .then(|| (l.viewport, build::canvas(l, theme, model.dimmed))),
@@ -611,11 +627,13 @@ impl PainterApp {
     /// What lies over the regions, with its rectangle: the cards of the menu that is held
     /// open, or the tooltip of the dock button the pointer rests on.
     fn overlay_list(&self, l: &MainLayout, theme: &Theme) -> Option<(Rect, List)> {
-        build::overlay(l, theme, &self.modern_model())
+        // A converted requester on top: its card, over the veiled window.
+        let dialog = self.modern_dialog();
+        build::overlay(l, theme, &self.modern_model(dialog.as_ref()))
     }
 
-    /// What the Modern chrome shows.
-    fn modern_model(&self) -> Model<'_> {
+    /// What the Modern chrome shows; `dialog`: the requester it shows as a card.
+    fn modern_model<'a>(&'a self, dialog: Option<&'a dpx_ui::dialog::Dialog>) -> Model<'a> {
         Model {
             ui: &self.ui,
             palette: self.palette(),
@@ -627,6 +645,9 @@ impl PainterApp {
             },
             hover: self.modern.hover,
             dimmed: self.modern_dimmed(),
+            dialog,
+            pointer: self.modern.pointer,
+            plain_picture: self.modern_plain_picture(),
         }
     }
 
@@ -790,7 +811,7 @@ impl PainterApp {
             list.append(over);
         }
         // As `upload_and_paint`: the requester's own screen, Show Page, or the screen.
-        let (screen, rgba) = match (&self.requester, &self.show_page) {
+        let (screen, rgba) = match (self.own_screen(), &self.show_page) {
             (Some(req), _) => {
                 let screen = req.render();
                 let rgba = dpx_ui::to_rgba(&screen, &crate::requester::palette(), 1, 1);
@@ -1028,10 +1049,18 @@ pub(crate) fn snapshot_image(
     scroll: (i32, i32),
     ui: &UiState,
     custom_brush: bool,
+    screen_format: Option<&dpx_ui::ScreenFormatRequester>,
 ) -> (u32, u32, Vec<u8>) {
+    // The requester the Modern skin draws itself as a card (slice 4a), if one is on top.
+    let card = modern_dialog::card(ui, screen_format.is_some(), false, false);
+    let dialog = card.and_then(|c| modern_dialog::view(c, ui, screen_format));
     // The classic screen without its chrome, one image pixel per displayed pixel (the pixel
     // shape of the display mode applied), exactly as a Classic snapshot at scale 1 makes it.
-    let (pw, ph, picture) = snapshot_rgba(1, doc, view, scroll, &quad_ui(ui), false);
+    let mut bare = quad_ui(ui);
+    if card.is_some() {
+        modern_dialog::without_cards(&mut bare);
+    }
+    let (pw, ph, picture) = snapshot_rgba(1, doc, view, scroll, &bare, false);
     // What the chrome shows: the Modern skin with its theme (the marks of Prefs ▸ Modern UI
     // and Prefs ▸ Theme) and, for a rested pointer, the tooltip of the button under it.
     let mut shown = ui.clone();
@@ -1039,12 +1068,17 @@ pub(crate) fn snapshot_image(
     shown.theme = options.choice;
     // A Classic tooltip (the Control Panel's, inside the quad) is not the chrome's.
     shown.tooltip = None;
-    let dimmed = has_requester(ui);
+    let dimmed = has_requester(ui) || screen_format.is_some();
+    let plain_picture = card.is_some() && !modern_dialog::classic_look_open(ui);
     let layout = Frame {
         size: options.size,
         scale: options.device_scale,
         theme: Theme::of(options.theme),
-        model: Model::new(&shown, doc.palette()),
+        model: Model {
+            dimmed,
+            plain_picture,
+            ..Model::new(&shown, doc.palette())
+        },
         picture: Image {
             width: pw,
             height: ph,
@@ -1083,6 +1117,14 @@ pub(crate) fn snapshot_image(
             custom_brush,
             hover,
             dimmed,
+            dialog: dialog.as_ref(),
+            pointer: dpx_ui_modern::dialog::Pointer {
+                // A resting pointer over the card raises the control under it.
+                at: options.pointer.filter(|_| card.is_some()),
+                down: false,
+                captured: None,
+            },
+            plain_picture,
             ..Model::new(&shown, doc.palette())
         },
         picture: Image {
@@ -1095,7 +1137,9 @@ pub(crate) fn snapshot_image(
     dpx_ui_modern::render_window(&frame, &mut Renderer::new())
 }
 
-/// Writes the Modern main window to the PNG `path`.
+/// Writes the Modern main window to the PNG `path`. `screen_format`: the Screen Format
+/// requester is open (it is no part of the shared interface state).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn snapshot(
     path: &str,
     options: &SnapshotOptions,
@@ -1104,8 +1148,9 @@ pub(crate) fn snapshot(
     scroll: (i32, i32),
     ui: &UiState,
     custom_brush: bool,
+    screen_format: Option<&dpx_ui::ScreenFormatRequester>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (w, h, rgba) = snapshot_image(options, doc, view, scroll, ui, custom_brush);
+    let (w, h, rgba) = snapshot_image(options, doc, view, scroll, ui, custom_brush, screen_format);
     write_png(path, w, h, &rgba)
 }
 
@@ -1113,6 +1158,10 @@ pub(crate) fn snapshot(
 mod tests {
     use super::*;
     use dpx_core::{DisplayMode, Palette};
+
+    // The requesters drawn as Modern cards (slice 4a): parity with Classic, and the card
+    // (`modern/tests/dialogs.rs`).
+    mod dialogs;
     use dpx_ui::{Action, Tool};
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1216,7 +1265,7 @@ mod tests {
             pointer: Some((1210.0, 105.0)),
             tooltip: false,
         };
-        let (iw, ih, rgba) = snapshot_image(&options, &doc, view, (0, 0), &ui, false);
+        let (iw, ih, rgba) = snapshot_image(&options, &doc, view, (0, 0), &ui, false, None);
         assert_eq!((iw, ih), (1280, 800));
         let c = palette.get(5).expect("colour 5");
         let page = [c.r, c.g, c.b];
@@ -1451,6 +1500,80 @@ mod tests {
         fn move_to(&mut self, place: Place) {
             let pos = self.point(place);
             self.pass(vec![egui::Event::PointerMoved(pos)]);
+        }
+
+        /// The description of the requester that has the pointer and the keys, in either
+        /// skin (the Classic skin does not show it; its controls say where to press).
+        fn dialog(&self) -> dpx_ui::dialog::Dialog {
+            let app = &self.app;
+            let card = modern_dialog::card(
+                &app.ui,
+                app.requester.is_some(),
+                app.anim.playing.is_some(),
+                app.anim_control.preview.is_some(),
+            )
+            .expect("a converted requester is on top");
+            modern_dialog::view(card, &app.ui, app.requester.as_ref()).expect("its view")
+        }
+
+        /// The window point `frac` of the way across control `id` of the requester on top:
+        /// in the Modern window across its place on the card, in the Classic window across
+        /// the rectangle in which the requester takes its press.
+        fn control_point(&self, id: dpx_ui::dialog::ControlId, frac: (f32, f32)) -> egui::Pos2 {
+            let dialog = self.dialog();
+            if self.app.is_modern() {
+                let l = self.app.modern_layout().expect("layout");
+                let built = dpx_ui_modern::dialog::build(
+                    &dialog,
+                    l.window,
+                    l.scale,
+                    &Theme::dark(),
+                    &Default::default(),
+                );
+                let r = built
+                    .spot(id)
+                    .unwrap_or_else(|| panic!("control {id} is on the card"))
+                    .rect;
+                return egui::pos2(r.x + r.w * frac.0, r.y + r.h * frac.1);
+            }
+            let area = dialog
+                .control(id)
+                .unwrap_or_else(|| panic!("control {id}"))
+                .area;
+            // The pixel of the area the fraction falls into, and the same fraction of it.
+            let along = |from: i32, size: i32, f: f32| {
+                let v = (size as f32 * f).min(size as f32 - 0.01);
+                (from + v.floor() as i32, v.fract())
+            };
+            let ((x, fx), (y, fy)) = (along(area.x, area.w, frac.0), along(area.y, area.h, frac.1));
+            let app = &self.app;
+            if app.requester.is_some() && app.ui.choice_requester.is_none() {
+                // Screen Format: the pixels of its own screen.
+                return self.point_at(Place::Screen(x, y), (fx, fy));
+            }
+            let (w, h) = app.view().ui_size();
+            let (ox, oy) = if let Some(r) = &app.ui.choice_requester {
+                r.origin(w, h)
+            } else if let Some(r) = &app.ui.note_requester {
+                r.origin(w, h)
+            } else {
+                dpx_ui::PageSizeRequester::origin(w, h)
+            };
+            let view = app.view();
+            self.point_at(
+                Place::Screen((ox + x) * view.ux, (oy + y) * view.uy),
+                (fx, fy),
+            )
+        }
+
+        /// A left click `frac` of the way across control `id` of the requester on top.
+        fn click_control(&mut self, id: dpx_ui::dialog::ControlId, frac: (f32, f32)) {
+            let pos = self.control_point(id, frac);
+            self.pass(vec![
+                egui::Event::PointerMoved(pos),
+                pointer_button(pos, Primary, true),
+            ]);
+            self.pass(vec![pointer_button(pos, Primary, false)]);
         }
 
         fn click(&mut self, place: Place, button: egui::PointerButton) {
@@ -2998,7 +3121,7 @@ mod tests {
     // ---- The layer column, requesters in the quad, the Control Panel (slice 1d of ADR-47) ----
 
     use dpx_core::Command;
-    use dpx_ui::{ReqEvent, ReqResponse};
+    use dpx_ui::ReqEvent;
 
     fn layer(hit: LayerHit) -> Place {
         Place::Layer(hit)
@@ -3455,41 +3578,40 @@ mod tests {
         seen(rig, "Cancel".into());
     }
 
-    /// Screen Format, on its own HiRes screen: the Chipset gadget, then Cancel by its
-    /// first pixel. In the Modern window it has the whole window.
+    /// Screen Format: the Chipset gadget, then Cancel by its first pixel. In Classic it
+    /// has a HiRes screen of its own; in the Modern window it is a card over the main
+    /// window (slice 4a), whose chrome stays where it is.
     fn screen_format_script(rig: &mut Rig, seen: &mut dyn FnMut(&mut Rig, String)) {
         use dpx_ui::ScreenFormatRequester as Req;
+        use dpx_ui::requester::ctl;
         let target = rig.app.engine.document().target();
+        let before = rig.app.modern_layout();
         rig.pick(Action::Command("picture.screen_format"));
         rig.pass(vec![]);
         let req = rig.app.requester.clone().expect("Screen Format");
         seen(rig, "Screen Format".into());
         if let Some(l) = rig.app.modern_layout() {
-            assert!(l.bar.is_none() && l.dock.is_none() && l.layers.is_none());
-            assert_eq!(l.viewport, l.window);
-            assert!(l.viewport.encloses(&l.picture), "the whole requester shows");
+            assert_eq!(Some(&l), before.as_ref(), "nothing of the window moves");
+            assert_eq!(
+                rig.app.modern_card(),
+                Some(crate::modern_dialog::Card::ScreenFormat)
+            );
         }
         let chipset = req.chipset();
-        let g = Req::chipset_gadget();
-        rig.click(Place::Screen(g.x + g.w / 2, g.y + g.h / 2), Primary);
+        rig.click_control(ctl::CHIPSET, (0.5, 0.5));
         let now = rig.app.requester.as_ref().map(Req::chipset);
         assert!(
             now.is_some() && now != Some(chipset),
             "the gadget took the click"
         );
         seen(rig, "Chipset".into());
-        let (first, _) = pixels_where(|x, y| {
-            let mut r = req.clone();
-            r.handle(ReqEvent::Press(x, y)) == ReqResponse::Cancel
-                || r.handle(ReqEvent::Release) == ReqResponse::Cancel
-        });
-        rig.click_at(Place::Screen(first.0, first.1), NEAR, Primary);
+        rig.click_control(ctl::CANCEL, NEAR);
         assert!(rig.app.requester.is_none(), "Cancel closes it");
         assert_eq!(rig.app.engine.document().target(), target);
         rig.pass(vec![]);
         seen(rig, "Cancel".into());
         if let Some(l) = rig.app.modern_layout() {
-            assert!(l.bar.is_some() && l.dock.is_some(), "the chrome is back");
+            assert!(l.bar.is_some() && l.dock.is_some(), "the chrome is there");
         }
     }
 
@@ -3768,8 +3890,8 @@ mod tests {
         }
     }
 
-    /// Screen Format has the whole Modern window for its own screen (no chrome, as in
-    /// Classic); Show Page is the picture's screen under veiled chrome. Playback is the
+    /// Screen Format is a card over the veiled main window (in Classic it has a screen of
+    /// its own); Show Page is the picture's screen under veiled chrome. Playback is the
     /// picture running: the chrome stays as it is, and still takes no input.
     #[test]
     fn full_screen_views_in_the_modern_window() {
@@ -3786,35 +3908,27 @@ mod tests {
         let spot = (bar.right() - 3.0, bar.y + 3.0);
         assert_eq!(probe(&lit, &main, spot.0, spot.1), rgb(theme.panel));
 
-        // Screen Format in the smallest window: all of its 640 × 512 screen shows.
+        // Screen Format in the smallest window: a card over the main window (slice 4a),
+        // which stays as it is under the scrim, picture included.
         rig.pick(Action::Command("picture.screen_format"));
         rig.pass(vec![]);
         assert!(rig.app.requester.is_some());
         let l = rig.app.modern_layout().expect("layout");
-        assert!(l.bar.is_none() && l.dock.is_none() && l.layers.is_none());
-        assert_eq!((l.picture.w, l.picture.h), (640.0, 512.0));
-        assert!(l.window.encloses(&l.picture));
+        assert_eq!(l, main, "nothing of the window moves");
+        let dialog = rig.app.modern_dialog().expect("the Screen Format card");
+        let built =
+            dpx_ui_modern::dialog::build(&dialog, l.window, l.scale, &theme, &Default::default());
+        assert!(l.window.encloses(&built.card), "{:?}", built.card);
         let image = shot(&mut rig, ThemeKind::Dark, "live-screen-format");
-        // Its screen's first and last pixel are in the image, where the layout says.
-        let (w, h, rgba) = rig.app.modern_window_image(ThemeKind::Dark);
-        assert_eq!((w, h), (720, 520));
-        let screen = rig.app.requester.as_ref().expect("requester").render();
-        let palette = crate::requester::palette();
-        for (x, y) in [(0, 0), (639, 255), (320, 128), (17, 200)] {
-            let c = palette
-                .get(screen.get(x, y).expect("a pixel"))
-                .expect("a colour");
-            let p = modern_point(&rig.app, Place::Screen(x, y));
-            assert_eq!(
-                pixel(&rgba, w, p.x as u32, p.y as u32),
-                [c.r, c.g, c.b],
-                "requester pixel ({x}, {y})"
-            );
-        }
-        // Around it: the canvas, veiled as under every requester.
-        let around = probe(&image, &l, 3.0, 3.0);
-        assert_ne!(around, rgb(theme.canvas));
-        assert!(around.iter().zip(rgb(theme.canvas)).all(|(a, b)| *a <= b));
+        // The card's ground inside its corner and the veiled chrome (the card covers the
+        // picture in this window).
+        assert_eq!(
+            probe(&image, &l, built.card.x + 6.0, built.card.y + 30.0),
+            rgb(theme.raised)
+        );
+        let around = probe(&image, &l, spot.0, spot.1);
+        assert_ne!(around, rgb(theme.panel));
+        assert!(around.iter().zip(rgb(theme.panel)).all(|(a, b)| *a <= b));
         rig.tap(egui::Key::Escape);
         assert!(rig.app.requester.is_none());
         rig.pass(vec![]);

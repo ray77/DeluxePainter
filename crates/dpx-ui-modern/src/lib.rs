@@ -15,6 +15,8 @@
 //! - [`menu`]: the pull-down menus: their cards, the pointer tracking, their drawing.
 //! - [`build`]: display lists of the bar, the dock, the layer column, the picture viewport
 //!   and the overlay (menu cards, tooltip); under a requester the chrome is dimmed.
+//! - [`dialog`]: the dialog kit: a requester's description (`dpx_ui::dialog`) as a card with
+//!   buttons, fields, lists and the mapping of the pointer back to the requester.
 //! - [`raster`]: display list to RGBA8 (`tiny-skia`, `ab_glyph`).
 //! - [`frame`]: a whole window in one call, for headless snapshots. The live window
 //!   rasterises the same lists region by region ([`Renderer::render_region`]).
@@ -22,6 +24,7 @@
 //! There is no egui here and no pixel logic: the picture arrives as a finished image.
 
 pub mod build;
+pub mod dialog;
 pub mod font;
 pub mod frame;
 pub mod hit;

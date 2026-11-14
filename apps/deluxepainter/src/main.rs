@@ -102,6 +102,7 @@ mod mcp_prefs;
 mod menu_actions;
 // The Modern skin's app side (ADR-47).
 mod modern;
+mod modern_dialog;
 mod palette_stencil;
 mod perspective;
 mod recovery;
@@ -344,7 +345,7 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         });
         if modern.is_some()
-            && let Some(flag) = ["--show-page", "--requester"]
+            && let Some(flag) = ["--show-page"]
                 .into_iter()
                 .find(|f| args.iter().any(|a| a == f))
         {
@@ -682,12 +683,23 @@ fn main() -> eframe::Result {
                 }
             }
         }
-        if args.iter().any(|a| a == "--requester") {
-            // ADR-46: `--requester-keys` drives it first.
-            let req = screen_format::snapshot_requester(&args, &doc).unwrap_or_else(|e| {
+        // Picture ▸ About.. (our own text in the note requester).
+        if args.iter().any(|a| a == "--about") {
+            ui.note_requester = Some(menu_actions::about_requester(&doc));
+        }
+        // Picture ▸ Quit with unsaved changes.
+        if args.iter().any(|a| a == "--quit-question") {
+            ui.choice_requester = Some(autosave::quit_requester());
+        }
+        // ADR-46: `--requester-keys` drives the Screen Format requester first. The Classic
+        // skin shows it on its own screen; the Modern one as a card over the main window.
+        let screen_format = args.iter().any(|a| a == "--requester").then(|| {
+            screen_format::snapshot_requester(&args, &doc).unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(2);
-            });
+            })
+        });
+        if let Some(req) = screen_format.as_ref().filter(|_| modern.is_none()) {
             let screen = req.render();
             let view = View::of(requester::SCREEN);
             let (sx, sy) = (scale * view.fx as usize, scale * view.fy as usize);
@@ -704,9 +716,16 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         let written = match &modern {
-            Some(options) => {
-                modern::snapshot(path, options, &doc, view, scroll, &ui, picked.is_some())
-            }
+            Some(options) => modern::snapshot(
+                path,
+                options,
+                &doc,
+                view,
+                scroll,
+                &ui,
+                picked.is_some(),
+                screen_format.as_ref(),
+            ),
             None => snapshot(path, scale, &doc, view, scroll, &ui, picked.is_some()),
         };
         if let Err(e) = written {
@@ -1470,7 +1489,7 @@ impl PainterApp {
 
     /// The screen currently shown: the requester screen or the document's display mode.
     fn view(&self) -> View {
-        if self.requester.is_some() {
+        if self.own_screen().is_some() {
             View::of(requester::SCREEN)
         } else {
             View::of_target(self.engine.document().target())
@@ -1948,6 +1967,7 @@ impl PainterApp {
             // The chrome takes no input under a requester: nothing in it is raised.
             self.modern_hover(None);
         }
+        self.modern_dialog_pass();
         if modern {
             // ADR-47: the Modern window is sized freely and never snaps. Forgetting the
             // snap state lets the window return to screen × pixel size back in Classic.
@@ -2423,6 +2443,8 @@ impl PainterApp {
                 (v.y / (scale * view.fy as f32)).floor() as i32,
             )
         });
+        // ADR-47: over the Modern card the pointer is mapped by the card's controls.
+        let pos = self.modern_dialog_pos(ctx).unwrap_or(pos);
         if press && let Some(p) = pos {
             self.req_pointer = Some(p);
             self.requester_event(ReqEvent::Press(p.0, p.1));
@@ -2653,6 +2675,8 @@ impl PainterApp {
             let (ux, uy) = view.ui_pos(screen);
             (ux - rx, uy - ry)
         });
+        // ADR-47: a requester shown as a Modern card maps the pointer by its controls.
+        let pos = self.modern_dialog_pos(ctx).unwrap_or(pos);
         if press && let Some(p) = pos {
             self.req_pointer = Some(p);
             out.push(ReqEvent::Press(p.0, p.1));
@@ -2905,7 +2929,7 @@ impl PainterApp {
             // ADR-44: after the Control Panel's state (the overlay keeps above it).
             self.sync_layer_panel();
             self.upload_layer_strip(ctx);
-            let (screen, rgba) = match (&self.requester, &self.show_page) {
+            let (screen, rgba) = match (self.own_screen(), &self.show_page) {
                 (Some(req), _) => {
                     let screen = req.render();
                     let rgba = to_rgba(&screen, &requester::palette(), 1, 1);

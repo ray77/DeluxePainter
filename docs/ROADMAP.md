@@ -56,23 +56,24 @@ Still open: hand testing in the window; layer opacity, lock and groups (not want
 
 Noted for Phase 3: choose the colour used for transparent pixels on import (owner idea, ADR-9) together with palette editing.
 
-## Modern UI skin status (ADR-47, 2026-11-13)
+## Modern UI skin status (ADR-47, 2026-11-14)
 
-The owner asked for a second, modern look: no pixels in the interface, only in the picture; dark and light; same hotkeys; switchable. Slice 1 (the main window) is built in four steps, 1a–1d.
+The owner asked for a second, modern look: no pixels in the interface, only in the picture; dark and light; same hotkeys; switchable. Slice 1 (the main window) is built in four steps, 1a–1d; slice 4a added the dialog kit and the first five requesters in the Modern look.
 
 Modern now (drawn by `dpx-ui-modern`):
 - Bar (menu titles, program name or frame counter, paint mode, flags, coordinates, layer name) and the pull-down menus held with the right button, with submenus, marks, ghosting and shortcuts; they also open with a left click on a title and stay open, like a usual menu bar (owner decision 2a of ADR-47).
 - Dock: built-in brushes, 18 tools with split halves, toggles, colour indicator, palette up to 64 colours, tooltips.
 - Layer column (Prefs ▸ Layers / `L`): rows with eye and name, active layer, rename by double-click with a caret, six buttons with tooltips, scroll arrows and wheel. Same commands and undo steps as the Classic panel.
+- Dialogs as cards over the dimmed window (slice 4a): notes, questions (Quit, Recover, Replace File?, AI & MCP questions), About, Page Size, Screen Format. The Classic requester stays the single source of state and behaviour; the kit in `dpx-ui-modern` draws its description and maps the pointer to the rectangles the Classic requester already answers.
 - Picture quad with zoom (Cmd/Ctrl `+` / `−` / `0`, Prefs ▸ Pixel Size), free window size, device scales, dark and light theme (system or fixed), the switch (Prefs ▸ Modern UI, `F12`, Cmd/Ctrl+Shift+U) remembered in the settings.
 
 Still in the Classic look inside the Modern window (they work, hosted in the picture quad):
-- All requesters (tool settings, file, Page Size, Color Mixer, Range, Import, Generate, AI & MCP, notes, questions, Anim requesters) under a dimmed interface; Screen Format on the whole window; Show Page.
+- The requesters that are not converted yet (tool settings, file, Color Mixer, Range, Import, Generate, AI & MCP, Anim requesters) under a dimmed interface; Show Page.
 - The Animation Control Panel and its tooltips; the Magnify divider.
 
-Next: slice 2 (Animation Control Panel as a Modern strip), slice 3 (free picture viewport: more than one Amiga screen, optional pixel grid), slice 4 and later (requesters, one family per slice).
+Next: slice 2 (Animation Control Panel as a Modern strip), slice 3 (free picture viewport: more than one Amiga screen, optional pixel grid), slice 4b and later (the remaining requesters, one family per slice, by the recipe in ADR-47: the form-based tool and anim requesters first, since one `Form::view()` converts most of them).
 
-Verified by tests on macOS (Apple silicon) only: parity scripts in a Classic and a Modern window (every tool button, brush and palette cell with both buttons; a key script with strokes; menu picks; the whole layer panel; one requester of each kind clicked on the first and last pixels of its buttons: tool settings, file, Screen Format, Show Page, Color Mixer, Import, Generate, AI & MCP; the Control Panel) at device scales 1, 1.5 and 2, and headless renders that were looked at.
+Verified by tests on macOS (Apple silicon) only: parity scripts in a Classic and a Modern window (every tool button, brush and palette cell with both buttons; a key script with strokes; menu picks; the whole layer panel; one requester of each kind clicked on the first and last pixels of its buttons: tool settings, file, Screen Format, Show Page, Color Mixer, Import, Generate, AI & MCP; the Control Panel) at device scales 1, 1.5 and 2, and headless renders that were looked at. Slice 4a: for each of the five converted dialogs a script (every button on its first and last pixel, typing, Return, Esc, Tab, hotkeys, arrows) run in a Classic and a Modern window at the same three scales and compared after every step; fit and contrast tests of every card in both themes down to 720 × 520.
 
 Not verified:
 - The Modern skin was never used by hand in a real window; what the GPU shows (region textures, the overlay's alpha) is outside the tests. The owner declines remote control of the app, so this needs the owner's own look.
@@ -81,6 +82,7 @@ Not verified:
 - Display modes other than PAL LoRes are covered by one test (every mode, three windows, with and without the layer column: the screen is whole and its corner pixels can be painted); menus, requesters other than Load.. and the layer column's buttons were run on PAL LoRes only. A screen shown smaller than one physical pixel per pixel drops pixels (nearest neighbour), as in Classic: not every pixel is under the pointer there; Magnify is.
 - The start window of the Modern skin (remembered size, cut to the monitor once) was tested as functions and through injected window sizes, not by starting the app; the test window reports no monitor.
 - Requesters other than the eight kinds above, playback and Show Page beyond one click, in Modern.
+- The dialog cards were never seen in a real window (tests and headless renders only). The Replace File? and AI & MCP questions were not triggered through their real flows: they are the same question requester as Quit and Recover, with other texts. Cards over HiRes or interlaced screens were not run.
 - Rendering times of the Modern chrome beyond one measurement (ADR-47, Consequences): one Mac, release build, the viewport region only.
 
 ## Wave 8 status (2026-11-13)

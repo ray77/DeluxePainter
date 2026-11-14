@@ -1,0 +1,2502 @@
+//! The dialog kit of the Modern skin (ADR-47, slice 4a): a requester drawn as a card over
+//! the dimmed window.
+//!
+//! A requester describes itself as a [`Dialog`] (`dpx_ui::dialog`): title, columns of items,
+//! buttons, and for every part that takes the pointer a [`Control`] with the rectangle in
+//! which the Classic requester takes its press. [`build`] lays that description out in
+//! points, draws it and returns, beside the display list, a [`Spot`] for every control: its
+//! rectangle in the window. A pointer position over a spot becomes the matching position
+//! inside the control's Classic rectangle ([`Built::press`], [`Built::drag`]); the app feeds
+//! it to the requester's own `handle` function as the Classic skin does. So the requester
+//! keeps its state, its events, its keys and its answers, and the kit holds no dialog logic.
+//!
+//! The kit's parts: the card (title, rounded corners, shadow), buttons (default with the
+//! accent, cancel, plain; under the pointer, held, ghosted), text and number fields with a
+//! caret, cycle gadgets (a stepper, or two segments for a gadget with two values), check
+//! boxes, sliders, radio rows, a list with a scroll bar, labels, headings, wrapped text
+//! with bullets, a panel of facts with a message, credits, rules.
+
+use dpx_ui::dialog::{
+    Button, Check, Choice, Control, ControlId, Cycle, Dialog, Field, Item, Kind, ListView, Part,
+    Role, Size, Slider, Tone,
+};
+
+use crate::font;
+use crate::icons;
+use crate::paint::{Color, List, Path, Rect, Weight};
+use crate::theme::Theme;
+
+/// Free space between the card's edge and its content.
+pub const PAD: f32 = 20.0;
+/// Corner radius of the card.
+pub const RADIUS: f32 = 12.0;
+/// The least space the card keeps to the window's edge.
+pub const MARGIN: f32 = 12.0;
+/// How far the card's shadow reaches beyond it.
+pub const SHADOW_REACH: f32 = 44.0;
+/// Em size of the title.
+pub const TITLE_SIZE: f32 = 15.0;
+/// Em size of text, labels and buttons.
+pub const SIZE: f32 = font::SIZE_BAR;
+/// Em size of headings.
+pub const SMALL: f32 = font::SIZE_PANEL;
+/// Height of a button.
+pub const BUTTON_H: f32 = 30.0;
+/// Least width of a button.
+pub const BUTTON_MIN_W: f32 = 84.0;
+/// Space between two buttons.
+pub const BUTTON_GAP: f32 = 8.0;
+/// The position a pointer has for the Classic requester while it is over no control: outside
+/// every requester's own rectangle.
+pub const NOWHERE: (i32, i32) = (-1, -1);
+
+/// How many faint cards make the shadow.
+const SHADOW_STEPS: usize = 10;
+const LINE_H: f32 = 19.0;
+const CONTROL_RADIUS: f32 = 7.0;
+const PART_GAP: f32 = 8.0;
+const LABEL_GAP: f32 = 12.0;
+const COLUMN_GAP: f32 = 24.0;
+const CHECK: f32 = 18.0;
+const KNOB_R: f32 = 8.0;
+const SCROLL_W: f32 = 14.0;
+const STEPPER_W: f32 = 116.0;
+
+/// Sizes that give way in a low window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Metrics {
+    /// Space between two items of a column.
+    gap: f32,
+    /// Height of a form line and of its controls.
+    line: f32,
+    control: f32,
+    /// Height of a list row, a radio row and a row of facts.
+    list_row: f32,
+    choice_row: f32,
+    fact_row: f32,
+    /// Height of the title block and the space over the buttons.
+    title: f32,
+    footer_gap: f32,
+}
+
+const ROOMY: Metrics = Metrics {
+    gap: 10.0,
+    line: 30.0,
+    control: 28.0,
+    list_row: 26.0,
+    choice_row: 30.0,
+    fact_row: 21.0,
+    title: 50.0,
+    footer_gap: 18.0,
+};
+
+const COMPACT: Metrics = Metrics {
+    gap: 6.0,
+    line: 28.0,
+    control: 26.0,
+    list_row: 22.0,
+    choice_row: 26.0,
+    fact_row: 18.0,
+    title: 44.0,
+    footer_gap: 12.0,
+};
+
+/// A control as it lies in the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spot {
+    pub control: Control,
+    /// Where the control takes the pointer, in window points.
+    pub rect: Rect,
+    /// For a slider: its knob's centre runs from `rect.x + inset` to `rect.right() - inset`
+    /// while the Classic knob (`knob_w` wide) runs through the control's area.
+    slider: Option<(f32, i32)>,
+}
+
+impl Spot {
+    /// The position in the Classic requester's coordinates that the window point (`x`, `y`)
+    /// stands for. A point inside the spot always gives a point inside the control's area; a
+    /// point outside (the pointer dragged away with the button held) gives one outside, in
+    /// the same direction. A slider takes any point: beyond its ends it stays at the end.
+    pub fn to_classic(&self, x: f32, y: f32) -> (i32, i32) {
+        let area = self.control.area;
+        if let Some((inset, knob_w)) = self.slider {
+            let run = (self.rect.w - 2.0 * inset).max(1.0);
+            let t = ((x - self.rect.x - inset) / run).clamp(0.0, 1.0);
+            let free = (area.w - knob_w).max(0) as f32;
+            return (
+                area.x + knob_w / 2 + (t * free).round() as i32,
+                area.y + area.h / 2,
+            );
+        }
+        let along = |p: f32, from: f32, len: f32, to: i32, size: i32| {
+            let t = (p - from) / len.max(f32::MIN_POSITIVE);
+            let v = (t * size as f32).floor() as i32;
+            // Inside stays inside (the float product may reach the far edge).
+            let v = if (0.0..1.0).contains(&t) {
+                v.clamp(0, size - 1)
+            } else {
+                v
+            };
+            to + v
+        };
+        (
+            along(x, self.rect.x, self.rect.w, area.x, area.w),
+            along(y, self.rect.y, self.rect.h, area.y, area.h),
+        )
+    }
+}
+
+/// One piece of text of a dialog with the box it has to fit in (for tests).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextBox {
+    pub text: String,
+    /// The rectangle the glyphs take: advance width, and the line around the capitals.
+    pub ink: Rect,
+    /// The part of the dialog the text belongs to.
+    pub within: Rect,
+    pub color: Color,
+    /// The surface under the text.
+    pub ground: Color,
+}
+
+/// The pointer over a dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pointer {
+    /// In window points; `None` outside the window.
+    pub at: Option<(f32, f32)>,
+    /// The left button is held.
+    pub down: bool,
+    /// The control the button went down on.
+    pub captured: Option<ControlId>,
+}
+
+/// A dialog laid out and drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Built {
+    /// Shadow and card, in window points.
+    pub list: List,
+    pub card: Rect,
+    /// What the drawing covers (the card and its shadow), cut to the window.
+    pub bounds: Rect,
+    /// The controls from back to front.
+    pub spots: Vec<Spot>,
+    pub texts: Vec<TextBox>,
+    /// The low-window sizes were used.
+    pub compact: bool,
+}
+
+impl Built {
+    /// The control under the window point.
+    pub fn spot_at(&self, x: f32, y: f32) -> Option<&Spot> {
+        self.spots.iter().rev().find(|s| s.rect.contains(x, y))
+    }
+
+    /// The spot of control `id`.
+    pub fn spot(&self, id: ControlId) -> Option<&Spot> {
+        self.spots.iter().find(|s| s.control.id == id)
+    }
+
+    /// The left button goes down at the window point: the control that takes it (to be kept
+    /// as [`Pointer::captured`] until the button is up) and the position for the Classic
+    /// requester's `Press` event.
+    pub fn press(&self, x: f32, y: f32) -> (Option<ControlId>, (i32, i32)) {
+        match self.spot_at(x, y) {
+            Some(spot) => (Some(spot.control.id), spot.to_classic(x, y)),
+            None => (None, NOWHERE),
+        }
+    }
+
+    /// The pointer moves to the window point with the button held since a press on
+    /// `captured`: the position for the Classic requester's `Drag` event.
+    pub fn drag(&self, captured: Option<ControlId>, x: f32, y: f32) -> (i32, i32) {
+        captured
+            .and_then(|id| self.spot(id))
+            .map_or(NOWHERE, |spot| spot.to_classic(x, y))
+    }
+}
+
+/// `text` wrapped at spaces into lines at most `width` wide; a word wider than a line is
+/// broken by characters.
+pub fn wrap(text: &str, width: f32, size: f32, weight: Weight) -> Vec<String> {
+    let fits = |s: &str| font::measure(s, size, weight) <= width;
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let joined = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if fits(&joined) {
+            cur = joined;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        for c in word.chars() {
+            let mut next = cur.clone();
+            next.push(c);
+            if !cur.is_empty() && !fits(&next) {
+                lines.push(std::mem::take(&mut cur));
+                cur.push(c);
+            } else {
+                cur = next;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// The fill of a plain button: at rest, under the pointer, held.
+pub fn button_fill(theme: &Theme, hover: bool, pressed: bool) -> Color {
+    match (pressed, hover) {
+        (true, _) => theme.hover.mix(theme.text, 16),
+        (false, true) => theme.hover.mix(theme.text, 8),
+        (false, false) => theme.hover,
+    }
+}
+
+/// The fill of the default button: at rest and held the accent, lighter under the pointer.
+pub fn default_fill(theme: &Theme, hover: bool, pressed: bool) -> Color {
+    if hover && !pressed {
+        theme.accent.mix(Color::rgb(255, 255, 255), 14)
+    } else {
+        theme.accent
+    }
+}
+
+/// The width of the card a dialog of `size` asks for.
+fn card_width(size: Size) -> f32 {
+    match size {
+        Size::Small => 400.0,
+        Size::Medium => 480.0,
+        Size::Large => 680.0,
+    }
+}
+
+struct Draw<'a> {
+    list: List,
+    spots: Vec<Spot>,
+    texts: Vec<TextBox>,
+    theme: &'a Theme,
+    pointer: &'a Pointer,
+    m: Metrics,
+    scale: f32,
+}
+
+impl Draw<'_> {
+    fn snap(&self, v: f32) -> f32 {
+        (v * self.scale).round() / self.scale
+    }
+
+    /// One line of text with its middle on `mid`; recorded with the box it belongs to.
+    #[allow(clippy::too_many_arguments)]
+    fn text(
+        &mut self,
+        x: f32,
+        mid: f32,
+        text: &str,
+        size: f32,
+        weight: Weight,
+        color: Color,
+        within: Rect,
+        ground: Color,
+    ) -> f32 {
+        let w = font::measure(text, size, weight);
+        if text.is_empty() {
+            return 0.0;
+        }
+        self.list.text(
+            x,
+            font::baseline_centered(mid, size, weight),
+            text,
+            size,
+            weight,
+            color,
+        );
+        let cap = font::cap_height(size, weight);
+        self.texts.push(TextBox {
+            text: text.to_string(),
+            ink: Rect::new(x, mid - cap / 2.0, w, cap),
+            within,
+            color,
+            ground,
+        });
+        w
+    }
+
+    /// A line under the first `key` of `text` drawn at `x` (the letter is the part's key).
+    #[allow(clippy::too_many_arguments)]
+    fn underline(
+        &mut self,
+        x: f32,
+        mid: f32,
+        text: &str,
+        key: Option<char>,
+        size: f32,
+        weight: Weight,
+        color: Color,
+    ) {
+        let Some(at) = key.and_then(|k| text.find(k)) else {
+            return;
+        };
+        let before = font::measure(&text[..at], size, weight);
+        let letter = &text[at..at + key.map_or(1, char::len_utf8)];
+        let w = font::measure(letter, size, weight);
+        let y = self.snap(mid + font::cap_height(size, weight) / 2.0 + 2.5);
+        self.list.rect(Rect::new(x + before, y, w, 1.0), color);
+    }
+
+    fn hovered(&self, id: ControlId, rect: &Rect) -> bool {
+        let over = self.pointer.at.is_some_and(|(x, y)| rect.contains(x, y));
+        match (self.pointer.down, self.pointer.captured) {
+            (true, captured) => over && captured == Some(id),
+            (false, _) => over,
+        }
+    }
+
+    fn spot(&mut self, control: Control, rect: Rect) {
+        self.spots.push(Spot {
+            control,
+            rect,
+            slider: None,
+        });
+    }
+
+    fn ink(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Normal | Tone::Alert => self.theme.text,
+            Tone::Dim => self.theme.text_dim,
+        }
+    }
+
+    /// A wrapped paragraph; returns its height.
+    #[allow(clippy::too_many_arguments)]
+    fn paragraph(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        text: &str,
+        tone: Tone,
+        bullet: bool,
+        centred: bool,
+    ) -> f32 {
+        let theme = self.theme;
+        let weight = if tone == Tone::Alert {
+            Weight::Medium
+        } else {
+            Weight::Regular
+        };
+        let indent = if bullet || tone == Tone::Alert {
+            14.0
+        } else {
+            0.0
+        };
+        let lines = wrap(text, w - indent, SIZE, weight);
+        let h = lines.len().max(1) as f32 * LINE_H;
+        let within = Rect::new(x, y, w, h);
+        if bullet {
+            self.list.fill(
+                Path::new().circle(x + 4.0, y + LINE_H / 2.0, 2.2),
+                theme.accent,
+            );
+        }
+        if tone == Tone::Alert {
+            // An accent bar marks the message; its text keeps the full contrast of text.
+            self.list
+                .round_rect(Rect::new(x, y + 2.0, 3.0, h - 4.0), 1.5, theme.accent);
+        }
+        let ink = self.ink(tone);
+        for (i, line) in lines.iter().enumerate() {
+            let mid = y + LINE_H * (i as f32 + 0.5);
+            let lx = if centred {
+                x + (w - font::measure(line, SIZE, weight)) / 2.0
+            } else {
+                x + indent
+            };
+            self.text(lx, mid, line, SIZE, weight, ink, within, theme.raised);
+        }
+        h
+    }
+
+    fn button(&mut self, b: &Button, rect: Rect) {
+        let theme = self.theme;
+        let hover = b.enabled && self.hovered(b.control.id, &rect);
+        let pressed = b.enabled && b.pressed;
+        let default = b.role == Role::Default;
+        let (fill, ink) = match (b.enabled, default) {
+            (false, _) => (theme.panel, theme.disabled),
+            (true, true) => (default_fill(theme, hover, pressed), theme.on_accent),
+            (true, false) => (button_fill(theme, hover, pressed), theme.text),
+        };
+        self.list.round_rect(rect, CONTROL_RADIUS, fill);
+        if default && b.enabled {
+            if pressed {
+                // Held: a dark rim inside, the ink keeps its contrast.
+                self.list
+                    .ring(rect, CONTROL_RADIUS, theme.on_accent.with_opacity(45), 2.0);
+            }
+        } else {
+            self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+        }
+        let label = font::fit(&b.label, rect.w - 12.0, SIZE, Weight::Medium);
+        let w = font::measure(&label, SIZE, Weight::Medium);
+        let (x, mid) = (rect.x + (rect.w - w) / 2.0, rect.y + rect.h / 2.0);
+        self.text(x, mid, &label, SIZE, Weight::Medium, ink, rect, fill);
+        self.underline(x, mid, &label, b.key, SIZE, Weight::Medium, ink);
+        self.spot(b.control, rect);
+    }
+
+    fn field_width(f: &Field) -> f32 {
+        let digit = font::measure("0", SIZE, Weight::Regular);
+        let wide = font::measure("M", SIZE, Weight::Regular);
+        let per = if f.numeric { digit } else { wide };
+        (f.max_chars.clamp(3, 32) as f32 * per + 22.0).ceil()
+    }
+
+    fn field(&mut self, f: &Field, rect: Rect) {
+        let theme = self.theme;
+        let active = f.caret.is_some() && f.enabled;
+        self.list.round_rect(rect, CONTROL_RADIUS, theme.panel);
+        if active {
+            self.list.ring(rect, CONTROL_RADIUS, theme.accent, 1.5);
+        } else {
+            self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+        }
+        let ink = if f.enabled {
+            theme.text
+        } else {
+            theme.disabled
+        };
+        let (pad, mid) = (10.0, rect.y + rect.h / 2.0);
+        let room = rect.w - 2.0 * pad;
+        let chars: Vec<char> = f.text.chars().collect();
+        let caret = f.caret.map_or(chars.len(), |c| c.min(chars.len()));
+        let width = |from: usize, to: usize| {
+            font::measure(
+                &chars[from..to].iter().collect::<String>(),
+                SIZE,
+                Weight::Regular,
+            )
+        };
+        // The first shown character: the caret stays in view.
+        let mut start = 0;
+        while start < caret && width(start, caret) > room - 2.0 {
+            start += 1;
+        }
+        let mut end = chars.len();
+        while end > caret.max(start) && width(start, end) > room {
+            end -= 1;
+        }
+        let shown: String = chars[start..end].iter().collect();
+        self.text(
+            rect.x + pad,
+            mid,
+            &shown,
+            SIZE,
+            Weight::Regular,
+            ink,
+            rect,
+            theme.panel,
+        );
+        if active {
+            let x = self.snap(rect.x + pad + width(start, caret));
+            self.list
+                .rect(Rect::new(x, mid - 9.0, 1.5, 18.0), theme.text);
+        }
+        if f.enabled {
+            self.spot(f.control, rect);
+        }
+    }
+
+    /// The natural width of a cycle gadget; `None` for a stepper, which takes what is left.
+    fn segments_width(c: &Cycle) -> Option<f32> {
+        (c.options.len() == 2).then(|| {
+            let widest = c
+                .options
+                .iter()
+                .map(|o| font::measure(o, SIZE, Weight::Medium))
+                .fold(0.0, f32::max);
+            2.0 * (widest + 24.0).ceil() + 4.0
+        })
+    }
+
+    fn cycle(&mut self, c: &Cycle, rect: Rect) {
+        let theme = self.theme;
+        let mid = rect.y + rect.h / 2.0;
+        if c.options.len() == 2 {
+            // Two values side by side; a press on the other one switches.
+            self.list.round_rect(rect, CONTROL_RADIUS, theme.panel);
+            self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+            let w = (rect.w - 4.0) / 2.0;
+            for (i, option) in c.options.iter().enumerate() {
+                let seg = Rect::new(rect.x + 2.0 + i as f32 * w, rect.y + 2.0, w, rect.h - 4.0);
+                let selected = i == c.selected;
+                let hover = !selected && self.hovered(c.control.id, &seg);
+                let (fill, ink, weight) = match (selected, c.enabled) {
+                    (true, true) => (Some(theme.accent), theme.on_accent, Weight::Medium),
+                    (true, false) => (Some(theme.hover), theme.text_dim, Weight::Medium),
+                    (false, true) if hover => (Some(theme.hover), theme.text, Weight::Regular),
+                    (false, true) => (None, theme.text_dim, Weight::Regular),
+                    (false, false) => (None, theme.disabled, Weight::Regular),
+                };
+                if let Some(fill) = fill {
+                    self.list.round_rect(seg, CONTROL_RADIUS - 2.0, fill);
+                }
+                let label = font::fit(option, seg.w - 8.0, SIZE, weight);
+                let tw = font::measure(&label, SIZE, weight);
+                self.text(
+                    seg.x + (seg.w - tw) / 2.0,
+                    mid,
+                    &label,
+                    SIZE,
+                    weight,
+                    ink,
+                    seg,
+                    fill.unwrap_or(theme.panel),
+                );
+                if !selected {
+                    self.spot(c.control, seg);
+                }
+            }
+            return;
+        }
+        // A stepper: the shown value, and a chevron for "next".
+        let hover = c.enabled && self.hovered(c.control.id, &rect);
+        let fill = button_fill(theme, hover, false);
+        self.list.round_rect(rect, CONTROL_RADIUS, fill);
+        self.list.ring(rect, CONTROL_RADIUS, theme.hairline, 1.0);
+        let (ink, mark) = if c.enabled {
+            (theme.text, theme.text_dim)
+        } else {
+            (theme.disabled, theme.disabled)
+        };
+        let value = c.options.get(c.selected).map_or("", String::as_str);
+        let label = font::fit(value, rect.w - 38.0, SIZE, Weight::Regular);
+        self.text(
+            rect.x + 12.0,
+            mid,
+            &label,
+            SIZE,
+            Weight::Regular,
+            ink,
+            rect,
+            fill,
+        );
+        self.list.stroke(
+            icons::chevron(rect.right() - 14.0, mid),
+            mark,
+            icons::MARK_STROKE,
+        );
+        self.spot(c.control, rect);
+    }
+
+    fn check_width(c: &Check) -> f32 {
+        CHECK + 8.0 + font::measure(&c.label, SIZE, Weight::Regular)
+    }
+
+    fn check(&mut self, c: &Check, rect: Rect) {
+        let theme = self.theme;
+        let mid = rect.y + rect.h / 2.0;
+        let boxed = Rect::new(rect.x, self.snap(mid - CHECK / 2.0), CHECK, CHECK);
+        let hover = c.enabled && self.hovered(c.control.id, &rect);
+        if c.on && c.enabled {
+            self.list.round_rect(boxed, 5.0, theme.accent);
+            self.list.stroke(
+                icons::check_mark(boxed.x + CHECK / 2.0, boxed.y + CHECK / 2.0),
+                theme.on_accent,
+                icons::MARK_STROKE,
+            );
+        } else {
+            let fill = if hover { theme.hover } else { theme.panel };
+            self.list.round_rect(boxed, 5.0, fill);
+            let rim = if c.enabled {
+                theme.text_dim
+            } else {
+                theme.disabled
+            };
+            self.list.ring(boxed, 5.0, rim, 1.5);
+            if c.on {
+                self.list.stroke(
+                    icons::check_mark(boxed.x + CHECK / 2.0, boxed.y + CHECK / 2.0),
+                    theme.disabled,
+                    icons::MARK_STROKE,
+                );
+            }
+        }
+        let ink = if c.enabled {
+            theme.text
+        } else {
+            theme.disabled
+        };
+        let x = rect.x + CHECK + 8.0;
+        self.text(
+            x,
+            mid,
+            &c.label,
+            SIZE,
+            Weight::Regular,
+            ink,
+            rect,
+            theme.raised,
+        );
+        self.underline(x, mid, &c.label, c.key, SIZE, Weight::Regular, ink);
+        self.spot(c.control, rect);
+    }
+
+    fn slider(&mut self, s: &Slider, rect: Rect) {
+        let theme = self.theme;
+        let mid = rect.y + rect.h / 2.0;
+        // The value in words has a fixed place at the right, so the track does not jump.
+        let value_w = font::measure("0000", SIZE, Weight::Regular).ceil();
+        let track = Rect::new(rect.x, rect.y, rect.w - value_w - 10.0, rect.h);
+        let free = (s.control.area.w - s.knob.w).max(1) as f32;
+        let t = ((s.knob.x - s.control.area.x) as f32 / free).clamp(0.0, 1.0);
+        let run = track.w - 2.0 * KNOB_R;
+        let cx = track.x + KNOB_R + t * run;
+        let groove = Rect::new(track.x, self.snap(mid - 2.0), track.w, 4.0);
+        self.list.round_rect(groove, 2.0, theme.hairline);
+        self.list.round_rect(
+            Rect::new(groove.x, groove.y, (cx - groove.x).max(4.0), 4.0),
+            2.0,
+            theme.accent,
+        );
+        let hover = self.hovered(s.control.id, &track);
+        let r = if hover { KNOB_R + 1.0 } else { KNOB_R };
+        self.list.fill(Path::new().circle(cx, mid, r), theme.accent);
+        self.list
+            .fill(Path::new().circle(cx, mid, r - 2.5), theme.raised);
+        let w = font::measure(&s.value, SIZE, Weight::Regular);
+        self.text(
+            rect.right() - w,
+            mid,
+            &s.value,
+            SIZE,
+            Weight::Regular,
+            theme.text,
+            rect,
+            theme.raised,
+        );
+        self.spots.push(Spot {
+            control: s.control,
+            rect: track,
+            slider: Some((KNOB_R, s.knob.w)),
+        });
+    }
+
+    /// The parts of a form line from `x` on, in a line `w` wide.
+    fn parts(&mut self, parts: &[Part], x: f32, y: f32, w: f32) {
+        let theme = self.theme;
+        let (line, ch) = (self.m.line, self.m.control);
+        let top = self.snap(y + (line - ch) / 2.0);
+        let mid = y + line / 2.0;
+        let natural = |p: &Part| -> Option<f32> {
+            match p {
+                Part::Field(f) => Some(Self::field_width(f)),
+                Part::Cycle(c) => Self::segments_width(c),
+                Part::Check(c) => Some(Self::check_width(c)),
+                Part::Slider(_) => None,
+                Part::Text(t, _) => Some(font::measure(t, SIZE, Weight::Regular).ceil()),
+            }
+        };
+        // The last stretchy part (a stepper or a slider) takes what the line has left; a
+        // stepper before it has a fixed width.
+        let last_stretchy = parts.iter().rposition(|p| natural(p).is_none());
+        let fixed: f32 = parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| match natural(p) {
+                Some(w) => w,
+                None if Some(i) == last_stretchy => 0.0,
+                None => STEPPER_W,
+            })
+            .sum::<f32>()
+            + PART_GAP * parts.len().saturating_sub(1) as f32;
+        let rest = (w - fixed).max(60.0);
+        let mut px = x;
+        for (i, part) in parts.iter().enumerate() {
+            let pw = match natural(part) {
+                Some(w) => w,
+                None if Some(i) == last_stretchy => rest,
+                None => STEPPER_W,
+            };
+            let rect = Rect::new(self.snap(px), top, self.snap(pw), ch);
+            match part {
+                Part::Field(f) => self.field(f, rect),
+                Part::Cycle(c) => self.cycle(c, rect),
+                Part::Check(c) => self.check(c, rect),
+                Part::Slider(s) => self.slider(s, rect),
+                Part::Text(t, tone) => {
+                    let ink = self.ink(*tone);
+                    self.text(
+                        rect.x,
+                        mid,
+                        t,
+                        SIZE,
+                        Weight::Regular,
+                        ink,
+                        rect,
+                        theme.raised,
+                    );
+                }
+            }
+            px += pw + PART_GAP;
+        }
+    }
+
+    fn choices(&mut self, rows: &[Choice], x: f32, y: f32, w: f32) -> f32 {
+        let theme = self.theme;
+        let row_h = self.m.choice_row;
+        for (i, row) in rows.iter().enumerate() {
+            let rect = Rect::new(x, self.snap(y + i as f32 * row_h), w, row_h);
+            let hover = row.enabled && self.hovered(row.control.id, &rect);
+            let ground = if row.pressed {
+                Some(theme.hover.mix(theme.text, 8))
+            } else if hover {
+                Some(theme.hover)
+            } else if row.selected {
+                Some(theme.panel)
+            } else {
+                None
+            };
+            let face = rect.inset(1.0);
+            if let Some(fill) = ground {
+                self.list.round_rect(face, CONTROL_RADIUS, fill);
+            }
+            let mid = rect.y + rect.h / 2.0;
+            let (cx, r) = (rect.x + 17.0, 7.0);
+            let (rim, ink, dim) = match (row.enabled, row.selected) {
+                (false, _) => (theme.disabled, theme.disabled, theme.disabled),
+                (true, true) => (theme.accent, theme.text, theme.text_dim),
+                (true, false) => (theme.text_dim, theme.text, theme.text_dim),
+            };
+            self.list
+                .stroke(Path::new().circle(cx, mid, r - 0.75), rim, 1.5);
+            if row.selected {
+                self.list.fill(Path::new().circle(cx, mid, 3.5), rim);
+            }
+            let under = ground.unwrap_or(theme.raised);
+            let detail_w = font::measure(&row.detail, SIZE, Weight::Regular);
+            let label = font::fit(
+                &row.label,
+                rect.w - 34.0 - detail_w - 24.0,
+                SIZE,
+                Weight::Regular,
+            );
+            self.text(
+                rect.x + 34.0,
+                mid,
+                &label,
+                SIZE,
+                Weight::Regular,
+                ink,
+                rect,
+                under,
+            );
+            self.text(
+                rect.right() - 12.0 - detail_w,
+                mid,
+                &row.detail,
+                SIZE,
+                Weight::Regular,
+                dim,
+                rect,
+                under,
+            );
+            self.spot(row.control, rect);
+        }
+        rows.len() as f32 * row_h
+    }
+
+    fn list_view(&mut self, view: &ListView, x: f32, y: f32, w: f32) -> f32 {
+        let theme = self.theme;
+        let row_h = self.m.list_row;
+        let h = view.capacity as f32 * row_h + 8.0;
+        let frame = Rect::new(x, y, w, h);
+        self.list
+            .round_rect(frame, CONTROL_RADIUS + 1.0, theme.panel);
+        self.list
+            .ring(frame, CONTROL_RADIUS + 1.0, theme.hairline, 1.0);
+        let bar_w = if view.scroll.is_some() { SCROLL_W } else { 0.0 };
+        for (i, row) in view.rows.iter().enumerate() {
+            let rect = Rect::new(
+                x + 4.0,
+                self.snap(y + 4.0 + i as f32 * row_h),
+                w - 8.0 - bar_w,
+                row_h,
+            );
+            let hover = self.hovered(row.control.id, &rect);
+            let (fill, ink, dim) = if row.selected {
+                (Some(theme.accent), theme.on_accent, theme.on_accent)
+            } else if hover {
+                (Some(theme.hover), theme.text, theme.text_dim)
+            } else {
+                (None, theme.text, theme.text_dim)
+            };
+            if let Some(fill) = fill {
+                self.list.round_rect(rect, 5.0, fill);
+            }
+            let under = fill.unwrap_or(theme.panel);
+            let mid = rect.y + rect.h / 2.0;
+            let detail_w = font::measure(&row.detail, SIZE, Weight::Regular);
+            let label = font::fit(
+                &row.label,
+                rect.w - 20.0 - detail_w - 12.0,
+                SIZE,
+                Weight::Regular,
+            );
+            self.text(
+                rect.x + 10.0,
+                mid,
+                &label,
+                SIZE,
+                Weight::Regular,
+                ink,
+                rect,
+                under,
+            );
+            self.text(
+                rect.right() - 10.0 - detail_w,
+                mid,
+                &row.detail,
+                SIZE,
+                Weight::Regular,
+                dim,
+                rect,
+                under,
+            );
+            self.spot(row.control, rect);
+        }
+        if let Some(bar) = &view.scroll {
+            let track = Rect::new(frame.right() - 4.0 - 10.0, y + 4.0, 10.0, h - 8.0);
+            let area = bar.control.area;
+            let span = area.h.max(1) as f32;
+            let top = track.y + (bar.knob.y - area.y) as f32 / span * track.h;
+            let len = (bar.knob.h as f32 / span * track.h).max(8.0);
+            let knob = Rect::new(track.x + 2.0, top, 6.0, len.min(track.bottom() - top));
+            let hover = self.hovered(bar.control.id, &track);
+            let ink = if hover {
+                theme.text_dim
+            } else {
+                theme.disabled
+            };
+            self.list.round_rect(knob, 3.0, ink);
+            self.spot(bar.control, track);
+        }
+        h
+    }
+
+    fn facts(
+        &mut self,
+        rows: &[(String, String)],
+        message: Option<&str>,
+        x: f32,
+        y: f32,
+        w: f32,
+    ) -> f32 {
+        let theme = self.theme;
+        let row_h = self.m.fact_row;
+        let h = rows.len() as f32 * row_h + 14.0;
+        let frame = Rect::new(x, y, w, h);
+        self.list
+            .round_rect(frame, CONTROL_RADIUS + 1.0, theme.panel);
+        let names = rows
+            .iter()
+            .map(|(n, _)| font::measure(n, SIZE, Weight::Regular))
+            .fold(0.0, f32::max)
+            .ceil();
+        // A message stands at the panel's bottom; the facts it would cover are left out,
+        // never shown in part (as in the Classic skin).
+        let lines = message.map(|m| {
+            let mut lines = wrap(m, w - 24.0 - 12.0, SIZE, Weight::Medium);
+            lines.truncate(4);
+            lines
+        });
+        let message_h = lines
+            .as_ref()
+            .map_or(0.0, |l| l.len() as f32 * LINE_H + 8.0);
+        let limit = frame.bottom() - 7.0 - message_h;
+        for (i, (name, value)) in rows.iter().enumerate() {
+            let top = y + 7.0 + i as f32 * row_h;
+            if top + row_h > limit + 0.01 {
+                break;
+            }
+            let mid = top + row_h / 2.0;
+            self.text(
+                x + 12.0,
+                mid,
+                name,
+                SIZE,
+                Weight::Regular,
+                theme.text_dim,
+                frame,
+                theme.panel,
+            );
+            let room = w - 24.0 - names - 12.0;
+            let value = font::fit(value, room, SIZE, Weight::Regular);
+            self.text(
+                x + 12.0 + names + 12.0,
+                mid,
+                &value,
+                SIZE,
+                Weight::Regular,
+                theme.text,
+                frame,
+                theme.panel,
+            );
+        }
+        if let Some(lines) = lines {
+            let top = frame.bottom() - 7.0 - lines.len() as f32 * LINE_H;
+            self.list.round_rect(
+                Rect::new(x + 12.0, top + 2.0, 3.0, lines.len() as f32 * LINE_H - 4.0),
+                1.5,
+                theme.accent,
+            );
+            for (i, line) in lines.iter().enumerate() {
+                self.text(
+                    x + 24.0,
+                    top + LINE_H * (i as f32 + 0.5),
+                    line,
+                    SIZE,
+                    Weight::Medium,
+                    theme.text,
+                    frame,
+                    theme.panel,
+                );
+            }
+        }
+        h
+    }
+
+    fn credits(&mut self, lines: &[String], x: f32, y: f32, w: f32) -> f32 {
+        let theme = self.theme;
+        let row_h = self.m.fact_row;
+        let h = lines.len() as f32 * row_h + 14.0;
+        let frame = Rect::new(x, y, w, h);
+        self.list
+            .round_rect(frame, CONTROL_RADIUS + 1.0, theme.panel);
+        for (i, line) in lines.iter().enumerate() {
+            let (weight, ink) = if i == 0 {
+                (Weight::Medium, theme.text)
+            } else {
+                (Weight::Regular, theme.text_dim)
+            };
+            let line = font::fit(line, w - 16.0, SIZE, weight);
+            let tw = font::measure(&line, SIZE, weight);
+            self.text(
+                x + (w - tw) / 2.0,
+                y + 7.0 + row_h * (i as f32 + 0.5),
+                &line,
+                SIZE,
+                weight,
+                ink,
+                frame,
+                theme.panel,
+            );
+        }
+        h
+    }
+
+    /// The program's name line of an About text: the name large, an accent line under it,
+    /// then what follows the colon.
+    fn about_head(&mut self, x: f32, y: f32, w: f32, text: &str) -> f32 {
+        let theme = self.theme;
+        let (name, rest) = text.split_once(": ").unwrap_or((text, ""));
+        let (size, weight) = (22.0, Weight::Medium);
+        let name = font::fit(name, w, size, weight);
+        let tw = font::measure(&name, size, weight);
+        let within = Rect::new(x, y, w, 40.0);
+        self.text(
+            x + (w - tw) / 2.0,
+            y + 16.0,
+            &name,
+            size,
+            weight,
+            theme.text,
+            within,
+            theme.raised,
+        );
+        self.list.round_rect(
+            Rect::new(x + (w - 44.0) / 2.0, self.snap(y + 34.0), 44.0, 3.0),
+            1.5,
+            theme.accent,
+        );
+        let mut h = 48.0;
+        if !rest.is_empty() {
+            let mut line = rest.to_string();
+            if let Some(first) = line.get(..1) {
+                line = first.to_uppercase() + &line[1..];
+            }
+            h += self.paragraph(x, y + h, w, &line, Tone::Normal, false, true);
+        }
+        h
+    }
+
+    /// One column from `y` down; returns its height.
+    fn column(&mut self, items: &[Item], kind: Kind, x: f32, y: f32, w: f32) -> f32 {
+        let theme = self.theme;
+        let label_w = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Line { label, .. } if !label.is_empty() => {
+                    Some(font::measure(label, SIZE, Weight::Regular))
+                }
+                _ => None,
+            })
+            .fold(0.0, f32::max);
+        let control_x = if label_w > 0.0 {
+            (label_w + LABEL_GAP).ceil()
+        } else {
+            0.0
+        };
+        let mut at = y;
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                // A heading belongs to what follows it.
+                at += match &items[i - 1] {
+                    Item::Heading(_) => 6.0,
+                    Item::Text { .. } if matches!(item, Item::Text { .. }) => self.m.gap.min(8.0),
+                    _ => self.m.gap,
+                };
+            }
+            let top = self.snap(at);
+            at = top
+                + match item {
+                    Item::Heading(text) => {
+                        let within = Rect::new(x, top, w, 16.0);
+                        let text = font::fit(text, w, SMALL, Weight::Medium);
+                        self.text(
+                            x,
+                            top + 8.0,
+                            &text,
+                            SMALL,
+                            Weight::Medium,
+                            theme.text_dim,
+                            within,
+                            theme.raised,
+                        );
+                        16.0
+                    }
+                    Item::Text { text, .. } if kind == Kind::About && i == 0 => {
+                        self.about_head(x, top, w, text)
+                    }
+                    Item::Text { text, tone, bullet } => {
+                        let (tone, centred) = match kind {
+                            Kind::About => (Tone::Dim, true),
+                            Kind::Plain => (*tone, false),
+                        };
+                        self.paragraph(x, top, w, text, tone, *bullet, centred)
+                    }
+                    Item::Line { label, key, parts } => {
+                        let mid = top + self.m.line / 2.0;
+                        let within = Rect::new(x, top, control_x.max(1.0), self.m.line);
+                        self.text(
+                            x,
+                            mid,
+                            label,
+                            SIZE,
+                            Weight::Regular,
+                            theme.text_dim,
+                            within,
+                            theme.raised,
+                        );
+                        self.underline(x, mid, label, *key, SIZE, Weight::Regular, theme.text_dim);
+                        self.parts(parts, x + control_x, top, w - control_x);
+                        self.m.line
+                    }
+                    Item::Choices(rows) => self.choices(rows, x, top, w),
+                    Item::List(view) => self.list_view(view, x, top, w),
+                    Item::Facts { rows, message } => {
+                        self.facts(rows, message.as_deref(), x, top, w)
+                    }
+                    Item::Credits(lines) => self.credits(lines, x, top, w),
+                    Item::Rule => {
+                        self.list.rect(Rect::new(x, top, w, 1.0), theme.hairline);
+                        1.0
+                    }
+                };
+        }
+        at - y
+    }
+}
+
+/// A dialog's content at a place: the drawing, the controls, the texts and the card's size.
+struct Laid {
+    list: List,
+    spots: Vec<Spot>,
+    texts: Vec<TextBox>,
+    size: (f32, f32),
+}
+
+/// Lays `dialog` out with the card's top-left corner at (`x`, `y`).
+fn lay_out(
+    dialog: &Dialog,
+    (x, y): (f32, f32),
+    width: f32,
+    m: Metrics,
+    scale: f32,
+    theme: &Theme,
+    pointer: &Pointer,
+) -> Laid {
+    let mut d = Draw {
+        list: List::new(),
+        spots: Vec::new(),
+        texts: Vec::new(),
+        theme,
+        pointer,
+        m,
+        scale,
+    };
+    let inner = width - 2.0 * PAD;
+    // Title.
+    let title = font::fit(&dialog.title, inner, TITLE_SIZE, Weight::Medium);
+    let title_box = Rect::new(x + PAD, y, inner, m.title);
+    d.text(
+        x + PAD,
+        y + m.title / 2.0 + 2.0,
+        &title,
+        TITLE_SIZE,
+        Weight::Medium,
+        theme.text,
+        title_box,
+        theme.raised,
+    );
+    // Columns: one, or two with the left one wider.
+    let top = y + m.title;
+    let widths: Vec<f32> = match dialog.columns.len() {
+        0 | 1 => vec![inner],
+        n => {
+            let free = inner - COLUMN_GAP * (n as f32 - 1.0);
+            let first = (free * 0.6).round();
+            let rest = (free - first) / (n as f32 - 1.0);
+            std::iter::once(first)
+                .chain(std::iter::repeat_n(rest, n - 1))
+                .collect()
+        }
+    };
+    let mut cx = x + PAD;
+    let mut body: f32 = 0.0;
+    for (items, w) in dialog.columns.iter().zip(&widths) {
+        body = body.max(d.column(items, dialog.kind, d.snap(cx), top, *w));
+        cx += w + COLUMN_GAP;
+    }
+    // Buttons: right-aligned, in the Classic order.
+    let by = d.snap(top + body + m.footer_gap);
+    let sizes: Vec<f32> = dialog
+        .buttons
+        .iter()
+        .map(|b| {
+            (font::measure(&b.label, SIZE, Weight::Medium) + 36.0)
+                .ceil()
+                .max(BUTTON_MIN_W)
+        })
+        .collect();
+    let total: f32 = sizes.iter().sum::<f32>() + BUTTON_GAP * sizes.len().saturating_sub(1) as f32;
+    // Too many or too long for the card: they share its width.
+    let shrink = (inner / total.max(1.0)).min(1.0);
+    let mut bx = x + width - PAD - total * shrink;
+    for (button, w) in dialog.buttons.iter().zip(&sizes) {
+        let w = w * shrink;
+        d.button(
+            button,
+            Rect::new(
+                d.snap(bx),
+                by,
+                d.snap(w - BUTTON_GAP * (1.0 - shrink)),
+                BUTTON_H,
+            ),
+        );
+        bx += w + BUTTON_GAP * shrink;
+    }
+    let height = by + BUTTON_H + PAD - 2.0 - y;
+    Laid {
+        list: d.list,
+        spots: d.spots,
+        texts: d.texts,
+        size: (width, height),
+    }
+}
+
+/// Lays out and draws `dialog` as a card in the middle of `window` (points; `scale`
+/// physical pixels per point). In a window too low for the roomy sizes the compact ones are
+/// used. The scrim over the window is not part of the drawing (see `build::overlay`).
+pub fn build(dialog: &Dialog, window: Rect, scale: f32, theme: &Theme, pointer: &Pointer) -> Built {
+    let snap = |v: f32| (v * scale).round() / scale;
+    let width = snap(card_width(dialog.size).min(window.w - 2.0 * MARGIN));
+    let room = window.h - 2.0 * MARGIN;
+    let measure = |m: Metrics| {
+        lay_out(dialog, (0.0, 0.0), width, m, scale, theme, pointer)
+            .size
+            .1
+    };
+    let (m, compact) = if measure(ROOMY) <= room {
+        (ROOMY, false)
+    } else {
+        (COMPACT, true)
+    };
+    let height = snap(measure(m));
+    let x = snap(window.x + (window.w - width) / 2.0);
+    let y = snap((window.y + (window.h - height) / 2.0).max(window.y + MARGIN.min(4.0)));
+    let card = Rect::new(x, y, width, height);
+    let mut list = List::new();
+    // The shadow: many faint cards of falling size, lower than the card, so that it fades
+    // without steps.
+    let step = Color {
+        a: (theme.shadow.a / SHADOW_STEPS as u8).max(1),
+        ..theme.shadow
+    };
+    for i in (0..SHADOW_STEPS).rev() {
+        let (grow, drop) = (1.0 + 3.0 * i as f32, 2.0 + 1.2 * i as f32);
+        let r = card.inset(-grow);
+        list.round_rect(Rect::new(r.x, r.y + drop, r.w, r.h), RADIUS + grow, step);
+    }
+    list.round_rect(card, RADIUS, theme.raised);
+    list.ring(card, RADIUS, theme.hairline, 1.0);
+    let drawn = lay_out(dialog, (x, y), width, m, scale, theme, pointer);
+    list.append(drawn.list);
+    let reach = card.inset(-SHADOW_REACH);
+    let (x0, y0) = (reach.x.max(window.x), reach.y.max(window.y));
+    let bounds = Rect::new(
+        x0,
+        y0,
+        reach.right().min(window.right()) - x0,
+        reach.bottom().min(window.bottom()) - y0,
+    );
+    Built {
+        list,
+        card,
+        bounds,
+        spots: drawn.spots,
+        texts: drawn.texts,
+        compact,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paint::Op;
+    use crate::raster::Renderer;
+    use crate::theme::ThemeKind;
+    use dpx_core::Target;
+    use dpx_ui::dialog::{ListRow, ScrollBar};
+    use dpx_ui::{
+        ChoiceRequester, NoteRequester, PageSizeRequester, Preset, ReqEvent, ReqKey,
+        ScreenFormatRequester,
+    };
+
+    const WINDOWS: [(f32, f32); 3] = [(720.0, 520.0), (1280.0, 800.0), (1001.0, 640.0)];
+    const SCALES: [f32; 3] = [1.0, 2.0, 1.5];
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn page_size() -> PageSizeRequester {
+        let preset = |label, size| Preset { label, size };
+        PageSizeRequester::new(
+            (320, 256),
+            [
+                preset("Standard", (320, 256)),
+                preset("Full Page", (320, 316)),
+                preset("Overscan", (368, 283)),
+            ],
+        )
+    }
+
+    fn screen_format() -> ScreenFormatRequester {
+        ScreenFormatRequester::new(Target::default(), (320, 256), 32)
+    }
+
+    fn press(r: &mut ScreenFormatRequester, id: ControlId) {
+        let a = r.view().control(id).expect("control").area;
+        r.handle(ReqEvent::Press(a.x + a.w / 2, a.y + a.h / 2));
+        r.handle(ReqEvent::Release);
+    }
+
+    /// The five converted dialogs in the states that change what they show.
+    fn dialogs() -> Vec<(&'static str, Dialog)> {
+        let mut out = Vec::new();
+        let notes = strings(&[
+            "4 layers saved as one picture, as shown, 1 hidden layer left out (save as .dpxproj to keep them)",
+            "PNG cannot store: display mode PAL:Low Res",
+        ]);
+        out.push((
+            "note",
+            NoteRequester::new("Picture exported", &notes).view(),
+        ));
+        let many: Vec<String> = (0..20).map(|i| format!("note number {i}")).collect();
+        out.push((
+            "many notes",
+            NoteRequester::new("Picture loaded", &many).view(),
+        ));
+        let about = strings(&[
+            "DeluxePainter 0.1.0: a pixel-art editor in the spirit of DeluxePaint IV AGA",
+            "Written in Rust; source-available under the PolyForm Noncommercial License 1.0.0",
+            "Not affiliated with Electronic Arts",
+            "Page 1280x512, 256 colours, PAL:Super-High Res Laced",
+        ]);
+        out.push((
+            "about",
+            NoteRequester::about("About DeluxePainter", &about).view(),
+        ));
+        let quit = ChoiceRequester::new(
+            "Quit",
+            &strings(&["Quit without saving?"]),
+            ["Yes", "No"],
+            1,
+            1,
+        );
+        out.push(("quit", quit.view()));
+        let mut recover = ChoiceRequester::new(
+            "Recover Picture",
+            &strings(&[
+                "Unsaved changes were found.",
+                "Picture: \"Castle\"",
+                "Autosaved: 2026-11-14 10:00 UTC",
+            ]),
+            ["Recover", "Discard"],
+            0,
+            1,
+        );
+        out.push(("recover", recover.view()));
+        let (x, y) = recover.button_centre(0);
+        recover.handle(ReqEvent::Press(x, y));
+        out.push(("recover, held", recover.view()));
+        // A question that shows a whole command, with a word longer than a line.
+        let command = strings(&[
+            "Run this command in a terminal to connect Claude Code:",
+            "claude mcp add deluxepainter -- /Applications/DeluxePainter.app/Contents/MacOS/deluxepainter-with-a-very-long-name --mcp",
+        ]);
+        let tall = ChoiceRequester::with_max_lines(
+            "Connect Claude Code",
+            &command,
+            ["Get Claude Code", "Close"],
+            1,
+            1,
+            16,
+        );
+        out.push(("command", tall.view()));
+        let mut page = page_size();
+        out.push(("page size", page.view()));
+        page.handle(ReqEvent::Key(ReqKey::Tab));
+        page.set_message("Size 320x200 to 1024x1024");
+        out.push(("page size, message", page.view()));
+        let mut format = screen_format();
+        out.push(("screen format", format.view()));
+        press(&mut format, dpx_ui::requester::ctl::SCREEN);
+        press(&mut format, dpx_ui::requester::ctl::SCREEN);
+        press(&mut format, dpx_ui::requester::ctl::SCREEN_W);
+        press(&mut format, dpx_ui::requester::ctl::PAGE);
+        format.set_message(
+            "A HAM picture needs 16 base colours; choose another palette size or keep the page",
+        );
+        out.push(("screen format, custom and refused", format.view()));
+        let mut hires = screen_format();
+        for _ in 0..4 {
+            hires.handle(ReqEvent::Key(ReqKey::Up));
+        }
+        assert!(!hires.chipset_switchable(), "Super-High Res is AGA only");
+        out.push(("screen format, chipset ghosted", hires.view()));
+        out
+    }
+
+    fn built(dialog: &Dialog, window: (f32, f32), scale: f32, kind: ThemeKind) -> Built {
+        build(
+            dialog,
+            Rect::new(0.0, 0.0, window.0, window.1),
+            scale,
+            &Theme::of(kind),
+            &Pointer::default(),
+        )
+    }
+
+    /// Every converted dialog, in both themes, in the smallest and larger windows and at
+    /// device scales 1, 1.5 and 2: the card lies inside the window, every text inside the
+    /// part it belongs to and inside the card, nothing is cut with an ellipsis, and every
+    /// control inside the card.
+    #[test]
+    fn every_dialog_fits_its_card_and_every_text_its_box() {
+        for (name, dialog) in dialogs() {
+            for kind in ThemeKind::ALL {
+                for window in WINDOWS {
+                    for scale in SCALES {
+                        let at = format!("{name}, {kind:?}, {window:?} at {scale}x");
+                        let b = built(&dialog, window, scale, kind);
+                        let win = Rect::new(0.0, 0.0, window.0, window.1);
+                        assert!(win.encloses(&b.card), "{at}: card {:?}", b.card);
+                        assert!(win.encloses(&b.bounds), "{at}");
+                        assert!(b.card.h >= 100.0 && b.card.w >= 300.0, "{at}");
+                        // On whole physical pixels.
+                        for v in [b.card.x, b.card.y, b.card.w, b.card.h] {
+                            assert!(((v * scale).round() - v * scale).abs() < 1e-3, "{at}");
+                        }
+                        let inner = Rect::new(
+                            b.card.x + PAD - 0.5,
+                            b.card.y,
+                            b.card.w - 2.0 * PAD + 1.0,
+                            b.card.h,
+                        );
+                        assert!(!b.texts.is_empty(), "{at}");
+                        for t in &b.texts {
+                            assert!(
+                                t.within.inset(-0.5).encloses(&t.ink),
+                                "{at}: '{}' {:?} leaves {:?}",
+                                t.text,
+                                t.ink,
+                                t.within
+                            );
+                            assert!(inner.encloses(&t.ink), "{at}: '{}' leaves the card", t.text);
+                        }
+                        for s in &b.spots {
+                            assert!(inner.encloses(&s.rect), "{at}: control {:?}", s.control);
+                            assert!(s.rect.w >= 10.0 && s.rect.h >= 18.0, "{at}: {:?}", s.rect);
+                        }
+                    }
+                }
+            }
+            // Nothing is cut that the dialog did not cut itself.
+            let source = format!("{dialog:?}");
+            let b = built(&dialog, WINDOWS[0], 1.0, ThemeKind::Dark);
+            for t in &b.texts {
+                let own = t.text.matches('\u{2026}').count();
+                assert!(
+                    own == 0 || source.contains(&t.text) || name == "command",
+                    "{name}: '{}' was cut",
+                    t.text
+                );
+            }
+        }
+    }
+
+    /// The ink of every text reaches 4.5:1 on its ground (ghosted ink 3:1), in both themes,
+    /// in every state of the five dialogs, with the pointer over each control in turn.
+    #[test]
+    fn every_text_is_legible_on_its_ground() {
+        for (name, dialog) in dialogs() {
+            for kind in ThemeKind::ALL {
+                let theme = Theme::of(kind);
+                let rest = built(&dialog, WINDOWS[1], 1.0, kind);
+                let mut pointers = vec![Pointer::default()];
+                for s in &rest.spots {
+                    let (x, y) = s.rect.center();
+                    pointers.push(Pointer {
+                        at: Some((x, y)),
+                        down: false,
+                        captured: None,
+                    });
+                }
+                for pointer in pointers {
+                    let window = Rect::new(0.0, 0.0, WINDOWS[1].0, WINDOWS[1].1);
+                    let b = build(&dialog, window, 1.0, &theme, &pointer);
+                    for t in &b.texts {
+                        let ratio = t.color.contrast(t.ground);
+                        let least = if t.color == theme.disabled { 3.0 } else { 4.5 };
+                        assert!(
+                            ratio >= least,
+                            "{name}, {kind:?}: '{}' is {ratio:.2}:1 ({:?} on {:?})",
+                            t.text,
+                            t.color,
+                            t.ground
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fills the kit mixes itself keep the contrast of the tokens they are made from.
+    #[test]
+    fn mixed_fills_keep_text_legible() {
+        for kind in ThemeKind::ALL {
+            let t = Theme::of(kind);
+            for (hover, pressed) in [(false, false), (true, false), (false, true), (true, true)] {
+                let plain = t.text.contrast(button_fill(&t, hover, pressed));
+                assert!(
+                    plain >= 4.5,
+                    "{kind:?}: plain {hover} {pressed}: {plain:.2}"
+                );
+                let accent = t.on_accent.contrast(default_fill(&t, hover, pressed));
+                assert!(
+                    accent >= 4.5,
+                    "{kind:?}: default {hover} {pressed}: {accent:.2}"
+                );
+            }
+            // The states differ visibly from each other.
+            assert_ne!(button_fill(&t, false, false), button_fill(&t, true, false));
+            assert_ne!(button_fill(&t, true, false), button_fill(&t, false, true));
+            assert_ne!(
+                default_fill(&t, false, false),
+                default_fill(&t, true, false)
+            );
+            // Rims and marks that carry meaning stand out from the card.
+            for (name, ink) in [("accent", t.accent), ("dim rim", t.text_dim)] {
+                assert!(ink.contrast(t.raised) >= 3.0, "{kind:?}: {name}");
+                assert!(ink.contrast(t.panel) >= 3.0, "{kind:?}: {name} on a field");
+            }
+        }
+    }
+
+    /// The middle and the corners of every control's place on the card map into the
+    /// rectangle in which the Classic requester takes its press; a point dragged off the
+    /// control maps outside it, on the same side.
+    #[test]
+    fn a_point_on_a_control_is_a_point_in_its_classic_rectangle() {
+        for (name, dialog) in dialogs() {
+            for window in WINDOWS {
+                for scale in SCALES {
+                    let b = built(&dialog, window, scale, ThemeKind::Dark);
+                    let ids: Vec<ControlId> = dialog.controls().iter().map(|c| c.id).collect();
+                    for s in &b.spots {
+                        assert!(ids.contains(&s.control.id), "{name}");
+                        let a = s.control.area;
+                        let inside = |(x, y): (i32, i32)| a.contains(x, y);
+                        let e = 0.01;
+                        for (x, y) in [
+                            s.rect.center(),
+                            (s.rect.x, s.rect.y),
+                            (s.rect.right() - e, s.rect.y),
+                            (s.rect.x, s.rect.bottom() - e),
+                            (s.rect.right() - e, s.rect.bottom() - e),
+                        ] {
+                            assert_eq!(b.spot_at(x, y).map(|t| t.control.id), Some(s.control.id));
+                            let p = s.to_classic(x, y);
+                            assert!(inside(p), "{name}: {:?} at ({x}, {y}) -> {p:?}", s.control);
+                            assert_eq!(b.press(x, y), (Some(s.control.id), p));
+                        }
+                        if s.slider.is_some() {
+                            // A slider follows the pointer along its length only.
+                            let left = s.to_classic(s.rect.x - 500.0, s.rect.y - 300.0);
+                            let right = s.to_classic(s.rect.right() + 500.0, s.rect.y + 300.0);
+                            assert!(inside(left) && inside(right) && left.0 < right.0, "{name}");
+                            continue;
+                        }
+                        // The first and the last pixel of the area are reached.
+                        assert_eq!(s.to_classic(s.rect.x, s.rect.y), (a.x, a.y), "{name}");
+                        assert_eq!(
+                            s.to_classic(s.rect.right() - e, s.rect.bottom() - e),
+                            (a.x + a.w - 1, a.y + a.h - 1),
+                            "{name}"
+                        );
+                        let (cx, cy) = s.rect.center();
+                        let away = [
+                            (s.rect.x - 30.0, cy, true, false),
+                            (s.rect.right() + 30.0, cy, true, true),
+                            (cx, s.rect.y - 30.0, false, false),
+                            (cx, s.rect.bottom() + 30.0, false, true),
+                        ];
+                        for (x, y, horizontal, beyond) in away {
+                            let p = b.drag(Some(s.control.id), x, y);
+                            assert!(!inside(p), "{name}: dragged off {:?}", s.control);
+                            let ok = match (horizontal, beyond) {
+                                (true, false) => p.0 < a.x,
+                                (true, true) => p.0 >= a.x + a.w,
+                                (false, false) => p.1 < a.y,
+                                (false, true) => p.1 >= a.y + a.h,
+                            };
+                            assert!(ok, "{name}: {p:?} is on the wrong side of {a:?}");
+                        }
+                    }
+                    // Beside every control: nowhere, and a drag without a control stays there.
+                    let (x, y) = (b.card.x + 3.0, b.card.y + 3.0);
+                    assert_eq!(b.press(x, y), (None, NOWHERE));
+                    assert_eq!(b.drag(None, 400.0, 300.0), NOWHERE);
+                    assert_eq!(b.drag(Some(9999), 400.0, 300.0), NOWHERE);
+                }
+            }
+        }
+    }
+
+    /// Every pixel of a slider's and a scroll bar's run can be reached from the card, so
+    /// every value the Classic gadget has can be set.
+    #[test]
+    fn every_position_of_a_slider_and_a_scroll_bar_is_reached() {
+        let dialog = screen_format().view();
+        let b = built(&dialog, WINDOWS[0], 1.0, ThemeKind::Dark);
+        let slider = b.spot(dpx_ui::requester::ctl::COLORS).expect("the slider");
+        let mut xs: Vec<i32> = (0..=4000)
+            .map(|i| {
+                slider
+                    .to_classic(slider.rect.x + slider.rect.w * i as f32 / 4000.0, 0.0)
+                    .0
+            })
+            .collect();
+        xs.dedup();
+        let (a, knob) = (slider.control.area, slider.slider.expect("a slider").1);
+        let wanted: Vec<i32> = (a.x + knob / 2..=a.x + knob / 2 + a.w - knob).collect();
+        assert_eq!(xs, wanted);
+        let bar = b
+            .spot(dpx_ui::requester::ctl::SCROLL)
+            .expect("the scroll bar");
+        let mut ys: Vec<i32> = (0..4000)
+            .map(|i| {
+                bar.to_classic(
+                    bar.rect.x + 1.0,
+                    bar.rect.y + bar.rect.h * i as f32 / 4000.0,
+                )
+                .1
+            })
+            .collect();
+        ys.dedup();
+        let a = bar.control.area;
+        assert_eq!(ys, (a.y..a.y + a.h).collect::<Vec<i32>>());
+    }
+
+    fn fills(list: &List, rect: Rect) -> Vec<Color> {
+        list.ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::RoundRect {
+                    rect: r,
+                    fill: Some(c),
+                    ..
+                } if *r == rect => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rings(list: &List, rect: Rect) -> Vec<(Color, f32)> {
+        list.ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::RoundRect {
+                    rect: r,
+                    fill: None,
+                    stroke: Some(s),
+                    ..
+                } if *r == rect => Some((s.color, s.width)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text_color(b: &Built, text: &str) -> Color {
+        b.texts
+            .iter()
+            .find(|t| t.text == text)
+            .unwrap_or_else(|| panic!("the text '{text}'"))
+            .color
+    }
+
+    /// The card: a shadow under it, the raised ground with a hairline, the title in the
+    /// medium cut at the top left; centred in the window.
+    #[test]
+    fn the_card_is_centred_with_shadow_ground_and_title() {
+        for kind in ThemeKind::ALL {
+            let theme = Theme::of(kind);
+            let dialog = page_size().view();
+            let b = built(&dialog, (1280.0, 800.0), 1.0, kind);
+            assert_eq!(b.card.w, 400.0);
+            assert_eq!(b.card.x, (1280.0 - 400.0) / 2.0);
+            assert!((b.card.y - (800.0 - b.card.h) / 2.0).abs() <= 0.5);
+            assert!(!b.compact);
+            let ground = b
+                .list
+                .ops()
+                .iter()
+                .position(|op| {
+                    matches!(op, Op::RoundRect { rect, radius, fill: Some(c), .. }
+                        if *rect == b.card && *radius == RADIUS && *c == theme.raised)
+                })
+                .expect("the card's ground");
+            assert_eq!(ground, SHADOW_STEPS, "the shadow lies under the card");
+            for op in &b.list.ops()[..ground] {
+                let Op::RoundRect {
+                    rect,
+                    fill: Some(c),
+                    ..
+                } = op
+                else {
+                    panic!("a shadow card: {op:?}");
+                };
+                assert!(c.a > 0 && c.a < 40 && rect.w > b.card.w && rect.y > b.card.y - 31.0);
+                assert!(b.card.inset(-SHADOW_REACH).encloses(rect), "{rect:?}");
+            }
+            assert_eq!(rings(&b.list, b.card), [(theme.hairline, 1.0)]);
+            let Some(Op::Text {
+                x,
+                text,
+                size,
+                weight,
+                color,
+                ..
+            }) = b.list.ops().iter().find(|op| matches!(op, Op::Text { .. }))
+            else {
+                panic!("a title");
+            };
+            assert_eq!(
+                (text.as_str(), *size, *weight, *color, *x),
+                (
+                    "Set Page Size",
+                    TITLE_SIZE,
+                    Weight::Medium,
+                    theme.text,
+                    b.card.x + PAD
+                )
+            );
+            // The card's width gives way in a window narrower than it; a tall dialog uses
+            // the compact sizes in a low window.
+            let narrow = built(&dialog, (360.0, 520.0), 1.0, kind);
+            assert_eq!(narrow.card.w, 360.0 - 2.0 * MARGIN);
+            let big = screen_format().view();
+            assert_eq!(built(&big, (1280.0, 800.0), 1.0, kind).card.w, 680.0);
+            let low = built(&big, (720.0, 440.0), 1.0, kind);
+            assert!(low.compact && low.card.h < built(&big, (720.0, 520.0), 1.0, kind).card.h);
+        }
+    }
+
+    /// Buttons: right-aligned in the Classic order; the default one on the accent, the
+    /// others raised with a hairline; under the pointer lighter, held darker or rimmed;
+    /// ghosted flat and faint; the key's letter underlined.
+    #[test]
+    fn buttons_show_role_pointer_and_press() {
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = screen_format();
+        let dialog = req.view();
+        let b = build(&dialog, window, 1.0, &theme, &Pointer::default());
+        let (use_, cancel) = (
+            b.spot(dpx_ui::requester::ctl::USE).expect("Use").rect,
+            b.spot(dpx_ui::requester::ctl::CANCEL).expect("Cancel").rect,
+        );
+        assert_eq!((use_.h, cancel.h), (BUTTON_H, BUTTON_H));
+        assert!(use_.w >= BUTTON_MIN_W && cancel.w >= BUTTON_MIN_W);
+        assert_eq!(cancel.right(), b.card.right() - PAD);
+        assert_eq!(
+            use_.right() + BUTTON_GAP,
+            cancel.x,
+            "Use, then Cancel, as in Classic"
+        );
+        assert!(b.card.bottom() - cancel.bottom() >= 16.0);
+        assert_eq!(fills(&b.list, use_), [theme.accent]);
+        assert!(rings(&b.list, use_).is_empty());
+        assert_eq!(fills(&b.list, cancel), [theme.hover]);
+        assert_eq!(rings(&b.list, cancel), [(theme.hairline, 1.0)]);
+        assert_eq!(text_color(&b, "Use"), theme.on_accent);
+        assert_eq!(text_color(&b, "Cancel"), theme.text);
+        // The underline of U and C: a one-point bar just under each label.
+        for rect in [use_, cancel] {
+            let bars = b
+                .list
+                .ops()
+                .iter()
+                .filter(|op| {
+                    matches!(op, Op::RoundRect { rect: r, radius, .. }
+                        if *radius == 0.0 && r.h == 1.0 && rect.encloses(r) && r.w < 14.0)
+                })
+                .count();
+            assert_eq!(bars, 1);
+        }
+        // Under the pointer.
+        let over = |rect: Rect, down: bool, captured: Option<ControlId>| Pointer {
+            at: Some(rect.center()),
+            down,
+            captured,
+        };
+        let h = build(&dialog, window, 1.0, &theme, &over(cancel, false, None));
+        assert_eq!(fills(&h.list, cancel), [button_fill(&theme, true, false)]);
+        assert_eq!(
+            fills(&h.list, use_),
+            [theme.accent],
+            "only the one under the pointer"
+        );
+        let h = build(&dialog, window, 1.0, &theme, &over(use_, false, None));
+        assert_eq!(fills(&h.list, use_), [default_fill(&theme, true, false)]);
+        // A button held elsewhere does not light up another one.
+        let other = Some(dpx_ui::requester::ctl::CANCEL);
+        let h = build(&dialog, window, 1.0, &theme, &over(use_, true, other));
+        assert_eq!(fills(&h.list, use_), [theme.accent]);
+        // Held: the requester says so.
+        let a = dialog.control(dpx_ui::requester::ctl::USE).unwrap().area;
+        req.handle(ReqEvent::Press(a.x + 2, a.y + 2));
+        let held = req.view();
+        let captured = Some(dpx_ui::requester::ctl::USE);
+        let p = build(&held, window, 1.0, &theme, &over(use_, true, captured));
+        assert_eq!(fills(&p.list, use_), [theme.accent]);
+        assert_eq!(
+            rings(&p.list, use_),
+            [(theme.on_accent.with_opacity(45), 2.0)]
+        );
+        req.handle(ReqEvent::Drag(0, 0));
+        req.handle(ReqEvent::Release);
+        let a = dialog.control(dpx_ui::requester::ctl::CANCEL).unwrap().area;
+        req.handle(ReqEvent::Press(a.x + 2, a.y + 2));
+        let captured = Some(dpx_ui::requester::ctl::CANCEL);
+        let p = build(
+            &req.view(),
+            window,
+            1.0,
+            &theme,
+            &over(cancel, true, captured),
+        );
+        assert_eq!(fills(&p.list, cancel), [button_fill(&theme, true, true)]);
+        // Ghosted.
+        let mut ghost = held.clone();
+        ghost.buttons[0].enabled = false;
+        ghost.buttons[0].pressed = false;
+        let g = build(&ghost, window, 1.0, &theme, &over(use_, false, None));
+        assert_eq!(fills(&g.list, use_), [theme.panel]);
+        assert_eq!(text_color(&g, "Use"), theme.disabled);
+        // A long label widens its button; both stay in the card.
+        let wide = ChoiceRequester::new("T", &[], ["Get Claude Code", "Close"], 1, 1).view();
+        let w = build(&wide, window, 1.0, &theme, &Pointer::default());
+        let (first, second) = (w.spots[0].rect, w.spots[1].rect);
+        assert!(first.w > second.w && second.w == BUTTON_MIN_W);
+        assert!(first.x >= w.card.x + PAD && first.right() + BUTTON_GAP == second.x);
+    }
+
+    /// Fields: a quiet well with a hairline; the one with the keys has the accent around it
+    /// and a caret after the characters before the cursor; a fixed value is faint and takes
+    /// no pointer. A text longer than the field keeps the caret in view.
+    #[test]
+    fn fields_show_text_caret_and_focus() {
+        use dpx_ui::page_size_requester::ctl;
+        let theme = Theme::light();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = page_size();
+        let draw =
+            |req: &PageSizeRequester| build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        let caret = |b: &Built, field: Rect| -> Vec<Rect> {
+            b.list
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::RoundRect {
+                        rect,
+                        fill: Some(c),
+                        ..
+                    } if rect.w == 1.5 && *c == theme.text && field.encloses(rect) => Some(*rect),
+                    _ => None,
+                })
+                .collect()
+        };
+        let b = draw(&req);
+        let (width, height) = (
+            b.spot(ctl::WIDTH).unwrap().rect,
+            b.spot(ctl::HEIGHT).unwrap().rect,
+        );
+        assert_eq!(width.h, 28.0);
+        assert_eq!(
+            (width.x, width.w),
+            (height.x, height.w),
+            "the fields line up"
+        );
+        assert_eq!(fills(&b.list, width), [theme.panel]);
+        assert_eq!(rings(&b.list, width), [(theme.accent, 1.5)]);
+        assert_eq!(rings(&b.list, height), [(theme.hairline, 1.0)]);
+        let at_end = caret(&b, width);
+        assert_eq!(at_end.len(), 1);
+        assert!(caret(&b, height).is_empty());
+        let end = width.x + 10.0 + font::measure("320", SIZE, Weight::Regular);
+        assert!((at_end[0].x - end).abs() <= 0.5, "{} vs {end}", at_end[0].x);
+        // The cursor moved left by one: the caret stands before the last digit.
+        req.handle(ReqEvent::Key(ReqKey::Left));
+        let moved = caret(&draw(&req), width);
+        let before = width.x + 10.0 + font::measure("32", SIZE, Weight::Regular);
+        assert!((moved[0].x - before).abs() <= 0.5);
+        // Tab: the other field has the keys.
+        req.handle(ReqEvent::Key(ReqKey::Tab));
+        let b = draw(&req);
+        assert_eq!(rings(&b.list, height), [(theme.accent, 1.5)]);
+        assert!(caret(&b, width).is_empty() && caret(&b, height).len() == 1);
+        // A field of a fixed value.
+        let format = screen_format().view();
+        let b = build(&format, window, 1.0, &theme, &Pointer::default());
+        assert!(
+            b.spot(dpx_ui::requester::ctl::SCREEN_W).is_none(),
+            "it takes no pointer"
+        );
+        assert_eq!(text_color(&b, "320"), theme.disabled);
+        // A long text in a short field: cut at the left, the caret inside.
+        let mut long = req.view();
+        let Item::Line { parts, .. } = &mut long.columns[0][1] else {
+            panic!("the width line");
+        };
+        let Part::Field(f) = &mut parts[0] else {
+            panic!("a field");
+        };
+        f.text = "12345678901234567890".into();
+        f.caret = Some(20);
+        let b = build(&long, window, 1.0, &theme, &Pointer::default());
+        let shown = b
+            .texts
+            .iter()
+            .find(|t| t.text.ends_with("890"))
+            .expect("the tail");
+        assert!(
+            shown.text.len() < 20 && width.encloses(&shown.ink),
+            "{shown:?}"
+        );
+        let c = caret(&b, width);
+        assert!(c.len() == 1 && c[0].right() <= width.right() - 6.0);
+    }
+
+    /// Cycle gadgets: two values side by side with the shown one on the accent (a press on
+    /// the other one is the gadget's press, the shown one takes none); more values as a
+    /// stepper with a chevron. Ghosted: faint, but the press still reaches the requester.
+    #[test]
+    fn cycle_gadgets_are_segments_or_steppers() {
+        use dpx_ui::requester::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let mut req = screen_format();
+        let b = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        // Page Size: Screen | Keep Same, Screen shown.
+        let other = b.spot(ctl::PAGE).expect("the other segment").rect;
+        let n = b.spots.iter().filter(|s| s.control.id == ctl::PAGE).count();
+        assert_eq!(n, 1, "the shown value takes no press");
+        let shown = Rect::new(other.x - other.w, other.y, other.w, other.h);
+        assert_eq!(fills(&b.list, shown), [theme.accent]);
+        assert!(fills(&b.list, other).is_empty());
+        assert_eq!(text_color(&b, "Screen"), theme.on_accent);
+        assert_eq!(text_color(&b, "Keep Same"), theme.text_dim);
+        assert_eq!(b.press(shown.x + 5.0, shown.y + 5.0), (None, NOWHERE));
+        // A press on the other one switches; then the first one is the other.
+        let (id, at) = b.press(other.x + 5.0, other.y + 5.0);
+        assert_eq!(id, Some(ctl::PAGE));
+        req.handle(ReqEvent::Press(at.0, at.1));
+        req.handle(ReqEvent::Release);
+        let b = build(&req.view(), window, 1.0, &theme, &Pointer::default());
+        assert_eq!(b.spot(ctl::PAGE).map(|s| s.rect), Some(shown));
+        assert_eq!(fills(&b.list, other), [theme.accent]);
+        // Under the pointer the other segment is raised.
+        let over = Pointer {
+            at: Some(shown.center()),
+            down: false,
+            captured: None,
+        };
+        let h = build(&req.view(), window, 1.0, &theme, &over);
+        assert_eq!(fills(&h.list, shown), [theme.hover]);
+        // Screen Size and Preset: steppers with a chevron, the value at the left.
+        for (id, value) in [
+            (ctl::SCREEN, "Standard"),
+            (ctl::PRESET, "PAL LoRes 320x256"),
+        ] {
+            let rect = b.spot(id).expect("a stepper").rect;
+            assert_eq!(fills(&b.list, rect), [theme.hover]);
+            assert_eq!(rings(&b.list, rect), [(theme.hairline, 1.0)]);
+            let t = b.texts.iter().find(|t| t.text == value).expect("the value");
+            assert!((t.ink.x - (rect.x + 12.0)).abs() < 0.01 && rect.encloses(&t.ink));
+            let chevrons = b
+                .list
+                .ops()
+                .iter()
+                .filter(|op| {
+                    matches!(op, Op::Path { path, stroke: Some(_), .. }
+                        if path.bounds().is_some_and(|p| rect.encloses(&p) && p.x > rect.right() - 24.0))
+                })
+                .count();
+            assert_eq!(chevrons, 1, "{value}");
+        }
+        // A stepper takes what its line has left: Preset the whole line, Screen Size what
+        // the two number fields leave, so both lines end at the same place.
+        let (preset, screen) = (
+            b.spot(ctl::PRESET).unwrap().rect,
+            b.spot(ctl::SCREEN).unwrap().rect,
+        );
+        assert!(preset.w > 250.0 && preset.x == screen.x && screen.w >= 100.0);
+        let last = b
+            .texts
+            .iter()
+            .find(|t| t.text == "256")
+            .expect("the height");
+        assert!(
+            (last.within.right() - preset.right()).abs() <= 0.5,
+            "{:?} {preset:?}",
+            last.within
+        );
+        // A ghosted Chipset: faint, and the press on the other value still goes through.
+        let mut hires = screen_format();
+        for _ in 0..4 {
+            hires.handle(ReqEvent::Key(ReqKey::Up));
+        }
+        let b = build(&hires.view(), window, 1.0, &theme, &Pointer::default());
+        assert_eq!(text_color(&b, "OCS"), theme.disabled);
+        // (The facts panel names the chipset too: the segment is the later text.)
+        let shown = b.texts.iter().rfind(|t| t.text == "AGA").expect("AGA");
+        assert_eq!(shown.color, theme.text_dim);
+        let ocs = b.spot(ctl::CHIPSET).expect("OCS takes the press").rect;
+        let (_, at) = b.press(ocs.x + 4.0, ocs.y + 4.0);
+        hires.handle(ReqEvent::Press(at.0, at.1));
+        let Item::Facts { message, .. } = &hires.view().columns[1][1] else {
+            panic!("facts");
+        };
+        assert_eq!(message.as_deref(), Some("Super-High Res needs AGA"));
+    }
+
+    /// Check box, slider, radio rows and the list with its scroll bar.
+    #[test]
+    fn check_slider_rows_and_list_follow_the_state() {
+        use dpx_ui::requester::ctl;
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let draw = |d: &Dialog| build(d, window, 1.0, &theme, &Pointer::default());
+        let mut req = screen_format();
+        let b = draw(&req.view());
+        // The check box: on the accent with a mark while on, an empty well when off.
+        let check = b.spot(ctl::RETAIN).expect("Retain").rect;
+        let boxed = |b: &Built| -> Vec<(Rect, Color)> {
+            b.list
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::RoundRect {
+                        rect,
+                        fill: Some(c),
+                        ..
+                    } if rect.w == CHECK && rect.h == CHECK && check.inset(-1.0).encloses(rect) => {
+                        Some((*rect, *c))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            boxed(&b).iter().map(|x| x.1).collect::<Vec<_>>(),
+            [theme.accent]
+        );
+        assert_eq!(text_color(&b, "Retain Picture"), theme.text);
+        req.handle(ReqEvent::Key(ReqKey::Char('r')));
+        let off = draw(&req.view());
+        assert_eq!(
+            boxed(&off).iter().map(|x| x.1).collect::<Vec<_>>(),
+            [theme.panel]
+        );
+        assert_eq!(rings(&off.list, boxed(&off)[0].0), [(theme.text_dim, 1.5)]);
+        // The slider: its knob stands where the Classic knob stands, the value beside it.
+        let knob_x = |b: &Built| -> f32 {
+            let slider = b.spot(ctl::COLORS).expect("slider").rect;
+            b.list
+                .ops()
+                .iter()
+                .find_map(|op| match op {
+                    Op::Path {
+                        path,
+                        fill: Some(c),
+                        ..
+                    } if *c == theme.accent => path
+                        .bounds()
+                        .filter(|p| {
+                            slider.inset(-2.0).encloses(p) && (p.w - 2.0 * KNOB_R).abs() < 0.1
+                        })
+                        .map(|p| p.x + p.w / 2.0),
+                    _ => None,
+                })
+                .expect("the knob")
+        };
+        let slider = b.spot(ctl::COLORS).unwrap();
+        let first = knob_x(&b);
+        assert!(b.texts.iter().any(|t| t.text == "32"));
+        // 32 colours are step 5 of 8: four sevenths of the way.
+        let run = slider.rect.w - 2.0 * KNOB_R;
+        assert!((first - (slider.rect.x + KNOB_R + run * 4.0 / 7.0)).abs() < run / 98.0 + 0.01);
+        // A press on the knob changes nothing; a press at the far end sets the most.
+        let at = slider.to_classic(first, slider.rect.y + 3.0);
+        req.handle(ReqEvent::Press(at.0, at.1));
+        req.handle(ReqEvent::Release);
+        assert_eq!(req.colors(), 32);
+        let at = slider.to_classic(slider.rect.right() - 1.0, slider.rect.y + 3.0);
+        req.handle(ReqEvent::Press(at.0, at.1));
+        req.handle(ReqEvent::Release);
+        assert_eq!(req.colors(), 256);
+        let most = draw(&req.view());
+        assert!((knob_x(&most) - (slider.rect.right() - KNOB_R)).abs() < 0.01);
+        assert!(most.texts.iter().any(|t| t.text == "256"));
+        // The list: five rows, the selected one on the accent; the scroll knob follows.
+        let rows: Vec<Rect> = (0..5)
+            .map(|i| b.spot(ctl::ROW + i).expect("a row").rect)
+            .collect();
+        for pair in rows.windows(2) {
+            assert_eq!(pair[0].bottom(), pair[1].y);
+            assert_eq!(pair[0].h, 26.0);
+        }
+        let lit: Vec<bool> = rows
+            .iter()
+            .map(|r| fills(&b.list, *r) == [theme.accent])
+            .collect();
+        assert_eq!(lit, [false, false, false, false, true]);
+        assert_eq!(text_color(&b, "PAL:Low Res"), theme.on_accent);
+        assert_eq!(text_color(&b, "PAL:High Res"), theme.text);
+        let bar = b.spot(ctl::SCROLL).expect("the scroll bar").rect;
+        assert!(bar.x >= rows[0].right() && bar.h > 100.0);
+        let knob = |b: &Built| -> Rect {
+            b.list
+                .ops()
+                .iter()
+                .find_map(|op| match op {
+                    Op::RoundRect {
+                        rect,
+                        fill: Some(c),
+                        ..
+                    } if *c == theme.disabled && bar.encloses(rect) => Some(*rect),
+                    _ => None,
+                })
+                .expect("the scroll knob")
+        };
+        req.handle(ReqEvent::Scroll(99));
+        let low = knob(&draw(&req.view()));
+        req.handle(ReqEvent::Scroll(-99));
+        let top = knob(&draw(&req.view()));
+        assert!(
+            top.y < low.y && (top.y - bar.y).abs() < 0.01,
+            "{top:?} {low:?}"
+        );
+        assert!((low.bottom() - bar.bottom()).abs() < 1.0, "{low:?} {bar:?}");
+        assert!(low.h >= 8.0 && low.h < bar.h / 2.0);
+        // Radio rows (Page Size's presets): the chosen one has the accent ring and dot.
+        let page = page_size();
+        let b = draw(&page.view());
+        let row = |i: u16| {
+            b.spot(dpx_ui::page_size_requester::ctl::PRESET + i)
+                .unwrap()
+                .rect
+        };
+        assert_eq!(row(0).bottom(), row(1).y);
+        assert_eq!(row(0).h, 30.0);
+        let dots = |rect: Rect| -> Vec<Color> {
+            b.list
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Path {
+                        path,
+                        fill: Some(c),
+                        ..
+                    } if path
+                        .bounds()
+                        .is_some_and(|p| rect.encloses(&p) && p.w < 8.0) =>
+                    {
+                        Some(*c)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(dots(row(0)), [theme.accent]);
+        assert!(dots(row(1)).is_empty() && dots(row(2)).is_empty());
+        let detail = b
+            .texts
+            .iter()
+            .find(|t| t.text == "368 x 283")
+            .expect("a size");
+        assert_eq!(detail.color, theme.text_dim);
+        assert!((detail.ink.right() - (row(2).right() - 12.0)).abs() < 0.01);
+    }
+
+    /// Text: wrapped to the card, notes with an accent bullet, a refused value with the
+    /// accent bar, the facts panel with a message in place of the facts it covers, the
+    /// About text centred under the program's name.
+    #[test]
+    fn text_wraps_and_messages_stand_out() {
+        let theme = Theme::dark();
+        let window = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let draw = |d: &Dialog| build(d, window, 1.0, &theme, &Pointer::default());
+        let lines = wrap("one two three four five six", 60.0, SIZE, Weight::Regular);
+        assert!(lines.len() > 2 && lines.join(" ") == "one two three four five six");
+        assert!(
+            lines
+                .iter()
+                .all(|l| font::measure(l, SIZE, Weight::Regular) <= 60.0)
+        );
+        let long = wrap(
+            "Supercalifragilisticexpialidocious",
+            50.0,
+            SIZE,
+            Weight::Regular,
+        );
+        assert!(long.len() > 2 && long.concat() == "Supercalifragilisticexpialidocious");
+        assert!(wrap("", 50.0, SIZE, Weight::Regular).is_empty());
+        // A note: one bullet per note, the wrapped lines under each other.
+        let notes = strings(&[
+            "4 layers saved as one picture, as shown, 1 hidden layer left out (save as .dpxproj to keep them)",
+            "second",
+        ]);
+        let b = draw(&NoteRequester::new("Picture exported", &notes).view());
+        let bullets = b
+            .list
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(op, Op::Path { fill: Some(c), path, .. }
+                if *c == theme.accent && path.bounds().is_some_and(|p| p.w < 5.0))
+            })
+            .count();
+        assert_eq!(bullets, 2);
+        let body: Vec<&TextBox> = b.texts.iter().skip(1).filter(|t| t.text != "Ok").collect();
+        assert!(body.len() >= 3, "the long note wraps: {}", body.len());
+        assert!(body.iter().all(|t| t.ink.x == b.card.x + PAD + 14.0));
+        assert_eq!(body[1].ink.y - body[0].ink.y, LINE_H);
+        // Page Size refuses a size: the message with the accent bar, in the medium cut.
+        let mut page = page_size();
+        page.set_message("Size 320x200 to 1024x1024");
+        let b = draw(&page.view());
+        let message = b
+            .texts
+            .iter()
+            .find(|t| t.text.starts_with("Size"))
+            .expect("message");
+        assert_eq!(message.color, theme.text);
+        let bars = fills(
+            &b.list,
+            Rect::new(b.card.x + PAD, message.within.y + 2.0, 3.0, LINE_H - 4.0),
+        );
+        assert_eq!(bars, [theme.accent]);
+        // Screen Format: the message covers the last facts, which are left out whole.
+        let mut format = screen_format();
+        let all = draw(&format.view());
+        for name in [
+            "Chipset",
+            "Max Colors",
+            "Size",
+            "Max Size",
+            "Pixel Shape",
+            "Aspect",
+        ] {
+            assert!(
+                all.texts.iter().filter(|t| t.text == name).count() >= 1,
+                "{name}"
+            );
+        }
+        format.set_message("OCS shows at most 32 colours in this mode");
+        let refused = draw(&format.view());
+        let has = |b: &Built, text: &str| b.texts.iter().any(|t| t.text == text);
+        assert!(has(&refused, "Max Colors") && !has(&refused, "Aspect"));
+        assert!(
+            refused
+                .texts
+                .iter()
+                .any(|t| t.text.starts_with("OCS shows"))
+        );
+        assert_eq!(refused.card, all.card, "a message does not move the card");
+        // About: the name large and centred, the rest centred and subdued.
+        let about = strings(&["DeluxePainter 0.1.0: a pixel-art editor", "Not affiliated"]);
+        let b = draw(&NoteRequester::about("About DeluxePainter", &about).view());
+        let name = b
+            .texts
+            .iter()
+            .find(|t| t.text == "DeluxePainter 0.1.0")
+            .expect("the name");
+        let centre = b.card.x + b.card.w / 2.0;
+        assert!((name.ink.x + name.ink.w / 2.0 - centre).abs() < 0.01);
+        assert!(name.ink.h > 14.0, "set large");
+        let rest = b
+            .texts
+            .iter()
+            .find(|t| t.text == "A pixel-art editor")
+            .expect("the rest");
+        assert!((rest.ink.x + rest.ink.w / 2.0 - centre).abs() < 0.01);
+        assert_eq!(text_color(&b, "Not affiliated"), theme.text_dim);
+    }
+
+    /// A list without a scroll bar and a dialog without buttons or columns do not break
+    /// the layout (the kit is used by requesters that are not converted yet).
+    #[test]
+    fn odd_descriptions_are_laid_out() {
+        let row = |i: u16| ListRow {
+            control: Control::new(i, dpx_core::Rect::new(0, i as i32 * 8, 100, 8)),
+            label: format!(
+                "A very long file name number {i} that does not fit the row it is shown in.iff"
+            ),
+            detail: "12345".into(),
+            selected: i == 1,
+        };
+        let dialog = Dialog {
+            title: "A title that is much longer than any card is wide, to be cut with an ellipsis"
+                .into(),
+            kind: Kind::Plain,
+            size: Size::Medium,
+            columns: vec![vec![
+                Item::List(ListView {
+                    rows: (0..3).map(row).collect(),
+                    capacity: 6,
+                    scroll: None,
+                }),
+                Item::Rule,
+                Item::Credits(strings(&["One", "Two"])),
+            ]],
+            buttons: Vec::new(),
+        };
+        let b = built(&dialog, (720.0, 520.0), 1.0, ThemeKind::Light);
+        assert_eq!(b.card.w, 480.0);
+        assert_eq!(b.spots.len(), 3);
+        assert!(b.texts[0].text.ends_with('\u{2026}'));
+        for t in &b.texts {
+            assert!(t.within.inset(-0.5).encloses(&t.ink), "{t:?}");
+        }
+        let cut: Vec<&str> = b.texts.iter().map(|t| t.text.as_str()).collect();
+        assert!(
+            cut.iter()
+                .any(|t| t.starts_with("A very long") && t.ends_with('\u{2026}')),
+            "{cut:?}"
+        );
+        let none = Dialog {
+            title: String::new(),
+            kind: Kind::Plain,
+            size: Size::Small,
+            columns: Vec::new(),
+            buttons: Vec::new(),
+        };
+        let b = built(&none, (720.0, 520.0), 2.0, ThemeKind::Dark);
+        assert!(b.spots.is_empty() && b.card.h > 0.0);
+        let bar = ScrollBar {
+            control: Control::new(9, dpx_core::Rect::new(0, 0, 10, 0)),
+            knob: dpx_core::Rect::new(0, 0, 10, 0),
+        };
+        let degenerate = Dialog {
+            columns: vec![vec![Item::List(ListView {
+                rows: Vec::new(),
+                capacity: 2,
+                scroll: Some(bar),
+            })]],
+            ..none
+        };
+        let b = built(&degenerate, (720.0, 520.0), 1.0, ThemeKind::Dark);
+        assert!(b.list.len() > 3);
+    }
+
+    /// The card reaches the pixels: its ground, the accent of the default button, a field's
+    /// well, and ink inside every text's box, dark at 1x and light at 2x.
+    #[test]
+    fn the_card_reaches_the_pixels() {
+        for (kind, scale) in [(ThemeKind::Dark, 1.0f32), (ThemeKind::Light, 2.0)] {
+            let theme = Theme::of(kind);
+            let (w, h) = (720.0, 520.0);
+            let b = built(&page_size().view(), (w, h), scale, kind);
+            let (pw, ph) = ((w * scale) as u32, (h * scale) as u32);
+            let rgba = Renderer::new().render(&b.list, &[], pw, ph, scale, theme.canvas);
+            let at = |x: f32, y: f32| {
+                let i = (((y * scale) as u32 * pw + (x * scale) as u32) * 4) as usize;
+                Color::rgb(rgba[i], rgba[i + 1], rgba[i + 2])
+            };
+            assert_eq!(at(b.card.x + 8.0, b.card.y + 30.0), theme.raised);
+            assert_eq!(at(3.0, 3.0), theme.canvas);
+            // Just outside the card: the shadow darkens the canvas.
+            let beside = at(b.card.x + b.card.w / 2.0, b.card.bottom() + 3.0);
+            assert!(beside != theme.canvas && beside.luminance() < theme.canvas.luminance());
+            let ok = b.spot(dpx_ui::page_size_requester::ctl::OK).unwrap().rect;
+            assert_eq!(at(ok.x + 5.0, ok.y + ok.h / 2.0), theme.accent);
+            let field = b
+                .spot(dpx_ui::page_size_requester::ctl::HEIGHT)
+                .unwrap()
+                .rect;
+            assert_eq!(
+                at(field.right() - 6.0, field.y + field.h / 2.0),
+                theme.panel
+            );
+            for t in &b.texts {
+                let mut inked = 0;
+                let (x0, x1) = (
+                    (t.ink.x * scale) as u32,
+                    (t.ink.right() * scale).ceil() as u32,
+                );
+                let (y0, y1) = (
+                    (t.ink.y * scale) as u32,
+                    (t.ink.bottom() * scale).ceil() as u32,
+                );
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let i = ((y * pw + x) * 4) as usize;
+                        let c = Color::rgb(rgba[i], rgba[i + 1], rgba[i + 2]);
+                        if c.contrast(t.ground) >= 3.0 {
+                            inked += 1;
+                        }
+                    }
+                }
+                assert!(inked >= 4, "{kind:?}: no ink for '{}'", t.text);
+            }
+        }
+    }
+    /// In the window: the card lies over the picture and the chrome, both veiled; the
+    /// picture keeps the place it has without a requester (it hosts none); the overlay
+    /// covers the picture and the card with its shadow.
+    #[test]
+    fn the_window_shows_the_card_over_the_veiled_picture() {
+        use crate::build::{self, Model};
+        use crate::frame::{Frame, render_window};
+        use crate::raster::Image;
+        let palette = dpx_core::Palette::dpaint_default_32();
+        let ui = dpx_ui::UiState::default();
+        let page: Vec<u8> = [200u8, 150, 100, 255].repeat(320 * 256);
+        let dialog = page_size().view();
+        for (kind, scale, size) in [
+            (ThemeKind::Dark, 1.0, (1280.0, 800.0)),
+            (ThemeKind::Light, 2.0, (720.0, 520.0)),
+        ] {
+            let theme = Theme::of(kind);
+            let frame = |dialog: Option<&'static Dialog>, plain_picture: bool| Frame {
+                size,
+                scale,
+                theme,
+                model: Model {
+                    dimmed: dialog.is_some() || !plain_picture,
+                    dialog,
+                    plain_picture,
+                    ..Model::new(&ui, &palette)
+                },
+                picture: Image {
+                    width: 320,
+                    height: 256,
+                    rgba: &page,
+                },
+                per_ui_pixel: 1,
+            };
+            // (A leaked copy: the frame borrows the description for as long as `ui`.)
+            let shown = frame(Some(Box::leak(Box::new(dialog.clone()))), true);
+            let mut idle = frame(None, true);
+            idle.model.dimmed = false;
+            let l = shown.layout();
+            assert_eq!(l, idle.layout(), "the picture keeps its place");
+            let (bounds, list) = build::overlay(&l, &theme, &shown.model).expect("the card");
+            assert_eq!(
+                list.ops()[0],
+                Op::RoundRect {
+                    rect: l.picture,
+                    radius: 0.0,
+                    fill: Some(theme.scrim),
+                    stroke: None
+                },
+                "the veil over the picture comes first"
+            );
+            let card = built(&dialog, size, scale, kind);
+            assert!(bounds.encloses(&card.bounds) && bounds.encloses(&l.picture));
+            assert!(l.window.encloses(&bounds));
+            assert_eq!(list.len(), card.list.len() + 1);
+            let (w, _, rgba) = render_window(&shown, &mut Renderer::new());
+            let at = |x: f32, y: f32| {
+                let i = (((y * scale) as u32 * w + (x * scale) as u32) * 4) as usize;
+                Color::rgb(rgba[i], rgba[i + 1], rgba[i + 2])
+            };
+            assert_eq!(at(card.card.x + 8.0, card.card.y + 30.0), theme.raised);
+            let a = u32::from(theme.scrim.a);
+            let veiled = |c: Color| {
+                let ch = |under: u8, over: u8| {
+                    ((u32::from(over) * a + u32::from(under) * (255 - a) + 127) / 255) as u8
+                };
+                Color::rgb(
+                    ch(c.r, theme.scrim.r),
+                    ch(c.g, theme.scrim.g),
+                    ch(c.b, theme.scrim.b),
+                )
+            };
+            let near = |a: Color, b: Color| {
+                a.r.abs_diff(b.r) <= 1 && a.g.abs_diff(b.g) <= 1 && a.b.abs_diff(b.b) <= 1
+            };
+            let corner = at(l.picture.x + 2.0, l.picture.y + 2.0);
+            assert!(
+                near(corner, veiled(Color::rgb(200, 150, 100))),
+                "{kind:?}: {corner:?}"
+            );
+            let bar = l.bar.expect("bar");
+            assert!(near(
+                at(bar.right() - 3.0, bar.y + 3.0),
+                veiled(theme.panel)
+            ));
+        }
+    }
+}
