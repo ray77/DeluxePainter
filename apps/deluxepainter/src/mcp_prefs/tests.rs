@@ -879,8 +879,10 @@ fn scratch_dir(tag: &str) -> PathBuf {
 #[test]
 fn a_failed_start_shows_off_after_off_and_on_tries_again() {
     let mut rig = Rig::new(Fake::default());
-    // A real failure: the token cannot be written under /dev/null.
-    rig.app.mcp.config_dir = Some(PathBuf::from("/dev/null/DeluxePainter"));
+    // A real failure on every OS: the token cannot be written under a plain file.
+    let blocker = scratch_dir("blocked").join("file");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    rig.app.mcp.config_dir = Some(blocker.join("DeluxePainter"));
     rig.click(McpControl::On);
     assert!(matches!(rig.app.mcp.status(), Status::Failed(_)));
     let status = rig.view().status;
